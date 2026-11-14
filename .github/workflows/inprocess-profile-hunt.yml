@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        runner: [windows-2022, ubuntu-24.04]
+        runner: [windows-2022]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
@@ -41,14 +41,14 @@ jobs:
         run: |
           SUDO=""; [ "$RUNNER_OS" = "Linux" ] && SUDO="sudo -E env PATH=$PATH"
           mkdir -p "$RUNNER_TEMP/prof"
-          for arm in ours oursone; do
+          for arm in oursnoscan oursonenoscan; do
             for mode in gil idle; do
               # one long-lived process to follow: ours = 32 reps, four browsers at once in it; oursone = four processes of
               # one browser each, 16 reps in a row, side by side (the load of four browsers), and the profile follows one
-              if [ "$arm" = "ours" ]; then
-                python scripts/hunt_goto_stopped.py ours 32 0 "$FF" > "$RUNNER_TEMP/prof/rows-$arm-$mode.log" 2>&1 &
+              if [ "$arm" = "oursnoscan" ]; then
+                python scripts/hunt_goto_stopped.py oursnoscan 32 0 "$FF" > "$RUNNER_TEMP/prof/rows-$arm-$mode.log" 2>&1 &
               else
-                for k in 0 1 2 3; do python scripts/hunt_goto_stopped.py oursone 16 $((k*16)) "$FF" >> "$RUNNER_TEMP/prof/rows-$arm-$mode.log" 2>&1 & done
+                for k in 0 1 2 3; do python scripts/hunt_goto_stopped.py oursonenoscan 16 $((k*16)) "$FF" >> "$RUNNER_TEMP/prof/rows-$arm-$mode.log" 2>&1 & done
               fi
               sleep 25
               # the python process that runs the arm (the newest hunt_goto_stopped.py)
