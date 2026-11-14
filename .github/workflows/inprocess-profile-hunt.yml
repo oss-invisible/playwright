@@ -52,7 +52,7 @@ jobs:
               fi
               sleep 25
               # the python process that runs the arm (the newest hunt_goto_stopped.py)
-              PID=$(python -c "import sys,psutil; c=[p for p in psutil.process_iter(['cmdline','create_time']) if p.info['cmdline'] and 'hunt_goto_stopped.py' in ' '.join(p.info['cmdline']) and sys.argv[1] in p.info['cmdline']]; print(max(c,key=lambda p:p.info['create_time']).pid if c else '')" "$arm")
+              PID=$(python -c "import os,sys,psutil; c=[p for p in psutil.process_iter(['cmdline','create_time']) if p.pid != os.getpid() and p.info['cmdline'] and any(a.endswith('hunt_goto_stopped.py') for a in p.info['cmdline']) and sys.argv[1] in p.info['cmdline']]; print(max(c,key=lambda p:p.info['create_time']).pid if c else '')" "$arm")
               echo "arm $arm mode $mode pid $PID"
               FLAG="--gil"; [ "$mode" = "idle" ] && FLAG="--idle"
               timeout 200 $SUDO py-spy record --pid "$PID" --duration 150 --rate 250 --threads $FLAG --nonblocking --format raw -o "$RUNNER_TEMP/prof/$arm-$mode.txt" || echo "py-spy ended $?"
