@@ -1,14 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# cpu-per-browser-hunt.yml - HUNT ONLY, never merged: under the same load, does OUR Firefox (invisible_playwright, in-process client) use more
-# CPU per browser than stock Firefox 159 (stock Playwright's firefox-1572 with its own client)? Split by process type: parent, tab (content),
-# gpu, socket, rdd, utility.
+# cpu-per-browser-hunt.yml - HUNT ONLY, never merged: why does OUR Firefox use more CPU than stock Firefox on Windows?
 #
-# scripts/hunt_cpu_per_browser.py runs an arm = 4 browsers at once in one client process, headless, 1 page each, every page looping 10 times
-# over the same local scenario (an RTCPeerConnection with no ICE servers up to iceGatheringState complete, 200 DOM elements and a 2D canvas
-# frame, then the next copy of the page). A separate process samples the CPU of every process every 250 ms; each firefox process is mapped to
-# its browser by walking ppid and to its type by its -contentproc argument (the script's docstring has the details).
-# Ours is headed Firefox on a hidden desktop on Windows, so the stock arm is run both --headless (stock) and headed (stockheaded).
-# The arms alternate: ours, stock, stockheaded, twice. Windows only. The final step prints the comparison table.
+# scripts/hunt_cpu_per_browser.py (its docstring has the details). Six arms: ours (headed on a hidden desktop made by invisible_core),
+# ourswin (headed on the interactive desktop), ourshl (our binary in true --headless), stock (--headless), stockwin (headed on the
+# interactive desktop), stockhid (headed on a hidden desktop made the way invisible_core makes it). Per arm and round, three runs:
+#   n1 loop    1 browser alone, 10 scenarios (an RTCPeerConnection with no ICE, 200 divs, a 2D canvas frame);
+#   n1 scenes  1 browser: idle on about:blank 30 s, a still page 15 s, a requestAnimationFrame canvas 15 s, then about:support;
+#   n4 loop    the same 10 scenarios with 4 browsers at once.
+# Every window gives the kernel's CPU time per process (by type) and per thread (by name), the machine's CPU and every other process of the
+# runner. The arms alternate and the order of the second round is the reverse of the first. Windows only; the last step prints the tables.
 # ─────────────────────────────────────────────────────────────────────────────
 name: cpu per browser hunt
 
@@ -32,9 +32,9 @@ env:
 
 jobs:
   hunt:
-    name: hunt (windows-2022, ours vs stock vs stock headed, 2 rounds each)
+    name: hunt (windows-2022, 6 arms, 1 and 4 browsers, scenes, 2 rounds)
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -53,75 +53,32 @@ jobs:
         run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
-      - name: Arm ours, round 1
-        id: ours1
-        continue-on-error: true
+      - name: Measure (6 arms x 3 runs x 2 rounds, alternating)
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          python -u scripts/hunt_cpu_per_browser.py --arm ours --binary "$FF" --round 1 --out "$RUNNER_TEMP/cpu-hunt/ours-1.json" && rc=0 || rc=$?
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
-          exit $rc
-      - name: Arm stock, round 1
-        id: stock1
-        continue-on-error: true
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          python -u scripts/hunt_cpu_per_browser.py --arm stock --round 1 --out "$RUNNER_TEMP/cpu-hunt/stock-1.json" && rc=0 || rc=$?
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
-          exit $rc
-      - name: Arm stockheaded, round 1
-        id: stockheaded1
-        continue-on-error: true
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 1 --out "$RUNNER_TEMP/cpu-hunt/stockheaded-1.json" && rc=0 || rc=$?
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
-          exit $rc
-      - name: Arm ours, round 2
-        id: ours2
-        continue-on-error: true
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          python -u scripts/hunt_cpu_per_browser.py --arm ours --binary "$FF" --round 2 --out "$RUNNER_TEMP/cpu-hunt/ours-2.json" && rc=0 || rc=$?
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
-          exit $rc
-      - name: Arm stock, round 2
-        id: stock2
-        continue-on-error: true
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          python -u scripts/hunt_cpu_per_browser.py --arm stock --round 2 --out "$RUNNER_TEMP/cpu-hunt/stock-2.json" && rc=0 || rc=$?
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
-          exit $rc
-      - name: Arm stockheaded, round 2
-        id: stockheaded2
-        continue-on-error: true
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 2 --out "$RUNNER_TEMP/cpu-hunt/stockheaded-2.json" && rc=0 || rc=$?
-          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
-          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
-          exit $rc
-      - name: Comparison table
+          OUT="$RUNNER_TEMP/cpu-hunt"; mkdir -p "$OUT"
+          run() {   # arm browsers mode round
+            taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+            echo "::group::$1 n$2 $3 round $4"
+            python -u scripts/hunt_cpu_per_browser.py --arm "$1" --browsers "$2" --mode "$3" --round "$4" --binary "$FF"               --log "$OUT/$1-n$2-$3-r$4.log" --out "$OUT/$1-n$2-$3-r$4.json" || echo "FAILED: $*"
+            echo "::endgroup::"
+            taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+            echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
+          }
+          ORDER1="ours stockwin stock ourswin stockhid ourshl"
+          ORDER2="ourshl stockhid ourswin stock stockwin ours"
+          for rnd in 1 2; do
+            if [ "$rnd" = 1 ]; then ORDER=$ORDER1; else ORDER=$ORDER2; fi
+            for arm in $ORDER; do
+              run "$arm" 1 loop "$rnd"
+              run "$arm" 1 scenes "$rnd"
+              run "$arm" 4 loop "$rnd"
+            done
+          done
+      - name: Comparison tables
         if: always()
-        run: python scripts/hunt_cpu_per_browser.py --compare "$RUNNER_TEMP/cpu-hunt"
+        run: python scripts/hunt_cpu_per_browser.py --compare "$RUNNER_TEMP/cpu-hunt" | tee "$RUNNER_TEMP/cpu-hunt/compare.txt"
       - name: Close every Firefox left
         if: always()
         shell: pwsh
@@ -133,6 +90,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cpu-per-browser-hunt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/cpu-hunt/*.json
+          path: |
+            ${{ runner.temp }}/cpu-hunt/*.json
+            ${{ runner.temp }}/cpu-hunt/compare.txt
+            ${{ runner.temp }}/cpu-hunt/*.log
           if-no-files-found: warn
           retention-days: 14
