@@ -8,7 +8,9 @@
 #   1. the POST on both sides (the page: performance.now() and Date.now(); the page server: time.time() of the request line and of the
 #      response written);
 #   2. the gateway's view of the connection that carried it (new CONNECT or an older connection, every step, time.time());
-#   3. who opens the TLS handshakes the FakeDoh rejects (time, SNI, client port, mapped to a process with psutil).
+#   3. the TLS handshakes the FakeDoh rejects (time, SNI, client port; no process lookup: it is costly and holds the GIL);
+#   4. a sentinel thread of the pytest process (sleep 10 ms, every gap over 50 ms);
+#   5. every gateway connection: accepted, first bytes of the greeting, greeted (histogram, and those over 500 ms).
 #
 # The load is the one of an e2e leg: scripts/run_e2e.py with its own settings (4 browsers, --dist loadfile), over the files of the Windows
 # e2e part 2 (computed as e2e.yml does), and the target test repeated 12 times (INVPW_HUNT_REPS, the parameter `hunt_rep`). The target file

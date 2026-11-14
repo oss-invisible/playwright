@@ -9,15 +9,16 @@ the page's POST clears it. Three questions, none of which changes the tick or an
    when its body is read and when its response is written (`Page.requests`).
 2. THE GATEWAY'S VIEW of the connection that carried the POST: new CONNECT or an older connection, and the time.time() of every step
    (`Chain.trace_events`: accepted, greeted, connect-request, replies sent, upstream open, every chunk each way, end).
-3. WHO opens the TLS handshakes the FakeDoh rejects: the time, the SNI, the client's port (`FakeDoh.handshakes`), mapped to a process
-   with psutil.net_connections (`ProcessMap`: it resolves the port of every connection the gateway accepts, at the moment it is
-   accepted, from a thread of its own, because the connection of a rejected handshake is closed a moment later).
+3. WHO opens the TLS handshakes the FakeDoh rejects: the time, the SNI, the client's port (`FakeDoh.handshakes`). No process lookup:
+   psutil.net_connections is costly on Windows and holds the GIL, so it could stall the process it is meant to observe.
+4. STALLS of the pytest process itself: a sentinel thread sleeps 10 ms in a loop and records every gap over 50 ms (`Sentinel`).
+5. EVERY gateway connection: accepted, first bytes read in the greeting, greeted (`Chain.trace_events`), as a histogram of
+   accepted -> first bytes and the list of those over 500 ms.
 """
 from __future__ import annotations
 
 import json
 import os
-import queue
 import re
 import sys
 import tempfile
@@ -56,97 +57,33 @@ def emit(lines: List[str]) -> None:
         pass
 
 
-class ProcessMap:
-    """port of a client socket of the gateway -> the process that owns it, resolved when the gateway accepts the connection."""
+class Sentinel:
+    """A thread that sleeps 10 ms in a loop and records every gap over 50 ms between two of its wake-ups: (start time.time(), length s).
+    A gap is the process not running Python code (the GIL held elsewhere, a descheduled process, a long call that does not release it)."""
 
-    def __init__(self, gateway_port: int, binary: Optional[str]) -> None:
-        self.gateway_port = gateway_port
-        self.engine_dir = os.path.normcase(os.path.dirname(binary)) if binary else None
-        self._pending: "queue.Queue[Optional[Tuple[float, int]]]" = queue.Queue()
-        #: client port -> [(time.time() of the accept, pid or None)]
-        self.by_port: Dict[int, List[Tuple[float, Optional[int]]]] = {}
-        #: pid -> (kind, cmdline)
-        self.info: Dict[int, Tuple[str, str]] = {}
-        self.errors: List[str] = []
+    STEP = 0.010
+    OVER = 0.050
+
+    def __init__(self) -> None:
+        self.gaps: List[Tuple[float, float]] = []
+        self._halt = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
     def stop(self) -> None:
-        self._pending.put(None)
-        self._thread.join(timeout=10)
-
-    def listen(self, record) -> None:
-        """The `trace_listener` of the gateway: only an accept matters."""
-        t, port, event, _detail = record
-        if event == "accepted" and port > 0:
-            self._pending.put((t, port))
+        self._halt.set()
+        self._thread.join(timeout=5)
 
     def _run(self) -> None:
-        import psutil
-        while True:
-            item = self._pending.get()
-            if item is None:
-                return
-            batch = [item]
-            while True:
-                try:
-                    more = self._pending.get_nowait()
-                except queue.Empty:
-                    break
-                if more is None:
-                    self._pending.put(None)
-                    break
-                batch.append(more)
-            wanted = {port: t for t, port in batch}
-            found: Dict[int, int] = {}
-            for attempt in range(4):
-                try:
-                    for c in psutil.net_connections(kind="tcp"):
-                        if c.laddr and c.raddr and c.raddr.port == self.gateway_port and c.laddr.port in wanted and c.pid:
-                            found[c.laddr.port] = c.pid
-                except Exception as exc:   # noqa: BLE001
-                    self.errors.append("%s: %s" % (type(exc).__name__, exc))
-                    break
-                if all(p in found for p in wanted):
-                    break
-                time.sleep(0.02)
-            for port, t in wanted.items():
-                pid = found.get(port)
-                self.by_port.setdefault(port, []).append((t, pid))
-                if pid is not None and pid not in self.info:
-                    self.info[pid] = self._describe(pid)
-
-    def _describe(self, pid: int) -> Tuple[str, str]:
-        import psutil
-        if pid == os.getpid():
-            return "python: this test process", "pid %d" % pid
-        try:
-            proc = psutil.Process(pid)
-            name, cmd = proc.name(), proc.cmdline()
-            exe = os.path.normcase(proc.exe() or "")
-        except Exception as exc:   # noqa: BLE001
-            return "gone (%s)" % type(exc).__name__, "pid %d" % pid
-        text = " ".join(cmd)
-        in_engine = bool(self.engine_dir) and exe.startswith(self.engine_dir)
-        if in_engine or "firefox" in name.lower():
-            if "-contentproc" in cmd:
-                return "firefox -contentproc %s" % (cmd[-1] if cmd else "?"), text[:200]
-            return "firefox parent", text[:200]
-        if "python" in name.lower():
-            return "python: another process", text[:200]
-        return "other: %s" % name, text[:200]
-
-    def who(self, port: Optional[int], t: float) -> Tuple[Optional[int], str]:
-        """The process of the client socket `port` that was accepted last before `t`."""
-        rows = [r for r in self.by_port.get(port or -1, []) if r[0] <= t + 0.05]
-        if not rows:
-            return None, "unmapped (no accept recorded)"
-        pid = rows[-1][1]
-        if pid is None:
-            return None, "unmapped (not in the TCP table when accepted)"
-        return pid, self.info.get(pid, ("?", ""))[0]
+        last_wall, last = time.time(), time.perf_counter()
+        while not self._halt.is_set():
+            time.sleep(self.STEP)
+            now_wall, now = time.time(), time.perf_counter()
+            if now - last > self.OVER:
+                self.gaps.append((last_wall, now - last))
+            last_wall, last = now_wall, now
 
 
 class Hunt:
@@ -156,19 +93,14 @@ class Hunt:
         self.gateway = gateway
         self.rep = rep
         self.tag = "HUNT[%d.%d.rep%s]" % (os.getpid(), int(time.time()), rep)
-        self.procs = ProcessMap(gateway.port, binary)
+        self.sentinel = Sentinel()
 
     def start(self) -> None:
-        try:
-            self.gateway.trace_listener = self.procs.listen
-            self.procs.start()
-        except Exception:   # noqa: BLE001
-            pass
+        self.sentinel.start()
 
     def stop(self) -> None:
         try:
-            self.gateway.trace_listener = None
-            self.procs.stop()
+            self.sentinel.stop()
         except Exception:   # noqa: BLE001
             pass
 
@@ -176,7 +108,7 @@ class Hunt:
     def report(self, result: Optional[dict], explain: bool) -> None:
         """Print everything. Never raises: a hunt must not change the verdict of the test."""
         lines: List[str] = []
-        for part in (self._page_and_server, self._gateway_view, self._tls):
+        for part in (self._page_and_server, self._gateway_view, self._connections, self._stalls, self._tls):
             try:
                 lines += part(result or {})
             except Exception as exc:   # noqa: BLE001
@@ -296,37 +228,87 @@ class Hunt:
                 self.tag, sorted(upstream_of_post)))
         return out
 
-    # --- 3: who opens the handshakes the FakeDoh rejects --------------------------------------------------------------
+    # --- 3: who opens the handshakes the FakeDoh rejects ---------------------------------------------------------------
     def _tls(self, result: dict) -> List[str]:
         doh = self.gateway.doh
         shakes = list(doh.handshakes)
         bad = [h for h in shakes if not h["ok"]]
-        good = [h for h in shakes if h["ok"]]
-        out = ["%s 3. FakeDoh: %d TLS handshake(s) served, %d rejected (tls_failures %d); process map errors: %s" % (
-            self.tag, len(shakes), len(bad), len(doh.tls_failures), self.procs.errors[:2] or "none")]
-        kinds: Counter = Counter()
-        times: Dict[str, List[float]] = {}
+        out = ["%s 3. FakeDoh: %d TLS handshake(s) served, %d rejected (tls_failures %d)" % (self.tag, len(shakes), len(bad), len(doh.tls_failures))]
         snis: Counter = Counter()
+        ports = set()
         for h in bad:
             port = h["client"][1] if h["client"] else None
-            pid, kind = self.procs.who(port, h["t_start"]) if port else (None, "direct to the FakeDoh (no gateway)")
-            kinds[kind] += 1
-            times.setdefault(kind, []).append(h["t_end"])
             snis[h["sni"]] += 1
-            out.append("%s 3.   rejected t=%.3f (handshake started %.3f) sni=%s client_port=%s via=%s pid=%s process=%s error=%s" % (
-                self.tag, h["t_end"], h["t_start"], h["sni"], port, h["via"], pid, kind, (h["error"] or "")[:90]))
-        for kind, n in kinds.most_common():
-            ts = times[kind]
-            out.append("%s 3. SUMMARY rejected by process kind: %-34s %3d   first t=%.3f  last t=%.3f  (span %.0f ms)" % (
-                self.tag, kind, n, min(ts), max(ts), (max(ts) - min(ts)) * 1000.0))
+            ports.add(port)
+            out.append("%s 3.   rejected t=%.3f (handshake started %.3f, %.0f ms) sni=%s client_port=%s via=%s error=%s" % (
+                self.tag, h["t_end"], h["t_start"], (h["t_end"] - h["t_start"]) * 1000.0, h["sni"], port, h["via"], (h["error"] or "")[:90]))
         if bad:
-            out.append("%s 3. SUMMARY rejected by SNI: %s" % (self.tag, dict(snis)))
-            out.append("%s 3. SUMMARY rejected, all: first t=%.3f last t=%.3f" % (self.tag, min(h["t_end"] for h in bad), max(h["t_end"] for h in bad)))
-        ok_kinds: Counter = Counter()
-        for h in good:
-            port = h["client"][1] if h["client"] else None
-            ok_kinds[self.procs.who(port, h["t_start"])[1] if port else "direct"] += 1
-        out.append("%s 3. for comparison, handshakes that SUCCEEDED by process kind: %s" % (self.tag, dict(ok_kinds)))
-        for pid, (kind, cmd) in sorted(self.procs.info.items()):
-            out.append("%s 3.   pid %d is %s: %s" % (self.tag, pid, kind, cmd))
+            out.append("%s 3. SUMMARY rejected: %d on %d client port(s); by SNI %s; first t=%.3f last t=%.3f (span %.0f ms)" % (
+                self.tag, len(bad), len(ports), dict(snis), min(h["t_end"] for h in bad), max(h["t_end"] for h in bad),
+                (max(h["t_end"] for h in bad) - min(h["t_end"] for h in bad)) * 1000.0))
+        return out
+
+    # --- 4: stalls of this process --------------------------------------------------------------------------------
+    def _stalls(self, result: dict) -> List[str]:
+        tl = result.get("timeline") or {}
+        send, resp, tick = tl.get("post_send_date"), tl.get("post_response_date"), tl.get("tick_fired_date")
+        base = (send / 1000.0) if send is not None else None
+        gaps = list(self.sentinel.gaps)
+
+        def rel(t: float) -> str:
+            return "%+.1f ms" % ((t - base) * 1000.0) if base is not None else "%.3f" % t
+
+        out = ["%s 4. sentinel (sleep %d ms, gaps over %d ms): %d gap(s), total %.0f ms" % (
+            self.tag, self.sentinel.STEP * 1000, self.sentinel.OVER * 1000, len(gaps), sum(g for _t, g in gaps) * 1000.0)]
+        windows = []
+        if send is not None and resp is not None:
+            windows.append(("post_send -> post_response", send / 1000.0, resp / 1000.0))
+        if send is not None and tick is not None:
+            windows.append(("post_send -> tick_fired", send / 1000.0, tick / 1000.0))
+        for name, a, b in windows:
+            hit = [(t, g) for t, g in gaps if t < b and t + g > a]
+            out.append("%s 4. gaps overlapping %s (%.0f ms): %s" % (
+                self.tag, name, (b - a) * 1000.0,
+                "; ".join("start %s length %.0f ms" % (rel(t), g * 1000.0) for t, g in hit) or "none"))
+        for t, g in sorted(gaps, key=lambda x: -x[1])[:10]:
+            out.append("%s 4.   largest: start t=%.3f (%s) length %.0f ms" % (self.tag, t, rel(t), g * 1000.0))
+        return out
+
+    # --- 5: every gateway connection: accepted -> first bytes -> greeted --------------------------------------------
+    def _connections(self, result: dict) -> List[str]:
+        tl = result.get("timeline") or {}
+        send = tl.get("post_send_date")
+        base = (send / 1000.0) if send is not None else None
+
+        def rel(t: Optional[float]) -> str:
+            if t is None:
+                return "n/a"
+            return "%+.1f ms" % ((t - base) * 1000.0) if base is not None else "%.3f" % t
+
+        rows = []
+        for seg in self._segments():
+            first = {}
+            for t, _p, event, detail in seg:
+                first.setdefault(event, t)
+            connect = next((d for _t, _p, e, d in seg if e == "connect-request"), "-")
+            rows.append({"port": seg[0][1], "accepted": first.get("accepted"), "first": first.get("first-bytes"),
+                         "greeted": first.get("greeted"), "connect": connect})
+        wait = [(r["first"] - r["accepted"]) * 1000.0 for r in rows if r["first"] is not None and r["accepted"] is not None]
+        edges = [10, 50, 100, 200, 500, 1000]
+        labels = ["< 10 ms"] + ["%d-%d ms" % (a, b) for a, b in zip(edges, edges[1:])] + [">= %d ms" % edges[-1]]
+        counts = [0] * len(labels)
+        for w in wait:
+            counts[sum(1 for e in edges if w >= e)] += 1
+        out = ["%s 5. gateway: %d connection(s) accepted, %d with first bytes read; accepted -> first bytes histogram: %s" % (
+            self.tag, len(rows), len(wait), ", ".join("%s: %d" % (l, c) for l, c in zip(labels, counts)))]
+        if wait:
+            out.append("%s 5. accepted -> first bytes: min %.1f, median %.1f, max %.1f ms" % (self.tag, min(wait), sorted(wait)[len(wait) // 2], max(wait)))
+        for r in rows:
+            gap = (r["first"] - r["accepted"]) * 1000.0 if r["first"] is not None and r["accepted"] is not None else None
+            if gap is None:
+                out.append("%s 5.   NO first bytes: client port %s accepted %s, greeted %s, connect %s" % (
+                    self.tag, r["port"], rel(r["accepted"]), rel(r["greeted"]), r["connect"]))
+            elif gap > 500:
+                out.append("%s 5.   OVER 500 ms: client port %s accepted %s, first bytes %s (+%.0f ms), greeted %s, connect %s" % (
+                    self.tag, r["port"], rel(r["accepted"]), rel(r["first"]), gap, rel(r["greeted"]), r["connect"]))
         return out

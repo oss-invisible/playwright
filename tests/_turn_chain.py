@@ -182,8 +182,6 @@ class Chain(DohGateway):
         #: HUNT (hunt/udp-chain-post, memory only): every step of every connection the gateway accepted, as
         #: (time.time(), port of the client socket, event, detail), in order. Read by tests/_udp_chain_hunt.py.
         self.trace_events: List[Tuple[float, int, str, object]] = []
-        #: HUNT: told every event as it is recorded (the process map of the hunt hangs here).
-        self.trace_listener = None
         self.turn = TurnServer()
         self.doh = FakeDoh({TURN_NAME: TURN_IP, PAGE_NAME: "127.0.0.1"})
         self.page = Page(self)
@@ -198,14 +196,7 @@ class Chain(DohGateway):
             port = c.getpeername()[1]
         except OSError:
             port = -1
-        record = (now, port, event, detail)
-        self.trace_events.append(record)
-        listener = self.trace_listener
-        if listener is not None:
-            try:
-                listener(record)
-            except Exception:   # noqa: BLE001 - instrumentation never changes what the gateway does
-                pass
+        self.trace_events.append((now, port, event, detail))
 
     def _handle(self, c) -> None:
         self._trace(c, "accepted")

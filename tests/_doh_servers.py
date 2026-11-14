@@ -667,6 +667,7 @@ class DohGateway(Gateway):
     def _greet(self, c: socket.socket) -> bool:
         """The base negotiation, recording the credentials a client sent."""
         ver, n = _recv_exact(c, 2)
+        self._trace(c, "first-bytes")      # HUNT: the first bytes of the client's greeting have been read
         methods = _recv_exact(c, n)
         if ver != 5:
             return False
