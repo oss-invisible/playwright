@@ -11,7 +11,16 @@
 #   - does it happen with the published invisible-playwright 0.52.0 (its own venv, its own binary), and with stock Playwright's firefox (headed and
 #     headless)?
 #   - is the probe at fault? (anything time-, random- or order-dependent in what it draws: three calls on the same canvas in the same page say so)
-# The arms: ours (this checkout's wrapper with the published binary of the job), ours_pypi052, stockheaded, stockheadless; two launches each.
+# The arms: ours (this checkout's wrapper with the published binary of the job), ours_pypi052, stockheaded, stockheadless and, from the second run,
+# `retail` (Mozilla's Firefox 159.0 installer, checked against its SHA256SUMS, launched by hand: subprocess, -no-remote, a fresh profile, no automation);
+# two launches each.
+#
+# FINDING OF THE FIRST RUN (43652292507), read again with a parser that checks the PNG against the specification: the pixels, the filter and the deflate
+# stream of every PNG are identical between two launches, between two runners, in every arm. The ONE difference is a 16-byte ancillary chunk `deBG` after the
+# IDATs (16 hex characters, plus its CRC): upstream Mozilla's nsPNGEncoder::MaybeAddCustomMetadata (image/encoders/png/nsPNGEncoder.cpp, the four letters
+# are set one by one, which is why `git grep deBG` finds nothing), keyed by the session's fingerprinting randomization key. The core turns
+# privacy.baselineFingerprintingProtection on to match retail 151 (invisible_core/prefs.py). What this run adds: does retail 159 write it, and with a
+# different value in every launch?
 # ─────────────────────────────────────────────────────────────────────────────
 name: encoding stability hunt
 
@@ -58,13 +67,18 @@ jobs:
       - name: Install the wrapper of this checkout, and stock Playwright with its firefox
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[dev]"
+          python -m pip install ".[dev]" psutil
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
           python -m playwright install firefox
       - name: Fetch the published firefox binary
         run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
+      - name: The PNG parser against PNGs whose chunks are known
+        run: python scripts/hunt_encoding.py selftest
+      - name: "Retail Firefox 159.0 (Mozilla's installer, checked against SHA256SUMS, unpacked with 7-Zip)"
+        continue-on-error: true
+        run: python -u scripts/hunt_first_run.py fetch-retail --out "$RUNNER_TEMP/retail"
       - name: Install the PUBLISHED invisible-playwright 0.52.0 in its own venv, and fetch its own binary
         continue-on-error: true
         run: |
@@ -102,6 +116,13 @@ jobs:
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
           python -u scripts/hunt_encoding.py collect --client stock --label stockheadless --headless --out "$RUNNER_TEMP/enc/${{ matrix.leg }}"
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "Arm retail (Mozilla's Firefox 159.0 launched by hand, no automation), 2 launches"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_encoding.py collect --client retail --label retail --retail-from "$RUNNER_TEMP/retail" --out "$RUNNER_TEMP/enc/${{ matrix.leg }}"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
       - name: "Per-key table of this runner (two launches, three calls in one page)"
         if: always()
         continue-on-error: true
@@ -132,6 +153,8 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      - name: The PNG parser against PNGs whose chunks are known
+        run: python scripts/hunt_encoding.py selftest
       - name: Download both legs
         continue-on-error: true
         env:
