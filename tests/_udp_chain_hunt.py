@@ -11,15 +11,19 @@ the page's POST clears it. Three questions, none of which changes the tick or an
    (`Chain.trace_events`: accepted, greeted, connect-request, replies sent, upstream open, every chunk each way, end).
 3. WHO opens the TLS handshakes the FakeDoh rejects: the time, the SNI, the client's port (`FakeDoh.handshakes`). No process lookup:
    psutil.net_connections is costly on Windows and holds the GIL, so it could stall the process it is meant to observe.
-4. STALLS of the pytest process itself: a sentinel thread sleeps 10 ms in a loop and records every gap over 50 ms (`Sentinel`).
+4. STALLS of the pytest process itself: a sentinel thread sleeps 10 ms in a loop and records every gap over 50 ms (`Sentinel`), with
+   the CPU the process used during it and, for a gap over 100 ms, the top frames of every thread; and the same loop in a second, tiny
+   process (`ChildSentinel`): both stalling = the CPU is starved, only the first = something in our process holds the GIL.
 5. EVERY gateway connection: accepted, first bytes read in the greeting, greeted (`Chain.trace_events`), as a histogram of
    accepted -> first bytes and the list of those over 500 ms.
 """
 from __future__ import annotations
 
 import json
+import linecache
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -58,16 +62,23 @@ def emit(lines: List[str]) -> None:
 
 
 class Sentinel:
-    """A thread that sleeps 10 ms in a loop and records every gap over 50 ms between two of its wake-ups: (start time.time(), length s).
-    A gap is the process not running Python code (the GIL held elsewhere, a descheduled process, a long call that does not release it)."""
+    """A thread that sleeps 10 ms in a loop and records every gap over 50 ms between two of its wake-ups.
+    A gap is the process not running Python code (the GIL held elsewhere, a descheduled process, a long call that does not release it).
+
+    Each gap is a dict: ``start`` (time.time()), ``length`` (s), ``cpu`` (s of time.process_time() of THIS process between the two
+    wake-ups, all threads: the CPU the process used during the gap), ``cpu_start`` / ``cpu_end`` (the two readings) and, for a gap over
+    100 ms, ``frames``: sys._current_frames() taken right after the gap ended, as {thread name: [(file, line, function) x top 6, innermost
+    first]}. The thread that held the GIL is usually still in the same call."""
 
     STEP = 0.010
     OVER = 0.050
+    SNAPSHOT_OVER = 0.100
+    DEPTH = 6
 
     def __init__(self) -> None:
-        self.gaps: List[Tuple[float, float]] = []
+        self.gaps: List[dict] = []
         self._halt = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="hunt-sentinel")
 
     def start(self) -> None:
         self._thread.start()
@@ -76,14 +87,92 @@ class Sentinel:
         self._halt.set()
         self._thread.join(timeout=5)
 
+    def _snapshot(self) -> Dict[str, List[Tuple[str, int, str]]]:
+        names = {t.ident: t.name for t in threading.enumerate()}
+        mine = threading.get_ident()
+        out: Dict[str, List[Tuple[str, int, str]]] = {}
+        for tid, frame in sys._current_frames().items():
+            if tid == mine:
+                continue
+            stack, f = [], frame
+            while f is not None and len(stack) < self.DEPTH:
+                stack.append((f.f_code.co_filename, f.f_lineno, f.f_code.co_name))
+                f = f.f_back
+            key = "%s#%d" % (names.get(tid, "thread"), tid)
+            out[key] = stack
+        return out
+
     def _run(self) -> None:
-        last_wall, last = time.time(), time.perf_counter()
+        last_wall, last, last_cpu = time.time(), time.perf_counter(), time.process_time()
         while not self._halt.is_set():
             time.sleep(self.STEP)
-            now_wall, now = time.time(), time.perf_counter()
+            now_wall, now, now_cpu = time.time(), time.perf_counter(), time.process_time()
             if now - last > self.OVER:
-                self.gaps.append((last_wall, now - last))
-            last_wall, last = now_wall, now
+                gap = {"start": last_wall, "length": now - last, "cpu": now_cpu - last_cpu, "cpu_start": last_cpu, "cpu_end": now_cpu,
+                       "frames": None}
+                if now - last > self.SNAPSHOT_OVER:
+                    try:
+                        gap["frames"] = self._snapshot()
+                    except Exception as exc:   # noqa: BLE001
+                        gap["frames"] = {"snapshot failed": [("", 0, "%s: %s" % (type(exc).__name__, exc))]}
+                self.gaps.append(gap)
+                # the snapshot itself took time: the next gap starts after it
+                now_wall, now, now_cpu = time.time(), time.perf_counter(), time.process_time()
+            last_wall, last, last_cpu = now_wall, now, now_cpu
+
+
+#: The second sentinel: a tiny process of its own, the same loop (10 ms sleeps, gaps over 50 ms, time.time() stamps). When both stall at
+#: once the machine's CPU is starved; when only the one in the pytest process does, something in that process holds the GIL.
+CHILD_CODE = r"""
+import json, sys, threading, time
+halt = threading.Event()
+threading.Thread(target=lambda: (sys.stdin.read(), halt.set()), daemon=True).start()
+gaps = []
+last = time.time()
+perf = time.perf_counter()
+print("ready", flush=True)
+while not halt.is_set():
+    time.sleep(0.010)
+    now, nperf = time.time(), time.perf_counter()
+    if nperf - perf > 0.050:
+        gaps.append([last, nperf - perf])
+    last, perf = now, nperf
+print(json.dumps(gaps), flush=True)
+"""
+
+
+class ChildSentinel:
+    def __init__(self) -> None:
+        self.gaps: List[Tuple[float, float]] = []
+        self.note = ""
+        self._proc: Optional["subprocess.Popen"] = None
+
+    def start(self) -> None:
+        try:
+            self._proc = subprocess.Popen([sys.executable, "-I", "-c", CHILD_CODE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          text=True)
+            ready = self._proc.stdout.readline()          # it is running before the browser starts
+            if "ready" not in ready:
+                self.note = "the second sentinel said %r instead of ready" % ready
+        except Exception as exc:   # noqa: BLE001
+            self.note = "the second sentinel did not start: %s: %s" % (type(exc).__name__, exc)
+            self._proc = None
+
+    def stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            line = proc.stdout.readline()
+            self.gaps = [(float(a), float(b)) for a, b in json.loads(line)]
+        except Exception as exc:   # noqa: BLE001
+            self.note = "the second sentinel gave no gaps: %s: %s" % (type(exc).__name__, exc)
+        finally:
+            try:
+                proc.wait(timeout=5)
+            except Exception:   # noqa: BLE001
+                proc.kill()
 
 
 class Hunt:
@@ -94,15 +183,18 @@ class Hunt:
         self.rep = rep
         self.tag = "HUNT[%d.%d.rep%s]" % (os.getpid(), int(time.time()), rep)
         self.sentinel = Sentinel()
+        self.child = ChildSentinel()
 
     def start(self) -> None:
+        self.child.start()
         self.sentinel.start()
 
     def stop(self) -> None:
-        try:
-            self.sentinel.stop()
-        except Exception:   # noqa: BLE001
-            pass
+        for sentinel in (self.sentinel, self.child):
+            try:
+                sentinel.stop()
+            except Exception:   # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------------------------------------------------
     def report(self, result: Optional[dict], explain: bool) -> None:
@@ -248,30 +340,67 @@ class Hunt:
                 (max(h["t_end"] for h in bad) - min(h["t_end"] for h in bad)) * 1000.0))
         return out
 
-    # --- 4: stalls of this process --------------------------------------------------------------------------------
+    # --- 4: stalls of this process, and of a second process beside it ----------------------------------------------
     def _stalls(self, result: dict) -> List[str]:
         tl = result.get("timeline") or {}
         send, resp, tick = tl.get("post_send_date"), tl.get("post_response_date"), tl.get("tick_fired_date")
         base = (send / 1000.0) if send is not None else None
         gaps = list(self.sentinel.gaps)
+        other = list(self.child.gaps)
 
         def rel(t: float) -> str:
             return "%+.1f ms" % ((t - base) * 1000.0) if base is not None else "%.3f" % t
 
-        out = ["%s 4. sentinel (sleep %d ms, gaps over %d ms): %d gap(s), total %.0f ms" % (
-            self.tag, self.sentinel.STEP * 1000, self.sentinel.OVER * 1000, len(gaps), sum(g for _t, g in gaps) * 1000.0)]
+        def overlaps(t: float, g: float) -> List[Tuple[float, float]]:
+            return [(a, b) for a, b in other if a < t + g and a + b > t]
+
+        out = ["%s 4. sentinel IN the pytest process (sleep %d ms, gaps over %d ms): %d gap(s), total %.0f ms, CPU used by the process during them %.0f ms" % (
+            self.tag, self.sentinel.STEP * 1000, self.sentinel.OVER * 1000, len(gaps), sum(g["length"] for g in gaps) * 1000.0,
+            sum(g["cpu"] for g in gaps) * 1000.0)]
+        out.append("%s 4. sentinel in a SEPARATE tiny process (same loop): %d gap(s), total %.0f ms%s" % (
+            self.tag, len(other), sum(b for _a, b in other) * 1000.0, ("; " + self.child.note) if self.child.note else ""))
         windows = []
         if send is not None and resp is not None:
             windows.append(("post_send -> post_response", send / 1000.0, resp / 1000.0))
         if send is not None and tick is not None:
             windows.append(("post_send -> tick_fired", send / 1000.0, tick / 1000.0))
         for name, a, b in windows:
-            hit = [(t, g) for t, g in gaps if t < b and t + g > a]
-            out.append("%s 4. gaps overlapping %s (%.0f ms): %s" % (
+            hit = [g for g in gaps if g["start"] < b and g["start"] + g["length"] > a]
+            out.append("%s 4. in-process gaps overlapping %s (%.0f ms): %s" % (
                 self.tag, name, (b - a) * 1000.0,
-                "; ".join("start %s length %.0f ms" % (rel(t), g * 1000.0) for t, g in hit) or "none"))
-        for t, g in sorted(gaps, key=lambda x: -x[1])[:10]:
-            out.append("%s 4.   largest: start t=%.3f (%s) length %.0f ms" % (self.tag, t, rel(t), g * 1000.0))
+                "; ".join("start %s length %.0f ms" % (rel(g["start"]), g["length"] * 1000.0) for g in hit) or "none"))
+            hit = [(t, g) for t, g in other if t < b and t + g > a]
+            out.append("%s 4. second-process gaps overlapping %s: %s" % (
+                self.tag, name, "; ".join("start %s length %.0f ms" % (rel(t), g * 1000.0) for t, g in hit) or "none"))
+        out.append("%s 4. every in-process gap, in time order: start relative to post_send, length, CPU of the process during it "
+                   "(process_time at start -> end), and whether the second process stalled at the same time" % self.tag)
+        for g in gaps:
+            both = overlaps(g["start"], g["length"])
+            out.append("%s 4.   start %s (t=%.3f) length %6.0f ms  cpu %6.0f ms (%.3f -> %.3f s)  %s" % (
+                self.tag, rel(g["start"]), g["start"], g["length"] * 1000.0, g["cpu"] * 1000.0, g["cpu_start"], g["cpu_end"],
+                "BOTH STALLED (second process: %s)" % ", ".join("start %s length %.0f ms" % (rel(a), b * 1000.0) for a, b in both)
+                if both else "only this process"))
+        out.append("%s 4. every second-process gap, in time order (overlap with an in-process gap marked)" % self.tag)
+        for t, g in other:
+            mine = [x for x in gaps if x["start"] < t + g and x["start"] + x["length"] > t]
+            out.append("%s 4.   start %s (t=%.3f) length %6.0f ms  %s" % (
+                self.tag, rel(t), t, g * 1000.0,
+                "BOTH STALLED (in-process: %s)" % ", ".join("start %s length %.0f ms" % (rel(x["start"]), x["length"] * 1000.0) for x in mine)
+                if mine else "only the second process"))
+        for rank, g in enumerate(sorted(gaps, key=lambda x: -x["length"])[:15], 1):
+            if not g["frames"]:
+                continue
+            out.append("%s 4.   largest #%d: start %s length %.0f ms cpu %.0f ms; every thread right after the gap, top %d frames, innermost first "
+                       "(identical stacks grouped):" % (self.tag, rank, rel(g["start"]), g["length"] * 1000.0, g["cpu"] * 1000.0, Sentinel.DEPTH))
+            groups: Dict[tuple, List[str]] = {}
+            for thread, stack in g["frames"].items():
+                groups.setdefault(tuple(stack), []).append(thread)
+            for stack, threads in sorted(groups.items(), key=lambda kv: len(kv[1])):
+                names = ", ".join(threads[:3]) + (" +%d more" % (len(threads) - 3) if len(threads) > 3 else "")
+                out.append("%s 4.     x%d [%s]" % (self.tag, len(threads), names))
+                for filename, lineno, func in stack:
+                    text = linecache.getline(filename, lineno).strip()[:70] if filename else ""
+                    out.append("%s 4.         %s:%d %s%s" % (self.tag, os.path.basename(filename), lineno, func, ("  | " + text) if text else ""))
         return out
 
     # --- 5: every gateway connection: accepted -> first bytes -> greeted --------------------------------------------
