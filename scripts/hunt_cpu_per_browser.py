@@ -64,6 +64,7 @@ SETTLE_S = 8
 IDLE_S = 30
 STATIC_S = 15
 RAF_S = 15
+LATE_S = 30
 
 PAGE = """<!doctype html><meta charset=utf-8><title>scenario</title>
 <body><div id=root></div><canvas id=c width=320 height=200></canvas>
@@ -174,6 +175,17 @@ if sys.platform == "win32":
     k32.OpenThread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
     k32.LocalFree.argtypes = (ctypes.c_void_p,)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    psapi.EnumProcessModulesEx.argtypes = (wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.DWORD)
+    psapi.GetModuleInformation.argtypes = (wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD)
+    psapi.GetModuleBaseNameW.argtypes = (wintypes.HANDLE, ctypes.c_void_p, ctypes.c_wchar_p, wintypes.DWORD)
+    ntdll.NtQueryInformationThread.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG, ctypes.c_void_p)
+
+    class MODULEINFO(ctypes.Structure):
+        _fields_ = [("base", ctypes.c_void_p), ("size", wintypes.DWORD), ("entry", ctypes.c_void_p)]
+
     getdesc = getattr(k32, "GetThreadDescription", None)
     if getdesc is None:
         getdesc = getattr(ctypes.WinDLL("kernelbase"), "GetThreadDescription", None)
@@ -183,23 +195,59 @@ if sys.platform == "win32":
     k32.GetSystemTimes.argtypes = (ctypes.POINTER(ctypes.c_ulonglong),) * 3
 
 
-def thread_name(pid, tid):
+def module_list(pid):
+    # [(base, size, basename)] of the modules of a process, or [] when it cannot be opened
+    out = []
+    h = k32.OpenProcess(0x0410, False, pid)      # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+    if not h:
+        return out
+    try:
+        arr = (ctypes.c_void_p * 4096)()
+        need = wintypes.DWORD()
+        if psapi.EnumProcessModulesEx(h, arr, ctypes.sizeof(arr), ctypes.byref(need), 3):
+            for i in range(min(4096, need.value // ctypes.sizeof(ctypes.c_void_p))):
+                info_ = MODULEINFO()
+                name = ctypes.create_unicode_buffer(260)
+                if psapi.GetModuleInformation(h, arr[i], ctypes.byref(info_), ctypes.sizeof(info_)) and psapi.GetModuleBaseNameW(h, arr[i], name, 260):
+                    out.append((info_.base or 0, info_.size, name.value))
+    finally:
+        k32.CloseHandle(h)
+    return out
+
+
+def thread_name(pid, tid, mods):
+    # the thread's description, or, when it has none, "?" + the module of its Win32 start address (so an unnamed thread says whose it is)
     key = (pid, tid)
     if names.get(key):
         return names[key]
-    name = ""
-    if getdesc is not None:
-        h = k32.OpenThread(0x0800, False, tid)      # THREAD_QUERY_LIMITED_INFORMATION
-        if h:
-            try:
+    name, start = "", 0
+    h = k32.OpenThread(0x0840, False, tid)      # THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION
+    if not h:
+        h = k32.OpenThread(0x0800, False, tid)
+    if h:
+        try:
+            if getdesc is not None:
                 buf = ctypes.c_void_p()
                 if getdesc(h, ctypes.byref(buf)) >= 0 and buf.value:
                     name = ctypes.wstring_at(buf.value)
                     k32.LocalFree(buf)
-            finally:
-                k32.CloseHandle(h)
-    names[key] = name
-    return name
+            if not name:
+                addr = ctypes.c_void_p()
+                if ntdll.NtQueryInformationThread(h, 9, ctypes.byref(addr), 8, None) == 0 and addr.value:   # ThreadQuerySetWin32StartAddress
+                    start = addr.value
+        finally:
+            k32.CloseHandle(h)
+    if name:
+        names[key] = name
+        return name
+    if start:
+        if pid not in mods:
+            mods[pid] = module_list(pid)
+        for base, size, mname in mods[pid]:
+            if base <= start < base + size:
+                return "?" + mname
+        return "?unmapped"
+    return "?"
 
 
 def machine_times():
@@ -298,10 +346,10 @@ def sample(threads=False):
 
 def snap(label):
     now, tab = sample(True)
-    procs = {}
+    procs, mods = {}, {}
     for pid, (name, _, _, th) in tab.items():
         if th:
-            procs[pid] = [[tid, c, ctx, state, thread_name(pid, tid)] for tid, c, ctx, state in th]
+            procs[pid] = [[tid, c, ctx, state, thread_name(pid, tid, mods)] for tid, c, ctx, state in th]
     snaps.append({"label": label, "t": now, "procs": procs})
 
 
@@ -499,6 +547,9 @@ ABOUT_SUPPORT_JS = r"""() => {
 }"""
 
 
+OPEN_BROWSERS: list = []   # the browsers of the arm, so that about:support can open a context of its own
+
+
 async def loop_one(page, base: str, index: int, outcome: dict) -> None:
     for n in range(ROUNDS):
         t = time.perf_counter()
@@ -526,6 +577,7 @@ async def launched(arm: str, binary: str, n: int):
             browsers = await asyncio.gather(*(stack.enter_async_context(
                 InvisiblePlaywright(seed=100 + i, binary_path=binary, headless=arm != "ourswin", locale="en-US", timezone="Europe/Rome"))
                 for i in range(n)))
+            OPEN_BROWSERS[:] = browsers
             yield await asyncio.gather(*(b.new_page() for b in browsers))
         return
     async_playwright = importlib.import_module("playwright.async_api").async_playwright   # by name: the fork's guard forbids a static import
@@ -536,6 +588,7 @@ async def launched(arm: str, binary: str, n: int):
         prefs.update({"security.sandbox.gpu.level": 0, "security.sandbox.content.level": 4})
     try:
         browsers = await asyncio.gather(*(pw.firefox.launch(headless=arm == "stock", firefox_user_prefs=prefs) for _ in range(n)))
+        OPEN_BROWSERS[:] = browsers
         yield await asyncio.gather(*(b.new_page() for b in browsers))
     finally:
         for b in browsers:
@@ -564,8 +617,15 @@ async def run_loop(pages: list, base: str, sampler: Sampler, notes: dict) -> Non
 
 
 async def run_scenes(pages: list, base: str, sampler: Sampler, notes: dict) -> None:
-    await asyncio.sleep(SETTLE_S)
-    await window(sampler, "idle", IDLE_S)
+    await window(sampler, "settle", SETTLE_S)            # the first seconds after the page exists
+    # idle in three slices of 10 s (idle-s1, idle-s2 are the cuts), to see whether the CPU decays or stays
+    sampler.snap("idle-b")
+    await asyncio.sleep(IDLE_S / 3)
+    sampler.snap("idle-s1")
+    await asyncio.sleep(IDLE_S / 3)
+    sampler.snap("idle-s2")
+    await asyncio.sleep(IDLE_S / 3)
+    sampler.snap("idle-e")
     for p in pages:
         await p.goto(base + "/static", wait_until="load", timeout=SCENARIO_TIMEOUT_S * 1000)
     await asyncio.sleep(2)
@@ -582,13 +642,18 @@ async def run_scenes(pages: list, base: str, sampler: Sampler, notes: dict) -> N
     notes["raf_frames"] = [{"frames": e["frames"] - b["frames"], "ms": e["now"] - b["now"],
                             "fps": (e["frames"] - b["frames"]) / ((e["now"] - b["now"]) / 1000.0) if e["now"] > b["now"] else None,
                             "dpr": e["dpr"]} for b, e in zip(frames.get("b", []), frames.get("e", []))]
+    for p in pages:
+        await p.goto("about:blank")
+    await asyncio.sleep(2)
+    await window(sampler, "late", LATE_S)                # idle again, after everything above: does the CPU end?
     # about:support, as evidence only: the compositor, WebRender software or not, the refresh rate, and the prefs that matter
     try:
-        page = await pages[0].context.new_page()
+        ctx = await OPEN_BROWSERS[0].new_context()
+        page = await ctx.new_page()
         await page.goto("about:support", timeout=30000)
         await asyncio.sleep(4)
         notes["about_support"] = await page.evaluate(ABOUT_SUPPORT_JS)
-        await page.close()
+        await ctx.close()
     except Exception as exc:   # noqa: BLE001
         notes["about_support"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
 
@@ -617,10 +682,14 @@ def run_arm(arm: str, binary: str, rnd: int, n: int, mode: str) -> dict:
     sampler.stop()
     httpd.shutdown()
     windows = {}
-    for w in (["loop"] if mode == "loop" else ["idle", "static", "raf"]):
+    for w in (["loop"] if mode == "loop" else ["settle", "idle", "static", "raf", "late"]):
         sb, se = sampler.snaps.get(w + "-b"), sampler.snaps.get(w + "-e")
         if sb and se:
             windows[w] = {"report": window_report(sampler, sb["t"], se["t"]), "threads": thread_report(sampler, w + "-b", w + "-e")}
+            if w == "idle":
+                cuts = ["idle-b", "idle-s1", "idle-s2", "idle-e"]
+                windows[w]["slices"] = [{"report": window_report(sampler, sampler.snaps[x]["t"], sampler.snaps[y]["t"]),
+                                         "threads": thread_report(sampler, x, y)} for x, y in zip(cuts, cuts[1:])]
     outcome = notes.get("outcome") or {"completed": 0, "incomplete": [], "failed": [], "ms": []}
     return {
         "arm": arm, "round": rnd, "browsers": n, "mode": mode, "error": err, "windows": windows,
@@ -733,7 +802,8 @@ def compare(directory: Path) -> int:
     print("runs: %d good of %d" % (len(good), len(results)))
     for r in results:
         print("  %s-n%d-%s-r%s %s" % (r["arm"], r["browsers"], r["mode"], r["round"], "ERROR " + r["error"][:300] if r["error"] else "ok"))
-    keys = sorted({(r["mode"], r["browsers"], w) for r in good for w in r["windows"]})
+    keys = sorted({(r["mode"], r["browsers"], w) for r in good for w in r["windows"]},
+                  key=lambda k: (k[0], k[1], ["loop", "settle", "idle", "static", "raf", "late"].index(k[2])))
     show = [a for a in ARMS if any(r["arm"] == a for r in good)]
 
     def runs(arm, key):
@@ -758,6 +828,12 @@ def compare(directory: Path) -> int:
                 return "%8.2f" % (vals[x] / vals[y]) if ok else "%8s" % "-"
             print("%-34s" % label + "".join("%10.2f" % vals[a] for a in show) + "   " + ratio("ours", "stockwin") + "       "
                   + ratio("ourswin", "stockwin") + "      " + ratio("ours", "stockhid") + "     " + ratio("ours", "stock"))
+        for a in show:
+            sl = [w["slices"] for w in runs(a, key) if w.get("slices")]
+            if sl:
+                print("   idle by 10 s slice, %s (parent CPU s; total per browser; GPU): " % a + "; ".join(
+                    "%.2f / %.2f / %.2f" % (mean([x[i]["report"]["median_by_type"]["parent"] for x in sl]), mean([x[i]["report"]["median_total"] for x in sl]),
+                                            mean([x[i]["report"]["median_by_type"]["gpu"] for x in sl])) for i in range(3)))
         for a in show:
             tops = [w["report"]["others_top"] for w in runs(a, key)]
             if tops:

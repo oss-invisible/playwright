@@ -5,7 +5,7 @@
 # ourswin (headed on the interactive desktop), ourshl (our binary in true --headless), stock (--headless), stockwin (headed on the
 # interactive desktop), stockhid (headed on a hidden desktop made the way invisible_core makes it). Per arm and round, three runs:
 #   n1 loop    1 browser alone, 10 scenarios (an RTCPeerConnection with no ICE, 200 divs, a 2D canvas frame);
-#   n1 scenes  1 browser: idle on about:blank 30 s, a still page 15 s, a requestAnimationFrame canvas 15 s, then about:support;
+#   n1 scenes  1 browser: settle 8 s, idle on about:blank 30 s (in 3 slices), a still page 15 s, a requestAnimationFrame canvas 15 s, about:blank again 30 s ("late"), then about:support;
 #   n4 loop    the same 10 scenarios with 4 browsers at once.
 # Every window gives the kernel's CPU time per process (by type) and per thread (by name), the machine's CPU and every other process of the
 # runner. The arms alternate and the order of the second round is the reverse of the first. Windows only; the last step prints the tables.
