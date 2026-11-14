@@ -28,13 +28,30 @@ context made with `ignore_https_errors=True` (applied per user context to the Do
 the provider is the FakeDoh's own name (`doh.gateway.test`, declared through `extra_prefs`): the DoH of Mozilla is HSTS-preloaded
 and Firefox never accepts an override for it.
 """
+import os
+
 import pytest
 
 import _turn_chain as chain_mod
 from _doh_servers import DOH_PROVIDER_PREFS
+from _udp_chain_hunt import Hunt   # HUNT (hunt/udp-chain-post): measurements kept in memory and printed, never asserted
 from _udp_line import declared_udp, egress_by_proxy, measure_servers
 
 pytestmark = pytest.mark.e2e
+
+#: HUNT: the loopback variant, repeated INVPW_HUNT_REPS times (the parameter `hunt_rep`; with the variable unset the test has no parameter).
+HUNT_TARGET = "test_a_turn_srflx_by_name_arrives_through_the_relay_when_the_exit_of_the_lab_is_loopback"
+
+
+def pytest_generate_tests(metafunc):
+    reps = int(os.environ.get("INVPW_HUNT_REPS") or 0)
+    if reps > 1 and metafunc.function.__name__ == HUNT_TARGET and "hunt_rep" in metafunc.fixturenames:
+        metafunc.parametrize("hunt_rep", range(reps))
+
+
+@pytest.fixture
+def hunt_rep():
+    return 0
 
 #: Loopback goes through the proxy too (as in test_doh_through_the_proxy_e2e.py), so the road of the page is observable.
 PREFS = {"network.proxy.allow_hijacking_localhost": True, "network.proxy.no_proxies_on": ""}
@@ -89,30 +106,37 @@ def test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick(gateway,
 
 
 def test_a_turn_srflx_by_name_arrives_through_the_relay_when_the_exit_of_the_lab_is_loopback(gateway_on_loopback, firefox_binary,
-                                                                                          engine_at_least):
+                                                                                          engine_at_least, hunt_rep):
     """The exit of the lab is 127.0.0.2 and the ICE context allows loopback (the pref): the same walk on every system, Windows too."""
-    _walk(gateway_on_loopback, firefox_binary, engine_at_least, PREFS_LOOPBACK_EXIT)
+    _walk(gateway_on_loopback, firefox_binary, engine_at_least, PREFS_LOOPBACK_EXIT, hunt_rep)
 
 
-def _walk(gateway, firefox_binary, engine_at_least, prefs):
+def _walk(gateway, firefox_binary, engine_at_least, prefs, hunt_rep=0):
     import h2  # noqa: F401 - the dev extra installs it: a missing one is a failure, never a skip
     engine_at_least("firefox-63")
     from invisible_playwright import InvisiblePlaywright
 
-    with InvisiblePlaywright(headless=True, binary_path=firefox_binary, timezone="America/New_York", locale="en-US",
-                             proxy=gateway.proxy, udp_stun_servers=measure_servers(gateway),
-                             extra_prefs={**prefs, **DOH_PROVIDER_PREFS}) as browser:
-        page = browser.new_context(ignore_https_errors=True).new_page()
-        page.goto(gateway.page.url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_function("window.__done === true", timeout=9000)
-        except Exception:   # noqa: BLE001
-            pass
-        try:
-            page.wait_for_function("window.__result.candidates.some(c => c.indexOf(' typ relay ') >= 0)", timeout=3000)
-        except Exception:   # noqa: BLE001
-            pass
-        result = page.evaluate("window.__result")
+    hunt, result = Hunt(gateway, hunt_rep, firefox_binary), None
+    hunt.start()
+    try:
+        with InvisiblePlaywright(headless=True, binary_path=firefox_binary, timezone="America/New_York", locale="en-US",
+                                 proxy=gateway.proxy, udp_stun_servers=measure_servers(gateway),
+                                 extra_prefs={**prefs, **DOH_PROVIDER_PREFS}) as browser:
+            page = browser.new_context(ignore_https_errors=True).new_page()
+            page.goto(gateway.page.url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_function("window.__done === true", timeout=9000)
+            except Exception:   # noqa: BLE001
+                pass
+            try:
+                page.wait_for_function("window.__result.candidates.some(c => c.indexOf(' typ relay ') >= 0)", timeout=3000)
+            except Exception:   # noqa: BLE001
+                pass
+            result = page.evaluate("window.__result")
+    finally:
+        hunt.stop()
+        verdicts = gateway.page.verdicts
+        hunt.report(result, explain=not (result and result.get("status") == "DONE" and verdicts and verdicts[-1]["ok"]))
     declared = declared_udp(gateway.proxy, measure_servers(gateway))
     assert declared == "coherent", "the core did not measure the chain's UDP coherent (%s): the engine would not use the relay" % declared + gateway.explain(result)
     ok = result.get("status") == "DONE" and gateway.page.verdicts and gateway.page.verdicts[-1]["ok"]

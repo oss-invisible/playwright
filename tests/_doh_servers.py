@@ -251,12 +251,18 @@ class FakeDoh:
         #: Every HTTP request that was not a well-formed DoH query: (via, method, target, status).
         self.bad_requests: List[Tuple[str, str, str, int]] = []
         self._lock = threading.Lock()
+        #: HUNT (hunt/udp-chain-post, in memory only): every TLS handshake served, as a dict with the wall-clock time
+        #: (time.time()) it started and ended, the road (``via``), the SNI the client sent, the address of the client
+        #: socket as the gateway saw it (``client``, set when a gateway hands the connection over) and the outcome.
+        self.handshakes: List[dict] = []
+        self._sni = threading.local()
         self._open: List[Tuple[str, ssl.SSLSocket]] = []
         self._dir = tempfile.TemporaryDirectory()
         self.certificate_path, self._key_path = make_certificate(Path(self._dir.name))
         self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._context.load_cert_chain(str(self.certificate_path), str(self._key_path))
         self._context.set_alpn_protocols(["h2", "http/1.1"] if self.offers_h2 else ["http/1.1"])
+        self._context.sni_callback = self._note_sni      # HUNT: the SNI of a handshake, kept even when it fails
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(("127.0.0.1", 0))
@@ -316,14 +322,27 @@ class FakeDoh:
                 return
             threading.Thread(target=self.serve, args=(conn, "direct"), daemon=True).start()
 
-    def serve(self, sock: socket.socket, via: str) -> None:
-        """Serve one connection (TLS first) that arrived by ``via``. Blocks until it ends, and closes ``sock``."""
+    def _note_sni(self, _ssl_socket, server_name, _context) -> None:
+        self._sni.name = server_name
+        return None
+
+    def serve(self, sock: socket.socket, via: str, client: Optional[Tuple[str, int]] = None) -> None:
+        """Serve one connection (TLS first) that arrived by ``via``. Blocks until it ends, and closes ``sock``.
+
+        ``client`` (HUNT) is the address of the client's own socket as the gateway that hands the connection over saw it."""
+        shake = {"t_start": time.time(), "via": via, "client": client, "sni": None, "ok": False, "error": None, "t_end": None}
+        self._sni.name = None
         try:
             sock.settimeout(60)
             tls = self._context.wrap_socket(sock, server_side=True)
+            shake.update(ok=True, t_end=time.time(), sni=self._sni.name)
+            with self._lock:
+                self.handshakes.append(shake)
         except (ssl.SSLError, OSError) as exc:
+            shake.update(t_end=time.time(), sni=self._sni.name, error="%s: %s" % (type(exc).__name__, exc))
             with self._lock:
                 self.tls_failures.append((via, "%s: %s" % (type(exc).__name__, exc)))
+                self.handshakes.append(shake)
             try:
                 sock.close()
             except OSError:
@@ -548,17 +567,23 @@ class FakeDoh:
 
 
 # --------------------------------------------------------------------------------------------------------- relaying
-def pump(source: socket.socket, sink: socket.socket, delay: float = 0.0) -> None:
+def pump(source: socket.socket, sink: socket.socket, delay: float = 0.0,
+         trace: Optional[Callable[[str, int], None]] = None, label: str = "") -> None:
     """Copy bytes from ``source`` to ``sink`` until either ends, then shut both. ``delay`` seconds wait before each
-    chunk is forwarded (a gateway that is far away)."""
+    chunk is forwarded (a gateway that is far away). ``trace`` (HUNT) is told ``label + "-in"`` when a chunk arrives
+    and ``label + "-out"`` when it has been forwarded, with its size."""
     try:
         while True:
             data = source.recv(65536)
             if not data:
                 break
+            if trace is not None:
+                trace(label + "-in", len(data))
             if delay:
                 time.sleep(delay)
             sink.sendall(data)
+            if trace is not None:
+                trace(label + "-out", len(data))
     except OSError:
         pass
     finally:
@@ -569,13 +594,15 @@ def pump(source: socket.socket, sink: socket.socket, delay: float = 0.0) -> None
                 pass
 
 
-def relay(a: socket.socket, b: socket.socket, delay: float = 0.0) -> None:
-    """Carry bytes both ways between two connected sockets until one ends. Blocks."""
+def relay(a: socket.socket, b: socket.socket, delay: float = 0.0,
+          trace: Optional[Callable[[str, int], None]] = None) -> None:
+    """Carry bytes both ways between two connected sockets until one ends. Blocks. ``trace`` (HUNT): see :func:`pump`;
+    ``a`` is the client side ("c2u" is a to b, "u2c" is b to a)."""
     a.settimeout(None)
     b.settimeout(None)
-    thread = threading.Thread(target=pump, args=(b, a, delay), daemon=True)
+    thread = threading.Thread(target=pump, args=(b, a, delay, trace, "u2c"), daemon=True)
     thread.start()
-    pump(a, b, delay)
+    pump(a, b, delay, trace, "c2u")
     thread.join(timeout=2)
 
 
@@ -624,6 +651,9 @@ class DohGateway(Gateway):
         options.update(gateway)
         super().__init__(user=user, password=password, **options)
 
+    def _trace(self, c: socket.socket, event: str, detail: object = "") -> None:
+        """HUNT: a step of the connection ``c``. Nothing here; the gateway of the hunt records it."""
+
     # --- accepting, and the slow first hello ---------------------------------------------------------------------
     def _handle(self, c: socket.socket) -> None:
         with self._live_lock:
@@ -666,15 +696,16 @@ class DohGateway(Gateway):
         if (host, port) in DOH_TARGETS:
             self.connects.append((host, port))
             self._send(c, self._reply(0))
+            client = _peer(c)
             if self.tcp_data_delay and self.rtt:   # a far gateway: every chunk of the tunnel waits half the round trip
                 near, far = socket.socketpair()
-                threading.Thread(target=self.doh.serve, args=(far, self.name), daemon=True).start()
+                threading.Thread(target=self.doh.serve, args=(far, self.name, client), daemon=True).start()
                 try:
                     relay(c, near, self.rtt / 2)
                 finally:
                     near.close()
                 return
-            self.doh.serve(c, self.name)
+            self.doh.serve(c, self.name, client)
             return
         if (host, port) in (WHOAMI4, WHOAMI6, (WEB_NAME, 80)):
             super()._connect(c, host, port)
@@ -692,10 +723,12 @@ class DohGateway(Gateway):
             return
         with self._live_lock:
             self._live.append(upstream)
+        self._trace(c, "upstream-open", "%s:%d from port %d" % (host, port, upstream.getsockname()[1]))
         self._send(c, self._reply(0))
         try:
-            relay(c, upstream, self.rtt / 2 if self.tcp_data_delay else 0.0)
+            relay(c, upstream, self.rtt / 2 if self.tcp_data_delay else 0.0, lambda event, n: self._trace(c, event, n))
         finally:
+            self._trace(c, "tunnel-ended")
             upstream.close()
 
     # --- the DoH road, by CONNECT target --------------------------------------------------------------------------
@@ -721,6 +754,13 @@ class DohGateway(Gateway):
                     action()
                 except OSError:
                     pass
+
+
+def _peer(c: socket.socket) -> Optional[Tuple[str, int]]:
+    try:
+        return c.getpeername()[:2]
+    except OSError:
+        return None
 
 
 def _is_address(host: str) -> bool:

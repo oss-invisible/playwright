@@ -179,12 +179,46 @@ class Chain(DohGateway):
         relay_host = relay_host or this_host_address()
         #: Where the gateway's datagrams and connections leave from: what the TURN server hears and what the page must read as its srflx.
         self.exit_ip = exit_host
+        #: HUNT (hunt/udp-chain-post, memory only): every step of every connection the gateway accepted, as
+        #: (time.time(), port of the client socket, event, detail), in order. Read by tests/_udp_chain_hunt.py.
+        self.trace_events: List[Tuple[float, int, str, object]] = []
+        #: HUNT: told every event as it is recorded (the process map of the hunt hangs here).
+        self.trace_listener = None
         self.turn = TurnServer()
         self.doh = FakeDoh({TURN_NAME: TURN_IP, PAGE_NAME: "127.0.0.1"})
         self.page = Page(self)
         super().__init__("chain", self.doh, udp="relay", tcp_exit=exit_host, udp_exit=exit_host,
                          relay_host=relay_host, rtt_ms=rtt_ms,
                          exit_host=exit_host, tcp_data_delay=True)
+
+    # --- HUNT: the gateway's view of every connection, wall clock ----------------------------------------------
+    def _trace(self, c, event, detail="") -> None:
+        now = time.time()
+        try:
+            port = c.getpeername()[1]
+        except OSError:
+            port = -1
+        record = (now, port, event, detail)
+        self.trace_events.append(record)
+        listener = self.trace_listener
+        if listener is not None:
+            try:
+                listener(record)
+            except Exception:   # noqa: BLE001 - instrumentation never changes what the gateway does
+                pass
+
+    def _handle(self, c) -> None:
+        self._trace(c, "accepted")
+        super()._handle(c)
+
+    def _greet(self, c) -> bool:
+        ok = super()._greet(c)
+        self._trace(c, "greeted", ok)
+        return ok
+
+    def _send(self, c, data) -> None:
+        super()._send(c, data)
+        self._trace(c, "sent", "%d bytes %s" % (len(data), data[:2].hex()))
 
     def close(self) -> None:
         super().close()
@@ -193,6 +227,7 @@ class Chain(DohGateway):
         self.page.close()
 
     def _connect(self, c, host, port) -> None:
+        self._trace(c, "connect-request", "%s:%d" % (host, port))
         if host.lower() in self.whoami_names and port == WHOAMI4[1]:
             Gateway._connect(self, c, host, port)       # the answer of "what is my address"
             return
@@ -270,12 +305,15 @@ class Chain(DohGateway):
 PAGE_HTML = """<!doctype html><meta charset=utf-8><title>relay-only</title><script>
 const t0 = performance.now(), mark = (k) => (window.__result.timeline[k] = Math.round(performance.now() - t0));
 window.__result = {status: 'PENDING', timeline: {}, errors: [], candidates: [], srflx: null};
+// HUNT: performance.now() and Date.now() of a step, kept in the timeline (they change nothing the page does).
+const stamp = (k) => { window.__result.timeline[k + '_perf'] = performance.now(); window.__result.timeline[k + '_date'] = Date.now(); };
+stamp('t0');
 let status = 'PENDING';
 const finish = (s) => { status = s; window.__result.status = s; window.__done = true; };
 document.addEventListener('DOMContentLoaded', () => {
   mark('dom');
   // the tick of a leak test: 2 seconds after the page starts. It is cleared only after the POST made on a srflx.
-  const tick = setInterval(() => { if (status === 'PENDING') { mark('tick'); finish('TIMEOUT'); } clearInterval(tick); }, 2000);
+  const tick = setInterval(() => { stamp('tick_fired'); if (status === 'PENDING') { mark('tick'); finish('TIMEOUT'); } clearInterval(tick); }, 2000);
   const pc = new RTCPeerConnection({iceServers: [{urls: ['turn:%(turn)s:%(port)d?transport=udp'], username: 'challenge-' + Date.now(), credential: '%(password)s'}]});
   pc.createDataChannel('x');
   mark('pc');
@@ -286,8 +324,11 @@ document.addEventListener('DOMContentLoaded', () => {
     window.__result.candidates.push(e.candidate.candidate);
     if (e.candidate.candidate.indexOf(' typ srflx ') < 0 || status !== 'PENDING') return;
     mark('srflx');
+    stamp('srflx');
     window.__result.srflx = e.candidate.candidate;
+    stamp('post_send');
     const r = await fetch('/verdict', {method: 'POST', body: JSON.stringify({srflx: e.candidate.candidate})});
+    stamp('post_response');
     mark('posted');
     if (status !== 'PENDING') return;
     clearInterval(tick);
@@ -306,12 +347,31 @@ class Page:
         self.verdicts: List[dict] = []
         #: Every GET the page server answered: the Host header and the path.
         self.hits: List[Tuple[str, str]] = []
+        #: HUNT (memory only): every request, with the time.time() of its connection's accept, of its request line, of its
+        #: body and of the end of its response, and the port the gateway's upstream socket connected from (``client_port``).
+        self.requests: List[dict] = []
+        self._connections = 0
 
         class Handler(BaseHTTPRequestHandler):
             timeout = 5
 
             def log_message(self, *a):
                 pass
+
+            def setup(self):
+                super().setup()
+                outer._connections += 1
+                self._conn = {"seq": outer._connections, "t_accept": time.time(), "requests": 0}
+
+            def parse_request(self):
+                t_line = time.time()          # the request line has just been read
+                ok = super().parse_request()
+                self._conn["requests"] += 1
+                self._req = {"method": self.command, "path": getattr(self, "path", ""), "client_port": self.client_address[1],
+                             "conn": self._conn["seq"], "nth_on_conn": self._conn["requests"],
+                             "t_accept": self._conn["t_accept"], "t_line": t_line, "t_body": None, "t_written": None}
+                outer.requests.append(self._req)
+                return ok
 
             def do_GET(self):
                 outer.hits.append((self.headers.get("Host", ""), self.path))
@@ -321,10 +381,13 @@ class Page:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                self._req["t_written"] = time.time()
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
-                cand = json.loads(self.rfile.read(n) or b"{}").get("srflx", "")
+                raw = self.rfile.read(n)
+                self._req["t_body"] = time.time()
+                cand = json.loads(raw or b"{}").get("srflx", "")
                 parts = cand.split()
                 ip, port = (parts[4], int(parts[5])) if len(parts) > 5 else ("", 0)
                 seen = [(a[0], a[1]) for a in chain.turn.allocations]
@@ -336,6 +399,7 @@ class Page:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                self._req["t_written"] = time.time()
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.daemon_threads = True
