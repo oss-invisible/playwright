@@ -156,7 +156,7 @@ async def main(arm, reps, first, binary):
     results = await asyncio.gather(*(one(arm, r, port, binary, gate) for r in numbers), return_exceptions=True)
     await asyncio.sleep(1)
     for rep, res in zip(numbers, results):
-        row = {"arm": arm, "rep": rep}
+        row = {"arm": globals().get("LABEL", arm), "rep": rep}
         row.update(log.get(str(rep), {}))
         if isinstance(res, Exception):
             row["crash"] = repr(res)[:120]
@@ -177,6 +177,7 @@ def _without_process_scans():
 
 
 if __name__ == "__main__":
+    LABEL = sys.argv[1]
     if sys.argv[1].endswith("noscan"):
         _without_process_scans()
         sys.argv[1] = sys.argv[1][:-len("noscan")]
