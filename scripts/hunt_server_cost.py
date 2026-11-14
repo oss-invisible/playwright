@@ -20,6 +20,7 @@ import time
 import psutil
 
 PAGE = "data:text/html,<title>cost</title><p>cost"
+SEEN = set()
 
 
 def _tree_rss():
@@ -32,10 +33,11 @@ def _tree_rss():
             rss = child.memory_info().rss
         except psutil.Error:
             continue
-        if "firefox" in name:
+        if "firefox" in name or "plugin-container" in name or "crashhelper" in name:
             firefox += rss
-        elif "python" in name or "node" in name:
+        else:   # everything else under the user's process serves the browsers: our server processes, the Node driver
             server += rss
+            SEEN.add(name)
     mb = lambda b: round(b / 2 ** 20, 1)
     return mb(client), mb(server), mb(firefox)
 
@@ -110,7 +112,7 @@ async def main(arm, n, reps, binary):
     for rep in range(reps):
         starts, client, server, firefox = await one_round(arm, n, binary)
         print("COSTROW " + json.dumps({"os": sys.platform, "arm": arm, "n": n, "rep": rep, "start_ms": starts,
-                                       "client_mb": client, "server_mb": server, "firefox_mb": firefox}), flush=True)
+                                       "client_mb": client, "server_mb": server, "firefox_mb": firefox, "server_names": sorted(SEEN)}), flush=True)
         await asyncio.sleep(1)
 
 
