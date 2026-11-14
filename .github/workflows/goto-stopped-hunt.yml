@@ -54,11 +54,6 @@ jobs:
             done
             python scripts/hunt_goto_stopped.py stock 8 $((b*8)) 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
           done
-            wait
-            cat "$RUNNER_TEMP"/one-*.log | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
-            python scripts/hunt_goto_stopped.py oursremote 8 $((b*8)) "$FF" 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
-            python scripts/hunt_goto_stopped.py stock 8 $((b*8)) 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
-          done
           cat "$RUNNER_TEMP/rows.log"
       - name: The two distributions
         run: |
