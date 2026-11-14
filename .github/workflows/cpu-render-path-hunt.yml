@@ -16,6 +16,17 @@
 #      recent release.yml run of the engine's repository, if one still exists and its xul.pdb id matches the binary (scripts/
 #      hunt_fetch_symbols.py; a candidate's are kept 2 days, a release's 14); for every module the zips do not have, Mozilla's symbol server.
 #      Where a module cannot be symbolicated the summary says so and prints module+offset; the raw profiles are always in the artifact.
+#   4. (second round of the hunt) the baseline of the parent: scripts/hunt_cpu_baseline.py, ONE browser for 20 s, three arms: `retail` (Mozilla's own
+#      Firefox installer of the stable release, unpacked with 7-Zip and launched by hand with subprocess, -no-remote, a fresh profile, the scene
+#      URL, no automation, no Playwright; if it cannot be had the step falls back to Playwright's firefox-1572 and says so), `ours`, and
+#      `ours_reused` (ours twice on the same persistent profile, profile_dir=). CPU per process type (the sampler) and per thread name (psutil
+#      threads + GetThreadDescription) in the whole window and in its last 10 s; the command line of every short-lived process.
+#   5. `ours_swwr` = ours with gfx.webrender.software=true, passed ONLY by the hunt through extra_prefs: its compositing facts (support), its CPU
+#      per process type next to ours and stockheaded (step 3 gains two rounds of it), and whether ANY byte a page reads differs from ours:
+#      scripts/hunt_page_bytes.py (canvas 2D, WebGL 1/2, text, strings, in both arms, launched twice each, diffed) and the wrapper's own byte
+#      suites (canvas_*, webgl_*, canvas text, fingerprint_*, system fonts, css calc) under both arms through scripts/hunt_extra_prefs_plugin.py.
+#   6. A readable profile of OUR GPU process only (profile --gpu): the profiler's thread filter limited to the GPU process's threads, a small buffer,
+#      3 rounds, and the run waits for every process to exit before reading the files (the first GPU profile came back truncated).
 # Every step is continue-on-error: a hunt must give whatever it got.
 # ─────────────────────────────────────────────────────────────────────────────
 name: cpu render path hunt
@@ -28,6 +39,10 @@ on:
       - scripts/hunt_cpu_per_browser.py
       - scripts/hunt_profile_summary.py
       - scripts/hunt_fetch_symbols.py
+      - scripts/hunt_cpu_baseline.py
+      - scripts/hunt_page_bytes.py
+      - scripts/hunt_page_bytes_probe.js
+      - scripts/hunt_extra_prefs_plugin.py
       - .github/workflows/cpu-render-path-hunt.yml
   workflow_dispatch:
     inputs:
@@ -49,9 +64,9 @@ env:
 
 jobs:
   hunt:
-    name: "hunt (windows-2022, ours vs stock headed - about:support, CPU by process type, Gecko profiles)"
+    name: "hunt (windows-2022, ours vs stock headed vs retail - about:support, CPU by process type, baseline, software WebRender, Gecko profiles)"
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 170
     defaults:
       run:
         shell: bash
@@ -89,6 +104,40 @@ jobs:
         continue-on-error: true
         run: python -u scripts/hunt_cpu_render_path.py diff "$RUNNER_TEMP/render-hunt/support" | tee "$RUNNER_TEMP/render-hunt/support/diff.txt"
 
+      - name: "5. Compositing facts of ours_swwr (does gfx.webrender.software=true from the hunt really take effect?)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_render_path.py support --arm ours_swwr --binary "$FF" --out "$RUNNER_TEMP/render-hunt/support"
+
+      # --------------------------------------------------------------------------------- 4. the baseline of the parent (one browser, 20 s)
+      - name: "4. Baseline, arm retail (Mozilla's Firefox, launched by hand, no automation)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm retail --out "$RUNNER_TEMP/render-hunt/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. Baseline, arm ours (fresh temporary profile)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm ours --binary "$FF" --out "$RUNNER_TEMP/render-hunt/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. Baseline, arm ours_reused (the same persistent profile twice; the second launch is measured)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm ours_reused --binary "$FF" --out "$RUNNER_TEMP/render-hunt/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. Baseline comparison table"
+        if: always()
+        continue-on-error: true
+        run: python scripts/hunt_cpu_baseline.py --compare "$RUNNER_TEMP/render-hunt/baseline" | tee "$RUNNER_TEMP/render-hunt/baseline/compare.txt"
+
       # ------------------------------------------------------------------------------------- 3. CPU by process type (sanity)
       - name: "3. CPU by process type, ours, round 1"
         if: always()
@@ -104,6 +153,13 @@ jobs:
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
           python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 1 --out "$RUNNER_TEMP/render-hunt/cpu/stockheaded-1.json"
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "3. CPU by process type, ours_swwr, round 1"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm ours_swwr --binary "$FF" --round 1 --out "$RUNNER_TEMP/render-hunt/cpu/ours_swwr-1.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
       - name: "3. CPU by process type, ours, round 2"
         if: always()
         continue-on-error: true
@@ -118,10 +174,37 @@ jobs:
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
           python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 2 --out "$RUNNER_TEMP/render-hunt/cpu/stockheaded-2.json"
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "3. CPU by process type, ours_swwr, round 2"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm ours_swwr --binary "$FF" --round 2 --out "$RUNNER_TEMP/render-hunt/cpu/ours_swwr-2.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
       - name: "3. Comparison table"
         if: always()
         continue-on-error: true
-        run: python scripts/hunt_cpu_per_browser.py --compare "$RUNNER_TEMP/render-hunt/cpu"
+        run: python scripts/hunt_cpu_per_browser.py --compare "$RUNNER_TEMP/render-hunt/cpu" | tee "$RUNNER_TEMP/render-hunt/cpu/compare.txt"
+
+      # ------------------------------------------------------------------------- 5. does any byte a page reads change with software WebRender?
+      - name: "5. Page-readable bytes, arm ours (canvas 2D, WebGL 1/2, text, strings; 2 launches)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_page_bytes.py collect --arm ours --binary "$FF" --launches 2 --out "$RUNNER_TEMP/render-hunt/pagebytes"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "5. Page-readable bytes, arm ours_swwr (2 launches)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_page_bytes.py collect --arm ours_swwr --binary "$FF" --launches 2 --out "$RUNNER_TEMP/render-hunt/pagebytes"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "5. Page-readable bytes, ours against ours_swwr"
+        if: always()
+        continue-on-error: true
+        run: python -u scripts/hunt_page_bytes.py diff "$RUNNER_TEMP/render-hunt/pagebytes" | tee "$RUNNER_TEMP/render-hunt/pagebytes/diff.txt"
 
       # -------------------------------------------------------------------------------------------- 2. the Gecko profiles
       - name: "2. Gecko profiles of the 10-scene loop, arm ours"
@@ -163,6 +246,76 @@ jobs:
           P="$RUNNER_TEMP/render-hunt/profiles"
           python -u scripts/hunt_profile_summary.py "$P/stockheaded" | tee "$P/summary-stockheaded.txt"
 
+
+      # ----------------------------------------------------------------------------------------- 6. a readable profile of OUR GPU process
+      - name: "6. Gecko profile of our GPU process only (filtered threads, small buffer, 3 rounds)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_render_path.py profile --arm ours --binary "$FF" --gpu --out "$RUNNER_TEMP/render-hunt/profiles-gpu"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "6. Summary of the GPU process: self time by module and the top functions"
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          P="$RUNNER_TEMP/render-hunt/profiles-gpu/ours"
+          SYM=$(ls "$RUNNER_TEMP"/render-hunt/symbols/symbols-*.zip 2>/dev/null | head -1 || true)
+          if [ -z "$SYM" ]; then
+            ID="$(python scripts/hunt_profile_summary.py "$P" --ids | awk '$3=="xul.dll"{print $2}' | head -1)"
+            echo "no symbols from step 2; breakpad id of our xul.dll in the GPU run: '$ID'"
+            if [ -n "$ID" ]; then python scripts/hunt_fetch_symbols.py --id "$ID" --run "${{ inputs.symbols_run }}" --out "$RUNNER_TEMP/render-hunt/symbols" | tee "$RUNNER_TEMP/render-hunt/symbols-gpu.log"; fi
+            SYM=$(ls "$RUNNER_TEMP"/render-hunt/symbols/symbols-*.zip 2>/dev/null | head -1 || true)
+          fi
+          python -u scripts/hunt_profile_summary.py "$P" ${SYM:+--symbols "$SYM"} --only gpu --detail 2 --threads 6 --top 20 | tee "$P/summary-gpu.txt"
+
+      # ----------------------------------------------------- 5b. the wrapper's own byte suites under both arms (the pref goes in through a plugin)
+      - name: "5. The wrapper's byte suites, arm ours"
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}/scripts
+          INVPW_BINARY_PATH: ${{ env.FF }}
+          INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog-suites.log
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          D="$RUNNER_TEMP/render-hunt/suites"; mkdir -p "$D"
+          FILES=$(ls tests/test_canvas_*.py tests/test_webgl_*.py tests/test_a_declared_webgl_extension_survives_its_use_e2e.py \
+                     tests/test_fingerprint_surface.py tests/test_fingerprint_consistency.py tests/test_system_fonts_and_colors_are_windows_e2e.py \
+                     tests/test_css_calc_is_windows_e2e.py tests/test_screenshot_of_text_returns_linux_e2e.py | sort -u)
+          echo "$FILES" > "$D/files.txt"; echo "$FILES" | wc -l
+          python -u -m pytest $FILES -o addopts= -p no:cacheprovider -p hunt_extra_prefs_plugin -q -rs --junitxml="$D/ours.xml" 2>&1 | tee "$D/ours.log" | tail -60
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "5. The wrapper's byte suites, arm ours_swwr (HUNT_EXTRA_PREFS gfx.webrender.software=true)"
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}/scripts
+          INVPW_BINARY_PATH: ${{ env.FF }}
+          INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog-suites.log
+          HUNT_EXTRA_PREFS: '{"gfx.webrender.software": true}'
+          HUNT_EXTRA_PREFS_LOG: ${{ runner.temp }}/render-hunt/suites/ours_swwr-prefs.log
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          D="$RUNNER_TEMP/render-hunt/suites"; mkdir -p "$D"
+          FILES=$(cat "$D/files.txt" 2>/dev/null || true)
+          [ -n "$FILES" ] || FILES=$(ls tests/test_canvas_*.py tests/test_webgl_*.py)
+          python -u -m pytest $FILES -o addopts= -p no:cacheprovider -p hunt_extra_prefs_plugin -q -rs --junitxml="$D/ours_swwr.xml" 2>&1 | tee "$D/ours_swwr.log" | tail -60
+          echo "browsers constructed with the pref: $(wc -l < "$D/ours_swwr-prefs.log" 2>/dev/null || echo 0)"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "5. The wrapper's byte suites, outcome per test in both arms"
+        if: always()
+        continue-on-error: true
+        run: |
+          D="$RUNNER_TEMP/render-hunt/suites"
+          python scripts/hunt_page_bytes.py suites "$D/ours.xml" "$D/ours_swwr.xml" | tee "$D/suites-diff.txt"
+
       - name: Close every Firefox left
         if: always()
         shell: pwsh
@@ -178,6 +331,10 @@ jobs:
             ${{ runner.temp }}/render-hunt/support
             ${{ runner.temp }}/render-hunt/cpu
             ${{ runner.temp }}/render-hunt/profiles
+            ${{ runner.temp }}/render-hunt/profiles-gpu
+            ${{ runner.temp }}/render-hunt/baseline
+            ${{ runner.temp }}/render-hunt/pagebytes
+            ${{ runner.temp }}/render-hunt/suites
             ${{ runner.temp }}/render-hunt/symbols.log
           if-no-files-found: warn
           retention-days: 14

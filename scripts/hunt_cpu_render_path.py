@@ -8,8 +8,12 @@ Nothing of the product is changed: this script only launches the two arms the wa
     python scripts/hunt_cpu_render_path.py profile  --arm ours        --binary "$FF" --out DIR     # 2. Gecko profiles of the 10-scene loop
     python scripts/hunt_cpu_render_path.py profile  --arm stockheaded                --out DIR
 
+    python scripts/hunt_cpu_render_path.py profile  --arm ours --binary "$FF" --gpu --out DIR           # 4. a readable profile of OUR GPU process
+    python scripts/hunt_cpu_render_path.py support  --arm ours_swwr   --binary "$FF" --out DIR          # compositing facts of the swwr arm
+
 ARMS (as in hunt_cpu_per_browser.py)
   ours         invisible_playwright, headless=True (on Windows: headed Firefox on a hidden desktop)
+  ours_swwr    ours with gfx.webrender.software=true through extra_prefs (hunt only); `support` then proves the pref took effect
   stockheaded  stock Playwright's firefox, firefox.launch(headless=False)
 
 1. `support` launches the arm TWICE, alone:
@@ -36,6 +40,11 @@ ARMS (as in hunt_cpu_per_browser.py)
    this process only (a hunt-side switch, not a change of the product); the profile run says whether the variables arrived by counting the
    profile files it got.
    The profiles are written when each process shuts down cleanly; the files are gzipped and left in <out> for the artifact.
+
+   `--gpu` is the same run narrowed to the GPU process: MOZ_PROFILER_STARTUP_FILTERS=Compositor,Renderer,RenderBackend,WRWorker,CanvasRenderer,
+   GeckoMain (read by every process: the parent and the tabs keep only their GeckoMain), MOZ_PROFILER_STARTUP_ENTRIES=1048576 (8 MiB instead of
+   the default), no `js`, 3 rounds. The run waits (up to 90 s) for every firefox process to exit before it looks at the files, and says for each
+   file whether it is valid JSON: the first GPU profile (pid 10492) was truncated.
 """
 from __future__ import annotations
 
@@ -56,6 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from hunt_cpu_per_browser import ARM_PREFS   # noqa: E402  (the one place the hunt's prefs are declared)
 
 MARIONETTE_PORTS = (28431, 2828)
 ENV_INTERESTING = re.compile(r"^(MOZ_|STEALTH|INVPW|GFX|WEBRENDER|DXGI|D3D|LIBGL|MESA|GDK_|GTK_|DISPLAY|USERNAME$|SESSIONNAME$)", re.I)
@@ -265,9 +275,12 @@ async def launched(arm: str, binary: str, marionette: bool):
     extra_args = ["-marionette", "-remote-allow-system-access"] if marionette else []
     if marionette:
         os.environ["MOZ_REMOTE_ALLOW_SYSTEM_ACCESS"] = "1"
-    if arm == "ours":
+    if arm in ("ours", "ours_swwr"):
         from invisible_playwright.async_api import InvisiblePlaywright
-        prefs = {"marionette.port": MARIONETTE_PORTS[0]} if marionette else None
+        prefs = dict(ARM_PREFS.get(arm) or {})                  # ours_swwr: gfx.webrender.software=true, from the hunt only
+        if marionette:
+            prefs["marionette.port"] = MARIONETTE_PORTS[0]
+        prefs = prefs or None
         async with InvisiblePlaywright(seed=100, binary_path=binary, headless=True, locale="en-US", timezone="Europe/Rome",
                                        extra_args=extra_args, extra_prefs=prefs) as browser:
             yield browser
@@ -362,6 +375,31 @@ def print_support(report: Dict[str, Any]) -> None:
     for key in ("launch_A_error", "launch_B_error"):
         if report.get(key):
             print("  %s: %s" % (key, report[key]))
+    sys.stdout.flush()
+
+
+def print_compositing(arm_dir: Path) -> None:
+    """What decided compositing in this arm: the effective gfx.webrender.* prefs and the feature lines of the snapshot."""
+    print("-" * 100)
+    print("compositing facts of %s:" % arm_dir.name)
+    pf = arm_dir / "effective_prefs.json"
+    if pf.is_file():
+        prefs = json.loads(pf.read_text(encoding="utf-8"))
+        for n in sorted(prefs):
+            if n.startswith(("gfx.webrender.", "gfx.canvas.", "layers.gpu-process", "gfx.webrender")) or n in ("gfx.webrender.software",):
+                print("  pref %s = %s (user-set: %s)" % (n, prefs[n][1], prefs[n][0]))
+    else:
+        print("  effective_prefs.json missing")
+    sf = arm_dir / "troubleshoot.json"
+    if sf.is_file():
+        data = json.loads(sf.read_text(encoding="utf-8"))
+        lines: List[str] = []
+        flatten("", data.get("graphics", {}), lines)
+        for l in lines:
+            if re.search(r"(?i)compositing|webrender|d3d11|warp|gpu.?process|description|adapter|vm|failure|blocklist", l.split(" = ")[0]) or                     re.search(r"(?i)FEATURE_|WebRender|D3D11|WARP", l):
+                print("  " + l[:240])
+    else:
+        print("  troubleshoot.json missing")
     sys.stdout.flush()
 
 
@@ -493,23 +531,58 @@ def diff_dir(root: Path) -> int:
 
 # ------------------------------------------------------------------------------------------------------------- the profile
 
-def profile_run(arm: str, binary: str, out: Path, rnd: int) -> int:
+GPU_THREADS = "Compositor,Renderer,RenderBackend,WRWorker,CanvasRenderer,GeckoMain"
+
+
+def wait_until_no_firefox(timeout: float) -> str:
+    """The profiles are written when each process shuts down: let them finish (the first GPU profile came back truncated)."""
+    end = time.time() + timeout
+    left = firefox_processes()
+    while left and time.time() < end:
+        time.sleep(1)
+        left = firefox_processes()
+    return "firefox processes left after %.0f s: %d%s" % (timeout - max(0.0, end - time.time()), len(left),
+                                                         (" (%s)" % ", ".join("%s %s" % (p["pid"], p["kind"]) for p in left)) if left else "")
+
+
+def profile_run(arm: str, binary: str, out: Path, rnd: int, gpu: bool = False, rounds: int = 0, browsers: int = 0) -> int:
     import hunt_cpu_per_browser as hunt
     out.mkdir(parents=True, exist_ok=True)
     pattern = str(out / "profile-%p.json")
-    os.environ.update({
-        "MOZ_PROFILER_STARTUP": "1",
-        "MOZ_PROFILER_STARTUP_FEATURES": "js,stackwalk,cpu,threads,processcpu",
-        "MOZ_PROFILER_STARTUP_FILTERS": "*",
-        "MOZ_PROFILER_STARTUP_INTERVAL": "2",
-        "MOZ_PROFILER_SHUTDOWN": pattern,
-    })
-    print("profile arm %s: %s" % (arm, pattern))
-    if arm == "ours":
+    if gpu:
+        # ONE question: where does the GPU process spend its CPU. Only the threads that matter there are sampled (the filter is read by
+        # EVERY process, so the parent and the tabs keep their GeckoMain too, which is cheap), a small buffer (1 Mi entries, 8 MiB: the
+        # first run's file was truncated) and a short loop. No `js`: nothing in the GPU process runs JS.
+        os.environ.update({
+            "MOZ_PROFILER_STARTUP": "1",
+            "MOZ_PROFILER_STARTUP_FEATURES": "stackwalk,cpu,threads,processcpu",
+            "MOZ_PROFILER_STARTUP_FILTERS": GPU_THREADS,
+            "MOZ_PROFILER_STARTUP_ENTRIES": "1048576",
+            "MOZ_PROFILER_STARTUP_INTERVAL": "2",
+            "MOZ_PROFILER_SHUTDOWN": pattern,
+        })
+        hunt.ROUNDS = rounds or 3
+        hunt.BROWSERS = browsers or hunt.BROWSERS
+    else:
+        os.environ.update({
+            "MOZ_PROFILER_STARTUP": "1",
+            "MOZ_PROFILER_STARTUP_FEATURES": "js,stackwalk,cpu,threads,processcpu",
+            "MOZ_PROFILER_STARTUP_FILTERS": "*",
+            "MOZ_PROFILER_STARTUP_INTERVAL": "2",
+            "MOZ_PROFILER_SHUTDOWN": pattern,
+        })
+        if rounds:
+            hunt.ROUNDS = rounds
+        if browsers:
+            hunt.BROWSERS = browsers
+    print("profile arm %s%s: %s; %d browsers x %d rounds" % (arm, " (GPU-process profile)" if gpu else "", pattern, hunt.BROWSERS, hunt.ROUNDS))
+    print("profiler environment: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(os.environ.items()) if k.startswith("MOZ_PROFILER_")))
+    if arm in ("ours", "ours_swwr"):
         print(let_profiler_env_through())
     kill_firefox()
     result = hunt.run_arm(arm, binary, rnd)
     hunt.print_arm(result)
+    print(wait_until_no_firefox(90))
     kill_firefox()
     time.sleep(3)
     files = sorted(out.glob("profile-*.json"))
@@ -517,6 +590,12 @@ def profile_run(arm: str, binary: str, out: Path, rnd: int) -> int:
     for f in files:
         raw = f.read_bytes()
         total += len(raw)
+        try:
+            json.loads(raw.decode("utf-8", "replace"))
+            state = "valid JSON"
+        except ValueError as exc:
+            state = "NOT VALID JSON (%s), ends with %r" % (str(exc)[:100], raw[-80:])
+        print("  %s: %.1f MB, %s" % (f.name, len(raw) / 2 ** 20, state))
         with gzip.open(str(f) + ".gz", "wb", 6) as g:
             g.write(raw)
         f.unlink()
@@ -532,23 +611,28 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("support", "profile"):
         p = sub.add_parser(name)
-        p.add_argument("--arm", choices=("ours", "stockheaded"), required=True)
+        p.add_argument("--arm", choices=("ours", "ours_swwr", "stockheaded"), required=True)
         p.add_argument("--binary", default=os.environ.get("INVPW_BINARY_PATH", ""))
         p.add_argument("--out", type=Path, required=True, help="the root; the arm's files go in <out>/<arm>/")
         p.add_argument("--round", type=int, default=1)
+        if name == "profile":
+            p.add_argument("--gpu", action="store_true", help="the GPU-process profile: filtered threads, small buffer, short loop")
+            p.add_argument("--rounds", type=int, default=0, help="scenes per browser (default 10, 3 with --gpu)")
+            p.add_argument("--browsers", type=int, default=0)
     d = sub.add_parser("diff")
     d.add_argument("root", type=Path)
     args = ap.parse_args()
     if args.cmd == "diff":
         return diff_dir(args.root)
-    if args.arm == "ours" and not args.binary:
-        ap.error("the arm ours needs --binary (or INVPW_BINARY_PATH)")
+    if args.arm in ("ours", "ours_swwr") and not args.binary:
+        ap.error("the arms ours and ours_swwr need --binary (or INVPW_BINARY_PATH)")
     arm_dir = args.out / args.arm
     if args.cmd == "support":
         report = asyncio.run(support_arm(args.arm, args.binary, arm_dir))
         print_support(report)
+        print_compositing(arm_dir)
         return 0
-    return profile_run(args.arm, args.binary, arm_dir, args.round)
+    return profile_run(args.arm, args.binary, arm_dir, args.round, gpu=args.gpu, rounds=args.rounds, browsers=args.browsers)
 
 
 if __name__ == "__main__":

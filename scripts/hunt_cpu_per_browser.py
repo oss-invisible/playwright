@@ -1,6 +1,7 @@
 """HUNT ONLY (branch hunt/cpu-render-path, never merged; copied from hunt/udp-chain-post at 5cb46f6): under the same load, does OUR Firefox use more CPU per browser than stock Firefox?
 
     python scripts/hunt_cpu_per_browser.py --arm ours        --binary "$FF" --out DIR/ours-1.json
+    python scripts/hunt_cpu_per_browser.py --arm ours_swwr   --binary "$FF" --out DIR/ours_swwr-1.json
     python scripts/hunt_cpu_per_browser.py --arm stock                      --out DIR/stock-1.json
     python scripts/hunt_cpu_per_browser.py --arm stockheaded                --out DIR/stockheaded-1.json
     python scripts/hunt_cpu_per_browser.py --compare DIR
@@ -17,6 +18,8 @@ served by an http server inside the client process:
   stock  stock Playwright's async client (its node driver) and the firefox-1572 it installed, headless=True, with
          firefox_user_prefs {"fission.autostart": true}. Stock's playwright.cfg forces webContentIsolationStrategy 0 by autoconfig, so the
          pref does not change the isolation the cfg picked; it is passed so that both arms are launched with Fission asked for.
+  ours_swwr  ours with gfx.webrender.software=true passed ONLY here, through extra_prefs (a hunt-side switch, the product is untouched):
+         would software WebRender on the VM cost as little as stock's fallback does?
   stockheaded  the same as stock with headless=False: a headed Firefox, which is what ours is on Windows (headless=True there creates a hidden
          desktop and runs headed Firefox on it), so that the comparison with ours is not headed against --headless.
 
@@ -52,9 +55,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-BROWSERS = 4
-ROUNDS = 10
-ARMS = ["ours", "stock", "stockheaded"]
+BROWSERS = int(os.environ.get("HUNT_BROWSERS", "4"))   # only the hunt's GPU-process profile shortens the loop; every other step leaves these alone
+ROUNDS = int(os.environ.get("HUNT_ROUNDS", "10"))
+ARMS = ["ours", "ours_swwr", "stock", "stockheaded"]
+#: prefs an arm passes through extra_prefs: the only place this pref is added, the hunt and never the product
+ARM_PREFS = {"ours_swwr": {"gfx.webrender.software": True}}
 TYPES = ["parent", "tab", "gpu", "socket", "rdd", "utility", "other"]
 ICE_WAIT_MS = 15000
 SCENARIO_TIMEOUT_S = 60
@@ -292,6 +297,52 @@ def per_browser(sampler: Sampler, a: float, b: float) -> tuple:
     return [rows[r] for r in roots], roots, client
 
 
+def process_listing(sampler: "Sampler", t0: float) -> list:
+    """Every firefox process the sampler saw: pid, parent, browser root, type, first/last sample (s from t0), lifetime, CPU used in all, command line."""
+    series = Series(sampler.samples)
+    where, _ = roots_and_kinds(sampler.info)
+    out = []
+    for pid, (root, kind) in sorted(where.items()):
+        ts, cs = series.t.get(pid, []), series.c.get(pid, [])
+        if not ts:
+            continue
+        cmd = sampler.info[pid][3] or []
+        out.append({"pid": pid, "ppid": sampler.info[pid][1], "root": root, "kind": kind, "first_s": round(ts[0] - t0, 2),
+                    "last_s": round(ts[-1] - t0, 2), "life_s": round(ts[-1] - ts[0], 2), "cpu_s": round(cs[-1], 3),
+                    "cmd": " ".join(str(x) for x in cmd)})
+    return out
+
+
+SHORT_S = 5.0
+
+
+def print_processes(listing: list) -> None:
+    """What the short-lived processes are. `default` = a firefox process with no recognised -contentproc type (parent or other here)."""
+    import re
+    print("  processes seen by the sampler (every 250 ms: one that lives less is not seen): %d in all" % len(listing))
+    kinds: dict = {}
+    for r in listing:
+        kinds.setdefault(r["kind"], []).append(r)
+    for k, rs in sorted(kinds.items()):
+        shorts = [r for r in rs if r["life_s"] < SHORT_S]
+        print("    %-8s %3d process(es), %3d shorter than %.0f s, lifetime median %.1f s, CPU of all of them %.2f s"
+              % (k, len(rs), len(shorts), SHORT_S, statistics.median([r["life_s"] for r in rs]), sum(r["cpu_s"] for r in rs)))
+    defaults = [r for r in listing if r["kind"] in ("parent", "other")]
+    print("  every firefox process WITHOUT a recognised -contentproc type (`default` in a Gecko profile), %d:" % len(defaults))
+    for r in defaults[:80]:
+        print("    pid %-6s ppid %-6s root %-6s first %6.1f s life %6.1f s cpu %6.2f s  %s"
+              % (r["pid"], r["ppid"], r["root"], r["first_s"], r["life_s"], r["cpu_s"], r["cmd"][:500]))
+    groups: dict = {}
+    for r in listing:
+        if r["life_s"] < SHORT_S and r["kind"] not in ("parent", "other"):
+            groups.setdefault((r["kind"], re.sub(r"\d+", "N", r["cmd"])), []).append(r)
+    print("  the other short-lived processes (< %.0f s), grouped by type and command line with the numbers blanked:" % SHORT_S)
+    for (kind, _norm), rs in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:20]:
+        print("    %3d x %-8s median life %.1f s, CPU %.2f s: %s" % (len(rs), kind, statistics.median([r["life_s"] for r in rs]),
+                                                                    sum(r["cpu_s"] for r in rs), rs[0]["cmd"][:400]))
+    sys.stdout.flush()
+
+
 def summarise(rows: list) -> dict:
     med = {t: (statistics.median([r[t] for r in rows]) if rows else 0.0) for t in TYPES}
     totals = [sum(r.values()) for r in rows]
@@ -323,11 +374,12 @@ async def run_scenarios(pages: list, base: str) -> tuple:
     return t0, time.time(), outcome
 
 
-async def arm_ours(base: str, binary: str):
+async def arm_ours(base: str, binary: str, extra_prefs: dict | None = None):
     from invisible_playwright.async_api import InvisiblePlaywright
     async with contextlib.AsyncExitStack() as stack:
         browsers = await asyncio.gather(*(stack.enter_async_context(
-            InvisiblePlaywright(seed=100 + i, binary_path=binary, headless=True, locale="en-US", timezone="Europe/Rome"))
+            InvisiblePlaywright(seed=100 + i, binary_path=binary, headless=True, locale="en-US", timezone="Europe/Rome",
+                                extra_prefs=extra_prefs))
             for i in range(BROWSERS)))
         pages = await asyncio.gather(*(b.new_page() for b in browsers))
         return await run_scenarios(pages, base)
@@ -362,8 +414,8 @@ def run_arm(arm: str, binary: str, rnd: int) -> dict:
     loop_a = loop_b = whole_a
     outcome = {"completed": 0, "incomplete": [], "failed": [], "ms": []}
     try:
-        if arm == "ours":
-            coro = arm_ours(base, binary)
+        if arm in ("ours", "ours_swwr"):
+            coro = arm_ours(base, binary, ARM_PREFS.get(arm))
         else:
             coro = arm_stock(base, binary, headless=(arm == "stock"))
         loop_a, loop_b, outcome = asyncio.run(coro)
@@ -383,6 +435,7 @@ def run_arm(arm: str, binary: str, rnd: int) -> dict:
         "loop": loop, "client_cpu_s": client,
         "cpu_per_scenario_s": (loop["total_all"] / outcome["completed"]) if outcome["completed"] else None,
         "whole": summarise(whole_rows), "whole_client_cpu_s": whole_client, "whole_wall_s": whole_b - whole_a,
+        "processes": process_listing(sampler, whole_a),
     }
     return result
 
@@ -406,6 +459,7 @@ def print_arm(r: dict) -> None:
               % (r["cpu_per_scenario_s"], r["median_scenario_ms"] or 0))
     print("  whole arm (launch to close, %.1f s): median total per browser %.2f s, all %.2f s, client side %.2f s"
           % (r["whole_wall_s"], r["whole"]["median_total"], r["whole"]["total_all"], r["whole_client_cpu_s"]))
+    print_processes(r.get("processes") or [])
     sys.stdout.flush()
 
 
@@ -430,7 +484,7 @@ def compare(directory: Path) -> int:
         ("total CPU s, all browsers", lambda r: r["loop"]["total_all"]),
         ("client side CPU s", lambda r: r["client_cpu_s"]),
         ("wall time of the loop, s", lambda r: r["wall_s"]),
-        ("completed scenarios (of 40)", lambda r: r["completed"]),
+        ("completed scenarios (of %d)" % (BROWSERS * ROUNDS), lambda r: r["completed"]),
         ("CPU s per completed scenario", lambda r: r["cpu_per_scenario_s"]),
         ("whole arm, total CPU s per browser", lambda r: r["whole"]["median_total"]),
     ]
@@ -438,10 +492,11 @@ def compare(directory: Path) -> int:
         return ("%.2f" % (a / b)) if b and b == b else "-"
 
     print()
-    print("%-52s %9s %9s %11s %11s %13s" % ("loop window, mean over the rounds", "ours", "stock", "stockheaded", "ours/stock", "ours/stockhd"))
+    print("%-52s %9s %9s %9s %11s %11s %13s %12s" % ("loop window, mean over the rounds", "ours", "ours_swwr", "stock", "stockheaded",
+                                                      "ours/stock", "ours/stockhd", "swwr/stockhd"))
     for label, f in rows:
-        o, s, h = mean("ours", f), mean("stock", f), mean("stockheaded", f)
-        print("%-52s %9.3f %9.3f %11.3f %11s %13s" % (label, o, s, h, ratio(o, s), ratio(o, h)))
+        o, w, s, h = mean("ours", f), mean("ours_swwr", f), mean("stock", f), mean("stockheaded", f)
+        print("%-52s %9.3f %9.3f %9.3f %11.3f %11s %13s %12s" % (label, o, w, s, h, ratio(o, s), ratio(o, h), ratio(w, h)))
     print()
     for a in ARMS:
         print("%s per round: " % a + "; ".join("r%s total/browser %.2f s, wall %.1f s" % (r["round"], r["loop"]["median_total"], r["wall_s"])
@@ -461,8 +516,8 @@ def main() -> int:
         return compare(args.compare)
     if not args.arm:
         ap.error("--arm or --compare")
-    if args.arm == "ours" and not args.binary:
-        ap.error("the arm ours needs --binary (or INVPW_BINARY_PATH)")
+    if args.arm in ("ours", "ours_swwr") and not args.binary:
+        ap.error("the arms ours and ours_swwr need --binary (or INVPW_BINARY_PATH)")
     result = run_arm(args.arm, args.binary, args.round)
     print_arm(result)
     if args.out:

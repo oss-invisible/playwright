@@ -1,7 +1,7 @@
 """HUNT ONLY (branch hunt/cpu-render-path, never merged): read the Gecko profiles of scripts/hunt_cpu_render_path.py and print what a person
 would otherwise click through in the Firefox Profiler.
 
-    python scripts/hunt_profile_summary.py DIR [--symbols ZIP ...] [--detail 2] [--ids]
+    python scripts/hunt_profile_summary.py DIR [--symbols ZIP ...] [--detail 2] [--ids] [--only gpu] [--threads 4] [--top 12]
 
 DIR holds profile-<pid>.json(.gz), one per process (written at each process's clean shutdown, MOZ_PROFILER_SHUTDOWN=...%p.json). A file may
 also carry the profiles of child processes under "processes"; those are read too.
@@ -17,6 +17,10 @@ Symbols. A native frame is a module and an RVA. Module names are always known (t
   2. Mozilla's symbol server (https://symbolication.services.mozilla.com/symbolicate/v5), for every module the zips do not have.
 A module neither source knows stays `module+0xRVA`, and the report says which modules were and were not symbolicated. Nothing here fails
 the job: every problem is printed as a line.
+
+--only gpu limits the detail to the process types listed (comma separated; default: default and gpu), --threads is how many threads of a process get
+their own table, --top how many leaf functions each table lists. For every detailed process a PROCESS-WIDE table comes first: self weight by module
+and the hottest leaf functions over all its threads together (this is the "d3d10warp.dll against d3d11.dll against xul.dll" number).
 
 --ids prints `debugName breakpadId name` of the libs of the first parent profile and exits (used to pick the symbols artifact).
 
@@ -250,6 +254,9 @@ def main() -> int:
     ap.add_argument("--symbols", nargs="*", default=[], type=Path)
     ap.add_argument("--detail", type=int, default=2)
     ap.add_argument("--ids", action="store_true")
+    ap.add_argument("--only", default="default,gpu", help="process types that get the detail tables")
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--top", type=int, default=12)
     args = ap.parse_args()
     files = sorted(list(args.dir.glob("profile-*.json")) + list(args.dir.glob("profile-*.json.gz")))
     if not files:
@@ -284,14 +291,21 @@ def main() -> int:
     print("total weight by process type: " + ", ".join("%s %.0f" % kv for kv in sorted(by_type.items(), key=lambda kv: -kv[1])))
 
     chosen = []
-    for kind in ("default", "gpu"):
+    for kind in [k for k in args.only.split(",") if k]:
         chosen += sorted([a for a in procs if a["type"] == kind], key=lambda a: -a["total"])[:args.detail]
     # which addresses to name
     wanted: Dict[Tuple[str, str], List[int]] = collections.defaultdict(list)
     for a in chosen:
-        for t in sorted(a["threads"], key=lambda t: -t["total"])[:4]:
-            for key, w in sorted(t["self"].items(), key=lambda kv: -kv[1])[:12]:
-                label, lib, rva, js = t["info"][key]
+        wide: Dict[tuple, float] = collections.defaultdict(float)
+        winfo: Dict[tuple, tuple] = {}
+        for t in a["threads"]:
+            for key, w in t["self"].items():
+                wide[key] += w
+                winfo[key] = t["info"][key]
+        a["wide"], a["winfo"] = wide, winfo
+        for tbl, inf in [(wide, winfo)] + [(t["self"], t["info"]) for t in sorted(a["threads"], key=lambda t: -t["total"])[:args.threads]]:
+            for key, w in sorted(tbl.items(), key=lambda kv: -kv[1])[:args.top]:
+                label, lib, rva, js = inf[key]
                 if lib is not None and rva is not None:
                     L = a["libs"][lib]
                     if L.get("debugName") and L.get("breakpadId"):
@@ -312,7 +326,26 @@ def main() -> int:
     for a in chosen:
         print("=" * 100)
         print("process %s, type %s, file %s: %d thread(s), weight %.0f %s" % (a["pid"], a["type"], a["file"], len(a["threads"]), a["total"], unit))
-        for t in sorted(a["threads"], key=lambda t: -t["total"])[:4]:
+        print("-" * 100)
+        print("PROCESS-WIDE (all %d threads together), weight %.0f" % (len(a["threads"]), a["total"]))
+        wmod: Dict[str, float] = collections.defaultdict(float)
+        for key, w in a["wide"].items():
+            label, lib, rva, js = a["winfo"][key]
+            wmod["[JS]" if js else (a["libs"][lib].get("name") if lib is not None else "(no module: %s)" % label[:40])] += w
+        wtot = a["total"] or 1
+        print("  self weight by module: " + ", ".join("%s %.0f (%.1f%%)" % (m, w, 100 * w / wtot)
+                                                      for m, w in sorted(wmod.items(), key=lambda kv: -kv[1])[:10]))
+        print("  weight by thread: " + ", ".join("%s %.0f (%.1f%%)" % (t["name"], t["total"], 100 * t["total"] / wtot)
+                                                for t in sorted(a["threads"], key=lambda t: -t["total"])[:10]))
+        for key, w in sorted(a["wide"].items(), key=lambda kv: -kv[1])[:args.top * 2]:
+            label, lib, rva, js = a["winfo"][key]
+            if lib is not None and rva is not None:
+                L = a["libs"][lib]
+                name = found.get((L.get("debugName"), L.get("breakpadId"), rva))
+                if name:
+                    label = "%s!%s" % (L.get("name"), name)
+            print("  %9.0f %5.1f%%  %s" % (w, 100 * w / wtot, label[:200]))
+        for t in sorted(a["threads"], key=lambda t: -t["total"])[:args.threads]:
             print("-" * 100)
             print("thread %s (tid %s): %d samples, weight %.0f%s" % (t["name"], t["tid"], t["samples"], t["total"],
                                                                    "   ERROR " + t["error"] if t.get("error") else ""))
@@ -323,7 +356,7 @@ def main() -> int:
             tot = t["total"] or 1
             print("  self weight by module: " + ", ".join("%s %.0f (%.0f%%)" % (m, w, 100 * w / tot)
                                                           for m, w in sorted(by_mod.items(), key=lambda kv: -kv[1])[:8]))
-            for key, w in sorted(t["self"].items(), key=lambda kv: -kv[1])[:12]:
+            for key, w in sorted(t["self"].items(), key=lambda kv: -kv[1])[:args.top]:
                 label, lib, rva, js = t["info"][key]
                 if lib is not None and rva is not None:
                     L = a["libs"][lib]
