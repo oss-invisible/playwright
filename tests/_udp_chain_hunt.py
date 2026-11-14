@@ -16,6 +16,8 @@ the page's POST clears it. Three questions, none of which changes the tick or an
    process (`ChildSentinel`): both stalling = the CPU is starved, only the first = something in our process holds the GIL.
 5. EVERY gateway connection: accepted, first bytes read in the greeting, greeted (`Chain.trace_events`), as a histogram of
    accepted -> first bytes and the list of those over 500 ms.
+6. CPU of every process on the machine, sampled every 250 ms by a third tiny process (`CpuSampler`): the top 8 during each in-process
+   gap over 300 ms and a run-wide top 10.
 """
 from __future__ import annotations
 
@@ -145,12 +147,14 @@ class ChildSentinel:
     def __init__(self) -> None:
         self.gaps: List[Tuple[float, float]] = []
         self.note = ""
+        self._pid: Optional[int] = None
         self._proc: Optional["subprocess.Popen"] = None
 
     def start(self) -> None:
         try:
             self._proc = subprocess.Popen([sys.executable, "-I", "-c", CHILD_CODE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           text=True)
+            self._pid = self._proc.pid
             ready = self._proc.stdout.readline()          # it is running before the browser starts
             if "ready" not in ready:
                 self.note = "the second sentinel said %r instead of ready" % ready
@@ -175,6 +179,164 @@ class ChildSentinel:
                 proc.kill()
 
 
+#: The CPU sampler: a third tiny process (NOT the second sentinel: psutil walks the whole process table, which is costly on Windows and
+#: would stall the very loop that measures stalls). Every 250 ms it reads cpu_times of every process on the machine (psutil.process_iter,
+#: never environ) and keeps the delta of user+system since the previous sample; a process seen for the first time after the first sample
+#: counts from zero. At the end it prints one JSON: {"info": {pid: [name, short cmdline, ppid]}, "samples": [[t_prev, t, {pid: cpu s}]]}.
+SAMPLER_CODE = r"""
+import json, os, sys, threading, time
+import psutil
+halt = threading.Event()
+threading.Thread(target=lambda: (sys.stdin.read(), halt.set()), daemon=True).start()
+info, samples, last_cpu, last_t, names_seen = {}, [], {}, None, {}
+
+
+def short(name, cmd):
+    if not cmd:
+        return name
+    exe = os.path.basename(cmd[0])
+    low = name.lower()
+    if "firefox" in low or "-contentproc" in cmd:
+        return "firefox -contentproc %s" % cmd[-1] if "-contentproc" in cmd else "firefox parent"
+    if "python" in low:
+        rest = cmd[1:]
+        while rest and rest[0].startswith("-") and rest[0] not in ("-m", "-c"):
+            rest = rest[1:]
+        if rest[:1] == ["-m"] and len(rest) > 1:
+            return "python -m %s %s" % (rest[1], " ".join(rest[2:])[:70])
+        if rest[:1] == ["-c"] and len(rest) > 1:
+            return "python -c %s" % rest[1][:70].replace("\n", " ")
+        return "python %s" % " ".join(os.path.basename(rest[0]) if i == 0 else a for i, a in enumerate(rest))[:90]
+    return (exe + " " + " ".join(cmd[1:]))[:100]
+
+
+def snapshot():
+    # {pid: (name, cpu seconds user+system, ppid)} of every process, in ONE call. On Windows psutil's cpu_times opens every process
+    # (OpenProcess + GetProcessTimes): measured 4.6 s for 450 processes on a machine with a security agent, so the table comes from
+    # NtQuerySystemInformation(SystemProcessInformation) instead, which holds the same numbers for all of them at once.
+    out = {}
+    if sys.platform == "win32":
+        import ctypes, struct
+        ntdll = ctypes.windll.ntdll
+        size = 1 << 20
+        while True:
+            buf = ctypes.create_string_buffer(size)
+            need = ctypes.c_ulong(0)
+            status = ntdll.NtQuerySystemInformation(5, buf, size, ctypes.byref(need)) & 0xFFFFFFFF
+            if status == 0xC0000004:
+                size = max(size * 2, need.value + 65536)
+                continue
+            if status != 0:
+                raise OSError("NtQuerySystemInformation %#x" % status)
+            break
+        base, raw, off = ctypes.addressof(buf), buf.raw, 0
+        while True:
+            nxt = struct.unpack_from("<I", raw, off)[0]
+            user, kernel = struct.unpack_from("<qq", raw, off + 40)
+            length = struct.unpack_from("<H", raw, off + 56)[0]
+            pointer = struct.unpack_from("<Q", raw, off + 64)[0]
+            pid, ppid = struct.unpack_from("<QQ", raw, off + 80)
+            name = raw[pointer - base:pointer - base + length].decode("utf-16-le", "replace") if pointer and length else "?"
+            if pid != 0:                                   # 0 is the idle process: its "CPU" is the idle time
+                out[pid] = (name, (user + kernel) / 1e7, ppid)
+            if nxt == 0:
+                break
+            off += nxt
+        return out
+    for proc in psutil.process_iter(["pid", "name", "cpu_times", "ppid"]):
+        ct = proc.info.get("cpu_times")
+        if ct is not None:
+            out[proc.info["pid"]] = (proc.info.get("name") or "?", ct.user + ct.system, proc.info.get("ppid") or -1)
+    return out
+
+
+def sample():
+    global last_t
+    now = time.time()
+    table = snapshot()
+    cpu = {pid: v[1] for pid, v in table.items()}
+    if last_t is not None:
+        delta = {}
+        for pid, c in cpu.items():
+            d = c - last_cpu.get(pid, 0.0)
+            if d > 0.0005:
+                delta[pid] = round(d, 4)
+            if d > 0.005 and pid not in info:
+                # the command line is read only for a process that has used CPU: reading it for all of them is slow on Windows
+                try:
+                    info[pid] = [table[pid][0], short(table[pid][0], psutil.Process(pid).cmdline()), table[pid][2]]
+                except Exception:
+                    info[pid] = [table[pid][0], "?", table[pid][2]]
+        samples.append([last_t, now, delta])
+    for pid, v in table.items():
+        names_seen.setdefault(pid, (v[0], v[2]))
+    last_cpu.clear()
+    last_cpu.update(cpu)
+    last_t = now
+
+
+print("ready", flush=True)
+while not halt.is_set():
+    try:
+        sample()
+    except Exception as exc:
+        info[-1] = ["sampler error", "%s: %s" % (type(exc).__name__, exc), -1]
+    halt.wait(0.25)
+for pid, (name, ppid) in names_seen.items():
+    info.setdefault(pid, [name, "?", ppid])
+print(json.dumps({"info": info, "samples": samples}), flush=True)
+"""
+
+
+class CpuSampler:
+    def __init__(self) -> None:
+        self.info: Dict[int, Tuple[str, str, int]] = {}
+        #: (t_prev, t, {pid: cpu seconds used between the two readings})
+        self.samples: List[Tuple[float, float, Dict[int, float]]] = []
+        self.note = ""
+        self.pid: Optional[int] = None
+        self._proc: Optional["subprocess.Popen"] = None
+
+    def start(self) -> None:
+        try:
+            self._proc = subprocess.Popen([sys.executable, "-I", "-c", SAMPLER_CODE], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            self.pid = self._proc.pid
+            ready = self._proc.stdout.readline()
+            if "ready" not in ready:
+                self.note = "the CPU sampler said %r instead of ready" % ready
+        except Exception as exc:   # noqa: BLE001
+            self.note = "the CPU sampler did not start: %s: %s" % (type(exc).__name__, exc)
+            self._proc = None
+
+    def stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            data = json.loads(proc.stdout.readline())
+            self.info = {int(k): (v[0], v[1], v[2]) for k, v in data["info"].items()}
+            self.samples = [(a, b, {int(k): v for k, v in d.items()}) for a, b, d in data["samples"]]
+        except Exception as exc:   # noqa: BLE001
+            self.note = "the CPU sampler gave nothing: %s: %s" % (type(exc).__name__, exc)
+        finally:
+            try:
+                proc.wait(timeout=10)
+            except Exception:   # noqa: BLE001
+                proc.kill()
+
+    def cpu_between(self, a: float, b: float) -> Dict[int, float]:
+        """CPU seconds per pid in [a, b]: each sample's delta is shared out over its own interval in proportion to the overlap."""
+        out: Dict[int, float] = {}
+        for t0, t1, delta in self.samples:
+            if t1 <= a or t0 >= b or t1 <= t0:
+                continue
+            share = (min(b, t1) - max(a, t0)) / (t1 - t0)
+            for pid, d in delta.items():
+                out[pid] = out.get(pid, 0.0) + d * share
+        return out
+
+
 class Hunt:
     """The three measurements of one run of the walk."""
 
@@ -184,13 +346,15 @@ class Hunt:
         self.tag = "HUNT[%d.%d.rep%s]" % (os.getpid(), int(time.time()), rep)
         self.sentinel = Sentinel()
         self.child = ChildSentinel()
+        self.cpu = CpuSampler()
 
     def start(self) -> None:
+        self.cpu.start()
         self.child.start()
         self.sentinel.start()
 
     def stop(self) -> None:
-        for sentinel in (self.sentinel, self.child):
+        for sentinel in (self.sentinel, self.child, self.cpu):
             try:
                 sentinel.stop()
             except Exception:   # noqa: BLE001
@@ -200,7 +364,7 @@ class Hunt:
     def report(self, result: Optional[dict], explain: bool) -> None:
         """Print everything. Never raises: a hunt must not change the verdict of the test."""
         lines: List[str] = []
-        for part in (self._page_and_server, self._gateway_view, self._connections, self._stalls, self._tls):
+        for part in (self._page_and_server, self._gateway_view, self._connections, self._stalls, self._cpu, self._tls):
             try:
                 lines += part(result or {})
             except Exception as exc:   # noqa: BLE001
@@ -401,6 +565,51 @@ class Hunt:
                 for filename, lineno, func in stack:
                     text = linecache.getline(filename, lineno).strip()[:70] if filename else ""
                     out.append("%s 4.         %s:%d %s%s" % (self.tag, os.path.basename(filename), lineno, func, ("  | " + text) if text else ""))
+        return out
+
+    # --- 6: who used the machine's CPU --------------------------------------------------------------------------------
+    def _who(self, pid: int) -> str:
+        name, cmd, ppid = self.cpu.info.get(pid, ("?", "?", -1))
+        mark = ""
+        if pid == os.getpid():
+            mark = " [THIS pytest worker]"
+        elif pid == self.cpu.pid:
+            mark = " [hunt: CPU sampler]"
+        elif self.child._pid == pid:
+            mark = " [hunt: second sentinel]"
+        return "pid %d %s: %s (ppid %d)%s" % (pid, name, cmd, ppid, mark)
+
+    def _cpu(self, result: dict) -> List[str]:
+        tl = result.get("timeline") or {}
+        send = tl.get("post_send_date")
+        base = (send / 1000.0) if send is not None else None
+        ncpu = os.cpu_count() or 1
+        samples = self.cpu.samples
+        out = ["%s 6. CPU sampler (a separate process, every 250 ms, cpu_times of every process): %d sample(s), %d process(es) seen, %d vCPU(s)%s" % (
+            self.tag, len(samples), len(self.cpu.info), ncpu, ("; " + self.cpu.note) if self.cpu.note else "")]
+        if not samples:
+            return out
+        gaps = [g for g in self.sentinel.gaps if g["length"] > 0.300]
+        out.append("%s 6. in-process gaps over 300 ms: %d. For each, the top 8 processes by CPU during it (each 250 ms sample shared over the gap in "
+                   "proportion to the overlap), and their share of the %d vCPU(s) (cpu / (gap length x %d))" % (self.tag, len(gaps), ncpu, ncpu))
+        for g in gaps:
+            a, b = g["start"], g["start"] + g["length"]
+            per = self.cpu.cpu_between(a, b)
+            total = sum(per.values())
+            out.append("%s 6.   gap start %s (t=%.3f) length %.0f ms: all processes together used %.0f ms of CPU = %.0f%% of the %d vCPU(s)" % (
+                self.tag, ("%+.1f ms" % ((a - base) * 1000.0)) if base is not None else "-", a, g["length"] * 1000.0, total * 1000.0,
+                100.0 * total / (g["length"] * ncpu), ncpu))
+            for pid, c in sorted(per.items(), key=lambda kv: -kv[1])[:8]:
+                out.append("%s 6.       %6.0f ms  %5.1f%% of the vCPUs  %s" % (self.tag, c * 1000.0, 100.0 * c / (g["length"] * ncpu), self._who(pid)))
+        run = {}
+        for _a, _b, delta in samples:
+            for pid, d in delta.items():
+                run[pid] = run.get(pid, 0.0) + d
+        span = samples[-1][1] - samples[0][0]
+        out.append("%s 6. run-wide top 10 by CPU seconds over %.1f s (%.1f s of CPU in all, %.0f%% of the %d vCPU(s))" % (
+            self.tag, span, sum(run.values()), 100.0 * sum(run.values()) / (span * ncpu), ncpu))
+        for pid, c in sorted(run.items(), key=lambda kv: -kv[1])[:10]:
+            out.append("%s 6.       %7.2f s  %5.1f%% of the vCPUs  %s" % (self.tag, c, 100.0 * c / (span * ncpu), self._who(pid)))
         return out
 
     # --- 5: every gateway connection: accepted -> first bytes -> greeted --------------------------------------------
