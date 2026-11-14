@@ -616,7 +616,50 @@ async def run_loop(pages: list, base: str, sampler: Sampler, notes: dict) -> Non
     notes["outcome"] = outcome
 
 
+PREF_RE = r"gfx|layers|webrender|layout\.frame_rate|widget\.|security\.sandbox|dom\.ipc|media\.hardware|apz|vsync|d3d11|angle|force-|idle|quota|indexeddb|dom\.storage|extensions\.|remote|telemetry|glean|classifier|safebrowsing|browser\.startup|toolkit\.|datareporting|app\.update|network\.|dom\.serviceWorkers|permissions|places|sessionstore|cache"
+
+
+def profile_evidence(launch_t: float) -> dict:
+    """What the browser parent's profile holds at the end of the scenes: the files (size, age relative to the launch) so that a burst of
+    IndexedDB / storage work shows where it wrote, and the prefs in user.js and prefs.js that touch the areas of interest."""
+    import re
+    import psutil
+    out: dict = {"profiles": []}
+    seen = set()
+    for p in psutil.Process().children(recursive=True):
+        try:
+            cmd = p.cmdline()
+        except Exception:   # noqa: BLE001
+            continue
+        if not cmd or "firefox" not in os.path.basename(cmd[0]).lower() or "-contentproc" in cmd or "-profile" not in cmd:
+            continue
+        prof = cmd[cmd.index("-profile") + 1]
+        if prof in seen or not os.path.isdir(prof):
+            continue
+        seen.add(prof)
+        files = []
+        for root, _dirs, names in os.walk(prof):
+            for n in names:
+                fp = os.path.join(root, n)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                files.append([os.path.relpath(fp, prof).replace("\\", "/"), st.st_size, round(st.st_mtime - launch_t, 1)])
+        recent = sorted(files, key=lambda f: -f[2])[:120]
+        largest = sorted(files, key=lambda f: -f[1])[:40]
+        prefs = {}
+        for name in ("user.js", "prefs.js"):
+            fp = os.path.join(prof, name)
+            if os.path.isfile(fp):
+                prefs[name] = [ln.strip()[:200] for ln in open(fp, encoding="utf-8", errors="replace") if re.search(PREF_RE, ln, re.I)][:400]
+                prefs[name + " lines"] = sum(1 for _ in open(fp, encoding="utf-8", errors="replace"))
+        out["profiles"].append({"cmd": [c for c in cmd[:12]], "nfiles": len(files), "recent": recent, "largest": largest, "prefs": prefs})
+    return out
+
+
 async def run_scenes(pages: list, base: str, sampler: Sampler, notes: dict) -> None:
+    notes["launch_t"] = time.time() - 3      # the browsers were opened a moment ago
     await window(sampler, "settle", SETTLE_S)            # the first seconds after the page exists
     # idle in three slices of 10 s (idle-s1, idle-s2 are the cuts), to see whether the CPU decays or stays
     sampler.snap("idle-b")
@@ -646,13 +689,24 @@ async def run_scenes(pages: list, base: str, sampler: Sampler, notes: dict) -> N
         await p.goto("about:blank")
     await asyncio.sleep(2)
     await window(sampler, "late", LATE_S)                # idle again, after everything above: does the CPU end?
-    # about:support, as evidence only: the compositor, WebRender software or not, the refresh rate, and the prefs that matter
+    try:
+        notes["profile"] = profile_evidence(notes["launch_t"])
+    except Exception as exc:   # noqa: BLE001
+        notes["profile"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
+    # about:support, as evidence only: the compositor, WebRender software or not, the refresh rate. A page cannot evaluate in it ("Permission
+    # denied") and stock never fires its load, so: wait for "commit" and read the tables with locators
     try:
         ctx = await OPEN_BROWSERS[0].new_context()
         page = await ctx.new_page()
-        await page.goto("about:support", timeout=30000)
-        await asyncio.sleep(4)
-        notes["about_support"] = await page.evaluate(ABOUT_SUPPORT_JS)
+        await page.goto("about:support", timeout=30000, wait_until="commit")
+        await asyncio.sleep(5)
+        support = {}
+        for sel in ("#graphics-features-tbody", "#graphics-tbody", "#graphics-diagnostics-tbody", "#graphics-decisions-tbody"):
+            try:
+                support[sel] = (await page.locator(sel).inner_text(timeout=8000))[:4000]
+            except Exception as exc:   # noqa: BLE001
+                support[sel] = "ERROR %s: %s" % (type(exc).__name__, str(exc)[:150])
+        notes["about_support"] = support
         await ctx.close()
     except Exception as exc:   # noqa: BLE001
         notes["about_support"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
@@ -696,7 +750,7 @@ def run_arm(arm: str, binary: str, rnd: int, n: int, mode: str) -> dict:
         "whole": window_report(sampler, whole_a, whole_b), "whole_wall_s": whole_b - whole_a, "ncpu": os.cpu_count(),
         "completed": outcome["completed"], "incomplete": outcome["incomplete"], "failed": outcome["failed"],
         "median_scenario_ms": statistics.median(outcome["ms"]) if outcome["ms"] else None,
-        "raf_frames": notes.get("raf_frames"), "about_support": notes.get("about_support"),
+        "raf_frames": notes.get("raf_frames"), "about_support": notes.get("about_support"), "profile": notes.get("profile"),
         "sampler_errors": [v[2] for v in sampler.info.values() if v[0] == "error"],
     }
 
@@ -727,6 +781,9 @@ def print_arm(r: dict) -> None:
         print("  rAF frames: " + str(r["raf_frames"]))
     if r["about_support"]:
         print("  about:support: " + json.dumps(r["about_support"])[:3000])
+    for prof in ((r.get("profile") or {}).get("profiles") or []):
+        print("  profile: %d files; written during the run (mtime relative to the launch, newest first): %s"
+              % (prof["nfiles"], "; ".join("%s %d B @%+.0fs" % tuple(f) for f in prof["recent"][:25])))
     if r["sampler_errors"]:
         print("  SAMPLER ERRORS: " + str(r["sampler_errors"][:5]))
     sys.stdout.flush()
@@ -860,6 +917,14 @@ def compare(directory: Path) -> int:
     for r in good:
         if r["raf_frames"]:
             print("rAF %s r%s: " % (r["arm"], r["round"]) + ", ".join("%.1f fps (dpr %s)" % (f["fps"] or 0, f["dpr"]) for f in r["raf_frames"]))
+    for r in good:
+        for prof in ((r.get("profile") or {}).get("profiles") or []):
+            if r["round"] != 1:
+                continue
+            print("profile %s r%s: %d files; largest: %s" % (r["arm"], r["round"], prof["nfiles"], "; ".join("%s %d" % (f[0], f[1]) for f in prof["largest"][:12])))
+            print("   newest files (path, bytes, s after launch): " + "; ".join("%s %d @%+.0f" % tuple(f) for f in prof["recent"][:40]))
+            print("   prefs.js/user.js lines: %s; matching lines kept: %s" % ({k: v for k, v in prof["prefs"].items() if k.endswith("lines")},
+                                                                            {k: len(v) for k, v in prof["prefs"].items() if not k.endswith("lines")}))
     for r in good:
         if r["about_support"]:
             print("about:support %s r%s: %s" % (r["arm"], r["round"], json.dumps(r["about_support"])[:1500]))

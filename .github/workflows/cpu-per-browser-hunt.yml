@@ -58,6 +58,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           OUT="$RUNNER_TEMP/cpu-hunt"; mkdir -p "$OUT"
+          MODES="scenes"      # the runs of this push; the full set is "loop1 scenes loop4" (run 43643634978 has the loops)
           run() {   # arm browsers mode round
             taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
             echo "::group::$1 n$2 $3 round $4"
@@ -71,9 +72,9 @@ jobs:
           for rnd in 1 2; do
             if [ "$rnd" = 1 ]; then ORDER=$ORDER1; else ORDER=$ORDER2; fi
             for arm in $ORDER; do
-              run "$arm" 1 loop "$rnd"
-              run "$arm" 1 scenes "$rnd"
-              run "$arm" 4 loop "$rnd"
+              case " $MODES " in *" loop1 "*) run "$arm" 1 loop "$rnd";; esac
+              case " $MODES " in *" scenes "*) run "$arm" 1 scenes "$rnd";; esac
+              case " $MODES " in *" loop4 "*) run "$arm" 4 loop "$rnd";; esac
             done
           done
       - name: Comparison tables
