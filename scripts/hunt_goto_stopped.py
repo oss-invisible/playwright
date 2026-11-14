@@ -169,10 +169,30 @@ async def main(arm, reps, first, binary):
 def _without_process_scans():
     """Hunt only (oursnoscan, oursonenoscan): what the arm costs when nothing scans every process of the machine
     for the session token - the launch-time adoption loop and the two teardown searches answer at once."""
+    # A faithful model of the fix, not "nothing": the teardown still finds and ends the session's processes, but it reads
+    # the environment of the browser's own processes only (here: those named firefox), never of every process of the
+    # machine; the launch adopts nothing (the fix makes the engine born inside the job, so there is nothing to adopt).
+    import psutil
     from invisible_core import process
     from invisible_core.juggler import _profile
-    process.find_processes = lambda token: []
-    _profile.find_processes = lambda token: []
+    original = process.find_processes
+
+    def browser_processes_only(token):
+        if not token:
+            return []
+        found = [p for p in psutil.process_iter(["name"]) if "firefox" in (p.info.get("name") or "").lower()
+                 and token.matches(p)]
+        pids = {p.pid for p in found}
+
+        def parent(p):
+            try:
+                return p.ppid()
+            except Exception:
+                return None
+        found.sort(key=lambda p: parent(p) in pids, reverse=True)
+        return found
+    process.find_processes = browser_processes_only
+    _profile.find_processes = browser_processes_only
     process.LifetimeGuard.bind = lambda self, token, **kw: 0
 
 
