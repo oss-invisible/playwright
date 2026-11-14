@@ -1,0 +1,312 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cpu-render-path-hunt-vm.yml - HUNT ONLY, never merged: second round of cpu-render-path-hunt.yml. Nothing of the product is changed: every pref goes
+# through the hunt scripts (extra_prefs, the pytest plugin) and this workflow.
+#
+# What the first round found: on the Windows VM runner (adapter Microsoft Hyper-V Video) stock Firefox's GfxInfo blocks D3D11 compositing and WebRender
+# with FEATURE_FAILURE_VM_VENDOR and falls back to WebRender (Software); ours declares OK for those features (the core's declaration, answered by
+# the engine before any blocklist) and takes the hardware path: a GPU process, D3D11 compositing, and ~6x the CPU.
+#
+# This round, one windows-2022 job, in this order:
+#   0. scripts/hunt_vmretail.py build: the arm `ours_vmretail` = ours made to take retail's VM decisions. It reads ours's DECLARED table
+#      (zoom.stealth.gfx.feature_status) and stock's own decision for every feature (nsIGfxInfo.getFeatureStatusStr), prints both side by side for
+#      every feature, and writes the extra_prefs: the declared table with only the compositing features replaced by stock's decision, plus
+#      gfx.webrender.software=true, gfx.webrender.software.d3d11=false (WebRender (Software), not Software D3D11) and webgl.angle.force-warp=true (WebGL on
+#      ANGLE with an explicit WARP device). The WebGL, media and every other feature keep what the persona declares: renderer, vendor and extensions stay
+#      as declared. The list is printed there, and read back from the effective prefs and Troubleshoot by the next steps.
+#   1. `support` for ours, stockheaded and ours_vmretail: effective prefs, feature decisions, Troubleshoot's windowLayerManagerType and
+#      windowLayerManagerRemote, WebRender/D3D11/WARP lines. Did the prefs take effect?
+#   2. scripts/hunt_cpu_baseline.py: one browser, 20 s, arms stockheaded, ours, ours_swwr, ours_vmretail: CPU per process type and per thread name, and
+#      WHERE COMPOSITING RUNS (the Compositor, Renderer, RenderBackend, WRWorker ... threads: in the parent or in the GPU process).
+#   3. scripts/hunt_page_bytes.py: every page-readable value (canvas 2D, WebGL 1/2, text, strings; 2 launches per arm), ours against ours_vmretail.
+#   4. The CPU per process type of the 4-browser, 10-scene loop (hunt_cpu_per_browser.py): ours, stockheaded, ours_vmretail, 2 rounds, alternating.
+#   5. A profile of OUR GPU process with NO thread filter (MOZ_PROFILER_STARTUP_FILTERS=*), small buffer, 3 rounds: every thread of the GPU process with
+#      its self weight by module, and the weight of the unnamed threads by module (are they d3d10warp.dll?).
+#   6. The wrapper's own byte suites (canvas_*, webgl_*, ...) under ours and under ours_vmretail (scripts/hunt_extra_prefs_plugin.py), outcome per test.
+# Every step is continue-on-error: a hunt must give whatever it got.
+# ─────────────────────────────────────────────────────────────────────────────
+name: cpu render path hunt vm
+
+on:
+  push:
+    branches: [hunt/cpu-render-path]
+    paths:
+      - scripts/hunt_vmretail.py
+      - scripts/hunt_cpu_render_path.py
+      - scripts/hunt_cpu_per_browser.py
+      - scripts/hunt_cpu_baseline.py
+      - scripts/hunt_page_bytes.py
+      - scripts/hunt_page_bytes_probe.js
+      - scripts/hunt_extra_prefs_plugin.py
+      - scripts/hunt_profile_summary.py
+      - scripts/hunt_fetch_symbols.py
+      - .github/workflows/cpu-render-path-hunt-vm.yml
+  workflow_dispatch:
+    inputs:
+      symbols_run:
+        description: "Run id of the engine's release.yml whose symbols-win-x86_64 artifact matches the binary (empty: look through the recent runs)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-render-path-hunt-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: "hunt (windows-2022, ours_vmretail - retail's VM decisions, where compositing runs, page bytes, GPU process profile)"
+    runs-on: windows-2022
+    timeout-minutes: 200
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install the wrapper, psutil, and stock Playwright with its firefox
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]" psutil
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+          python -m playwright install firefox
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Where the prefs of ours_vmretail are written
+        run: echo "HUNT_VMRETAIL_PREFS=$RUNNER_TEMP/vm/vmretail/prefs.json" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------------------------------------ 0. the arm ours_vmretail
+      - name: "0. Build ours_vmretail (the declared table of ours, the decisions of stock, the prefs)"
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_vmretail.py build --binary "$FF" --out "$RUNNER_TEMP/vm/vmretail" | tee "$RUNNER_TEMP/vm/vmretail-build.txt"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+
+      # ------------------------------------------------------------------------------------------------ 1. did the prefs take effect, where does it composite
+      - name: "1. Compositing facts, arm ours"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_render_path.py support --arm ours --binary "$FF" --out "$RUNNER_TEMP/vm/support"
+      - name: "1. Compositing facts, arm stockheaded"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_render_path.py support --arm stockheaded --out "$RUNNER_TEMP/vm/support"
+      - name: "1. Compositing facts, arm ours_vmretail (the prefs read back)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_render_path.py support --arm ours_vmretail --binary "$FF" --out "$RUNNER_TEMP/vm/support"
+      - name: "1. Graphics diff, ours_vmretail against stockheaded (is it the same compositing as stock now?)"
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/vm/support-vm"
+          rm -rf "$RUNNER_TEMP/vm/support-vm/ours" "$RUNNER_TEMP/vm/support-vm/stockheaded"
+          cp -r "$RUNNER_TEMP/vm/support/ours_vmretail" "$RUNNER_TEMP/vm/support-vm/ours"
+          cp -r "$RUNNER_TEMP/vm/support/stockheaded" "$RUNNER_TEMP/vm/support-vm/stockheaded"
+          python -u scripts/hunt_cpu_render_path.py diff "$RUNNER_TEMP/vm/support-vm" | tee "$RUNNER_TEMP/vm/support-vm/diff.txt"
+
+      # ------------------------------------------------------------------------------------------------ 2. one browser, 20 s: CPU by process and thread
+      - name: "2. Baseline, arm stockheaded"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm stockheaded --out "$RUNNER_TEMP/vm/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "2. Baseline, arm ours"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm ours --binary "$FF" --out "$RUNNER_TEMP/vm/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "2. Baseline, arm ours_vmretail"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm ours_vmretail --binary "$FF" --out "$RUNNER_TEMP/vm/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "2. Baseline, arm ours_swwr"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_baseline.py --arm ours_swwr --binary "$FF" --out "$RUNNER_TEMP/vm/baseline"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "2. Baseline comparison and where compositing runs"
+        if: always()
+        continue-on-error: true
+        run: python scripts/hunt_cpu_baseline.py --compare "$RUNNER_TEMP/vm/baseline" | tee "$RUNNER_TEMP/vm/baseline/compare.txt"
+
+      # ------------------------------------------------------------------------------------------------ 3. page-readable bytes
+      - name: "3. Page-readable bytes, arm ours (2 launches)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_page_bytes.py collect --arm ours --binary "$FF" --launches 2 --out "$RUNNER_TEMP/vm/pagebytes"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "3. Page-readable bytes, arm ours_vmretail (2 launches)"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_page_bytes.py collect --arm ours_vmretail --binary "$FF" --launches 2 --out "$RUNNER_TEMP/vm/pagebytes"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "3. Page-readable bytes, ours against ours_vmretail"
+        if: always()
+        continue-on-error: true
+        run: python -u scripts/hunt_page_bytes.py diff "$RUNNER_TEMP/vm/pagebytes" --a ours --b ours_vmretail | tee "$RUNNER_TEMP/vm/pagebytes/diff.txt"
+
+      # ------------------------------------------------------------------------------------------------ 4. CPU of the 4-browser loop
+      - name: "4. CPU by process type, ours, round 1"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm ours --binary "$FF" --round 1 --out "$RUNNER_TEMP/vm/cpu/ours-1.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. CPU by process type, stockheaded, round 1"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 1 --out "$RUNNER_TEMP/vm/cpu/stockheaded-1.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. CPU by process type, ours_vmretail, round 1"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm ours_vmretail --binary "$FF" --round 1 --out "$RUNNER_TEMP/vm/cpu/ours_vmretail-1.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. CPU by process type, ours, round 2"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm ours --binary "$FF" --round 2 --out "$RUNNER_TEMP/vm/cpu/ours-2.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. CPU by process type, stockheaded, round 2"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 2 --out "$RUNNER_TEMP/vm/cpu/stockheaded-2.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. CPU by process type, ours_vmretail, round 2"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm ours_vmretail --binary "$FF" --round 2 --out "$RUNNER_TEMP/vm/cpu/ours_vmretail-2.json"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "4. Comparison table"
+        if: always()
+        continue-on-error: true
+        run: python scripts/hunt_cpu_per_browser.py --compare "$RUNNER_TEMP/vm/cpu" | tee "$RUNNER_TEMP/vm/cpu/compare.txt"
+
+      # ------------------------------------------------------------------------------------------------ 5. our GPU process, every thread
+      - name: "5. Gecko profile of our GPU process, NO thread filter (MOZ_PROFILER_STARTUP_FILTERS=*), small buffer, 3 rounds"
+        if: always()
+        continue-on-error: true
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_render_path.py profile --arm ours --binary "$FF" --gpu --filters '*' --out "$RUNNER_TEMP/vm/profiles-gpu-all"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "5. Symbols of our engine (artifact symbols-win-x86_64 of the engine's release.yml)"
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          P="$RUNNER_TEMP/vm/profiles-gpu-all"
+          ID="$(python scripts/hunt_profile_summary.py "$P/ours" --ids | awk '$3=="xul.dll"{print $2}' | head -1)"
+          echo "breakpad id of our xul.dll in the profile: '$ID'"
+          if [ -z "$ID" ]; then echo "SYMBOLS: none (no id: no parent profile of ours)"; exit 0; fi
+          python scripts/hunt_fetch_symbols.py --id "$ID" --run "${{ inputs.symbols_run }}" --out "$RUNNER_TEMP/vm/symbols" | tee "$RUNNER_TEMP/vm/symbols.log"
+      - name: "5. Summary of the GPU process: every thread, its self weight by module, the unnamed threads, the top functions"
+        if: always()
+        continue-on-error: true
+        run: |
+          P="$RUNNER_TEMP/vm/profiles-gpu-all/ours"
+          SYM=$(ls "$RUNNER_TEMP"/vm/symbols/symbols-*.zip 2>/dev/null | head -1 || true)
+          python -u scripts/hunt_profile_summary.py "$P" ${SYM:+--symbols "$SYM"} --only gpu --detail 2 --thread-table --threads 8 --top 20 | tee "$P/summary-gpu-all.txt"
+
+      # ------------------------------------------------------------------------------------------------ 6. the wrapper's byte suites
+      - name: "6. The wrapper's byte suites, arm ours"
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 35
+        env:
+          PYTHONPATH: ${{ github.workspace }}/scripts
+          INVPW_BINARY_PATH: ${{ env.FF }}
+          INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog-suites.log
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          D="$RUNNER_TEMP/vm/suites"; mkdir -p "$D"
+          FILES=$(ls tests/test_canvas_*.py tests/test_webgl_*.py tests/test_a_declared_webgl_extension_survives_its_use_e2e.py \
+                     tests/test_fingerprint_surface.py tests/test_fingerprint_consistency.py tests/test_system_fonts_and_colors_are_windows_e2e.py \
+                     tests/test_css_calc_is_windows_e2e.py tests/test_screenshot_of_text_returns_linux_e2e.py | sort -u)
+          echo "$FILES" > "$D/files.txt"; echo "$FILES" | wc -l
+          python -u -m pytest $FILES -o addopts= -p no:cacheprovider -p hunt_extra_prefs_plugin -q -rs --junitxml="$D/ours.xml" 2>&1 | tee "$D/ours.log" | tail -60
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "6. The wrapper's byte suites, arm ours_vmretail (HUNT_EXTRA_PREFS = the prefs of hunt_vmretail.py build)"
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 35
+        env:
+          PYTHONPATH: ${{ github.workspace }}/scripts
+          INVPW_BINARY_PATH: ${{ env.FF }}
+          INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog-suites.log
+          HUNT_EXTRA_PREFS_LOG: ${{ runner.temp }}/vm/suites/ours_vmretail-prefs.log
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          D="$RUNNER_TEMP/vm/suites"; mkdir -p "$D"
+          export HUNT_EXTRA_PREFS="$(python scripts/hunt_vmretail.py prefs-json "$HUNT_VMRETAIL_PREFS")"
+          echo "HUNT_EXTRA_PREFS has $(echo -n "$HUNT_EXTRA_PREFS" | wc -c) characters"
+          FILES=$(cat "$D/files.txt" 2>/dev/null || true)
+          [ -n "$FILES" ] || FILES=$(ls tests/test_canvas_*.py tests/test_webgl_*.py)
+          python -u -m pytest $FILES -o addopts= -p no:cacheprovider -p hunt_extra_prefs_plugin -q -rs --junitxml="$D/ours_vmretail.xml" 2>&1 | tee "$D/ours_vmretail.log" | tail -60
+          echo "browsers constructed with the prefs: $(wc -l < "$D/ours_vmretail-prefs.log" 2>/dev/null || echo 0)"
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+      - name: "6. The wrapper's byte suites, outcome per test in both arms"
+        if: always()
+        continue-on-error: true
+        run: |
+          D="$RUNNER_TEMP/vm/suites"
+          python scripts/hunt_page_bytes.py suites "$D/ours.xml" "$D/ours_vmretail.xml" --b-name ours_vmretail | tee "$D/suites-diff.txt"
+
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cpu-render-path-hunt-vm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/vm
+          if-no-files-found: warn
+          retention-days: 14

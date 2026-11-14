@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from hunt_cpu_per_browser import ARM_PREFS   # noqa: E402  (the one place the hunt's prefs are declared)
+from hunt_cpu_per_browser import arm_prefs, is_ours   # noqa: E402  (the one place the hunt's prefs are declared)
 
 MARIONETTE_PORTS = (28431, 2828)
 ENV_INTERESTING = re.compile(r"^(MOZ_|STEALTH|INVPW|GFX|WEBRENDER|DXGI|D3D|LIBGL|MESA|GDK_|GTK_|DISPLAY|USERNAME$|SESSIONNAME$)", re.I)
@@ -275,9 +275,9 @@ async def launched(arm: str, binary: str, marionette: bool):
     extra_args = ["-marionette", "-remote-allow-system-access"] if marionette else []
     if marionette:
         os.environ["MOZ_REMOTE_ALLOW_SYSTEM_ACCESS"] = "1"
-    if arm in ("ours", "ours_swwr"):
+    if is_ours(arm):
         from invisible_playwright.async_api import InvisiblePlaywright
-        prefs = dict(ARM_PREFS.get(arm) or {})                  # ours_swwr: gfx.webrender.software=true, from the hunt only
+        prefs = dict(arm_prefs(arm) or {})                      # ours_swwr / ours_vmretail: from the hunt only
         if marionette:
             prefs["marionette.port"] = MARIONETTE_PORTS[0]
         prefs = prefs or None
@@ -379,24 +379,37 @@ def print_support(report: Dict[str, Any]) -> None:
 
 
 def print_compositing(arm_dir: Path) -> None:
-    """What decided compositing in this arm: the effective gfx.webrender.* prefs and the feature lines of the snapshot."""
+    """What decided compositing in this arm, and WHERE it runs: the prefs the hunt passed (as read back), the feature decisions, the layer manager."""
     print("-" * 100)
     print("compositing facts of %s:" % arm_dir.name)
     pf = arm_dir / "effective_prefs.json"
     if pf.is_file():
         prefs = json.loads(pf.read_text(encoding="utf-8"))
         for n in sorted(prefs):
-            if n.startswith(("gfx.webrender.", "gfx.canvas.", "layers.gpu-process", "gfx.webrender")) or n in ("gfx.webrender.software",):
+            if n.startswith(("gfx.webrender.", "gfx.canvas.", "layers.gpu-process", "layers.d3d11", "webgl.angle.", "webgl.disable-angle", "gfx.direct")):
                 print("  pref %s = %s (user-set: %s)" % (n, prefs[n][1], prefs[n][0]))
+        decl = prefs.get("zoom.stealth.gfx.feature_status")
+        if decl and isinstance(decl[1], str):
+            entries = [e for e in decl[1].split(",") if e]
+            odd = [e for e in entries if e.split("|")[1:2] != ["1"]]
+            print("  pref zoom.stealth.gfx.feature_status: %d features declared, the ones that are not OK (|1): %s"
+                  % (len(entries), "; ".join(odd) if odd else "none"))
+            comp = [e for e in entries if re.match(r"(DIRECT3D_11_LAYERS|GPU_PROCESS|WEBRENDER[A-Z_]*|D3D11_KEYED_MUTEX|DX_INTEROP2|CANVAS2D_ACCELERATION|"
+                                                 r"ACCELERATED_CANVAS2D|DIRECT3D_11_ANGLE|WEBGL_ANGLE|WEBGL_USE_HARDWARE)\|", e)]
+            print("    the compositing/WebGL ones: " + "; ".join(comp))
     else:
         print("  effective_prefs.json missing")
     sf = arm_dir / "troubleshoot.json"
     if sf.is_file():
         data = json.loads(sf.read_text(encoding="utf-8"))
+        g = data.get("graphics", {})
+        print("  Troubleshoot graphics.windowLayerManagerType = %s, windowLayerManagerRemote = %s, windowProtocol = %s"
+              % (g.get("windowLayerManagerType"), g.get("windowLayerManagerRemote"), g.get("windowProtocol")))
         lines: List[str] = []
-        flatten("", data.get("graphics", {}), lines)
+        flatten("", g, lines)
         for l in lines:
-            if re.search(r"(?i)compositing|webrender|d3d11|warp|gpu.?process|description|adapter|vm|failure|blocklist", l.split(" = ")[0]) or                     re.search(r"(?i)FEATURE_|WebRender|D3D11|WARP", l):
+            key = l.split(" = ")[0]
+            if re.search(r"(?i)compositing|webrender|d3d11|warp|gpu.?process|description|adapter|failure|blocklist|layermanager", key) or                     re.search(r"(?i)FEATURE_|WebRender|D3D11|WARP", l):
                 print("  " + l[:240])
     else:
         print("  troubleshoot.json missing")
@@ -545,7 +558,7 @@ def wait_until_no_firefox(timeout: float) -> str:
                                                          (" (%s)" % ", ".join("%s %s" % (p["pid"], p["kind"]) for p in left)) if left else "")
 
 
-def profile_run(arm: str, binary: str, out: Path, rnd: int, gpu: bool = False, rounds: int = 0, browsers: int = 0) -> int:
+def profile_run(arm: str, binary: str, out: Path, rnd: int, gpu: bool = False, rounds: int = 0, browsers: int = 0, filters: str = "") -> int:
     import hunt_cpu_per_browser as hunt
     out.mkdir(parents=True, exist_ok=True)
     pattern = str(out / "profile-%p.json")
@@ -556,7 +569,7 @@ def profile_run(arm: str, binary: str, out: Path, rnd: int, gpu: bool = False, r
         os.environ.update({
             "MOZ_PROFILER_STARTUP": "1",
             "MOZ_PROFILER_STARTUP_FEATURES": "stackwalk,cpu,threads,processcpu",
-            "MOZ_PROFILER_STARTUP_FILTERS": GPU_THREADS,
+            "MOZ_PROFILER_STARTUP_FILTERS": filters or GPU_THREADS,
             "MOZ_PROFILER_STARTUP_ENTRIES": "1048576",
             "MOZ_PROFILER_STARTUP_INTERVAL": "2",
             "MOZ_PROFILER_SHUTDOWN": pattern,
@@ -577,7 +590,7 @@ def profile_run(arm: str, binary: str, out: Path, rnd: int, gpu: bool = False, r
             hunt.BROWSERS = browsers
     print("profile arm %s%s: %s; %d browsers x %d rounds" % (arm, " (GPU-process profile)" if gpu else "", pattern, hunt.BROWSERS, hunt.ROUNDS))
     print("profiler environment: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(os.environ.items()) if k.startswith("MOZ_PROFILER_")))
-    if arm in ("ours", "ours_swwr"):
+    if is_ours(arm):
         print(let_profiler_env_through())
     kill_firefox()
     result = hunt.run_arm(arm, binary, rnd)
@@ -611,7 +624,7 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("support", "profile"):
         p = sub.add_parser(name)
-        p.add_argument("--arm", choices=("ours", "ours_swwr", "stockheaded"), required=True)
+        p.add_argument("--arm", choices=("ours", "ours_swwr", "ours_vmretail", "stockheaded"), required=True)
         p.add_argument("--binary", default=os.environ.get("INVPW_BINARY_PATH", ""))
         p.add_argument("--out", type=Path, required=True, help="the root; the arm's files go in <out>/<arm>/")
         p.add_argument("--round", type=int, default=1)
@@ -619,20 +632,22 @@ def main() -> int:
             p.add_argument("--gpu", action="store_true", help="the GPU-process profile: filtered threads, small buffer, short loop")
             p.add_argument("--rounds", type=int, default=0, help="scenes per browser (default 10, 3 with --gpu)")
             p.add_argument("--browsers", type=int, default=0)
+            p.add_argument("--filters", default="", help="MOZ_PROFILER_STARTUP_FILTERS for --gpu (default: the six GPU-process threads; '*' = every thread)")
     d = sub.add_parser("diff")
     d.add_argument("root", type=Path)
     args = ap.parse_args()
     if args.cmd == "diff":
         return diff_dir(args.root)
-    if args.arm in ("ours", "ours_swwr") and not args.binary:
-        ap.error("the arms ours and ours_swwr need --binary (or INVPW_BINARY_PATH)")
+    if is_ours(args.arm) and not args.binary:
+        ap.error("the ours arms need --binary (or INVPW_BINARY_PATH)")
     arm_dir = args.out / args.arm
     if args.cmd == "support":
         report = asyncio.run(support_arm(args.arm, args.binary, arm_dir))
         print_support(report)
         print_compositing(arm_dir)
         return 0
-    return profile_run(args.arm, args.binary, arm_dir, args.round, gpu=args.gpu, rounds=args.rounds, browsers=args.browsers)
+    return profile_run(args.arm, args.binary, arm_dir, args.round, gpu=args.gpu, rounds=args.rounds, browsers=args.browsers,
+                       filters=args.filters)
 
 
 if __name__ == "__main__":

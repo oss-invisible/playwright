@@ -5,9 +5,17 @@
 //   worker.* an OffscreenCanvas WebGL context in a worker
 //   dom.*   text layout: the boxes of spans in many fonts, wrapped paragraphs, system colours
 //   env.*   the values the persona declares around it (so that a difference in them is seen, not guessed)
+// ENCODING MODE (scripts/hunt_encoding.py sets globalThis.__ENCODING_MODE = true before this expression): only the scenes whose PNG output was not stable
+// between two launches run (c2d shapes/composite/image/text, OffscreenCanvas, the WebGL triangle), and each one, instead of the usual keys, puts
+//   <scene>.getImageData / readPixels  the pixels of the draw
+//   <scene>.png1..3, <scene>.blob1..3  the raw bytes of three toDataURL and three toBlob calls on the SAME canvas in the SAME page
+//   <scene>.png.decoded                the pixels the browser itself decodes from png1
+// so that "the pixels differ" and "only the encoding differs" can be told apart, and a call that is not repeatable inside one page is seen.
 // Every scene is wrapped: an exception becomes `<scene>.error` and is compared like any other value, so both arms give the same keys.
 (async () => {
   const out = {};
+  const ENC = globalThis.__ENCODING_MODE === true;
+  const ENC_SCENES = new Set(["env", "c2d.shapes", "c2d.composite", "c2d.filter_draw_image", "c2d.text", "c2d.offscreen", "gl1", "gl2", "gl1.triangle", "gl2.triangle"]);
   const enc = new TextEncoder();
   function hashBytes(u8) {   // cyrb53 over bytes: no crypto.subtle (it needs a secure context)
     let h1 = 0xdeadbeef ^ u8.length, h2 = 0x41c6ce57 ^ u8.length;
@@ -33,6 +41,7 @@
     }
   }
   async function scene(k, fn) {
+    if (ENC && !ENC_SCENES.has(k)) return;
     try { await fn(); } catch (e) { put(k + ".error", String((e && e.message) || e)); }
   }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -52,7 +61,26 @@
 
   // ---------------------------------------------------------------------------------------------------- canvas 2D
   function c2d(w, h) { const c = document.createElement("canvas"); c.width = w; c.height = h; return [c, c.getContext("2d")]; }
+  function dataUrlBytes(url) {
+    const bin = atob(url.split(",")[1]);
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  }
+  async function encProbe(k, c, px, w) {
+    put(k + ".getImageData", px, w);
+    const urls = [c.toDataURL(), c.toDataURL(), c.toDataURL()];
+    for (let i = 0; i < 3; i++) put(k + ".png" + (i + 1), dataUrlBytes(urls[i]));
+    for (let i = 0; i < 3; i++) {
+      const blob = await new Promise((r) => c.toBlob(r));
+      put(k + ".blob" + (i + 1), new Uint8Array(await blob.arrayBuffer()));
+    }
+    const im = new Image(); im.src = urls[0]; await im.decode();
+    const [c2, g2] = c2d(im.naturalWidth, im.naturalHeight); g2.drawImage(im, 0, 0);
+    put(k + ".png.decoded", g2.getImageData(0, 0, im.naturalWidth, im.naturalHeight).data, im.naturalWidth);
+  }
   async function read2d(k, c, g) {
+    if (ENC) return encProbe(k, c, g.getImageData(0, 0, c.width, c.height).data, c.width);
     put(k + ".getImageData", g.getImageData(0, 0, c.width, c.height).data, c.width);
     put(k + ".png", c.toDataURL());
     put(k + ".jpeg", c.toDataURL("image/jpeg", 0.8));
@@ -137,6 +165,10 @@
     g.fillStyle = "#fed"; g.fillRect(0, 0, 160, 80); g.fillStyle = "rgba(10,120,200,.7)"; g.beginPath(); g.arc(50, 40, 30, 0, 6.2); g.fill();
     g.font = "bold 18px sans-serif"; g.fillStyle = "#222"; g.fillText("offscreen 2d", 70, 45);
     put("c2d.offscreen.getImageData", g.getImageData(0, 0, 160, 80).data, 160);
+    if (ENC) {
+      for (let i = 1; i <= 3; i++) { const b = await oc.convertToBlob(); put("c2d.offscreen.png" + i, new Uint8Array(await b.arrayBuffer())); }
+      return;
+    }
     const blob = await oc.convertToBlob();
     put("c2d.offscreen.convertToBlob", new Uint8Array(await blob.arrayBuffer()));
   });
@@ -218,6 +250,7 @@
       buffer(gl, 0, [-0.8, -0.7, 0.9, -0.5, -0.1, 0.85], 2);
       buffer(gl, 1, [1, 0, 0, 1, 0, 1, 0, 0.7, 0, 0, 1, 0.3], 4);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+      if (ENC) { await encProbe(p + ".triangle", c, pixels(gl, 96, 96), 96); return; }
       put(p + ".triangle.readPixels", pixels(gl, 96, 96), 96);
       put(p + ".triangle.toDataURL", c.toDataURL());
       put(p + ".triangle.toDataURL_jpeg", c.toDataURL("image/jpeg", 0.8));

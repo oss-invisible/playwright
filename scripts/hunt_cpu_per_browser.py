@@ -20,6 +20,9 @@ served by an http server inside the client process:
          pref does not change the isolation the cfg picked; it is passed so that both arms are launched with Fission asked for.
   ours_swwr  ours with gfx.webrender.software=true passed ONLY here, through extra_prefs (a hunt-side switch, the product is untouched):
          would software WebRender on the VM cost as little as stock's fallback does?
+  ours_vmretail  ours made to take the retail decisions of the VM: the feature-status declaration of the core with the compositing features
+         replaced by what stock decides on this runner, gfx.webrender.software=true, gfx.webrender.software.d3d11=false, webgl.angle.force-warp=true
+         (scripts/hunt_vmretail.py; the list is printed there and in `support`).
   stockheaded  the same as stock with headless=False: a headed Firefox, which is what ours is on Windows (headless=True there creates a hidden
          desktop and runs headed Firefox on it), so that the comparison with ours is not headed against --headless.
 
@@ -57,9 +60,26 @@ from pathlib import Path
 
 BROWSERS = int(os.environ.get("HUNT_BROWSERS", "4"))   # only the hunt's GPU-process profile shortens the loop; every other step leaves these alone
 ROUNDS = int(os.environ.get("HUNT_ROUNDS", "10"))
-ARMS = ["ours", "ours_swwr", "stock", "stockheaded"]
-#: prefs an arm passes through extra_prefs: the only place this pref is added, the hunt and never the product
+ARMS = ["ours", "ours_swwr", "ours_vmretail", "stock", "stockheaded"]
+#: prefs an arm passes through extra_prefs: the only place they are added, the hunt and never the product
 ARM_PREFS = {"ours_swwr": {"gfx.webrender.software": True}}
+#: ours_vmretail: the prefs are BUILT in the run (scripts/hunt_vmretail.py build reads the retail decisions of the VM from stock and writes this file)
+VMRETAIL_FILE = os.environ.get("HUNT_VMRETAIL_PREFS", "")
+
+
+def arm_prefs(arm: str) -> dict | None:
+    """The extra_prefs of an arm (None for ours and the stock arms). ours_vmretail reads the file hunt_vmretail.py build wrote and says so if it is missing."""
+    if arm == "ours_vmretail":
+        path = os.environ.get("HUNT_VMRETAIL_PREFS", VMRETAIL_FILE)
+        if not path or not os.path.isfile(path):
+            raise RuntimeError("the arm ours_vmretail needs HUNT_VMRETAIL_PREFS=<prefs.json of scripts/hunt_vmretail.py build>; %r is not a file" % path)
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)["prefs"]
+    return ARM_PREFS.get(arm)
+
+
+def is_ours(arm: str) -> bool:
+    return arm.startswith("ours")
 TYPES = ["parent", "tab", "gpu", "socket", "rdd", "utility", "other"]
 ICE_WAIT_MS = 15000
 SCENARIO_TIMEOUT_S = 60
@@ -414,8 +434,8 @@ def run_arm(arm: str, binary: str, rnd: int) -> dict:
     loop_a = loop_b = whole_a
     outcome = {"completed": 0, "incomplete": [], "failed": [], "ms": []}
     try:
-        if arm in ("ours", "ours_swwr"):
-            coro = arm_ours(base, binary, ARM_PREFS.get(arm))
+        if is_ours(arm):
+            coro = arm_ours(base, binary, arm_prefs(arm))
         else:
             coro = arm_stock(base, binary, headless=(arm == "stock"))
         loop_a, loop_b, outcome = asyncio.run(coro)
@@ -492,11 +512,11 @@ def compare(directory: Path) -> int:
         return ("%.2f" % (a / b)) if b and b == b else "-"
 
     print()
-    print("%-52s %9s %9s %9s %11s %11s %13s %12s" % ("loop window, mean over the rounds", "ours", "ours_swwr", "stock", "stockheaded",
-                                                      "ours/stock", "ours/stockhd", "swwr/stockhd"))
+    print("%-52s %9s %9s %9s %9s %11s %11s %13s %12s %12s" % ("loop window, mean over the rounds", "ours", "ours_swwr", "ours_vmret", "stock",
+                                                                "stockheaded", "ours/stock", "ours/stockhd", "swwr/stockhd", "vmret/stockhd"))
     for label, f in rows:
-        o, w, s, h = mean("ours", f), mean("ours_swwr", f), mean("stock", f), mean("stockheaded", f)
-        print("%-52s %9.3f %9.3f %9.3f %11.3f %11s %13s %12s" % (label, o, w, s, h, ratio(o, s), ratio(o, h), ratio(w, h)))
+        o, w, v, s, h = mean("ours", f), mean("ours_swwr", f), mean("ours_vmretail", f), mean("stock", f), mean("stockheaded", f)
+        print("%-52s %9.3f %9.3f %9.3f %9.3f %11.3f %11s %13s %12s %12s" % (label, o, w, v, s, h, ratio(o, s), ratio(o, h), ratio(w, h), ratio(v, h)))
     print()
     for a in ARMS:
         print("%s per round: " % a + "; ".join("r%s total/browser %.2f s, wall %.1f s" % (r["round"], r["loop"]["median_total"], r["wall_s"])
@@ -516,8 +536,8 @@ def main() -> int:
         return compare(args.compare)
     if not args.arm:
         ap.error("--arm or --compare")
-    if args.arm in ("ours", "ours_swwr") and not args.binary:
-        ap.error("the arms ours and ours_swwr need --binary (or INVPW_BINARY_PATH)")
+    if is_ours(args.arm) and not args.binary:
+        ap.error("the ours arms need --binary (or INVPW_BINARY_PATH)")
     result = run_arm(args.arm, args.binary, args.round)
     print_arm(result)
     if args.out:

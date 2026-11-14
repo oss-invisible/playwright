@@ -1,7 +1,7 @@
 """HUNT ONLY (branch hunt/cpu-render-path, never merged): read the Gecko profiles of scripts/hunt_cpu_render_path.py and print what a person
 would otherwise click through in the Firefox Profiler.
 
-    python scripts/hunt_profile_summary.py DIR [--symbols ZIP ...] [--detail 2] [--ids] [--only gpu] [--threads 4] [--top 12]
+    python scripts/hunt_profile_summary.py DIR [--symbols ZIP ...] [--detail 2] [--ids] [--only gpu] [--threads 4] [--top 12] [--thread-table]
 
 DIR holds profile-<pid>.json(.gz), one per process (written at each process's clean shutdown, MOZ_PROFILER_SHUTDOWN=...%p.json). A file may
 also carry the profiles of child processes under "processes"; those are read too.
@@ -21,6 +21,11 @@ the job: every problem is printed as a line.
 --only gpu limits the detail to the process types listed (comma separated; default: default and gpu), --threads is how many threads of a process get
 their own table, --top how many leaf functions each table lists. For every detailed process a PROCESS-WIDE table comes first: self weight by module
 and the hottest leaf functions over all its threads together (this is the "d3d10warp.dll against d3d11.dll against xul.dll" number).
+
+--thread-table adds, for every detailed process, ONE LINE PER THREAD (all of them): name, tid, weight, share, and the self weight by module of that
+thread; then a total for the threads that have no name. If DIR holds cpu_profiled.json (written by `hunt_cpu_render_path.py profile`), each detailed
+process is also compared with the CPU the sampler measured for that pid: how much of the process the profile's threads account for (the rest is in
+threads the profiler does not register).
 
 --ids prints `debugName breakpadId name` of the libs of the first parent profile and exits (used to pick the symbols artifact).
 
@@ -248,6 +253,15 @@ def analyse(profile: dict) -> dict:
             "cpu": any(((cols(t.get("samples")).get("threadCPUDelta")) for t in profile.get("threads") or []))}
 
 
+def thread_modules(a: dict, t: dict) -> Dict[str, float]:
+    """Self weight by module of one thread."""
+    out: Dict[str, float] = collections.defaultdict(float)
+    for key, w in t["self"].items():
+        label, lib, rva, js = t["info"][key]
+        out["[JS]" if js else (a["libs"][lib].get("name") if lib is not None else "(no module: %s)" % label[:40])] += w
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("dir", type=Path)
@@ -257,6 +271,7 @@ def main() -> int:
     ap.add_argument("--only", default="default,gpu", help="process types that get the detail tables")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--thread-table", action="store_true")
     args = ap.parse_args()
     files = sorted(list(args.dir.glob("profile-*.json")) + list(args.dir.glob("profile-*.json.gz")))
     if not files:
@@ -280,6 +295,14 @@ def main() -> int:
                         print(lib.get("debugName"), lib.get("breakpadId"), lib.get("name"))
                 break
         return 0
+    sampler_cpu_by_pid: Dict[str, float] = {}
+    cp = args.dir / "cpu_profiled.json"
+    if cp.is_file():
+        try:
+            for r in json.loads(cp.read_text(encoding="utf-8")).get("processes", []):
+                sampler_cpu_by_pid[str(r["pid"])] = float(r["cpu_s"])
+        except Exception as exc:   # noqa: BLE001
+            print("cpu_profiled.json unreadable: %s" % exc)
     unit = "us of CPU" if any(a["cpu"] for a in procs) else "samples"
     print("%d process profile(s) from %d file(s); weights are %s" % (len(procs), len(files), unit))
     print("%-8s %-26s %7s %9s %14s   file" % ("pid", "type", "threads", "samples", "weight"))
@@ -345,6 +368,29 @@ def main() -> int:
                 if name:
                     label = "%s!%s" % (L.get("name"), name)
             print("  %9.0f %5.1f%%  %s" % (w, 100 * w / wtot, label[:200]))
+        sampler_cpu = sampler_cpu_by_pid.get(str(a["pid"]))
+        if sampler_cpu is not None:
+            print("  the sampler measured %.2f s of CPU for pid %s; the profile's threads weigh %.2f s (%.0f%% of it; the rest is CPU the profile did not attribute: threads the profiler does not register, time before and after sampling, the buffer overwritten)"
+                  % (sampler_cpu, a["pid"], a["total"] / 1e6, 100 * a["total"] / 1e6 / sampler_cpu if sampler_cpu else 0))
+        if args.thread_table:
+            print("-" * 100)
+            print("EVERY THREAD of process %s (%s), by weight; self weight by module" % (a["pid"], a["type"]))
+            unnamed: Dict[str, float] = collections.defaultdict(float)
+            for t in sorted(a["threads"], key=lambda t: -t["total"]):
+                mods = thread_modules(a, t)
+                tot = t["total"] or 1
+                mod_text = ", ".join("%s %.0f%%" % (m, 100 * w / tot) for m, w in sorted(mods.items(), key=lambda kv: -kv[1])[:4]) or "(no samples)"
+                nm = t["name"] if t["name"] not in ("", "?", None) else "(unnamed)"
+                print("  %-26s tid %-7s %10.0f %5.1f%%  %s" % (nm[:26], t["tid"], t["total"], 100 * t["total"] / (a["total"] or 1), mod_text))
+                if nm == "(unnamed)":
+                    for m, w in mods.items():
+                        unnamed[m] += w
+            if unnamed:
+                ut = sum(unnamed.values()) or 1
+                print("  UNNAMED threads together: weight %.0f (%.1f%% of the process), by module: %s"
+                      % (ut, 100 * ut / (a["total"] or 1), ", ".join("%s %.0f%%" % (m, 100 * w / ut) for m, w in sorted(unnamed.items(), key=lambda kv: -kv[1])[:5])))
+            else:
+                print("  every thread has a name")
         for t in sorted(a["threads"], key=lambda t: -t["total"])[:args.threads]:
             print("-" * 100)
             print("thread %s (tid %s): %d samples, weight %.0f%s" % (t["name"], t["tid"], t["samples"], t["total"],

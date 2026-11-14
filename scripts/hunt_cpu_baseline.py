@@ -57,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import hunt_cpu_per_browser as hunt   # noqa: E402
 
-ARMS = ["retail", "ours", "ours_reused"]
+ARMS = ["retail", "ours", "ours_reused", "ours_swwr", "ours_vmretail", "stockheaded"]
 WINDOW_S = 20.0
 TYPES = hunt.TYPES
 
@@ -325,11 +325,31 @@ def launch_retail(exe: Path, base: str, profile: Path, t0: float) -> None:
             proc.wait(timeout=15)
 
 
-async def ours_session(base: str, binary: str, label: str, profile_dir: Optional[str], t0: float) -> None:
+async def stock_session(base: str, label: str, t0: float) -> None:
+    """Stock Playwright's firefox, headed (what stock does with a window), one browser, the same scene."""
+    import importlib
+    pw = await importlib.import_module("playwright.async_api").async_playwright().start()   # by name: the fork's guard forbids a static import
+    browser = None
+    try:
+        browser = await pw.firefox.launch(headless=False, firefox_user_prefs={"fission.autostart": True})
+        page = await browser.new_page()
+        await page.goto("%s/p/%s/0" % (base, label), wait_until="load", timeout=60000)
+        await asyncio.sleep(max(0.0, t0 + WINDOW_S - time.time()))
+    finally:
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                await browser.close()
+        with contextlib.suppress(Exception):
+            await pw.stop()
+
+
+async def ours_session(base: str, binary: str, label: str, profile_dir: Optional[str], t0: float, extra_prefs: Optional[dict] = None) -> None:
     from invisible_playwright.async_api import InvisiblePlaywright
     kwargs: Dict[str, Any] = {}
     if profile_dir:
         kwargs["profile_dir"] = profile_dir
+    if extra_prefs:
+        kwargs["extra_prefs"] = extra_prefs
     async with InvisiblePlaywright(seed=100, binary_path=binary, headless=True, locale="en-US", timezone="Europe/Rome", **kwargs) as browser:
         page = await browser.new_page()
         await page.goto("%s/p/%s/0" % (base, label), wait_until="load", timeout=60000)
@@ -421,8 +441,42 @@ def print_result(r: Dict[str, Any], note: str = "") -> None:
         print("    %-34s %7s %9s %9s" % ("thread", "threads", "full s", "steady s"))
         for name, (cnt, f, s) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:18]:
             print("    %-34s %7d %9.2f %9.2f" % (name[:34], cnt, f, s))
+    print_compositing_where(r)
     hunt.print_processes(r["processes"])
     sys.stdout.flush()
+
+
+COMPOSITING_THREADS = re.compile(r"(?i)^(compositor|renderer|renderbackend|scenebuilder|wrworker|canvasrenderer|swcomposite|paintthread|compositorbridge)")
+
+
+def compositing_by_kind(r: Dict[str, Any]) -> Dict[str, Dict[str, List[float]]]:
+    """{process kind: {thread name: [threads, full s, steady s]}} for the threads that do the compositing and the drawing for it."""
+    out: Dict[str, Dict[str, List[float]]] = {}
+    for t in r["threads"]:
+        if COMPOSITING_THREADS.match(t["name"] or ""):
+            g = out.setdefault(t["kind"], {}).setdefault(normalise(t["name"]), [0, 0.0, 0.0])
+            g[0] += 1
+            g[1] += t["cpu_s"]
+            g[2] += t["steady_s"]
+    return out
+
+
+def where_compositing_runs(r: Dict[str, Any]) -> str:
+    by = compositing_by_kind(r)
+    cpu = {k: sum(v[1] for v in g.values()) for k, g in by.items()}
+    if not cpu or sum(cpu.values()) <= 0:
+        return "no compositing thread (Compositor, Renderer, RenderBackend, WRWorker, ...) was seen with CPU in the parent or the GPU process"
+    best = max(cpu, key=cpu.get)
+    return "compositing threads: %s; they run mostly in the %s process" % (", ".join("%s process %.2f s" % (k, v) for k, v in sorted(cpu.items())), best)
+
+
+def print_compositing_where(r: Dict[str, Any]) -> None:
+    print("  WHERE COMPOSITING RUNS (threads named Compositor, Renderer, RenderBackend, SceneBuilder, WRWorker, CanvasRenderer, ... by process):")
+    by = compositing_by_kind(r)
+    for kind, g in sorted(by.items()):
+        for name, (cnt, f, st) in sorted(g.items(), key=lambda kv: -kv[1][1]):
+            print("    %-8s %-26s %3d thread(s) %8.2f s full %8.2f s steady" % (kind, name[:26], cnt, f, st))
+    print("    -> " + where_compositing_runs(r))
 
 
 def run_arm(args) -> int:
@@ -448,10 +502,16 @@ def run_arm(args) -> int:
             print_result(r, note)
             (out / "retail.json").write_text(json.dumps(r, indent=1), encoding="utf-8")
             rc = 1 if r["error"] else 0
-        elif args.arm == "ours":
-            r = measure("ours", "ours", "ours", lambda t0: asyncio.run(ours_session(base, args.binary, "ours", None, t0)))
-            print_result(r, "fresh temporary profile")
-            (out / "ours.json").write_text(json.dumps(r, indent=1), encoding="utf-8")
+        elif args.arm == "stockheaded":
+            r = measure("stockheaded", "stockheaded", "stockheaded", lambda t0: asyncio.run(stock_session(base, "stockheaded", t0)))
+            print_result(r, "stock Playwright firefox, headless=False, fresh profile")
+            (out / "stockheaded.json").write_text(json.dumps(r, indent=1), encoding="utf-8")
+            rc = 1 if r["error"] else 0
+        elif args.arm in ("ours", "ours_swwr", "ours_vmretail"):
+            prefs = hunt.arm_prefs(args.arm)
+            r = measure(args.arm, args.arm, args.arm, lambda t0: asyncio.run(ours_session(base, args.binary, args.arm, None, t0, prefs)))
+            print_result(r, "fresh temporary profile%s" % (("; extra_prefs from the hunt: %s" % sorted(prefs)) if prefs else ""))
+            (out / ("%s.json" % args.arm)).write_text(json.dumps(r, indent=1), encoding="utf-8")
             rc = 1 if r["error"] else 0
         else:
             persistent = str(work / "profile-reused")
@@ -474,7 +534,8 @@ def run_arm(args) -> int:
 # -------------------------------------------------------------------------------------------------------------------- compare
 
 def compare(root: Path) -> int:
-    files = [("retail", "retail.json"), ("ours (fresh)", "ours.json"), ("reused #1 (fresh dir)", "ours_reused-1.json"), ("reused #2 (REUSED)", "ours_reused-2.json")]
+    files = [("retail", "retail.json"), ("stockheaded", "stockheaded.json"), ("ours", "ours.json"), ("ours_swwr", "ours_swwr.json"),
+             ("ours_vmretail", "ours_vmretail.json"), ("reused #1 fresh", "ours_reused-1.json"), ("reused #2 REUSED", "ours_reused-2.json")]
     runs = []
     for title, name in files:
         p = root / name
@@ -489,12 +550,12 @@ def compare(root: Path) -> int:
     for window in ("full", "steady"):
         print("-" * 100)
         print("CPU seconds by process type, %s window" % window)
-        print("  %-24s" % "" + "".join("%22s" % t for t, _ in runs))
+        print("  %-24s" % "" + "".join("%17s" % t for t, _ in runs))
         for kind in TYPES:
-            print("  %-24s" % kind + "".join("%22.2f" % r[window][kind] for _, r in runs))
-        print("  %-24s" % "TOTAL" + "".join("%22.2f" % sum(r[window].values()) for _, r in runs))
-    print("  %-24s" % "scenes completed" + "".join("%22d" % r["scenes_completed"] for _, r in runs))
-    print("  %-24s" % "CPU s per scene (full)" + "".join("%22s" % (("%.3f" % (sum(r["full"].values()) / r["scenes_completed"])) if r["scenes_completed"] else "-")
+            print("  %-24s" % kind + "".join("%17.2f" % r[window][kind] for _, r in runs))
+        print("  %-24s" % "TOTAL" + "".join("%17.2f" % sum(r[window].values()) for _, r in runs))
+    print("  %-24s" % "scenes completed" + "".join("%17d" % r["scenes_completed"] for _, r in runs))
+    print("  %-24s" % "CPU s per scene (full)" + "".join("%17s" % (("%.3f" % (sum(r["full"].values()) / r["scenes_completed"])) if r["scenes_completed"] else "-")
                                                         for _, r in runs))
     for kind in ("parent", "gpu"):
         names: Dict[str, Dict[str, float]] = {}
@@ -506,9 +567,13 @@ def compare(root: Path) -> int:
         order = sorted(names, key=lambda n: -max(names[n].values()))[:20]
         print("-" * 100)
         print("CPU seconds by thread name of the %s process, STEADY window (largest first)" % kind)
-        print("  %-30s" % "" + "".join("%22s" % t for t, _ in runs))
+        print("  %-30s" % "" + "".join("%17s" % t for t, _ in runs))
         for n in order:
-            print("  %-30s" % n[:30] + "".join("%22.2f" % names[n].get(t, 0.0) for t, _ in runs))
+            print("  %-30s" % n[:30] + "".join("%17.2f" % names[n].get(t, 0.0) for t, _ in runs))
+    print("-" * 100)
+    print("WHERE COMPOSITING RUNS, per arm (CPU of the Compositor/Renderer/RenderBackend/SceneBuilder/WRWorker/CanvasRenderer threads, full window)")
+    for title, r in runs:
+        print("  %-18s %s" % (title, where_compositing_runs(r)))
     return 0
 
 

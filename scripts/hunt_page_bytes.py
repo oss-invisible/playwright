@@ -5,6 +5,7 @@ The wrapper's own byte suites cannot take a pref, so two instruments:
 
     python scripts/hunt_page_bytes.py collect --arm ours      --binary "$FF" --out DIR [--launches 2]
     python scripts/hunt_page_bytes.py collect --arm ours_swwr --binary "$FF" --out DIR [--launches 2]
+    python scripts/hunt_page_bytes.py collect --arm ours_vmretail --binary "$FF" --out DIR     # needs HUNT_VMRETAIL_PREFS (scripts/hunt_vmretail.py)
     python scripts/hunt_page_bytes.py diff DIR [--a ours --b ours_swwr]
     python scripts/hunt_page_bytes.py suites A.xml B.xml [--a ours --b ours_swwr]
 
@@ -36,7 +37,7 @@ from typing import Any, Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from hunt_cpu_per_browser import ARM_PREFS   # noqa: E402
+from hunt_cpu_per_browser import arm_prefs   # noqa: E402
 
 SEED = 42
 
@@ -63,7 +64,7 @@ def collect_once(arm: str, binary: str) -> Dict[str, Any]:
     expression = (HERE / "hunt_page_bytes_probe.js").read_text(encoding="utf-8")
     try:
         with InvisiblePlaywright(seed=SEED, binary_path=binary, headless=True, locale="en-US", timezone="Europe/Rome",
-                                 extra_prefs=ARM_PREFS.get(arm)) as browser:
+                                 extra_prefs=arm_prefs(arm)) as browser:
             page = browser.new_page()
             page.goto(url, wait_until="load", timeout=60000)
             return page.evaluate(expression)
@@ -245,19 +246,19 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("collect")
-    c.add_argument("--arm", choices=("ours", "ours_swwr"), required=True)
+    c.add_argument("--arm", choices=("ours", "ours_swwr", "ours_vmretail"), required=True)
     c.add_argument("--binary", default=os.environ.get("INVPW_BINARY_PATH", ""))
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--launches", type=int, default=2)
     d = sub.add_parser("diff")
     d.add_argument("root", type=Path)
     d.add_argument("--a", default="ours")
-    d.add_argument("--b", default="ours_swwr")
+    d.add_argument("--b", default="ours_swwr", help="ours_swwr or ours_vmretail")
     s = sub.add_parser("suites")
     s.add_argument("a", type=Path)
     s.add_argument("b", type=Path)
     s.add_argument("--a-name", default="ours")
-    s.add_argument("--b-name", default="ours_swwr")
+    s.add_argument("--b-name", default="ours_swwr", help="ours_swwr or ours_vmretail")
     args = ap.parse_args()
     if args.cmd == "collect":
         if not args.binary:

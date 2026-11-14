@@ -31,19 +31,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 name: cpu render path hunt
 
+# Dispatch only since the second round: its scripts are shared with cpu-render-path-hunt-vm.yml and encoding-stability-hunt.yml, which start on push
+# to this branch, and a 2 h Windows run must not start again on every push that touches a shared script.
 on:
-  push:
-    branches: [hunt/cpu-render-path]
-    paths:
-      - scripts/hunt_cpu_render_path.py
-      - scripts/hunt_cpu_per_browser.py
-      - scripts/hunt_profile_summary.py
-      - scripts/hunt_fetch_symbols.py
-      - scripts/hunt_cpu_baseline.py
-      - scripts/hunt_page_bytes.py
-      - scripts/hunt_page_bytes_probe.js
-      - scripts/hunt_extra_prefs_plugin.py
-      - .github/workflows/cpu-render-path-hunt.yml
   workflow_dispatch:
     inputs:
       symbols_run:
