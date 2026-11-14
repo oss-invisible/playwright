@@ -54,10 +54,11 @@ jobs:
                       print("%s n=%d: NO ROWS" % (arm, n)); continue
                   st = sorted(v for x in r for v in x["start_ms"])
                   med = lambda k: statistics.median(x[k] for x in r)
+                  names = sorted({nm for x in r for nm in x.get("server_names", [])})
                   print("%s n=%d: start to first new_page ms p50 %d max %d | per browser MB: client %.1f server %.1f firefox %.1f (medians of %d rounds)"
-                        % (arm, n, st[len(st)//2], st[-1], med("client_mb") / n, med("server_mb") / n, med("firefox_mb") / n, len(r)))
+                        % (arm, n, st[len(st)//2], st[-1], med("client_mb") / n, med("server_mb") / n, med("firefox_mb") / n, len(r)) + " | server processes: %s" % names)
           PY
       - name: Close every browser left
         if: always()
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then pkill -f firefox || true; else powershell -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force"; fi
+          if [ "$RUNNER_OS" = "Linux" ]; then pkill -f firefox || true; else powershell -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"; fi
