@@ -21,6 +21,11 @@ name: udp chain hunt
 on:
   push:
     branches: [hunt/udp-chain-post]
+    # not for the other hunt's files (the CPU-per-browser hunt on the same branch), nor for this file alone
+    paths-ignore:
+      - scripts/hunt_cpu_per_browser.py
+      - .github/workflows/cpu-per-browser-hunt.yml
+      - .github/workflows/udp-chain-hunt.yml
 
 permissions:
   contents: read
