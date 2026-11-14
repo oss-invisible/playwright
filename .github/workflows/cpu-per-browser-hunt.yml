@@ -7,7 +7,8 @@
 # over the same local scenario (an RTCPeerConnection with no ICE servers up to iceGatheringState complete, 200 DOM elements and a 2D canvas
 # frame, then the next copy of the page). A separate process samples the CPU of every process every 250 ms; each firefox process is mapped to
 # its browser by walking ppid and to its type by its -contentproc argument (the script's docstring has the details).
-# The arms alternate: ours, stock, ours, stock. Windows only. The final step prints the comparison table.
+# Ours is headed Firefox on a hidden desktop on Windows, so the stock arm is run both --headless (stock) and headed (stockheaded).
+# The arms alternate: ours, stock, stockheaded, twice. Windows only. The final step prints the comparison table.
 # ─────────────────────────────────────────────────────────────────────────────
 name: cpu per browser hunt
 
@@ -31,7 +32,7 @@ env:
 
 jobs:
   hunt:
-    name: hunt (windows-2022, ours vs stock, 2 rounds each)
+    name: hunt (windows-2022, ours vs stock vs stock headed, 2 rounds each)
     runs-on: windows-2022
     timeout-minutes: 60
     defaults:
@@ -74,6 +75,17 @@ jobs:
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
           echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
           exit $rc
+      - name: Arm stockheaded, round 1
+        id: stockheaded1
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 1 --out "$RUNNER_TEMP/cpu-hunt/stockheaded-1.json" && rc=0 || rc=$?
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
+          exit $rc
       - name: Arm ours, round 2
         id: ours2
         continue-on-error: true
@@ -93,6 +105,17 @@ jobs:
         run: |
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
           python -u scripts/hunt_cpu_per_browser.py --arm stock --round 2 --out "$RUNNER_TEMP/cpu-hunt/stock-2.json" && rc=0 || rc=$?
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
+          exit $rc
+      - name: Arm stockheaded, round 2
+        id: stockheaded2
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          python -u scripts/hunt_cpu_per_browser.py --arm stockheaded --round 2 --out "$RUNNER_TEMP/cpu-hunt/stockheaded-2.json" && rc=0 || rc=$?
           taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
           echo "firefox left: $(tasklist //FI "IMAGENAME eq firefox.exe" 2>/dev/null | grep -c firefox.exe || true)"
           exit $rc

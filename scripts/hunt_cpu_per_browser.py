@@ -1,7 +1,8 @@
 """HUNT ONLY (branch hunt/udp-chain-post, never merged): under the same load, does OUR Firefox use more CPU per browser than stock Firefox?
 
-    python scripts/hunt_cpu_per_browser.py --arm ours  --binary "$FF" --out DIR/ours-1.json
-    python scripts/hunt_cpu_per_browser.py --arm stock                --out DIR/stock-1.json
+    python scripts/hunt_cpu_per_browser.py --arm ours        --binary "$FF" --out DIR/ours-1.json
+    python scripts/hunt_cpu_per_browser.py --arm stock                      --out DIR/stock-1.json
+    python scripts/hunt_cpu_per_browser.py --arm stockheaded                --out DIR/stockheaded-1.json
     python scripts/hunt_cpu_per_browser.py --compare DIR
 
 An arm runs 4 browsers at once in ONE client process, each headless with 1 page, and each page loops 10 times over the same scenario,
@@ -16,6 +17,8 @@ served by an http server inside the client process:
   stock  stock Playwright's async client (its node driver) and the firefox-1572 it installed, headless=True, with
          firefox_user_prefs {"fission.autostart": true}. Stock's playwright.cfg forces webContentIsolationStrategy 0 by autoconfig, so the
          pref does not change the isolation the cfg picked; it is passed so that both arms are launched with Fission asked for.
+  stockheaded  the same as stock with headless=False: a headed Firefox, which is what ours is on Windows (headless=True there creates a hidden
+         desktop and runs headed Firefox on it), so that the comparison with ours is not headed against --headless.
 
 THE CPU. A tiny separate process (SAMPLER_CODE) reads NtQuerySystemInformation(SystemProcessInformation) every 250 ms (psutil elsewhere): one
 call that holds name, ppid and user+kernel time of every process. It keeps, per sample, the cumulative CPU of every firefox process and of
@@ -51,6 +54,7 @@ from pathlib import Path
 
 BROWSERS = 4
 ROUNDS = 10
+ARMS = ["ours", "stock", "stockheaded"]
 TYPES = ["parent", "tab", "gpu", "socket", "rdd", "utility", "other"]
 ICE_WAIT_MS = 15000
 SCENARIO_TIMEOUT_S = 60
@@ -329,12 +333,12 @@ async def arm_ours(base: str, binary: str):
         return await run_scenarios(pages, base)
 
 
-async def arm_stock(base: str, binary: str):
+async def arm_stock(base: str, binary: str, headless: bool = True):
     async_playwright = importlib.import_module("playwright.async_api").async_playwright   # by name: the fork's guard forbids a static import
     pw = await async_playwright().start()
     browsers = []
     try:
-        browsers = await asyncio.gather(*(pw.firefox.launch(headless=True, firefox_user_prefs={"fission.autostart": True})
+        browsers = await asyncio.gather(*(pw.firefox.launch(headless=headless, firefox_user_prefs={"fission.autostart": True})
                                           for _ in range(BROWSERS)))
         pages = await asyncio.gather(*(b.new_page() for b in browsers))
         return await run_scenarios(pages, base)
@@ -358,7 +362,11 @@ def run_arm(arm: str, binary: str, rnd: int) -> dict:
     loop_a = loop_b = whole_a
     outcome = {"completed": 0, "incomplete": [], "failed": [], "ms": []}
     try:
-        loop_a, loop_b, outcome = asyncio.run((arm_ours if arm == "ours" else arm_stock)(base, binary))
+        if arm == "ours":
+            coro = arm_ours(base, binary)
+        else:
+            coro = arm_stock(base, binary, headless=(arm == "stock"))
+        loop_a, loop_b, outcome = asyncio.run(coro)
     except BaseException as exc:   # noqa: BLE001
         err = "%s: %s" % (type(exc).__name__, exc)
     time.sleep(0.6)           # two more samples after the last close
@@ -405,18 +413,18 @@ def print_arm(r: dict) -> None:
 
 def compare(directory: Path) -> int:
     results = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(directory.glob("*.json"))]
-    arms = {a: [r for r in results if r["arm"] == a and not r["error"]] for a in ("ours", "stock")}
+    arms = {a: [r for r in results if r["arm"] == a and not r["error"]] for a in ARMS}
     for a, rs in arms.items():
         print("%s: %d good run(s) (%s)" % (a, len(rs), ", ".join("round %s" % r["round"] for r in rs)))
-    if not arms["ours"] or not arms["stock"]:
-        print("no comparison: one arm has no good run")
+    if not arms["ours"] or not (arms["stock"] or arms["stockheaded"]):
+        print("no comparison: ours or every stock arm has no good run")
         return 1
 
     def mean(a, f):
         values = [f(r) for r in arms[a] if f(r) is not None]
         return sum(values) / len(values) if values else float("nan")
 
-    rows = [("%s CPU s per browser (median of 4, mean of rounds)" % t, lambda r, t=t: r["loop"]["median_by_type"][t]) for t in TYPES]
+    rows = [("%s CPU s per browser (median of 4)" % t, lambda r, t=t: r["loop"]["median_by_type"][t]) for t in TYPES]
     rows += [
         ("TOTAL CPU s per browser (median of 4)", lambda r: r["loop"]["median_total"]),
         ("total CPU s, all browsers", lambda r: r["loop"]["total_all"]),
@@ -426,13 +434,16 @@ def compare(directory: Path) -> int:
         ("CPU s per completed scenario", lambda r: r["cpu_per_scenario_s"]),
         ("whole arm, total CPU s per browser", lambda r: r["whole"]["median_total"]),
     ]
+    def ratio(a, b):
+        return ("%.2f" % (a / b)) if b and b == b else "-"
+
     print()
-    print("%-58s %10s %10s %8s" % ("loop window, mean over the rounds", "ours", "stock", "ours/stock"))
+    print("%-52s %9s %9s %11s %11s %13s" % ("loop window, mean over the rounds", "ours", "stock", "stockheaded", "ours/stock", "ours/stockhd"))
     for label, f in rows:
-        o, s = mean("ours", f), mean("stock", f)
-        print("%-58s %10.3f %10.3f %8s" % (label, o, s, ("%.2f" % (o / s)) if s else "-"))
+        o, s, h = mean("ours", f), mean("stock", f), mean("stockheaded", f)
+        print("%-52s %9.3f %9.3f %11.3f %11s %13s" % (label, o, s, h, ratio(o, s), ratio(o, h)))
     print()
-    for a in ("ours", "stock"):
+    for a in ARMS:
         print("%s per round: " % a + "; ".join("r%s total/browser %.2f s, wall %.1f s" % (r["round"], r["loop"]["median_total"], r["wall_s"])
                                                for r in arms[a]))
     return 0
@@ -440,7 +451,7 @@ def compare(directory: Path) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["ours", "stock"])
+    ap.add_argument("--arm", choices=ARMS)
     ap.add_argument("--binary", default=os.environ.get("INVPW_BINARY_PATH", ""))
     ap.add_argument("--round", type=int, default=1)
     ap.add_argument("--out", type=Path)
