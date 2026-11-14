@@ -10,7 +10,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   hunt:
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     defaults:
       run:
@@ -25,31 +30,30 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-          python -m playwright install firefox
-      - name: Stock Firefox with Fission strategy 1 (a copy whose playwright.cfg says 1, as retail and ours)
-        run: |
-          src=$(ls -d "$LOCALAPPDATA"/ms-playwright/firefox-*/firefox | head -1)
-          cp -r "$src" "$RUNNER_TEMP/stock-fission"
-          grep -n 'fission.webContentIsolationStrategy' "$RUNNER_TEMP/stock-fission/playwright.cfg"
-          sed -i 's/pref("fission.webContentIsolationStrategy", 0);/pref("fission.webContentIsolationStrategy", 1);/' "$RUNNER_TEMP/stock-fission/playwright.cfg"
-          grep -n 'fission.webContentIsolationStrategy' "$RUNNER_TEMP/stock-fission/playwright.cfg"
-          grep -q 'webContentIsolationStrategy", 1)' "$RUNNER_TEMP/stock-fission/playwright.cfg"
-          echo "SF=$RUNNER_TEMP/stock-fission/firefox.exe" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = "Linux" ]; then python -m playwright install --with-deps firefox; else python -m playwright install firefox; fi
       - name: Fetch our published firefox binary
         run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: Two CPU burners for the whole hunt
         run: |
           for i in 1 2; do nohup python -c "while True: pass" > /dev/null 2>&1 & done
           echo started
-      - name: 80 reps per arm, four arms alternating in batches of 8, four browsers at once
+      - name: 80 reps per arm, five arms alternating in batches of 8, four browsers at once
         env:
           PYTHONUNBUFFERED: "1"
         run: |
           for b in 0 1 2 3 4 5 6 7 8 9; do
-            python scripts/hunt_goto_stopped.py ours 8 $((b*8)) "$FF" 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
-            for k in 0 1 2 3; do
-              python scripts/hunt_goto_stopped.py oursone 2 $((b*8 + k*2)) "$FF" > "$RUNNER_TEMP/one-$k.log" 2>&1 &
+            for arm in ours oursnoscan; do
+              python scripts/hunt_goto_stopped.py $arm 8 $((b*8)) "$FF" 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
             done
+            for arm in oursone oursonenoscan; do
+              for k in 0 1 2 3; do
+                python scripts/hunt_goto_stopped.py $arm 2 $((b*8 + k*2)) "$FF" > "$RUNNER_TEMP/one-$k.log" 2>&1 &
+              done
+              wait
+              cat "$RUNNER_TEMP"/one-*.log | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
+            done
+            python scripts/hunt_goto_stopped.py stock 8 $((b*8)) 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
+          done
             wait
             cat "$RUNNER_TEMP"/one-*.log | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
             python scripts/hunt_goto_stopped.py oursremote 8 $((b*8)) "$FF" 2>&1 | grep HUNTROW >> "$RUNNER_TEMP/rows.log"
@@ -61,7 +65,7 @@ jobs:
           python - "$RUNNER_TEMP/rows.log" <<'PY'
           import json, sys
           rows = [json.loads(l.split("HUNTROW ", 1)[1]) for l in open(sys.argv[1], encoding="utf-8") if "HUNTROW " in l]
-          for arm in ("ours", "oursone", "oursremote", "stock"):
+          for arm in ("ours", "oursnoscan", "oursone", "oursonenoscan", "stock"):
               r = [x for x in rows if x["arm"] == arm]
               late = sorted(x["late_ms"] for x in r if "late_ms" in x)
               q = lambda p: late[min(len(late) - 1, int(p * len(late)))] if late else None

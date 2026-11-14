@@ -166,7 +166,20 @@ async def main(arm, reps, first, binary):
     server.shutdown()
 
 
+def _without_process_scans():
+    """Hunt only (oursnoscan, oursonenoscan): what the arm costs when nothing scans every process of the machine
+    for the session token - the launch-time adoption loop and the two teardown searches answer at once."""
+    from invisible_core import process
+    from invisible_core.juggler import _profile
+    process.find_processes = lambda token: []
+    _profile.find_processes = lambda token: []
+    process.LifetimeGuard.bind = lambda self, token, **kw: 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1].endswith("noscan"):
+        _without_process_scans()
+        sys.argv[1] = sys.argv[1][:-len("noscan")]
     if sys.argv[1] == "serve":
         serve_one_browser(sys.argv[2])
         sys.exit(0)
