@@ -1,0 +1,73 @@
+name: in-process profile hunt
+on:
+  push:
+    branches: [hunt/goto-stopped-timing]
+    paths: [.github/workflows/inprocess-profile-hunt.yml]
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+concurrency:
+  group: inprocess-profile-hunt
+  cancel-in-progress: true
+jobs:
+  profile:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install (our wrapper, py-spy)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]" py-spy==0.4.0 psutil
+      - name: Fetch our published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: Two CPU burners for the whole hunt
+        run: |
+          for i in 1 2; do nohup python -c "while True: pass" > /dev/null 2>&1 & done
+          echo started
+      - name: Profile each arm twice (who holds the GIL; where every thread waits), 150 s each, timings kept
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          SUDO=""; [ "$RUNNER_OS" = "Linux" ] && SUDO="sudo -E env PATH=$PATH"
+          mkdir -p "$RUNNER_TEMP/prof"
+          for arm in ours oursone; do
+            for mode in gil idle; do
+              # one long-lived process to follow: ours = 32 reps, four browsers at once in it; oursone = four processes of
+              # one browser each, 16 reps in a row, side by side (the load of four browsers), and the profile follows one
+              if [ "$arm" = "ours" ]; then
+                python scripts/hunt_goto_stopped.py ours 32 0 "$FF" > "$RUNNER_TEMP/prof/rows-$arm-$mode.log" 2>&1 &
+              else
+                for k in 0 1 2 3; do python scripts/hunt_goto_stopped.py oursone 16 $((k*16)) "$FF" >> "$RUNNER_TEMP/prof/rows-$arm-$mode.log" 2>&1 & done
+              fi
+              sleep 25
+              # the python process that runs the arm (the newest hunt_goto_stopped.py)
+              PID=$(python -c "import sys,psutil; c=[p for p in psutil.process_iter(['cmdline','create_time']) if p.info['cmdline'] and 'hunt_goto_stopped.py' in ' '.join(p.info['cmdline']) and sys.argv[1] in p.info['cmdline']]; print(max(c,key=lambda p:p.info['create_time']).pid if c else '')" "$arm")
+              echo "arm $arm mode $mode pid $PID"
+              FLAG="--gil"; [ "$mode" = "idle" ] && FLAG="--idle"
+              timeout 200 $SUDO py-spy record --pid "$PID" --duration 150 --rate 250 --threads $FLAG --nonblocking --format raw -o "$RUNNER_TEMP/prof/$arm-$mode.txt" || echo "py-spy ended $?"
+              wait || true
+              if [ "$RUNNER_OS" = "Linux" ]; then pkill -f firefox || true; else powershell -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"; fi
+              wc -l "$RUNNER_TEMP/prof/$arm-$mode.txt" || true
+            done
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: inprocess-profile-${{ matrix.runner }}
+          path: ${{ runner.temp }}/prof
+          retention-days: 7
+      - name: Close every browser left
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then pkill -f firefox || true; else powershell -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"; fi
