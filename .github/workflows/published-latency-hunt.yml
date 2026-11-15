@@ -1,0 +1,103 @@
+# HUNT ONLY, never merged. The PUBLISHED packages against stock Playwright, same job, alternated rounds, Windows and Linux:
+# after = invisible-playwright 0.52.1 + invisible-core 64.73.0, before = 0.52.0 + 64.71.0, both on the engine firefox-64.
+# Arms: inproc4 (4 browsers in one process), one (1 browser per process, 4 processes at once), remote (launch_server), stock, before.
+name: published latency hunt
+on:
+  push:
+    branches: [hunt/published-latency]
+    paths: [scripts/hunt_published_latency.py, .github/workflows/published-latency-hunt.yml]
+permissions:
+  contents: read
+concurrency:
+  group: published-latency-hunt
+  cancel-in-progress: true
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - name: Two venvs from PyPI (after 0.52.1, before 0.52.0) and stock Playwright
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=Scripts; else BIN=bin; fi
+          for v in after before; do python -m venv "$RUNNER_TEMP/$v"; done
+          "$RUNNER_TEMP/after/$BIN/python" -m pip install -q --upgrade pip
+          "$RUNNER_TEMP/after/$BIN/python" -m pip install -q "invisible-playwright==0.52.1" psutil "playwright==$(cat scripts/playwright_pin.txt)"
+          "$RUNNER_TEMP/before/$BIN/python" -m pip install -q --upgrade pip
+          "$RUNNER_TEMP/before/$BIN/python" -m pip install -q "invisible-playwright==0.52.0" psutil
+          for v in after before; do "$RUNNER_TEMP/$v/$BIN/python" -c "import importlib.metadata as m; print('$v', m.version('invisible-playwright'), m.version('invisible-core'))"; done
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb; "$RUNNER_TEMP/after/$BIN/python" -m playwright install --with-deps firefox; else "$RUNNER_TEMP/after/$BIN/python" -m playwright install firefox; fi
+          echo "PY_AFTER=$RUNNER_TEMP/after/$BIN/python" >> "$GITHUB_ENV"
+          echo "PY_BEFORE=$RUNNER_TEMP/before/$BIN/python" >> "$GITHUB_ENV"
+      - name: The engine each venv fetches
+        run: |
+          echo "FF_AFTER=$(cd "$RUNNER_TEMP" && "$PY_AFTER" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+          echo "FF_BEFORE=$(cd "$RUNNER_TEMP" && "$PY_BEFORE" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: Six rounds, the five arms in rotating order
+        continue-on-error: true
+        timeout-minutes: 70
+        run: |
+          set +e
+          S=scripts/hunt_published_latency.py
+          run_arm() {
+            case "$1" in
+              inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [inproc4] /' ;;
+              before)  "$PY_BEFORE" $S inproc 4 "$2" "$FF_BEFORE" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [before] /' ;;
+              remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [remote] /' ;;
+              stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [stock] /' ;;
+              one)     for k in 0 1 2 3; do "$PY_AFTER" $S inproc 1 "$2-$k" "$FF_AFTER" > "$RUNNER_TEMP/one-$k.log" 2>&1 & done; wait
+                       cat "$RUNNER_TEMP"/one-*.log | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [one] /' ;;
+            esac
+            if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
+          }
+          ARMS=(inproc4 one remote stock before)
+          for r in 0 1 2 3 4 5; do
+            for k in 0 1 2 3 4; do a=${ARMS[$(( (k + r) % 5 ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"; done
+          done
+          true
+      - name: The table
+        if: always()
+        run: |
+          python - "$RUNNER_TEMP/rows.log" <<'PY'
+          import json, re, sys, statistics
+          rows = {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTROW \[(\w+)\] (.*)", line.strip())
+              if m:
+                  rows.setdefault(m.group(1), []).append(json.loads(m.group(2)))
+          def q(v, p):
+              v = sorted(x for x in v if x is not None)
+              return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          for arm in ("before", "inproc4", "one", "remote", "stock"):
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              crashes = len(rows.get(arm, [])) - len(r)
+              ev = [e for x in r for e in x["eval_ms"]]
+              gr = [g for x in r for g in x["goto_req_ms"]]
+              print("HUNTTABLE %-8s browsers %3d crashes %d | launch ms p50 %s p95 %s | close ms p50 %s p95 %s | eval ms p50 %s p95 %s max %s >300ms %d of %d | goto->request ms p50 %s p90 %s max %s | cpu s/browser p50 %s"
+                    % (arm, len(r), crashes, q([x["launch_ms"] for x in r], .5), q([x["launch_ms"] for x in r], .95), q([x["close_ms"] for x in r], .5), q([x["close_ms"] for x in r], .95),
+                       q(ev, .5), q(ev, .95), max(ev) if ev else None, sum(1 for e in ev if e > 300), len(ev), q(gr, .5), q(gr, .9), max((g for g in gr if g is not None), default=None),
+                       q([x["cpu_s_per_browser"] for x in r], .5)))
+          PY
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
+          echo done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: "published-latency-${{ matrix.os }}-${{ github.run_id }}", path: "${{ runner.temp }}/rows.log" }
