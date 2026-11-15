@@ -186,17 +186,21 @@ def _content_processes(engine_dir):
     return pids
 
 
-def _quiet(engine_dir, seconds=3.0, limit=30.0):
-    """The set of content processes once it has not changed for `seconds` (the engine keeps a spare one)."""
-    end = time.time() + limit
-    last, since = _content_processes(engine_dir), time.time()
-    while time.time() < end:
+def _quiet(engine_dir, samples=13, limit=30.0):
+    """The set of content processes once `samples` reads in a row (0.25 s apart: 3 s when nothing stalls) have given the same set.
+
+    The evidence of quiet is a COUNT of reads, not the seconds on a clock: when the machine stalls for a few seconds, the test and the browser
+    stand still together, the clock still runs, and "unchanged for 3 s" was true of a set that nothing had had the time to change. A stalled
+    read counts as one read, whatever its length. `limit` (30 s) is only the deadline of a set that never settles."""
+    end = time.monotonic() + limit
+    last, same = _content_processes(engine_dir), 1
+    while same < samples and time.monotonic() < end:
         time.sleep(0.25)
         now = _content_processes(engine_dir)
         if now != last:
-            last, since = now, time.time()
-        elif time.time() - since >= seconds:
-            break
+            last, same = now, 1
+        else:
+            same += 1
     return last
 
 

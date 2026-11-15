@@ -28,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from _waits import wait_until
+
 pytestmark = pytest.mark.e2e
 
 
@@ -405,8 +407,12 @@ def test_popup_document_reaches_the_context(browser, harness):
             page.click("#open-simple")
         popup = info.value
         popup.wait_for_load_state("load", timeout=10_000)
-        popup.wait_for_timeout(500)
         url = harness["popup_url"]
+        # until the document's request and its response have been heard (a condition with a deadline, not 500 ms);
+        # then a short window is left only for a DUPLICATE, which is what the two counts below look for
+        wait_until(lambda: url in requests and any(r.url == url for r in responses), 30,
+                   lambda: popup.wait_for_timeout(50))
+        popup.wait_for_timeout(500)
         assert requests.count(url) == 1, (url, requests)
         documents = [r for r in responses if r.url == url]
         assert len(documents) == 1, (url, [r.url for r in responses])
@@ -428,10 +434,9 @@ def test_a_popup_the_site_closes_is_closed(browser, harness):
         popup = info.value
         closes = []
         popup.on("close", lambda _p: closes.append(1))
-        deadline = 50
-        while not popup.is_closed() and deadline:
-            page.wait_for_timeout(100)
-            deadline -= 1
+        # until the page is closed (the site closes it 300 ms after it loads; the close crosses processes): a
+        # deadline of 30 s, not 5 s of looks; then a short window is left only for a SECOND close event
+        wait_until(popup.is_closed, 30, lambda: page.wait_for_timeout(100))
         page.wait_for_timeout(300)
         assert popup.is_closed()
         assert len(closes) <= 1

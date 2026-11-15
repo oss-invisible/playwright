@@ -21,8 +21,6 @@ being replaced here.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from invisible_playwright._juggler import transport as factory
@@ -49,22 +47,19 @@ IS_IN_VIEWPORT = """el => {
                                   INSIDE_A_SCROLLER],
                          ids=["already in view", "3000px below the fold",
                               "400px below the fold", "inside a scroller"])
-def test_scroll_into_view_puts_the_element_in_the_viewport(firefox_binary, html):
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+def test_scroll_into_view_puts_the_element_in_the_viewport(firefox_binary, html, monkeypatch):
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     from invisible_playwright import InvisiblePlaywright
-    try:
-        with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
-                                 headless=True) as browser:
-            page = browser.new_page()
-            page.set_content(html)
-            # ⛔ A SHORT TIMEOUT ON PURPOSE. The defect this covers was a 30 s
-            # timeout, so the default would let a regression come back as a
-            # slow pass on a loaded machine instead of a red test.
-            page.locator("#x").scroll_into_view_if_needed(timeout=5000)
-            assert page.eval_on_selector("#x", IS_IN_VIEWPORT), (
-                "the call returned and the element is still out of view")
-    finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
+    with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
+                             headless=True) as browser:
+        page = browser.new_page()
+        page.set_content(html)
+        # ⛔ A SHORT TIMEOUT ON PURPOSE. The defect this covers was a 30 s
+        # timeout, so the default would let a regression come back as a
+        # slow pass on a loaded machine instead of a red test.
+        page.locator("#x").scroll_into_view_if_needed(timeout=5000)
+        assert page.eval_on_selector("#x", IS_IN_VIEWPORT), (
+            "the call returned and the element is still out of view")
 
 
 IS_IN_FULL_VIEW = """el => {
@@ -80,7 +75,7 @@ CENTRE_OFFSET = """el => {
 
 
 @pytest.mark.e2e
-def test_it_scrolls_ONLY_IF_NEEDED_and_then_centres(firefox_binary):
+def test_it_scrolls_ONLY_IF_NEEDED_and_then_centres(firefox_binary, monkeypatch):
     """What the method does with the page: nothing for an element in full view,
     and centring for one that is not.
 
@@ -96,35 +91,32 @@ def test_it_scrolls_ONLY_IF_NEEDED_and_then_centres(firefox_binary):
     still centred would move the page in the first half, and one that scrolled
     the minimum would leave it on the bottom edge in the second.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     from invisible_playwright import InvisiblePlaywright
-    try:
-        with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
-                                 headless=True) as browser:
-            page = browser.new_page()
-            # `80vh` rather than a pixel count: the viewport height is a
-            # property of the profile, and this must hold whatever it is.
-            page.set_content(
-                "<div style='height:80vh'></div>"
-                "<div id=x style='width:120px;height:40px'>target</div>"
-                "<div style='height:3000px'></div>")
-            assert page.eval_on_selector("#x", IS_IN_FULL_VIEW), (
-                "the element starts partly out of view: the test proves nothing")
-            page.locator("#x").scroll_into_view_if_needed(timeout=5000)
-            assert page.evaluate("window.scrollY") == 0, (
-                "the element was in full view, and the page moved anyway")
+    with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
+                             headless=True) as browser:
+        page = browser.new_page()
+        # `80vh` rather than a pixel count: the viewport height is a
+        # property of the profile, and this must hold whatever it is.
+        page.set_content(
+            "<div style='height:80vh'></div>"
+            "<div id=x style='width:120px;height:40px'>target</div>"
+            "<div style='height:3000px'></div>")
+        assert page.eval_on_selector("#x", IS_IN_FULL_VIEW), (
+            "the element starts partly out of view: the test proves nothing")
+        page.locator("#x").scroll_into_view_if_needed(timeout=5000)
+        assert page.evaluate("window.scrollY") == 0, (
+            "the element was in full view, and the page moved anyway")
 
-            # Half of it below the bottom edge: now it is needed.
-            page.set_content(
-                "<div style='height:calc(100vh - 20px)'></div>"
-                "<div id=x style='width:120px;height:40px'>target</div>"
-                "<div style='height:3000px'></div>")
-            assert not page.eval_on_selector("#x", IS_IN_FULL_VIEW), (
-                "the element starts in full view: the test proves nothing")
-            page.locator("#x").scroll_into_view_if_needed(timeout=5000)
-            assert page.evaluate("window.scrollY") > 0, (
-                "the element was cut by the bottom edge, and the page did not move")
-            assert page.eval_on_selector("#x", CENTRE_OFFSET) <= 1, (
-                "the page moved, but not to centre the element")
-    finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
+        # Half of it below the bottom edge: now it is needed.
+        page.set_content(
+            "<div style='height:calc(100vh - 20px)'></div>"
+            "<div id=x style='width:120px;height:40px'>target</div>"
+            "<div style='height:3000px'></div>")
+        assert not page.eval_on_selector("#x", IS_IN_FULL_VIEW), (
+            "the element starts in full view: the test proves nothing")
+        page.locator("#x").scroll_into_view_if_needed(timeout=5000)
+        assert page.evaluate("window.scrollY") > 0, (
+            "the element was cut by the bottom edge, and the page did not move")
+        assert page.eval_on_selector("#x", CENTRE_OFFSET) <= 1, (
+            "the page moved, but not to centre the element")

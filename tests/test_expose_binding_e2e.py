@@ -16,6 +16,8 @@ import threading
 
 import pytest
 
+from _waits import wait_until
+
 pytestmark = pytest.mark.e2e
 
 PAGE = "<!doctype html><title>t</title><body><iframe id='f' srcdoc='<p>frame</p>'></iframe>"
@@ -155,6 +157,16 @@ def test_without_an_exposed_function_nothing_is_added_and_with_one_only_its_name
     assert seen["keys"][-1] == "foo"
 
 
+def _all_frames_there(page, wanted):
+    """Until the page lists exactly the frames of the three documents (the frames of other processes are announced
+    after the load of the top), with a deadline far beyond a healthy run: a machine's speed is not the verdict."""
+    def listed():
+        return sorted(f.url.split("?")[0] for f in page.frames)
+
+    assert wait_until(lambda: listed() == wanted, 30, lambda: page.wait_for_timeout(100)), (
+        "the page never listed the three frames %r; it lists %r" % (wanted, listed()))
+
+
 def test_the_only_name_is_foo_in_a_frame_of_another_site_and_in_the_document_after_a_navigation(browser, tmp_path):
     """127.0.0.1 and localhost are two sites, so two processes. The frame of the other site, a nested frame, the document the
     page navigates to and the one a `document.open()` rewrites: each shows `foo` and nothing else."""
@@ -180,11 +192,11 @@ def test_the_only_name_is_foo_in_a_frame_of_another_site_and_in_the_document_aft
         "/child": "<!doctype html><title>child</title><iframe src='http://127.0.0.1:%d/grand'></iframe>" % port,
         "/grand": "<!doctype html><title>grand</title>",
     }
+    wanted = sorted(["http://127.0.0.1:%d/top" % port, "http://localhost:%d/child" % port, "http://127.0.0.1:%d/grand" % port])
     try:
         plain = browser.new_context().new_page()
         plain.goto("http://127.0.0.1:%d/top" % port, wait_until="load")
-        plain.wait_for_function("window.frames.length >= 0")
-        plain.wait_for_timeout(1500)
+        _all_frames_there(plain, wanted)
         base = {f.url: f.evaluate(WINDOW) for f in plain.frames}
         assert len(base) == 3, sorted(base)
         context = browser.new_context()
@@ -192,7 +204,7 @@ def test_the_only_name_is_foo_in_a_frame_of_another_site_and_in_the_document_aft
         context.expose_function("foo", lambda x: x)
         for target in ("http://127.0.0.1:%d/top" % port, "http://127.0.0.1:%d/top?again" % port):
             page.goto(target, wait_until="load")
-            page.wait_for_timeout(1500)
+            _all_frames_there(page, wanted)
             seen = {f.url.split("?")[0]: f.evaluate(WINDOW) for f in page.frames}
             assert sorted(seen) == sorted(base)
             for frame_url, window in seen.items():

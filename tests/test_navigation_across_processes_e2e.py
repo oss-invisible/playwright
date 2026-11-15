@@ -37,6 +37,10 @@ pytestmark = pytest.mark.e2e
 #: The longest any wait of this file lasts; no healthy run comes near it. It is the only clock the verdicts have.
 DEADLINE = 8.0
 
+#: The timeout of the gotos that are stopped or replaced below. A goto that is not stopped waits for its held answer and
+#: ends at this timeout with another error: it is the bound of the waits that lead up to the stop, nothing narrower.
+GOTO_TIMEOUT_MS = 15000
+
 FISSION_ON = {
     "fission.autostart": True,
     "fission.webContentIsolationStrategy": 1,
@@ -48,6 +52,8 @@ FISSION_ON = {
 @pytest.fixture
 def sites():
     arrived = set()
+    # what the server holds until the test lets it go, after the call that must not wait for it has returned
+    release = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 10
@@ -59,6 +65,19 @@ def sites():
             path = self.path.split("?")[0]
             arrived.add(path)
             try:
+                if path == "/act":
+                    # the page asks whether the request it is to stop has arrived
+                    body = b"go" if "/held" in arrived else b"wait"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if path == "/held":
+                    # nothing is answered until the test opens the gate
+                    release.wait()
+                    path = "/plain"
                 if path == "/partial":
                     # the headers and the start of the body arrive, the rest is held: the response is there, the
                     # navigation has changed process, the document is not complete
@@ -68,7 +87,7 @@ def sites():
                     self.end_headers()
                     self.wfile.write(b"<!doctype html><title>partial</title><p>start")
                     self.wfile.flush()
-                    time.sleep(5)
+                    release.wait()
                     self.wfile.write(b" " * 156)
                     return
                 if path == "/slow-frame":
@@ -86,7 +105,9 @@ def sites():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.server_address[1]
-    yield {"at": lambda host, path, p=None: "http://%s:%d%s" % (host, p or port, path), "arrived": arrived}
+    yield {"at": lambda host, path, p=None: "http://%s:%d%s" % (host, p or port, path), "arrived": arrived,
+           "release": release}
+    release.set()
     server.shutdown()
     server.server_close()
     thread.join()
@@ -107,46 +128,63 @@ def _run(firefox_binary, scenario):
 def test_a_goto_to_another_site_stopped_by_the_page_it_leaves_raises_aborted(firefox_binary, sites):
     async def scenario(page):
         await page.goto(sites["at"]("a.test", "/plain"))
-        await page.evaluate("setTimeout(() => window.stop(), 1000)")
-        began = time.monotonic()
+        # the page stops its load when the server says the request of the goto has arrived (and is held): the stop
+        # comes while the navigation is on its way, whatever the machine; a timer in the page could come before it
+        await page.evaluate(
+            "window.__w = setInterval(() => fetch('/act', {cache: 'no-store'}).then(r => r.text())"
+            ".then(t => { if (t === 'go') { clearInterval(window.__w); window.stop(); } }), 50)")
         try:
-            await page.goto(sites["at"]("b.test", "/slow-frame"), wait_until="domcontentloaded", timeout=15000)
+            # the server answers it only once this call has returned: it can end only by the stop (or by its timeout,
+            # which carries no NS_BINDING_ABORTED)
+            await page.goto(sites["at"]("b.test", "/held"), wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
         except Exception as e:
-            return str(e), time.monotonic() - began, page.url
-        return None, time.monotonic() - began, page.url
+            return str(e), page.url
+        finally:
+            sites["release"].set()
+        return None, page.url
 
-    error, took, url = _run(firefox_binary, scenario)
+    error, url = _run(firefox_binary, scenario)
     assert error is not None and "NS_BINDING_ABORTED" in error, error
-    assert took < 8, took
     assert url.startswith("http://a.test:"), url
 
 
 def test_a_second_goto_to_a_third_site_interrupts_the_first_and_lands(firefox_binary, sites):
     async def scenario(page):
         await page.goto(sites["at"]("a.test", "/plain"))
+        # The responses the client heard: the one of the first goto is the moment its headers and the start of its body
+        # reached the parent, which is where the navigation is handed to the process of b.test. A document that has its
+        # start but not its end does not commit (CI of 15/11, run 43763144152: "neither committed nor been aborted"), so
+        # the URL of the page is not the condition; the response is.
+        responses = []
+        page.on("response", lambda r: responses.append(urlsplit(r.url).path))
 
         async def go(url, after=None):
-            while after is not None and after not in sites["arrived"]:
-                await asyncio.sleep(0.02)
             if after is not None:
-                # the first response has arrived and is held: the navigation has changed process
-                await asyncio.sleep(1.0)
+                # the first response is there and the rest is held: the navigation is on its way to another process
+                # (a condition, not 1 s after the request arrived)
+                seen = await awatch(lambda: (after in sites["arrived"], after in responses),
+                                    lambda state: state[0] and state[1],
+                                    GOTO_TIMEOUT_MS / 1000, lambda: asyncio.sleep(0.02))
+                if not seen.ok:
+                    return "the client never heard the response of the first goto; seen: %s" % seen.render()
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
                 return None
             except Exception as e:
                 return str(e)
 
-        began = time.monotonic()
-        first, second = await asyncio.gather(
-            go(sites["at"]("b.test", "/partial")),
-            go(sites["at"]("c.test", "/second"), after="/partial"))
-        return first, second, time.monotonic() - began, page.url
+        try:
+            first, second = await asyncio.gather(
+                go(sites["at"]("b.test", "/partial")),
+                go(sites["at"]("c.test", "/second"), after="/partial"))
+        finally:
+            # the rest of the first response is sent only now: it can have ended only by being replaced
+            sites["release"].set()
+        return first, second, page.url
 
-    first, second, took, url = _run(firefox_binary, scenario)
+    first, second, url = _run(firefox_binary, scenario)
     assert first is not None and "is interrupted by another navigation" in first, first
     assert second is None, second
-    assert took < 8, took
     assert url == "http://c.test:" + url.split(":")[2], url
 
 

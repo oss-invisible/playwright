@@ -29,6 +29,11 @@ from invisible_core.juggler.actions import Actions, ElementNotActionable
 
 from _servers import LocalServer
 
+#: The retry budget of an action that is MEANT to fail (an element that is not there, one that is disabled): the test reads the reason of the
+#: last attempt, so the budget must leave a loaded runner the time to finish an attempt and say why (2 s was red on Windows, 13/11 and 14/11,
+#: where stalls of 2.5 s are seen). Such a test costs its whole budget by design, and still fails if the action does not say the reason.
+NEGATIVE_S = 10
+
 #: Who draws the pointer approach in `_open`; set per test by the fixture below.
 _ENGINE_APPROACH = False
 
@@ -231,7 +236,7 @@ def test_a_timeout_SAYS_the_reason_for_the_last_attempt(firefox_binary):
     actions, inj, f, close = _open(firefox_binary, PAGE)
     try:
         with pytest.raises(ElementNotActionable) as e:
-            actions.click("#doesnotexist", timeout=2)
+            actions.click("#doesnotexist", timeout=NEGATIVE_S)
         text = str(e.value)
         assert "#doesnotexist" in text
         assert "attempts" in text
@@ -250,7 +255,7 @@ def test_an_element_that_is_NEVER_actionable_says_WHICH_state_is_missing(
     actions, inj, f, close = _open(firefox_binary, body)
     try:
         with pytest.raises(ElementNotActionable) as e:
-            actions.click("#disabled", timeout=2)
+            actions.click("#disabled", timeout=NEGATIVE_S)
         assert "missing enabled" in str(e.value), str(e.value)
     finally:
         close()

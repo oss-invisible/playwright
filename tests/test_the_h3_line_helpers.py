@@ -392,7 +392,7 @@ class _FakeUdpSocket:
     tried: list = []
 
     def __init__(self, family, kind):
-        pass
+        self.closed = False
 
     def bind(self, where):
         _FakeUdpSocket.tried.append(where[1])
@@ -402,7 +402,7 @@ class _FakeUdpSocket:
     refuse_all = False
 
     def close(self):
-        pass
+        self.closed = True
 
 
 def _fake_layer(monkeypatch, refuse_all=False):
@@ -420,9 +420,10 @@ def _fake_layer(monkeypatch, refuse_all=False):
 
 def test_the_server_takes_a_number_both_tcp_and_udp_bind_outside_a_refused_udp_range(monkeypatch):
     module = _fake_layer(monkeypatch)
-    server, port = module._tcp_server_on_a_port_udp_binds("127.0.0.1")
+    server, port, udp = module._tcp_server_on_a_port_udp_binds("127.0.0.1")
     assert port not in _REFUSED_UDP, "the server took a number UDP refuses: %d" % port
     assert server.server_address[1] == port
+    assert isinstance(udp, _FakeUdpSocket) and not udp.closed, "the UDP socket of the number is kept for the caller, not closed"
     assert _FakeUdpSocket.tried[0] in _REFUSED_UDP, "the fake did not make the system's first pick a refused one"
     assert all(s.closed for s in _FakeTcpServer.opened if s is not server), "a TCP server of a refused number was left open"
 
@@ -446,3 +447,42 @@ def test_the_server_closes_its_event_loop_on_its_own_thread_when_it_closes():
         loop, thread = server._loop, server._thread
     assert not thread.is_alive(), "the server's thread is still running after close()"
     assert loop.is_closed(), "the server's event loop was left for the garbage collector to close"
+
+
+def test_the_server_holds_its_number_on_udp_from_the_pick_to_the_quic_server(monkeypatch):
+    """Known-bad: the picker closed its UDP probe and the server bound the number again after it had read the certificate into its QUIC
+    configuration, so for that time any other bind of the UDP number could take it and the server then failed to start (or, worse, never
+    got its datagrams). Here the real server starts on loopback and, at the moment its QUIC configuration reads the certificate (after
+    the pick, before the loop serves), a bind of the same UDP number is tried: it must be refused, and the number the loop serves must be
+    the one the picker held."""
+    import _h3_server
+    from aioquic.quic.configuration import QuicConfiguration
+
+    picked = {}
+    real_pick = _h3_server._tcp_server_on_a_port_udp_binds
+
+    def pick(address):
+        result = real_pick(address)
+        picked["port"] = result[1]
+        return result
+
+    attempts = []
+    real_load = QuicConfiguration.load_cert_chain
+
+    def load_cert_chain(self, *args, **kwargs):
+        taker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            taker.bind(("127.0.0.1", picked["port"]))
+            attempts.append("taken")
+        except OSError:
+            attempts.append("refused")
+        finally:
+            taker.close()
+        return real_load(self, *args, **kwargs)
+
+    monkeypatch.setattr(_h3_server, "_tcp_server_on_a_port_udp_binds", pick)
+    monkeypatch.setattr(QuicConfiguration, "load_cert_chain", load_cert_chain)
+    with H3Server("127.0.0.1") as server:
+        assert attempts == ["refused"], "another bind of the UDP number succeeded between the pick and the QUIC server: %s" % attempts
+        assert server.port == picked["port"]
+        assert server._quic._transport.get_extra_info("sockname")[1] == server.port, "the loop serves another number than the one held"

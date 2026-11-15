@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from _waits import wait_until
 from invisible_playwright import InvisiblePlaywright
 
 
@@ -27,7 +28,10 @@ def test_a_reloaded_page_is_controlled_by_its_service_worker(firefox_binary, fix
         page.wait_for_function("window.__swState === 'registered'", timeout=10_000)
         page.evaluate("navigator.serviceWorker.ready.then(() => true)")
         page.reload(timeout=15_000)
-        page.wait_for_timeout(500)
+        # until the worker has taken the page (a condition with a deadline, not 500 ms); a page that never gets a
+        # controller (the defect above) still ends here, red, at the deadline
+        wait_until(lambda: page.evaluate("navigator.serviceWorker.controller !== null"), 30,
+                   lambda: page.wait_for_timeout(50))
         assert page.evaluate("navigator.serviceWorker.controller !== null"), (
             "the reloaded page is not controlled by its service worker")
         assert page.evaluate("fetch('/from-sw').then(r => r.text())") == "hello from SW"

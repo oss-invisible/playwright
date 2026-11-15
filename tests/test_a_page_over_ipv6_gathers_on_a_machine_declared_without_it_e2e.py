@@ -30,7 +30,14 @@ _GATHER_JS = r"""async () => {
   const cands = [];
   pc.addEventListener('icecandidate', e => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); });
   await pc.setLocalDescription(await pc.createOffer());
-  await new Promise(r => setTimeout(r, 2500));
+  // Until the gathering says it is over, not for a fixed time: how long a gathering takes is the speed of the machine, whether it ends is the product.
+  // The deadline is far beyond any healthy run; a gathering that never completes returns what it has, and the assertions on the candidates fail on it.
+  await new Promise(resolve => {
+    const timer = setTimeout(resolve, 30000);
+    const done = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); } };
+    pc.addEventListener('icegatheringstatechange', done);
+    done();
+  });
   try { pc.close(); } catch (e) {}
   return cands;
 }"""

@@ -24,6 +24,8 @@ import threading
 
 import pytest
 
+from _waits import wait_until
+
 PAGE = b"<!doctype html><html><body><form><textarea></textarea></form></body></html>"
 HELD = b"<!doctype html><html><body><img src='/held.png'></body></html>"
 
@@ -76,10 +78,8 @@ def test_answering_a_route_the_next_navigation_aborted_does_not_raise(
             page = b.new_context().new_page()
             page.route("**/*", handler)
             page.goto(base + "/held", wait_until="commit", timeout=15000)
-            for _ in range(100):
-                if held:
-                    break
-                page.wait_for_timeout(50)
+            # until the handler has the image (a deadline of 30 s, not 5 s of 50 ms looks)
+            wait_until(lambda: held, 30, lambda: page.wait_for_timeout(50))
             assert held, "the page's image never reached the handler"
 
             page.goto(base + "/next", wait_until="load", timeout=15000)

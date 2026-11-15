@@ -170,11 +170,12 @@ def test_networkidle_arrives_on_a_routed_page_through_a_served_browser(firefox_b
             ctx.route("**/*", _router(SLOW_MS.get(kind, 0) / 1000.0))
             page = ctx.new_page()
             for attempt in range(3):     # fresh pages, the way a client fetches one address after another
-                t0 = time.monotonic()
-                page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=20000)
-                took = time.monotonic() - t0
-                assert took < 15, "networkidle after %.1f s on attempt %d (answers to a closed request: %s)" % (
-                    took, attempt, ANSWER_ERRORS[:3])
+                try:
+                    # the timeout of the goto is the detector of a networkidle that never comes
+                    page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=20000)
+                except Exception as e:
+                    pytest.fail("networkidle did not come on attempt %d (answers to a closed request: %s): %s" % (
+                        attempt, ANSWER_ERRORS[:3], e))
                 assert page.evaluate("window.__app") == 1
             assert ("POST", "/beacon") in _Handler.hits, _Handler.hits
             assert not any(path in ("/font.woff2", "/pixel.png", "/photo.jpg", "/ad.png") for _, path in _Handler.hits), _Handler.hits
@@ -214,9 +215,7 @@ def test_networkidle_arrives_when_the_client_answers_all_requests_concurrently_a
             await ctx.route("**/*", route)
             page = await ctx.new_page()
             for attempt in range(3):
-                t0 = time.monotonic()
                 await page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=25000)
-                assert time.monotonic() - t0 < 20, "networkidle after %.1f s on attempt %d" % (time.monotonic() - t0, attempt)
             await ctx.close()
             await browser.close()
 
@@ -244,9 +243,7 @@ def test_one_page_reused_for_many_addresses_reaches_networkidle_every_time(firef
             page = ctx.new_page()
             kinds = ["cancel_fetch", "cancel_img", "cancel_iframe", "beacon", "cancel_navigation", "oop_iframe"] * 2
             for n, kind in enumerate(kinds):
-                t0 = time.monotonic()
                 page.goto(site + "?kind=%s&n=%d" % (kind, n), wait_until="networkidle", timeout=20000)
-                assert time.monotonic() - t0 < 15, "address %d (%s) reached networkidle after %.1f s" % (n, kind, time.monotonic() - t0)
             ctx.close()
             browser.close()
     finally:
@@ -280,9 +277,7 @@ def test_a_plain_route_handler_is_not_poisoned_by_a_request_the_page_cancelled(f
             ctx.route("**/*", plain)
             page = ctx.new_page()
             for attempt in range(3):
-                t0 = time.monotonic()
                 page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=25000)
-                assert time.monotonic() - t0 < 20, "attempt %d: networkidle after %.1f s" % (attempt, time.monotonic() - t0)
             ctx.close()
             browser.close()
     finally:

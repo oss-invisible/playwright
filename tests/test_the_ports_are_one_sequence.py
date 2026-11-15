@@ -65,12 +65,12 @@ class _Layer:
 
 def test_the_picker_leaves_the_range_that_the_systems_sequential_picks_fall_in():
     layer = _Layer()
-    tcp, port = _ports.bind_tcp_and_probe_udp("10.1.0.111", layer.make_tcp, socket_module=layer)
+    tcp, port, udp = _ports.bind_tcp_and_hold_udp("10.1.0.111", layer.make_tcp, socket_module=layer)
     assert port not in REFUSED and 20000 <= port <= 32767, port
     assert tcp.server_address == ("10.1.0.111", port)
     assert layer.tcp_open == [tcp], "the refused TCP servers were closed and the chosen one is kept"
     assert layer.udp_tries[0] in REFUSED, "the first try is the system's own pick"
-    assert layer.udp_closed == len(layer.udp_tries), "every probe was closed again"
+    assert layer.udp_closed == len(layer.udp_tries) - 1, "every refused probe was closed, and the one that bound is kept for the caller"
 
 
 def test_the_picker_that_finds_none_says_how_many_tries_and_the_codes_of_the_last_refusals(monkeypatch):
@@ -78,7 +78,7 @@ def test_the_picker_that_finds_none_says_how_many_tries_and_the_codes_of_the_las
     asked = []
     monkeypatch.setattr(_ports, "who_holds", lambda port: asked.append(port) or "; held by: a process")
     with pytest.raises(RuntimeError) as caught:
-        _ports.bind_tcp_and_probe_udp("10.1.0.111", layer.make_tcp, tries=7, socket_module=layer)
+        _ports.bind_tcp_and_hold_udp("10.1.0.111", layer.make_tcp, tries=7, socket_module=layer)
     message = str(caught.value)
     assert "10.1.0.111" in message and "7 tries" in message and message.count("10013") == 3, message
     # The last number tried is named and the machine is asked who holds it (ss or netstat: Linux says, the message carries it).
@@ -97,7 +97,7 @@ def test_a_tcp_bind_that_is_refused_is_a_refusal_too_and_the_next_number_is_trie
             raise OSError(10048, "address in use")
         return real(address, port)
 
-    tcp, port = _ports.bind_tcp_and_probe_udp("10.1.0.111", flaky, socket_module=layer)
+    tcp, port, _udp = _ports.bind_tcp_and_hold_udp("10.1.0.111", flaky, socket_module=layer)
     assert len(calls) >= 2 and tcp.server_address[1] == port
 
 
@@ -105,8 +105,8 @@ def test_the_h3_server_takes_its_port_from_the_shared_picker(monkeypatch):
     layer = _Layer()
     monkeypatch.setattr(_h3_server, "socket", layer)
     monkeypatch.setattr(_h3_server, "_TcpServer", lambda pair, handler: layer.make_tcp(pair[0], pair[1]))
-    monkeypatch.setattr(_h3_server, "bind_tcp_and_probe_udp", _ports.bind_tcp_and_probe_udp)
-    tcp, port = _h3_server._tcp_server_on_a_port_udp_binds("10.1.0.111")
+    monkeypatch.setattr(_h3_server, "bind_tcp_and_hold_udp", _ports.bind_tcp_and_hold_udp)
+    tcp, port, _udp = _h3_server._tcp_server_on_a_port_udp_binds("10.1.0.111")
     assert port not in REFUSED and tcp.server_address == ("10.1.0.111", port)
     import inspect
     assert "_ports" in inspect.getsource(_h3_server) and "randint" not in inspect.getsource(_h3_server), "a copy of the picker is back in the server"

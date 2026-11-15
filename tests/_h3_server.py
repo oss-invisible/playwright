@@ -23,7 +23,7 @@ import threading
 from pathlib import Path
 from typing import List, Tuple
 
-from _ports import bind_tcp_and_probe_udp
+from _ports import bind_tcp_and_hold_udp
 
 
 def _certificate(address: str, directory: Path):
@@ -57,12 +57,13 @@ class _TcpServer(socketserver.ThreadingTCPServer):
 
 
 def _tcp_server_on_a_port_udp_binds(address: str):
-    """A TCP server on a port number that UDP can bind too, as ``(server, port)``: the one picker of the harness (tests/_ports.py), which the
+    """A TCP server on a port number that UDP can bind too, with the UDP socket already bound to it, as ``(server, port, udp)``: the one picker of the harness (tests/_ports.py), which the
     witness and the resolver trap walk the same sequence of. The first try is the system's own pick (port 0); the others are drawn at random
     below the dynamic range, because Windows hands out ephemeral TCP ports in sequence and keeps excluded ranges of a hundred ports for UDP
     inside the same zone (run 43230437094, ``wrapper.e2e.web`` on Windows: fifty consecutive picks refused, three tests red). Every refusal is
-    kept with its code and the last three are in the error."""
-    return bind_tcp_and_probe_udp(address, lambda host, number: _TcpServer((host, number), _TcpHandler), socket_module=socket)
+    kept with its code and the last three are in the error. The UDP socket is NOT closed again: it goes to the QUIC server's loop, so that the
+    number is held on UDP from the first look at it to its use (a probe that was closed left a window for any other bind of that number)."""
+    return bind_tcp_and_hold_udp(address, lambda host, number: _TcpServer((host, number), _TcpHandler), socket_module=socket)
 
 
 class _TcpHandler(socketserver.BaseRequestHandler):
@@ -145,8 +146,8 @@ class H3Server:
     """TCP+TLS (HTTP/2) and QUIC (HTTP/3) on one port of `address`."""
 
     def __init__(self, address: str):
-        from aioquic.asyncio import serve
         from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.asyncio.server import QuicServer
         from aioquic.h3.connection import H3_ALPN, H3Connection
         from aioquic.h3.events import HeadersReceived
         from aioquic.quic.configuration import QuicConfiguration
@@ -169,10 +170,11 @@ class H3Server:
         server = self
 
         # One port for both: the TCP port first, then the same number for UDP.
-        tcp, port = _tcp_server_on_a_port_udp_binds(address)
+        tcp, port, udp = _tcp_server_on_a_port_udp_binds(address)
         self.port = port
         #: What the TCP answer says about HTTP/3: the same port, for an hour.
         self.alt_svc = 'h3=":%d"; ma=3600' % port
+        self._udp = udp
         self._tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._tls.load_cert_chain(str(cert), str(key))
         self._tls.set_alpn_protocols(["h2", "http/1.1"])
@@ -209,8 +211,9 @@ class H3Server:
 
         def run():
             asyncio.set_event_loop(self._loop)
-            self._quic = self._loop.run_until_complete(
-                serve(address, port, configuration=configuration, create_protocol=Protocol))
+            # What ``aioquic.asyncio.serve(address, port)`` does (1.x), with the socket that already holds the number.
+            _transport, self._quic = self._loop.run_until_complete(self._loop.create_datagram_endpoint(
+                lambda: QuicServer(configuration=configuration, create_protocol=Protocol), sock=self._udp))
             started.set()
             try:
                 self._loop.run_forever()

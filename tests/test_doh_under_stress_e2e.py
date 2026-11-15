@@ -18,14 +18,15 @@ knows the names used here, so a page loads only if the lookup went to the DoH).
   `flaky-a.test` by ending the exchange with no answer (a reset h2 stream: a failure of the CHANNEL, the kind
   `ConfirmationContext::RecordTRRStatus` counts; `_doh_servers.FAILURE_KINDS` has the other two) and serves it afterwards.
   The first navigation may fail (NS_ERROR_UNKNOWN_HOST) or load; then a retry loop (up to 5 navigations 2 s apart, each in a
-  fresh page of the same context, nothing cleared) must load within 15 s AND the FakeDoh must have been asked a second time:
+  fresh page of the same context, nothing cleared) must load at one of them AND the FakeDoh must have been asked a second time:
   the browser asks again instead of serving the failure from a cache or from a temporary block that a global TRR-only
   mode would not have (`IsTemporarilyBlocked` returns false under global mode 3, and its blocklist is fed by failures
   counted under the global modes).
 
 Red on an engine with the 1.5 s DoH timeout (the giro-2 and giro-3 binaries before the timeout fix) for the first test:
 the lookup of `slow-a.test` fails after 1.5 s, the navigation ends in NS_ERROR_UNKNOWN_HOST and the page never loads. The
-second test is red if the failure of the first lookup sticks (negative cache or temporary block) longer than the retry loop.
+second test is red if the failure of the first lookup sticks (negative cache or temporary block) through all the attempts of the retry loop
+(a count of navigations 2 s apart, not a stopwatch: a slow machine lengthens the loop and never shortens what it tries).
 """
 from __future__ import annotations
 
@@ -48,10 +49,13 @@ pytestmark = pytest.mark.e2e
 #: The latency of the slow DoH, and what a page behind it may take at most.
 DOH_LATENCY_S = 2.0
 SLOW_LOAD_LIMIT_S = 20.0
-#: The retries after a refusal: how many, how far apart, and the time they all have.
+#: The retries after a refusal: how many and how far apart (more than the 1 s negative cache). The loop is a COUNT of navigations, so
+#: a runner that stalls for seconds between two of them lengthens the test and never takes an attempt away from it.
 RETRIES = 5
 RETRY_GAP_S = 2.0
-RETRY_WINDOW_S = 15.0
+#: What one navigation of that loop may take: far beyond any healthy run (the product's own limits are 1.5 s for a DoH request and
+#: the 20 s of the slow page); a navigation that reaches it is a page that never ends, and is reported as that attempt's error.
+NAVIGATION_LIMIT_MS = 30000
 
 
 #: Firefox keeps the failure of ANY lookup (a refused DoH query included) in the DNS cache for network.dnsNegativeCacheExpiration
@@ -122,10 +126,11 @@ def test_a_slow_doh_still_resolves_the_name_of_a_proxied_context(firefox_binary,
         started = time.monotonic()
         try:
             page.goto(pages.url("slow-a.test"), wait_until="load", timeout=int(SLOW_LOAD_LIMIT_S * 1000))
+            seconds = time.monotonic() - started       # the load, as the limit judges it: the read of the text is not part of it
             text = _text(page)
         except Exception as exc:  # noqa: BLE001 - reported below with what the FakeDoh saw
             error = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0] if str(exc) else "")
-        seconds = time.monotonic() - started
+            seconds = time.monotonic() - started
         context.close()
     watcher.stop()
     record_property("goto_seconds", "%.2f" % seconds)
@@ -177,17 +182,10 @@ def test_a_name_the_doh_refused_once_resolves_on_the_next_request(firefox_binary
     with _launch_with_a_short_negative_cache(firefox_binary) as browser:
         context, page = _page_in(browser, proxy=gw.proxy)
         page.close()
-        attempts.append(_navigate(context, url, 20000))
-        window_starts = time.monotonic()
+        attempts.append(_navigate(context, url, NAVIGATION_LIMIT_MS))
         while attempts[-1][0] is None and len(attempts) <= RETRIES:
-            remaining = RETRY_WINDOW_S - (time.monotonic() - window_starts)
-            if remaining <= 0:
-                break
-            time.sleep(min(RETRY_GAP_S, remaining))
-            remaining = RETRY_WINDOW_S - (time.monotonic() - window_starts)
-            if remaining <= 0:
-                break
-            attempts.append(_navigate(context, url, int(min(8.0, remaining) * 1000)))
+            time.sleep(RETRY_GAP_S)
+            attempts.append(_navigate(context, url, NAVIGATION_LIMIT_MS))
         context.close()
     watcher.stop()
     record_property("attempts", str([(ok is not None, err, round(s, 2)) for ok, err, s in attempts]))
@@ -203,8 +201,8 @@ def test_a_name_the_doh_refused_once_resolves_on_the_next_request(firefox_binary
         "the FakeDoh never refused the first A query of the name: the test did not exercise a refusal" + why)
     loaded = [a for a in attempts if a[0] is not None]
     assert loaded, (
-        "no navigation to a name the DoH refused once loaded in %d attempts / %.0f s: the failure of the first lookup "
-        "sticks (a cached failure or a temporary block)" % (len(attempts), RETRY_WINDOW_S) + why)
+        "no navigation to a name the DoH refused once loaded in %d attempts, %.0f s apart: the failure of the first lookup "
+        "sticks (a cached failure or a temporary block)" % (len(attempts), RETRY_GAP_S) + why)
     assert "HOST=flaky-a.test:%d" % pages.port in loaded[0][0], "the page is not the page of the name: %r" % loaded[0][0] + why
     assert len(queries) >= 2, (
         "the DoH was asked for the A record of the name %d time(s): the browser must ask again after a refusal, not serve "

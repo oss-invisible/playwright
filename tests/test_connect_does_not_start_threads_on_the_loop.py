@@ -108,15 +108,18 @@ def test_a_browsers_reader_and_the_transports_workers_share_ONE_starter():
     async def scenario():
         server = _Server()
         transport = InProcessTransport(asyncio.get_running_loop(), server)
-        before = len(ThreadStarter.open_starters())
+        # The starters of THIS scenario, by identity: the registry is the process's, and a starter an earlier test of the
+        # same worker is still closing (or one it left) moved a count taken before and after (red in a pre-push of 15/11).
+        before = set(ThreadStarter.open_starters())
         await transport.connect()
         lease = ThreadStarterLease(lambda: server.thread_starter)
         ran = threading.Event()
         lease.start(target=ran.set, name="invpw-test-started")
-        assert ran.wait(10)
-        opened = len(ThreadStarter.open_starters()) - before
+        assert ran.wait(30)
+        opened, mine = [s for s in ThreadStarter.open_starters() if s not in before], server.thread_starter
         transport.request_stop()
-        await asyncio.wait_for(transport.wait_until_stopped(), 10)
-        return opened
+        await asyncio.wait_for(transport.wait_until_stopped(), 30)
+        return opened, mine
 
-    assert asyncio.run(scenario()) == 1
+    opened, the_servers = asyncio.run(scenario())
+    assert opened == [the_servers], opened

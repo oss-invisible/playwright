@@ -55,6 +55,8 @@ import pytest
 from invisible_core._fpforge import generate_profile
 from invisible_core.prefs import _BASELINE, translate_profile_to_prefs
 
+from _waits import wait_until
+
 
 # ────────────────────────────────────────────────────────────────────
 # Unit layer - fast, no browser, runs on every CI
@@ -286,6 +288,18 @@ def test_cross_origin_iframe_url_appears_in_page_frames(firefox_binary, cross_or
         )
 
 
+def _child_frame_of(page, handle, child_origin):
+    """The frame of an iframe handle once it has NAVIGATED to the child origin (a frame of another process is attached
+    before it has an address), or whatever it is when the deadline of 30 s, far beyond a healthy run, passes: the
+    caller's assertions then say what was wrong. A condition is waited for, not a duration."""
+    def navigated():
+        frame = handle.content_frame()
+        return frame is not None and child_origin in (frame.url or "")
+
+    wait_until(navigated, 30, lambda: page.wait_for_timeout(100))
+    return handle.content_frame()
+
+
 @pytest.mark.e2e
 def test_cross_origin_iframe_content_frame_resolves(firefox_binary, cross_origin_harness):
     """``handle.content_frame()`` must return a Frame (not None) for every
@@ -298,12 +312,11 @@ def test_cross_origin_iframe_content_frame_resolves(firefox_binary, cross_origin
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
         page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
-        page.wait_for_timeout(500)
 
         for sel in ("iframe#ifr_plain", "iframe#ifr_sandbox", "iframe#ifr_titled"):
             handle = page.query_selector(sel)
             assert handle is not None, f"{sel!r} not found in DOM"
-            cf = handle.content_frame()
+            cf = _child_frame_of(page, handle, cross_origin_harness["child_origin"])
             assert cf is not None, f"{sel!r}: content_frame() returned None"
             assert cross_origin_harness["child_origin"] in (cf.url or ""), (
                 f"{sel!r}: content_frame().url = {cf.url!r}, "
@@ -325,9 +338,8 @@ def test_cross_origin_iframe_evaluate_returns_real_values(firefox_binary, cross_
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
         page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
-        page.wait_for_timeout(500)
 
-        cf = page.query_selector("iframe#ifr_plain").content_frame()
+        cf = _child_frame_of(page, page.query_selector("iframe#ifr_plain"), cross_origin_harness["child_origin"])
         assert cf is not None
         href = cf.evaluate("() => location.href")
         assert cross_origin_harness["child_origin"] in href
@@ -374,9 +386,11 @@ def test_cross_origin_iframe_dispatch_event_click_works(firefox_binary, cross_or
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
         page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
 
-        page.frame_locator("iframe#ifr_plain").locator("button#ok").dispatch_event(
-            "click", timeout=4_000
-        )
+        # the button of a document in another process can come later on a loaded runner: wait for it as a script would
+        # (Windows CI of 13/11, run 43383366904: "found 0 elements"), then act, both with a deadline of 30 s
+        button = page.frame_locator("iframe#ifr_plain").locator("button#ok")
+        button.wait_for(timeout=30_000)
+        button.dispatch_event("click", timeout=30_000)
         cf = page.query_selector("iframe#ifr_plain").content_frame()
         assert cf.evaluate("() => document.title") == "clicked"
 
@@ -477,7 +491,9 @@ def test_the_geometry_invariant_holds_inside_a_nested_frame(firefox_binary):
             frame = page.frame_locator("#f")
             page.frames[1].evaluate("() => { window.__ev = []; }")
             frame.locator("#g").hover(timeout=10000)
-            page.wait_for_timeout(400)
+            # until the frame has heard the pointer (its events come from another process, after the hover returned)
+            wait_until(lambda: page.frames[1].evaluate("() => window.__ev.length") > 0, 30,
+                       lambda: page.wait_for_timeout(100))
             ev = page.frames[1].evaluate("() => window.__ev")
             inner = page.frames[1].evaluate("() => window.__inner()")
             assert ev, "no event received in the iframe: coverage absent, and this is NOT a pass"

@@ -32,6 +32,7 @@ import threading
 import pytest
 
 from _servers import LocalServer
+from _waits import wait_until
 
 pytestmark = pytest.mark.e2e
 
@@ -155,7 +156,11 @@ def test_the_aria_snapshot_writes_nothing_the_page_can_see(firefox_binary):
             seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto(site.url)
-        page.wait_for_timeout(200)
+        # until the watcher has looked once (its 50 ms interval has written a verdict) and the control has been
+        # written: both are "not yet" until then. A condition with a deadline, not 200 ms. A watcher that never
+        # runs ends red at the deadline on the assertions below, as before.
+        wait_until(lambda: "not yet" not in (_verdict(page, "verdict"), _verdict(page, "control")), 30,
+                   lambda: page.wait_for_timeout(50))
 
         assert "the watcher sees:" in _verdict(page, "control"), (
             "the watcher cannot see the property it is hunting, so its 'clean' "

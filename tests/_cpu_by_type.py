@@ -98,9 +98,14 @@ class CpuSampler:
         self._thread.start()
 
     def end(self) -> Dict[str, float]:
-        """Stop, take one more sample, and return the CPU seconds of the window by type."""
+        """Stop, take one more sample, and return the CPU seconds of the window by type.
+
+        The window ends HERE. The counters are cumulative, so the sample taken now already holds everything the processes used until
+        this call: waiting before it (the old ``sleep(0.3)``) added a third of a second of whatever the browser did after the
+        measured work to the number, and a slower machine added more. The sampler's thread is waited for up to 30 s (it ends at once:
+        its only wait is the event just set, after the sample it was in the middle of), and a sample still running then is a hang."""
         self._halt.set()
-        self._thread.join(timeout=10)
-        time.sleep(0.3)
+        self._thread.join(timeout=30)
+        assert not self._thread.is_alive(), "the CPU sampler's thread did not end within 30 s of being told to stop"
         self._take()
         return delta_by_type(self.start, self.last)

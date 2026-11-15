@@ -29,6 +29,7 @@ from invisible_playwright import InvisiblePlaywright
 
 from _screencast_evidence import Stream, engine_screencast_lines
 from _servers import LocalServer
+from _waits import wait_until
 
 # The page the session loads: served by this test from 127.0.0.1, so nothing
 # here depends on a site of the real web.
@@ -121,7 +122,9 @@ def test_hidden_desktop_takes_the_window_off_screen_but_keeps_rendering(firefox_
     with headed as browser:
         page = browser.new_page()
         page.goto(served, timeout=30_000)
-        time.sleep(1.0)
+        # until the window is on the desktop (a condition with a deadline, not 1 s); a headed session that never
+        # puts one there still ends red below
+        wait_until(lambda: _moz_windows_on(None, headed) >= 1, 30, lambda: page.wait_for_timeout(100))
         assert _moz_windows_on(None, headed) >= 1, (
             "a headed session left no window on the interactive desktop, so "
             "the enumeration below could not tell hidden from broken")

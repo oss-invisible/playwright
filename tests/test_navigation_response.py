@@ -36,7 +36,6 @@ from __future__ import annotations
 import http.server
 import socket
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -663,9 +662,10 @@ def test_navigation_answers_with_a_real_response(firefox_binary):
             # navigation never has, and raised at the timeout. Measured on
             # 0.35.2: 8.0 s and a TimeoutError for `go_back(timeout=8000)`.
             for go, where in ((page.go_back, url), (page.go_forward, url + "#deeper")):
-                began = time.monotonic()
+                # The timeout is the detector: a go_back that waits for a
+                # navigation id a same-document entry never has raises at
+                # 8 s ("it waited out the timeout"), not None.
                 assert go(timeout=8_000) is None
-                assert time.monotonic() - began < 2.0, "it waited out the timeout"
                 assert page.url == where, page.url
     finally:
         srv.shutdown()
