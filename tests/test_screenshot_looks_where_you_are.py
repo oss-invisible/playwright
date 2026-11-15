@@ -197,7 +197,11 @@ def shots(tmp_path_factory, firefox_binary):
             # reads back where it actually went rather than assuming, which
             # is the same mistake in miniature as the defect it covers.
             page.evaluate("() => window.scrollTo(1400, 0)")
-            page.wait_for_timeout(300)
+            # until the page IS where the clamp puts it (the scrollable width, at most 1400), not 300 ms; if it never lands, `landed` below is
+            # read at the deadline and the assertions on it say so
+            wait_until(lambda: page.evaluate(
+                "() => Math.round(window.scrollX) === Math.round(Math.min(1400, document.documentElement.scrollWidth"
+                " - document.documentElement.clientWidth))"), 30, lambda: page.wait_for_timeout(50))
             landed = page.evaluate("() => Math.round(window.scrollX)")
             page.screenshot(path=str(out / "sideways.png"))
             wide = page.evaluate(

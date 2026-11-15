@@ -15,7 +15,17 @@ import pytest
 TYPE = re.compile(r"Setting remoteType of process (\d+) to (\S+)")
 
 
-def _remote_types(tmp_path, binary, **option):
+def _read_types(tmp_path, base):
+    types = []
+    for path in sorted(tmp_path.glob(base.name + "*")):
+        types += [m.group(2) for m in TYPE.finditer(path.read_text(encoding="utf-8", errors="replace"))]
+    return types
+
+
+def _remote_types(tmp_path, binary, until, window=0.0, **option):
+    """The types of the processes the engine made. It waits (30 s) until ``until(types)`` holds, which is the positive thing the verdict needs to read, and then leaves
+    ``window`` seconds in which a process that must NOT be born could show: that window looks for something that must not happen, so a slow machine can only make it weaker."""
+    from _waits import wait_until
     from invisible_playwright import InvisiblePlaywright
 
     mp = pytest.MonkeyPatch()
@@ -27,18 +37,16 @@ def _remote_types(tmp_path, binary, **option):
                                  timezone="America/New_York", **option) as browser:
             page = browser.new_context().new_page()
             page.goto("about:blank")
-            time.sleep(10)
+            wait_until(lambda: until(_read_types(tmp_path, base)), 30, lambda: page.wait_for_timeout(100))
+            time.sleep(window)
     finally:
         mp.undo()
-    types = []
-    for path in sorted(tmp_path.glob(base.name + "*")):
-        types += [m.group(2) for m in TYPE.finditer(path.read_text(encoding="utf-8", errors="replace"))]
-    return types
+    return _read_types(tmp_path, base)
 
 
 @pytest.mark.e2e
 def test_without_the_option_the_new_tab_page_is_preloaded_in_its_own_process(firefox_binary, tmp_path):
-    types = _remote_types(tmp_path, firefox_binary)
+    types = _remote_types(tmp_path, firefox_binary, lambda found: "privilegedabout" in found)
     assert types, "the engine wrote no line about its processes: the control cannot judge"
     assert "privilegedabout" in types, "the retail keeps the New Tab page preloaded: %s" % sorted(set(types))
 
@@ -49,6 +57,6 @@ def test_asked_to_turn_the_preload_off_there_is_no_privileged_about_process(fire
 
     if "preload_newtab" not in inspect.signature(core_prefs.compose_session_prefs).parameters:
         pytest.skip("this core does not know preload_newtab yet")
-    types = _remote_types(tmp_path, firefox_binary, preload_newtab=False)
+    types = _remote_types(tmp_path, firefox_binary, bool, window=10, preload_newtab=False)
     assert types, "the engine wrote no line about its processes: the control cannot judge"
     assert "privilegedabout" not in types, "a process of the preloaded New Tab page was born: %s" % sorted(set(types))

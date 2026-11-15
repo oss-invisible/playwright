@@ -94,7 +94,9 @@ def test_the_client_hears_the_document_and_the_fetches_and_no_preflight(firefox_
         page = context.new_page()
         page.on("request", lambda r: heard.append((r.method, r.url.rsplit("/", 1)[-1] or "page")))
         page.goto(two_origins, wait_until="load")
-        pump = lambda: page.wait_for_timeout(100)    # the events of a sync client are delivered while it calls the browser
+        def pump():
+            page.wait_for_timeout(100)    # the events of a sync client are delivered while it calls the browser
+
         # The fetches are the page's own; each one's preflight reaches the server BEFORE its GET, so once the server
         # has seen both GETs every OPTIONS the browser would make has been made.
         assert wait_until(lambda: sum(1 for m, _ in list(_Api.hits) if m == "GET") >= 2, 30, pump), (

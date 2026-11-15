@@ -65,7 +65,7 @@ def test_the_four_states_are_reached_on_a_real_page(firefox_binary):
                          {"removeOnDetach": True})
             page = c.send("Browser.newPage",
                           {"browserContextId": ctx["browserContextId"]})
-            deadline = time.time() + 15
+            deadline = time.time() + 30
             while page["targetId"] not in sessions and time.time() < deadline:
                 time.sleep(0.02)
             v = sessions[page["targetId"]]
@@ -84,8 +84,8 @@ def test_the_four_states_are_reached_on_a_real_page(firefox_binary):
             assert v.inflight == 0
 
             tree = v.frame_tree()
-            children = [d for d in tree.values() if d["parent"]]
-            assert len(children) == 1, tree
+            iframes = [d for d in tree.values() if d["parent"]]    # the frames of the page's tree: its one <iframe>, not a count of processes
+            assert len(iframes) == 1, tree
             assert "load" in tree[v.main_frame]["states"]
         finally:
             c.close()

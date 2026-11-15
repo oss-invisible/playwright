@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from _waits import wait_until
 from stroke_shape import stroke_problems
 
 PAGE = """<!doctype html><html><body style="margin:0">
@@ -44,7 +45,6 @@ def test_a_stroke_from_standstill_does_not_open_with_the_point_it_stands_on(fire
     """After a move that stopped on (500, 300) and a pause, the click's stroke
     begins at its first real step: the page's next `mousemove` is not (500, 300)
     again."""
-    import time
     from invisible_playwright import InvisiblePlaywright
 
     with InvisiblePlaywright(seed=4252, binary_path=firefox_binary, headless=True,
@@ -52,7 +52,9 @@ def test_a_stroke_from_standstill_does_not_open_with_the_point_it_stands_on(fire
         page = browser.new_context().new_page()
         page.set_content(PAGE)
         page.mouse.move(500, 300)
-        time.sleep(0.3)
+        # until the page has heard the move end on its point (a condition with a deadline, not 0.3 s): the click below starts from a pointer at rest
+        assert wait_until(lambda: (page.evaluate("window.moves") or [None])[-1] == [500, 300], 30,
+                          lambda: page.wait_for_timeout(50)), page.evaluate("window.moves")
         seen = len(page.evaluate("window.moves"))
         assert page.evaluate("window.moves")[-1] == [500, 300]
         page.mouse.click(400, 240)
