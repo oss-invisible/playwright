@@ -131,6 +131,8 @@ jobs:
         shell: bash
         run: python scripts/ci_lab_geoip.py build
 
+      # test_release_e2e.py and test_upgrade_e2e.py (pip, uv, PyPI, the GitHub release) are NOT in this run or in the Windows legs below: tests/conftest.py leaves
+      # them out of every run that does not name their file, and user-install.yml (the round after the publication) names it. tests/_post_publication.py.
       - name: Run the full e2e suite under a virtual display, without the root ones
         # PYTHONUNBUFFERED, and it is not a nicety. Without it Python block-buffers
         # stdout when it is a pipe, and this step printed NOTHING for 39 minutes

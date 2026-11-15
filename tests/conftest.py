@@ -96,6 +96,18 @@ def pytest_runtest_teardown(item, nextitem):
         faulthandler.cancel_dump_traceback_later()
 
 
+def pytest_collection_modifyitems(config, items):
+    """The e2e tests of the post-publication files (``tests/_post_publication.py``: pip, uv, PyPI, GitHub) belong to the round after a publication: a run
+    that does not NAME their file does not run them. ``user-install.yml`` names both files; ``scripts/run_e2e.py`` and every PR or candidate leg do not."""
+    import _post_publication
+
+    left = [item for item in items
+            if item.get_closest_marker("e2e") is not None and _post_publication.is_left_out(item.path, config.args)]
+    if left:
+        items[:] = [item for item in items if item not in left]
+        config.hook.pytest_deselected(items=left)
+
+
 def pytest_unconfigure(config):
     global _watchdog_handle
     if _watchdog_handle is not None:
