@@ -40,7 +40,7 @@ jobs:
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database
         run: python scripts/ci_lab_geoip.py build
-      - name: 10 runs: a redirect a closed context still follows
+      - name: "10 runs, a redirect a closed context still follows"
         env:
           HUNT_CLOSE: fast
           HUNT_SECOND_DELAY: ${{ matrix.delay }}
