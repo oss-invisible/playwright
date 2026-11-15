@@ -794,7 +794,7 @@ def test_hunt_a_redirect_a_closed_context_still_follows_is_resolved_through_its_
         doh.names[second] = "127.0.0.1"
         proxy = gateway("gw-context")
         with _launch(firefox_binary) as browser:
-            context = browser.new_context(proxy=proxy.proxy)
+            context = browser.new_context(proxy=proxy.proxy, ignore_https_errors=True)
             page = context.new_page()
             page.goto("http://%s:%d/page" % (first, port), wait_until="load", timeout=30000)
             print("HUNTCLOSE begin %s" % _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f"))
