@@ -20,8 +20,8 @@ THE RULES (a stable name each; ``CLASS`` is the letter of the audit of the e2e t
 * ``egress`` (D): the conftest has no autouse session fixture that declares the exit of the lab (tests/_lab_egress.py), so a launch asks three services of the internet.
 
 WHAT IS ACCEPTED WITHOUT A LIST, because it is recognised by its shape: a pause that is the step of a poll with a deadline (a ``while``/``for`` that compares with a clock
-or a deadline and ends with a ``return``, ``break`` or ``raise``); the body of ``pump``/``pause``/``wait_*``/``*_until``/``poll*`` and a lambda passed as the ``pump`` of
-``wait_until``/``watch``/``awatch``; a ``sleep`` in a method of a ``*Handler``/``*Server`` class (a test server that is slow on purpose); a ``sleep(0)``; a test that
+or a deadline and ends with a ``return``, ``break`` or ``raise``); the body of ``pump``/``pause``/``wait_*``/``*_until``/``poll*``, a function handed by name to ``wait_until``/``watch``/``awatch``, and a lambda passed as the ``pump`` of
+those; a ``sleep`` in a method of a ``*Handler``/``*Server`` class (a test server that is slow on purpose); a ``sleep(0)``; a test that
 carries no ``e2e`` marker (it runs in the unit run, with fakes).
 
 An occurrence is named by ``(file, scope, rule, nth)``: the file, the qualified name of the function or class that holds it (a module-level constant: ``<module>.NAME``), the rule,
@@ -175,6 +175,11 @@ class _Reader(ast.NodeVisitor):
         self.class_marks: List[Set[str]] = []
         self.post = file in POST_PUBLICATION
         self.server_depth = 0
+        #: The functions this file hands to ``wait_until``/``watch``/``awatch`` by name: their body is the step between two looks of a wait with a deadline.
+        self.pumps: Set[str] = set()
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) and _dotted(call.func).rsplit(".", 1)[-1] in _PUMP_CALLEES:
+                self.pumps.update(a.id for a in list(call.args) + [k.value for k in call.keywords] if isinstance(a, ast.Name))
         for node in tree.body:
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
                 self.module_marks |= _marks(node.value)
@@ -353,7 +358,7 @@ class _Reader(ast.NodeVisitor):
             parent = getattr(parent, "_parent", None)
         if lambda_of_a_pump:
             return True
-        if function is not None and not function.name.startswith("test_") and _POLLING_FUNCTIONS.match(function.name):
+        if function is not None and not function.name.startswith("test_") and (_POLLING_FUNCTIONS.match(function.name) or function.name in self.pumps):
             return True
         if self.server_depth > 0:
             return True

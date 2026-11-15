@@ -202,6 +202,7 @@ def test_a_polling_step_with_a_deadline_is_accepted():
         "def test_x(page, ready):\n    wait_until(ready, 30, lambda: page.wait_for_timeout(50))\n",
         "def test_x(page, ready):\n    watch(ready, bool, 30, pump=lambda: page.wait_for_timeout(50))\n",
         "def pump(page):\n    page.wait_for_timeout(50)\n",
+        "async def test_x(ready):\n    async def ask():\n        await asyncio.sleep(0.1)\n    await awatch(ready, bool, 30, ask)\n",
         "def _wait_for_the_frame(page):\n    page.wait_for_timeout(50)\n",
         "import time\n\nclass SlowHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        time.sleep(1.0)\n",
     ):
