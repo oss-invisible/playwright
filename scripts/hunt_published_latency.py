@@ -155,8 +155,16 @@ class StackSampler:
                     row[p.pid] = (proc_kind(p), t.user + t.system)
                 except psutil.Error:
                     pass
+            # The pingsender outlives the browser and may leave our tree when its parent exits: look for it machine-wide.
+            for p in psutil.process_iter(["name"]):
+                try:
+                    if "pingsender" in (p.info["name"] or "").lower() and p.pid not in row:
+                        t = p.cpu_times()
+                        row[p.pid] = ("pingsender", t.user + t.system)
+                except psutil.Error:
+                    pass
             self.cpu.append((now, row))
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     def explain(self, t0, t1):
         counts = {}
@@ -176,7 +184,19 @@ class StackSampler:
             d = c - (b.get(pid, (kind, 0.0))[1])
             if d > 0.01:
                 by_kind[kind] = round(by_kind.get(kind, 0) + d, 2)
-        return {"samples": n, "top_stacks": [[k, v] for k, v in top], "cpu_s_by_kind": by_kind}
+        # Who was alive during the window: per process kind, the first and last time it was seen (ms from the start of the event)
+        # and how many processes of that kind.
+        alive = {}
+        for t, row in self.cpu:
+            if t0 - 0.1 <= t <= t1 + 0.1:
+                for pid, (kind, _c) in row.items():
+                    a = alive.setdefault(kind, [None, None, set()])
+                    ms = round((t - t0) * 1000)
+                    a[0] = ms if a[0] is None else a[0]
+                    a[1] = ms
+                    a[2].add(pid)
+        return {"samples": n, "top_stacks": [[k, v] for k, v in top], "cpu_s_by_kind": by_kind,
+                "alive_ms": {k: [v[0], v[1], len(v[2])] for k, v in alive.items() if k != "python.exe" and k != "python"}}
 
 
 SAMPLER = StackSampler()
