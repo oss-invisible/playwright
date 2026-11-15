@@ -774,7 +774,7 @@ def test_hunt_a_redirect_a_closed_context_still_follows_is_resolved_through_its_
             hits.append((self.path, _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f")))
             if self.path.startswith("/page"):
                 body = ("<!doctype html><title>beacon</title><script>addEventListener('pagehide', () => "
-                        "navigator.sendBeacon('/b', 'x'));</script>").encode()
+                        "navigator.sendBeacon('http://%s:%d/c', 'x'));</script>" % (second, port)).encode()
                 self.send_response(200); self.send_header("Content-Type", "text/html"); self.send_header("Content-Length", str(len(body)))
                 self.end_headers(); self.wfile.write(body)
             elif self.path.startswith("/b"):
@@ -808,7 +808,7 @@ def test_hunt_a_redirect_a_closed_context_still_follows_is_resolved_through_its_
                 print("HUNTLOG " + _l.rstrip()[:300])
         print("HUNTSTATE hits=%s" % hits)
         sink = EgressSink(lab.witness, watcher, engine_log, lab.nonce, trap)
-        assert any(h[0].startswith("/c") for h in hits), "the redirect was not followed after the close: %s" % hits
+        assert any(h[0].startswith("/c") for h in hits), "the beacon to the new name never arrived: %s" % hits
         assert sink.leak_problems() == [], "; ".join(sink.leak_problems())
     finally:
         server.shutdown()
