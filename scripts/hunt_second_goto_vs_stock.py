@@ -26,7 +26,9 @@ repetition, a binary that is not there). The result is one JSON per browser and 
 
     python scripts/hunt_second_goto_vs_stock.py --binary "$FF" --out-dir out            # both browsers, 20 repetitions each
     python scripts/hunt_second_goto_vs_stock.py --browser stock --repetitions 3 --out-dir out
+    python scripts/hunt_second_goto_vs_stock.py --binary "$FF" --browser invisible --trace --out-dir out   # the protocol trace of ours
 
+`--trace` (our browser only) adds to every repetition what the client heard of the protocol, and when: see "the protocol trace" below.
 Stock Firefox is the one `python -m playwright install firefox` downloads for the `playwright` package installed (scripts/playwright_pin.txt).
 """
 from __future__ import annotations
@@ -204,8 +206,10 @@ def _error_class(message):
     return "other"
 
 
-async def _scenario(page, sites):
+async def _scenario(page, sites, trace=None):
     """The measurement. Every time is perf_counter; the row says them in ms from the start of goto 1 (`t=0`)."""
+    if trace is not None:
+        trace.attach(page)         # before the first goto: nothing the navigations of the page say is missed
     heard = {}                                              # path -> perf_counter the client heard its response
     page.on("response", lambda r: heard.setdefault(urlsplit(r.url).path, time.perf_counter()))
 
@@ -223,6 +227,8 @@ async def _scenario(page, sites):
             ends["first"] = time.perf_counter()
 
     t_first = time.perf_counter()
+    if trace is not None:
+        trace.t0 = t_first
     first = asyncio.ensure_future(goto1())
     deadline = time.monotonic() + HEAR_RESPONSE_S
     while "/partial" not in heard or "/partial" not in sites.arrived:
@@ -235,6 +241,8 @@ async def _scenario(page, sites):
     t_second = None
     if row["response_heard"]:
         t_second = time.perf_counter()
+        if trace is not None:
+            trace.t_second = t_second
         try:
             response = await page.goto(sites.at("c.test", "/second"), wait_until="domcontentloaded", timeout=GOTO2_TIMEOUT_MS)
             second_status = response.status if response is not None else None
@@ -277,10 +285,11 @@ async def _scenario(page, sites):
     return row
 
 
-async def _repetition(maker, index, binary):
+async def _repetition(maker, index, binary, trace_on=False):
     row = {"repetition": index, "browser": maker.name, "launched": False}
     sites = Sites()
     kind = maker(binary)
+    trace = Trace() if trace_on else None
     try:
         try:
             browser = await asyncio.wait_for(kind.launch(), LAUNCH_S)
@@ -294,16 +303,224 @@ async def _repetition(maker, index, binary):
             return row
         try:
             page = await browser.new_page()
-            row.update(await asyncio.wait_for(_scenario(page, sites), REPETITION_S))
+            row.update(await asyncio.wait_for(_scenario(page, sites, trace), REPETITION_S))
         except Exception as e:
             row["scenario_error"] = "%s: %s" % (type(e).__name__, e)
     finally:
+        if trace is not None:
+            try:
+                row.update(trace.finish(row))
+            except Exception as e:                      # the trace never costs the measurement
+                row["trace_error"] = "%s: %s" % (type(e).__name__, e)
         sites.close()
         try:
             await asyncio.wait_for(kind.close(), CLOSE_S)
         except BaseException as e:
             row["close_error"] = "%s: %s" % (type(e).__name__, e)
     return row
+
+
+# ---------------------------------------------------------------- the protocol trace
+
+#: What the client hears, by method: the events of the navigations of the pages, of the requests of their documents, of their contexts, of the targets.
+_TRACED = frozenset((
+    "Page.navigationStarted", "Page.navigationCommitted", "Page.navigationAborted", "Page.sameDocumentNavigation", "Page.eventFired",
+    "Page.frameAttached", "Page.frameDetached",
+    "Network.requestWillBeSent", "Network.responseReceived", "Network.requestFinished", "Network.requestFailed",
+    "Runtime.executionContextsCleared", "Runtime.executionContextCreated",
+    "Browser.attachedToTarget", "Browser.detachedFromTarget",
+))
+#: The commands that start, stop or replace a navigation: what the client SAID, with the reply of `Page.navigate` (the id of its navigation).
+_SAID = frozenset(("Page.navigate", "Page.stop", "Page.reload", "Page.goBack", "Page.goForward", "Page.close"))
+#: The params kept, per method (the rest is the bulk: headers, timing, security details).
+_KEPT = {
+    "Page.navigationStarted": ("frameId", "navigationId"),
+    "Page.navigationCommitted": ("frameId", "navigationId", "url"),
+    "Page.navigationAborted": ("frameId", "navigationId", "errorText"),
+    "Page.sameDocumentNavigation": ("frameId", "url"),
+    "Page.eventFired": ("frameId", "name"),
+    "Page.frameAttached": ("frameId", "parentFrameId"),
+    "Page.frameDetached": ("frameId",),
+    "Network.requestWillBeSent": ("requestId", "frameId", "navigationId", "url", "redirectedFrom", "cause"),
+    "Network.responseReceived": ("requestId", "status", "fromCache"),
+    "Network.requestFinished": ("requestId",),
+    "Network.requestFailed": ("requestId", "errorCode"),
+    "Runtime.executionContextCreated": ("executionContextId", "auxData"),
+    "Runtime.executionContextsCleared": (),
+    "Browser.attachedToTarget": ("sessionId",),
+    "Browser.detachedFromTarget": ("sessionId",),
+}
+
+
+def _reduced(method, params):
+    out = {k: params[k] for k in _KEPT.get(method, ()) if params.get(k) is not None}
+    if method == "Browser.attachedToTarget":
+        info = params.get("targetInfo") or {}
+        out.update({k: info[k] for k in ("targetId", "type", "url") if k in info})
+    return out
+
+
+class Trace:
+    """Every protocol event of the traced kinds that the CLIENT receives, with the time it received it.
+
+    The hook is the public one of the connection of the core, `Connection.add_listener(fn)` (invisible_core.juggler.connection): `fn(method,
+    params, session)` is called on the reader thread of the connection for every event the engine sends, after the subscribers the page
+    registered earlier. The connection is found the way tests/_screencast_evidence.py finds it:
+    `page._impl_obj._connection._transport._server.object(guid).conn`. The commands that start, stop or replace a navigation are seen on the
+    same connection (`send_placed`, wrapped on THIS instance only and passing everything through unchanged; removed in `finish`), so that the id of
+    each goto is the one the engine answered to its `Page.navigate`. Nothing of src/ is touched.
+
+    Times are `time.perf_counter()`, the clock of the rest of the script; `finish` turns them into ms from the start of goto 1 (`t=0`).
+    Of the network only the requests of DOCUMENTS are kept: the ones that carry a navigation id (or whose cause says document), and what follows them.
+    """
+
+    def __init__(self):
+        self.t0 = None            # perf_counter of the start of goto 1
+        self.t_second = None      # perf_counter of the start of goto 2
+        self._raw = []            # (perf_counter, method, params, session)
+        self._documents = set()   # request ids of documents
+        self._conn = None
+
+    # -- the hook
+    def attach(self, page):
+        impl = page._impl_obj
+        conn = impl._connection._transport._server.object(impl._guid).conn
+        self._conn = conn
+        conn.add_listener(self._on_event)
+        original = conn.send_placed
+        raw = self._raw
+
+        def send_placed(method, params=None, session=None, timeout=30.0):
+            said = method in _SAID
+            if said:
+                raw.append((time.perf_counter(), "send " + method, dict(params or {}), session))
+            try:
+                answer = original(method, params, session, timeout)
+            except BaseException as failure:
+                if said:
+                    raw.append((time.perf_counter(), "error " + method, {"error": str(failure)[:300]}, session))
+                raise
+            if said:
+                result = answer[0] if isinstance(answer, tuple) else answer
+                raw.append((time.perf_counter(), "reply " + method, dict(result) if isinstance(result, dict) else {}, session))
+            return answer
+
+        conn.send_placed = send_placed
+
+    def _on_event(self, method, params, session):
+        if method not in _TRACED:
+            return
+        now = time.perf_counter()
+        params = params if isinstance(params, dict) else {}
+        if method == "Network.requestWillBeSent":
+            if params.get("navigationId") or "document" in str(params.get("cause", "")).lower():
+                self._documents.add(params.get("requestId"))
+        elif method.startswith("Network.") and params.get("requestId") not in self._documents:
+            return
+        self._raw.append((now, method, params, session))
+
+    def detach(self):
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.remove_listener(self._on_event)
+            conn.__dict__.pop("send_placed", None)          # back to the method of the class
+
+    # -- the result
+    def finish(self, row):
+        self.detach()
+        raw = sorted(self._raw, key=lambda item: item[0])
+        base = self.t0 if self.t0 is not None else (raw[0][0] if raw else 0.0)
+        events = []
+        for stamp, method, params, session in raw:
+            if method.startswith(("reply ", "error ")):
+                kept = dict(params)
+            elif method.startswith("send "):
+                kept = {k: params[k] for k in ("url", "frameId") if k in params}
+            else:
+                kept = _reduced(method, params)
+            if session:
+                kept["session"] = session
+            events.append([_ms(stamp - base), method, kept])
+
+        def navigate_id(path):
+            """The id of the navigation the engine answered to the `Page.navigate` of `path`."""
+            sent = None
+            for _, method, params, _ in raw:
+                if method == "send Page.navigate":
+                    sent = params.get("url", "")
+                elif method == "reply Page.navigate" and sent is not None and urlsplit(sent).path == path:
+                    return params.get("navigationId")
+            return None
+
+        g1, g2 = navigate_id("/partial"), navigate_id("/second")
+        source = "the reply of Page.navigate"
+        if g1 is None or g2 is None:
+            # no reply to say it: the navigationStarted that follows each goto
+            started = [(stamp, params.get("navigationId")) for stamp, method, params, _ in raw if method == "Page.navigationStarted"]
+            after1 = [nid for stamp, nid in started if self.t0 is not None and stamp >= self.t0]
+            after2 = [nid for stamp, nid in started if self.t_second is not None and stamp >= self.t_second]
+            g1 = g1 or (after1[0] if after1 else None)
+            g2 = g2 or (after2[0] if after2 else None)
+            source = "the navigationStarted after each goto"
+        if row.get("goto2_outcome") is None:
+            esito = "no goto 2 (%s)" % ("scenario error" if row.get("response_heard") else "the response of the first was never heard")
+        elif row["goto2_outcome"] == "commit":
+            esito = "commit"
+        else:
+            esito = "hung" if row.get("goto2_error_class") == "timeout" else "error: %s" % row.get("goto2_error_class")
+        return {"goto1_id": g1, "goto2_id": g2, "goto_ids_from": source, "esito": esito, "events": events}
+
+
+def _token(event, goto1, goto2):
+    """One event as a short word: its method, the goto its navigation id belongs to (G1, G2, other) and what tells it apart."""
+    _, method, params = event
+    nid = params.get("navigationId")
+    who = None if not nid else "G1" if nid == goto1 else "G2" if nid == goto2 else "other"
+    short = method.replace("Page.", "").replace("Network.", "net.").replace("Runtime.", "").replace("Browser.", "")
+    path = urlsplit(params["url"]).path if params.get("url") else None
+    detail = [d for d in (who, path, params.get("errorText") or params.get("errorCode"), params.get("status"), params.get("name")) if d is not None]
+    return "%s(%s)" % (short, " ".join(str(d) for d in detail)) if detail else short
+
+
+def trace_sequences(rows):
+    """Per outcome (hung, committed, other), the sequences of the events after the `navigationStarted` of goto 2, most frequent first:
+    {outcome: [(count, [[word, ms after that navigationStarted, repeats], ...])]}. The ms are those of the first repetition with that sequence."""
+    groups = {}
+    for r in rows:
+        events, g1, g2 = r.get("events"), r.get("goto1_id"), r.get("goto2_id")
+        if not events or g2 is None:
+            continue
+        kind = {"hung": "hung", "commit": "good (committed)"}.get(r.get("esito"), r.get("esito") or "?")
+        start = next((i for i, e in enumerate(events) if e[1] == "Page.navigationStarted" and e[2].get("navigationId") == g2), None)
+        if start is None:
+            groups.setdefault(kind + ", no navigationStarted for goto 2", {}).setdefault((), [0, []])[0] += 1
+            continue
+        t_start = events[start][0]
+        folded = []
+        for e in events[start + 1:]:
+            if e[1] in ("send Page.navigate", "reply Page.navigate"):
+                continue                           # said once per goto: not what the browser does after
+            word = _token(e, g1, g2)
+            if folded and folded[-1][0] == word:   # consecutive repeats collapse: "x3"
+                folded[-1][2] += 1
+            else:
+                folded.append([word, round(e[0] - t_start, 1), 1])
+        slot = groups.setdefault(kind, {}).setdefault(tuple(w for w, _, _ in folded), [0, folded])
+        slot[0] += 1
+    return {kind: sorted(((n, f) for n, f in seqs.values()), key=lambda item: -item[0]) for kind, seqs in groups.items()}
+
+
+def render_trace(sequences, top=3):
+    out = []
+    for kind, seqs in sorted(sequences.items()):
+        out.append("== trace, repetitions %s: %d" % (kind, sum(n for n, _ in seqs)))
+        for n, folded in seqs[:top]:
+            out.append("   x%d, after the navigationStarted of goto 2 (G1 = goto 1, G2 = goto 2):" % n)
+            if not folded:
+                out.append("        (nothing)")
+            for word, at, count in folded:
+                out.append("        +%8.1f ms  %s%s" % (at, word, " x%d" % count if count > 1 else ""))
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- the summary
@@ -390,15 +607,17 @@ def _declare_the_lab(directory):
     return patch
 
 
-async def _run(makers, repetitions, binary, out_dir):
+async def _run(makers, repetitions, binary, out_dir, trace_on=False):
     rows = {m.name: [] for m in makers}
     for index in range(1, repetitions + 1):
         for maker in makers:                       # alternate: ours, stock, ours, stock, ...
-            row = await _repetition(maker, index, binary)
+            row = await _repetition(maker, index, binary, trace_on)
             rows[maker.name].append(row)
-            print("[%s %d/%d] %s" % (maker.name, index, repetitions, json.dumps({
-                k: row.get(k) for k in ("launched", "second_request_arrived", "second_request_after_goto2_start_ms", "goto1_error_class",
-                                        "goto2_outcome", "goto2_ms", "launch_error", "scenario_error")}, default=str)), flush=True)
+            shown = ["launched", "second_request_arrived", "second_request_after_goto2_start_ms", "goto1_error_class",
+                     "goto2_outcome", "goto2_ms", "launch_error", "scenario_error"]
+            if trace_on:
+                shown += ["esito", "goto1_id", "goto2_id", "trace_error"]
+            print("[%s %d/%d] %s" % (maker.name, index, repetitions, json.dumps({k: row.get(k) for k in shown}, default=str)), flush=True)
     system = {"win32": "windows", "linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
     result = {}
     for maker in makers:
@@ -408,12 +627,17 @@ async def _run(makers, repetitions, binary, out_dir):
                      "versions": _versions(), "binary": binary if maker.name == "invisible" else "the Firefox of `playwright install firefox`",
                      "prefs": FISSION_ON, "hosts": "a.test, b.test, c.test -> the local server, by network.dns.localDomains",
                      "goto1_timeout_ms": GOTO1_TIMEOUT_MS, "goto2_timeout_ms": GOTO2_TIMEOUT_MS,
-                     "fresh_browser_per_repetition": True, "browsers_alternate": len(makers) > 1,
+                     "trace": trace_on, "fresh_browser_per_repetition": True, "browsers_alternate": len(makers) > 1,
                      "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
             "summary": summary,
             "rows": rows[maker.name],
         }
-        path = Path(out_dir) / ("second-goto-%s-%s.json" % (maker.name, system))
+        if trace_on:
+            payload["trace_sequences"] = {
+                kind: [{"repetitions": n, "events": [{"word": w, "ms_after_goto2_started": at, "times": c} for w, at, c in folded]}
+                       for n, folded in seqs]
+                for kind, seqs in trace_sequences(rows[maker.name]).items()}
+        path = Path(out_dir) / ("second-goto-%s%s-%s.json" % ("trace-" if trace_on else "", maker.name, system))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
         print("written", path, flush=True)
@@ -421,6 +645,8 @@ async def _run(makers, repetitions, binary, out_dir):
     print()
     for maker in makers:
         print(render(maker.name, result[maker.name]), flush=True)
+        if trace_on:
+            print(render_trace(trace_sequences(rows[maker.name])), flush=True)
     return result
 
 
@@ -432,7 +658,11 @@ def main(argv=None):
                         help="the engine of invisible_playwright (default: $INVPW_BINARY_PATH, then $FF)")
     parser.add_argument("--repetitions", type=int, default=REPETITIONS, help="per browser (default %d)" % REPETITIONS)
     parser.add_argument("--out-dir", default="second-goto", help="where the JSON of each browser is written")
+    parser.add_argument("--trace", action="store_true",
+                        help="record, in every repetition, the protocol events the client hears with their time (needs --browser invisible)")
     args = parser.parse_args(argv)
+    if args.trace and args.browser != "invisible":
+        parser.error("--trace records the protocol of OUR browser: say --browser invisible")
 
     makers = {"both": [_Ours, _Stock], "invisible": [_Ours], "stock": [_Stock]}[args.browser]
     if _Ours in makers and not args.binary:
@@ -440,7 +670,7 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(prefix="second-goto-") as lab:
         patch = _declare_the_lab(lab) if _Ours in makers else None
         try:
-            result = asyncio.run(_run(makers, args.repetitions, args.binary, args.out_dir))
+            result = asyncio.run(_run(makers, args.repetitions, args.binary, args.out_dir, args.trace))
         finally:
             if patch is not None:
                 patch.undo()
