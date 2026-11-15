@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+import socketserver
 import sys
 import threading
 import time
@@ -30,10 +32,11 @@ EVALS = 100
 GOTOS = 10
 SEED = 42
 TEXT = "someone@example.com"
-#: The page stamps every keydown, keyup, mousemove and click with performance.timeOrigin + performance.now() in the handler.
+#: The page stamps every keydown and keyup with two clocks, the event's birth (performance.timeOrigin + event.timeStamp) and the
+#: handler (performance.timeOrigin + performance.now()); every mousemove and click with the handler's.
 TYPE_PAGE = (b"<!doctype html><html><body style='margin:0'><div style='height:300px'></div><input id=f style='margin-left:300px'>"
              b"<script>window.__k=[];window.__u=[];window.__m=[];window.__c=[];const T=()=>performance.timeOrigin+performance.now();"
-             b"document.addEventListener('keydown',e=>__k.push([e.key,T()]),true);document.addEventListener('keyup',e=>__u.push([e.key,T()]),true);"
+             b"document.addEventListener('keydown',e=>__k.push([e.key,performance.timeOrigin+e.timeStamp,T()]),true);document.addEventListener('keyup',e=>__u.push([e.key,performance.timeOrigin+e.timeStamp,T()]),true);"
              b"document.addEventListener('mousemove',e=>__m.push(T()),true);document.addEventListener('click',e=>__c.push(T()),true);</script></body></html>")
 
 
@@ -43,25 +46,41 @@ def typing_plan():
     return plan_typing(TEXT, TypingPersona.from_seed(SEED), nonce=1)
 
 
-def typing_report(arm, keys, ups, moves, clicks, plan):
-    """What the page saw against the plan: per key the slip of its keydown (page time from the first keydown, against the planned
-    time); keys over 100 ms from the plan; compressions (a gap between two keydowns under half the planned gap, the catch-up after a
-    stall); the mouse: the longest gap between two mousemoves and the bursts (gaps under 2 ms)."""
-    downs = [t for k, t in keys if k != "Shift"]
+def _against_plan(times, planned, prefix):
+    """Slip of each instant against the plan, both anchored at their first: p50 and max of |slip|, keys over 100 ms, compressions (a
+    gap under half the planned gap, the catch-up after a stall)."""
+    page = [x - times[0] for x in times]
+    slip = [p - q for p, q in zip(page, planned)]
+    rel = sorted(abs(s) for s in slip)
+    gaps_p = [page[i + 1] - page[i] for i in range(len(page) - 1)]
+    gaps_q = [planned[i + 1] - planned[i] for i in range(len(planned) - 1)]
+    return {prefix + "slip_abs_p50": round(rel[len(rel) // 2], 1), prefix + "slip_abs_max": round(rel[-1], 1),
+            prefix + "keys_over_100ms": sum(1 for s in rel if s > 100), prefix + "slip_last": round(slip[-1], 1),
+            prefix + "compressions": sum(1 for a, b in zip(gaps_p, gaps_q) if b >= 40 and a < 0.5 * b)}
+
+
+def typing_report(arm, keys, ups, moves, clicks, plan, sends=None):
+    """What the page saw against the plan, on TWO clocks of each keydown: event.timeStamp (the event's birth: criterion 1b is judged
+    on it, unprefixed keys) and performance.now() in the handler (prefix h_). With the client's sends of the keydowns (wall ms
+    before the command went out, after its answer came back), per key: planned, sent, answered, timeStamp, handler, all in ms from
+    the first send; and the client's own slip against the plan (prefix c_). The mouse: longest gap between two mousemoves and the
+    bursts (gaps under 2 ms)."""
+    downs = [(ts, h) for k, ts, h in keys if k != "Shift"]
     planned, t = [], 0.0
     for dwell, gap in plan:
         planned.append(t)
         t += dwell + gap
     out = {"keys_seen": len(downs), "keys_planned": len(plan)}
     if downs and len(downs) == len(plan):
-        page = [x - downs[0] for x in downs]
-        slip = [p - q for p, q in zip(page, planned)]
-        rel = [abs(s) for s in slip]
-        gaps_p = [page[i + 1] - page[i] for i in range(len(page) - 1)]
-        gaps_q = [planned[i + 1] - planned[i] for i in range(len(planned) - 1)]
-        out.update({"slip_abs_p50": round(sorted(rel)[len(rel) // 2], 1), "slip_abs_max": round(max(rel), 1),
-                    "keys_over_100ms": sum(1 for s in rel if s > 100), "slip_last": round(slip[-1], 1),
-                    "compressions": sum(1 for a, b in zip(gaps_p, gaps_q) if b >= 40 and a < 0.5 * b)})
+        ts, hd = [d[0] for d in downs], [d[1] for d in downs]
+        out.update(_against_plan(ts, planned, ""))
+        out.update(_against_plan(hd, planned, "h_"))
+        out["handler_minus_ts"] = [round(h - s, 1) for s, h in downs]
+        if sends and len(sends) == len(plan):
+            s0 = sends[0][0]
+            out.update(_against_plan([s for s, _r in sends], planned, "c_"))
+            out["detail"] = [[round(p, 1), round(s - s0, 1), round(r - s0, 1), round(a - s0, 1), round(b - s0, 1)]
+                             for p, (s, r), (a, b) in zip(planned, sends, downs)]
     mg = [moves[i + 1] - moves[i] for i in range(len(moves) - 1)]
     out.update({"mousemoves": len(moves), "mouse_gap_max": round(max(mg), 1) if mg else None,
                 "mouse_bursts_under_2ms": sum(1 for g in mg if g < 2), "clicks": len(clicks)})
@@ -73,7 +92,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):  # noqa: N802
-        if self.path.startswith("/type"):
+        # Through the hunt's proxy the request line carries the absolute URI.
+        if urlsplit(self.path).path.startswith("/type"):
             body = TYPE_PAGE
         else:
             q = parse_qs(urlsplit(self.path).query)
@@ -103,6 +123,124 @@ def engine_cpu():
 
 SLOW = []          # (kind, tag, t0, t1) in time.monotonic(): every event over SLOW_MS
 SLOW_MS = 1000
+#: The late arm (HUNT_TYPE_LATE_S): typing waits until every browser of the process launched, plus this many seconds.
+TYPE_LATE_S = float(os.environ.get("HUNT_TYPE_LATE_S") or 0)
+LAUNCHED = {"n": 0, "of": 1, "t": None, "event": None}
+#: The proxy arm (HUNT_PROXY=1): a local forwarding proxy (CONNECT and absolute-URI GET) in this process.
+PROXY_PORT = 0
+#: Every keydown and keyup our client sent through the core's Keyboard: (id of the keyboard, "down" or "up", key, wall ms before
+#: the command went out, wall ms after its answer came back).
+KEYSENDS = []
+
+
+class ProxyHandler(socketserver.StreamRequestHandler):
+    """HUNT: a forwarding proxy, so the proxy arm needs nothing outside the runner but the internet the egress echo already uses."""
+
+    def handle(self):
+        line = self.rfile.readline(65536)
+        parts = line.split()
+        if len(parts) < 2:
+            return
+        head = [line]
+        while True:
+            h = self.rfile.readline(65536)
+            head.append(h)
+            if h in (b"\r\n", b"\n", b""):
+                break
+        try:
+            if parts[0] == b"CONNECT":
+                host, port = parts[1].decode().rsplit(":", 1)
+                up = socket.create_connection((host.strip("[]"), int(port)), 15)
+                self.wfile.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                self.wfile.flush()
+            else:
+                u = urlsplit(parts[1].decode())
+                up = socket.create_connection((u.hostname, u.port or 80), 15)
+                up.sendall(b"".join(head))
+        except OSError:
+            return
+        up.settimeout(None)
+        self.connection.settimeout(None)
+
+        def pump(a, b):
+            try:
+                while True:
+                    d = a.recv(65536)
+                    if not d:
+                        break
+                    b.sendall(d)
+            except OSError:
+                pass
+            finally:
+                for x in (a, b):
+                    try:
+                        x.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+        t = threading.Thread(target=pump, args=(up, self.connection), daemon=True)
+        t.start()
+        pump(self.connection, up)
+        t.join(30)
+        up.close()
+
+
+class ThreadingProxy(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def install_key_probe():
+    """Wrap the core's Keyboard.down / up (the only senders of Page.dispatchKeyEvent in our client): the wall time before the command
+    goes out and after its answer, per keyboard instance (one per page)."""
+    try:
+        from invisible_core.juggler import keyboard as kb
+    except Exception as exc:   # noqa: BLE001
+        PROBE.append(("probe-error keyboard", "", 0, 0, repr(exc)[:200]))
+        return
+    for verb in ("down", "up"):
+        real = getattr(kb.Keyboard, verb)
+        if getattr(real, "_hunt", False):
+            continue
+
+        def call(self, key, *a, _real=real, _verb=verb, **k):
+            t = time.time() * 1000
+            try:
+                return _real(self, key, *a, **k)
+            finally:
+                KEYSENDS.append((id(self), _verb, key, t, time.time() * 1000))
+        call._hunt = True
+        setattr(kb.Keyboard, verb, call)
+
+
+def match_sends(rows):
+    """Give each browser of our arms the keydowns its own keyboard sent: the assignment of keyboards to browsers that puts every
+    keydown's answer closest to the page's timeStamp of the same key (brute force: at most 4 browsers per process)."""
+    import itertools
+    groups = {}
+    for kid, verb, key, t, r in KEYSENDS:
+        if verb == "down" and key != "Shift":
+            groups.setdefault(kid, []).append((t, r))
+    raws = [(i, r["typing"]["raw"]) for i, r in enumerate(rows) if isinstance(r, dict) and "raw" in (r.get("typing") or {})]
+    need = [(i, raw) for i, raw in raws if raw[5] is None]
+    gl = list(groups.values())
+    if not need or not gl:
+        return
+
+    def cost(raw, g):
+        ts = [x[1] for x in raw[0] if x[0] != "Shift"]
+        if len(ts) != len(g):
+            return 1e12
+        d = sorted(abs(a - r) for a, (_t, r) in zip(ts, g))
+        return d[len(d) // 2]
+    best = None
+    for perm in itertools.permutations(range(len(gl)), min(len(need), len(gl))):
+        c = sum(cost(raw, gl[j]) for (_i, raw), j in zip(need, perm))
+        if best is None or c < best[0]:
+            best = (c, perm)
+    for (i, raw), j in zip(need, best[1]):
+        if cost(raw, gl[j]) < 1e12:
+            raw[5] = gl[j]
+            rows[i]["typing"]["match_ms"] = round(cost(raw, gl[j]), 1)
 
 
 def proc_kind(p):
@@ -226,14 +364,25 @@ async def typing(page, port, arm):
     follows the core's plan; stock through the same plan driven by hand (it has none of its own: only the runner's delay)."""
     plan = typing_plan()
     await page.goto("http://127.0.0.1:%d/type" % port, wait_until="load", timeout=30000)
+    if TYPE_LATE_S:
+        # The late arm: typing starts TYPE_LATE_S after the last browser of this process finished launching (browsers settled).
+        try:
+            await asyncio.wait_for(LAUNCHED["event"].wait(), 300)
+            await asyncio.sleep(max(0.0, LAUNCHED["t"] + TYPE_LATE_S - time.monotonic()))
+        except asyncio.TimeoutError:
+            pass
     m0 = time.monotonic()
+    cpu0 = psutil.cpu_times()
+    sends = []
     if arm == "stock":
         await page.mouse.move(10, 10)
         await page.click("#f")
         for (dwell, gap), ch in zip(plan, TEXT):
             if ch == "@":
                 await page.keyboard.down("Shift")
+            ts = time.time() * 1000
             await page.keyboard.down(ch)
+            sends.append((ts, time.time() * 1000))
             await asyncio.sleep(dwell / 1000)
             await page.keyboard.up(ch)
             if ch == "@":
@@ -243,10 +392,12 @@ async def typing(page, port, arm):
         await page.locator("#f").click()
         await page.locator("#f").press_sequentially(TEXT)
     took = time.monotonic() - m0
+    cpu1 = psutil.cpu_times()
+    tot = sum(cpu1) - sum(cpu0)
     keys, ups, moves, clicks = await page.evaluate("[window.__k, window.__u, window.__m, window.__c]")
-    rep = typing_report(arm, keys, ups, moves, clicks, plan)
-    rep["typing_wall_ms"] = round(took * 1000)
-    return rep
+    # The report is made in main(), once the client's sends of our arms are matched to their browser.
+    return {"raw": [keys, ups, moves, clicks, plan, sends or None], "typing_wall_ms": round(took * 1000),
+            "machine_cpu_busy_pct": round(100 * (1 - (cpu1.idle - cpu0.idle) / tot), 1) if tot > 0 else None}
 
 
 async def serve_endpoint(binary):
@@ -277,7 +428,12 @@ async def one_browser(arm, binary, port, tag):
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
         extra = json.loads(os.environ.get("HUNT_EXTRA_PREFS") or "{}") or None
-        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True, extra_prefs=extra)
+        more = {}
+        if os.environ.get("HUNT_TIMEZONE"):
+            more["timezone"] = os.environ["HUNT_TIMEZONE"]
+        if PROXY_PORT:
+            more["proxy"] = {"server": "http://127.0.0.1:%d" % PROXY_PORT}
+        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True, extra_prefs=extra, **more)
         browser = await cm.__aenter__()
         close = lambda: cm.__aexit__(None, None, None)
     elif arm == "remote":
@@ -301,6 +457,10 @@ async def one_browser(arm, binary, port, tag):
             await pw.stop()
     page = await browser.new_page()
     row["launch_ms"] = round((time.monotonic() - t0) * 1000)
+    LAUNCHED["n"] += 1
+    if LAUNCHED["n"] >= LAUNCHED["of"]:
+        LAUNCHED["t"] = time.monotonic()
+        LAUNCHED["event"].set()
     if row["launch_ms"] > SLOW_MS:
         SLOW.append(("launch", tag, t0, time.monotonic()))
     row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag)
@@ -434,9 +594,26 @@ async def main(arm, n, rnd, binary):
     SAMPLER.start()
     if arm in ("inproc", "remote") and os.environ.get("HUNT_PROBES") == "1":
         install_probes()
+    if arm == "inproc":
+        install_key_probe()
+    global PROXY_PORT
+    if os.environ.get("HUNT_PROXY") == "1":
+        proxy = ThreadingProxy(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=proxy.serve_forever, daemon=True, name="hunt-proxy").start()
+        PROXY_PORT = proxy.server_address[1]
+    LAUNCHED.update({"of": n, "event": asyncio.Event()})
     t0, t_mono0 = time.time(), time.monotonic()
     rows = await asyncio.gather(*(one_browser(arm, binary, port, "%s-%s-%d" % (arm, rnd, i)) for i in range(n)), return_exceptions=True)
     cpu = sampler.total()
+    match_sends(rows)
+    for r in rows:
+        if isinstance(r, dict) and "raw" in (r.get("typing") or {}):
+            t = r["typing"]
+            keys, ups, moves, clicks, plan, sends = t.pop("raw")
+            try:
+                t.update(typing_report(arm, keys, ups, moves, clicks, plan, sends))
+            except Exception as exc:   # noqa: BLE001
+                t["error"] = "report %s: %s" % (type(exc).__name__, str(exc)[:200])
     for r in rows:
         if isinstance(r, Exception):
             print("HUNTROW " + json.dumps({"arm": arm, "round": rnd, "crash": repr(r)[:800]}), flush=True)

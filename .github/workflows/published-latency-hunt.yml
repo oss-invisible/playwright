@@ -1,6 +1,8 @@
 # HUNT ONLY, never merged. The PUBLISHED packages against stock Playwright, same job, alternated rounds, Windows and Linux:
 # after = invisible-playwright 0.52.1 + invisible-core 64.73.0, before = 0.52.0 + 64.71.0, both on the engine firefox-64.
-# Arms: inproc4 (4 browsers in one process), one (1 browser per process, 4 processes at once), remote (launch_server), stock, before.
+# Arms: inproc4 (4 browsers in one process, no timezone, no proxy), inproc4tz (timezone given), inproc4px (through a local proxy),
+# inproc4np (network.proxy.type 0), late (typing 60 s after the last launch), solo (one browser alone on the machine),
+# one (1 browser per process, 4 processes at once), remote (launch_server), stock, before.
 name: published latency hunt
 on:
   push:
@@ -60,6 +62,10 @@ jobs:
             case "$1" in
               inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4] /' ;;
               before)  "$PY_BEFORE" $S inproc 4 "$2" "$FF_BEFORE" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [before] /' ;;
+              inproc4tz) HUNT_TIMEZONE=Europe/Rome "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4tz] /' ;;
+              inproc4px) HUNT_PROXY=1 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4px] /' ;;
+              late)    HUNT_TYPE_LATE_S=60 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [late] /' ;;
+              solo)    "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [solo] /' ;;
               inproc4np) HUNT_EXTRA_PREFS='{"network.proxy.type": 0}' "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4np] /' ;;
               remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [remote] /' ;;
               stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [stock] /' ;;
@@ -68,7 +74,7 @@ jobs:
             esac
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
-          ARMS=(inproc4 inproc4np one remote stock before)
+          ARMS=(inproc4 inproc4tz inproc4px inproc4np late solo one remote stock before)
           if [ -n "$ONLY_ARMS" ]; then read -ra ARMS <<< "$ONLY_ARMS"; fi
           N=${#ARMS[@]}
           for r in 0 1 2 3 4 5; do
@@ -88,7 +94,7 @@ jobs:
           def q(v, p):
               v = sorted(x for x in v if x is not None)
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
-          for arm in ("before", "inproc4", "inproc4np", "one", "remote", "stock"):
+          for arm in ("before", "inproc4", "inproc4tz", "inproc4px", "inproc4np", "late", "solo", "one", "remote", "stock"):
               r = [x for x in rows.get(arm, []) if "crash" not in x]
               crashes = len(rows.get(arm, [])) - len(r)
               ev = [e for x in r for e in x["eval_ms"]]
@@ -105,6 +111,24 @@ jobs:
                        sum(t["keys_over_100ms"] for t in ok), sum(t["keys_planned"] for t in ok), sum(t["compressions"] for t in ok),
                        max((t["mouse_gap_max"] or 0 for t in ty if "mousemoves" in t), default=None), sum(t.get("mouse_bursts_under_2ms", 0) for t in ty),
                        sum(t.get("clicks", 0) for t in ty), errs[:2]))
+              # Where the slip is born, per key (detail = planned, sent, answered, timeStamp, handler; ms from the first send).
+              det = [d for t in ok for d in t.get("detail") or []]
+              late_c = [d[1] - d[0] for d in det]
+              rt = [d[2] - d[1] for d in det]
+              birth = [d[3] - d[1] for d in det]
+              hts = [h for t in ok for h in t.get("handler_minus_ts") or []]
+              print("HUNTKEYCLOCKS %-8s on event.timeStamp: keys over 100 ms %d, max %s, compressions %d | on the handler: keys over 100 ms %d, max %s | handler - timeStamp p50 %s p95 %s max %s | matched %d of %d | machine CPU busy %% during typing p50 %s max %s"
+                    % (arm, sum(t["keys_over_100ms"] for t in ok), max((t["slip_abs_max"] for t in ok), default=None), sum(t["compressions"] for t in ok),
+                       sum(t.get("h_keys_over_100ms", 0) for t in ok), max((t.get("h_slip_abs_max", 0) for t in ok), default=None),
+                       q(hts, .5), q(hts, .95), max(hts, default=None), sum(1 for t in ok if t.get("detail")), len(ok),
+                       q([t.get("machine_cpu_busy_pct") for t in ty], .5), max((t.get("machine_cpu_busy_pct") or 0 for t in ty), default=None)))
+              if det:
+                  print("HUNTKEYSPLIT %-8s client send vs plan: keys over 100 ms %d, p50 %s max %s | client send -> engine answer p50 %s p95 %s max %s | client send -> event.timeStamp p50 %s p95 %s max %s"
+                        % (arm, sum(1 for x in late_c if abs(x) > 100), q(late_c, .5), max(late_c), q(rt, .5), q(rt, .95), max(rt), q(birth, .5), q(birth, .95), max(birth)))
+                  worst = sorted(((abs((t["detail"][i][3] - t["detail"][0][3]) - t["detail"][i][0]), t["detail"][max(0, i - 1):i + 1]) for t in ok if t.get("detail")
+                                  for i in range(len(t["detail"]))), key=lambda w: -w[0])[:4]
+                  for slip, pair in worst:
+                      print("HUNTKEYWORST %-8s timeStamp slip %.0f ms | previous and this key [planned, sent, answered, timeStamp, handler]: %s" % (arm, slip, pair))
           PY
           python - "$RUNNER_TEMP/rows.log" <<'PY2'
           import json, re, sys
