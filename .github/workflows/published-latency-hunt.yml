@@ -50,20 +50,18 @@ jobs:
           echo "FF_BEFORE=$(cd "$RUNNER_TEMP" && "$PY_BEFORE" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: Six rounds, the arms in rotating order
         continue-on-error: true
-        env:
-          ONLY_ARMS: "remote stock"
         timeout-minutes: 70
         run: |
           set +e
           S=scripts/hunt_published_latency.py
           run_arm() {
             case "$1" in
-              inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [inproc4] /' ;;
-              before)  "$PY_BEFORE" $S inproc 4 "$2" "$FF_BEFORE" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [before] /' ;;
-              remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [remote] /' ;;
-              stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [stock] /' ;;
+              inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4] /' ;;
+              before)  "$PY_BEFORE" $S inproc 4 "$2" "$FF_BEFORE" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [before] /' ;;
+              remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [remote] /' ;;
+              stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [stock] /' ;;
               one)     for k in 0 1 2 3; do "$PY_AFTER" $S inproc 1 "$2-$k" "$FF_AFTER" > "$RUNNER_TEMP/one-$k.log" 2>&1 & done; wait
-                       cat "$RUNNER_TEMP"/one-*.log | grep HUNTROW | sed 's/^HUNTROW /HUNTROW [one] /' ;;
+                       cat "$RUNNER_TEMP"/one-*.log | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [one] /' ;;
             esac
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }

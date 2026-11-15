@@ -59,18 +59,103 @@ def engine_cpu():
     return out
 
 
+SLOW = []          # (kind, tag, t0, t1) in time.monotonic(): every event over SLOW_MS
+SLOW_MS = 1000
+
+
+def proc_kind(p):
+    try:
+        name = p.name().lower()
+        if "firefox" in name or "plugin-container" in name:
+            cmd = p.cmdline()
+            return "ff:" + (cmd[-1] if "-contentproc" in cmd else "parent")
+        return name
+    except psutil.Error:
+        return "?"
+
+
+class StackSampler:
+    """Every 25 ms the top frames of every Python thread of this process; every 200 ms the CPU of every process under it, by kind.
+    An event over SLOW_MS is then explained from what was sampled in its window."""
+
+    def __init__(self):
+        self.stacks, self.cpu, self.stop = [], [], threading.Event()
+        self.me = threading.get_ident()
+
+    def start(self):
+        threading.Thread(target=self._stacks, daemon=True, name="hunt-stacks").start()
+        threading.Thread(target=self._cpu, daemon=True, name="hunt-cpu").start()
+
+    def _stacks(self):
+        import traceback
+        while not self.stop.is_set():
+            now = time.monotonic()
+            names = {t.ident: t.name for t in threading.enumerate()}
+            snap = {}
+            for ident, frame in sys._current_frames().items():
+                if ident == self.me or names.get(ident, "").startswith("hunt-"):
+                    continue
+                snap[names.get(ident, str(ident))] = tuple("%s:%d %s" % (f.filename.replace("\\", "/").rsplit("/", 2)[-1], f.lineno, f.name)
+                                                          for f in traceback.extract_stack(frame)[-6:])
+            self.stacks.append((now, snap))
+            time.sleep(0.025)
+
+    def _cpu(self):
+        while not self.stop.is_set():
+            now, row = time.monotonic(), {}
+            try:
+                procs = [psutil.Process()] + psutil.Process().children(recursive=True)
+            except psutil.Error:
+                procs = []
+            for p in procs:
+                try:
+                    t = p.cpu_times()
+                    row[p.pid] = (proc_kind(p), t.user + t.system)
+                except psutil.Error:
+                    pass
+            self.cpu.append((now, row))
+            time.sleep(0.2)
+
+    def explain(self, t0, t1):
+        counts = {}
+        n = 0
+        for t, snap in self.stacks:
+            if t0 <= t <= t1:
+                n += 1
+                for th, frames in snap.items():
+                    key = th + " | " + " < ".join(reversed(frames[-3:]))
+                    counts[key] = counts.get(key, 0) + 1
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+        before = [r for t, r in self.cpu if t <= t0][-1:] or [{}]
+        after = [r for t, r in self.cpu if t >= t1][:1] or [self.cpu[-1][1] if self.cpu else {}]
+        b, a = before[0], after[0]
+        by_kind = {}
+        for pid, (kind, c) in a.items():
+            d = c - (b.get(pid, (kind, 0.0))[1])
+            if d > 0.01:
+                by_kind[kind] = round(by_kind.get(kind, 0) + d, 2)
+        return {"samples": n, "top_stacks": [[k, v] for k, v in top], "cpu_s_by_kind": by_kind}
+
+
+SAMPLER = StackSampler()
+
+
 async def work(page, port, tag):
     goto = []
     for i in range(GOTOS):
-        t0 = time.time() * 1000
+        t0, m0 = time.time() * 1000, time.monotonic()
         await page.goto("http://127.0.0.1:%d/p?b=%s&i=%d" % (port, tag, i), wait_until="load", timeout=30000)
         arrived = ARRIVED.get((tag, str(i)))
         goto.append(round(arrived - t0, 1) if arrived else None)
+        if arrived and arrived - t0 > SLOW_MS:
+            SLOW.append(("goto->request", tag, m0, m0 + (arrived - t0) / 1000))
     ev = []
     for _ in range(EVALS):
-        t0 = time.perf_counter()
+        t0 = time.monotonic()
         await page.evaluate("1 + 1")
-        ev.append(round((time.perf_counter() - t0) * 1000, 2))
+        ev.append(round((time.monotonic() - t0) * 1000, 2))
+        if ev[-1] > SLOW_MS:
+            SLOW.append(("evaluate", tag, t0, time.monotonic()))
     return goto, ev
 
 
@@ -98,7 +183,7 @@ def serve_one(binary):
 
 async def one_browser(arm, binary, port, tag):
     row = {"arm": arm, "tag": tag}
-    t0 = time.perf_counter()
+    t0 = time.monotonic()
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
         cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=False, headless=True)
@@ -124,11 +209,15 @@ async def one_browser(arm, binary, port, tag):
             await browser.close()
             await pw.stop()
     page = await browser.new_page()
-    row["launch_ms"] = round((time.perf_counter() - t0) * 1000)
+    row["launch_ms"] = round((time.monotonic() - t0) * 1000)
+    if row["launch_ms"] > SLOW_MS:
+        SLOW.append(("launch", tag, t0, time.monotonic()))
     row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag)
-    t1 = time.perf_counter()
+    t1 = time.monotonic()
     await close()
-    row["close_ms"] = round((time.perf_counter() - t1) * 1000)
+    row["close_ms"] = round((time.monotonic() - t1) * 1000)
+    if row["close_ms"] > SLOW_MS:
+        SLOW.append(("close", tag, t1, time.monotonic()))
     return row
 
 
@@ -157,6 +246,7 @@ async def main(arm, n, rnd, binary):
     port = httpd.server_address[1]
     sampler = CpuSampler()
     sampler.t.start()
+    SAMPLER.start()
     t0 = time.time()
     rows = await asyncio.gather(*(one_browser(arm, binary, port, "%s-%s-%d" % (arm, rnd, i)) for i in range(n)), return_exceptions=True)
     cpu = sampler.total()
@@ -166,6 +256,10 @@ async def main(arm, n, rnd, binary):
             continue
         r.update({"round": rnd, "n": n, "os": sys.platform, "wall_s": round(time.time() - t0, 1), "cpu_s_per_browser": round(cpu / n, 2)})
         print("HUNTROW " + json.dumps(r), flush=True)
+    SAMPLER.stop.set()
+    for kind, tag, a, b in SLOW:
+        print("HUNTSLOW " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "kind": kind, "tag": tag, "ms": round((b - a) * 1000),
+                                        **SAMPLER.explain(a, b)}), flush=True)
     httpd.shutdown()
 
 
