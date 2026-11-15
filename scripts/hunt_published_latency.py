@@ -27,6 +27,44 @@ import psutil
 ARRIVED = {}
 EVALS = 100
 GOTOS = 10
+SEED = 42
+TEXT = "someone@example.com"
+#: The page stamps every keydown, keyup, mousemove and click with performance.timeOrigin + performance.now() in the handler.
+TYPE_PAGE = (b"<!doctype html><html><body style='margin:0'><div style='height:300px'></div><input id=f style='margin-left:300px'>"
+             b"<script>window.__k=[];window.__u=[];window.__m=[];window.__c=[];const T=()=>performance.timeOrigin+performance.now();"
+             b"document.addEventListener('keydown',e=>__k.push([e.key,T()]),true);document.addEventListener('keyup',e=>__u.push([e.key,T()]),true);"
+             b"document.addEventListener('mousemove',e=>__m.push(T()),true);document.addEventListener('click',e=>__c.push(T()),true);</script></body></html>")
+
+
+def typing_plan():
+    """The core's plan for the session's first field: (dwell, gap) per character, for the persona of SEED and typing nonce 1."""
+    from invisible_core.juggler._behaviour import TypingPersona, plan_typing
+    return plan_typing(TEXT, TypingPersona.from_seed(SEED), nonce=1)
+
+
+def typing_report(arm, keys, ups, moves, clicks, plan):
+    """What the page saw against the plan: per key the slip of its keydown (page time from the first keydown, against the planned
+    time); keys over 100 ms from the plan; compressions (a gap between two keydowns under half the planned gap, the catch-up after a
+    stall); the mouse: the longest gap between two mousemoves and the bursts (gaps under 2 ms)."""
+    downs = [t for k, t in keys if k != "Shift"]
+    planned, t = [], 0.0
+    for dwell, gap in plan:
+        planned.append(t)
+        t += dwell + gap
+    out = {"keys_seen": len(downs), "keys_planned": len(plan)}
+    if downs and len(downs) == len(plan):
+        page = [x - downs[0] for x in downs]
+        slip = [p - q for p, q in zip(page, planned)]
+        rel = [abs(s) for s in slip]
+        gaps_p = [page[i + 1] - page[i] for i in range(len(page) - 1)]
+        gaps_q = [planned[i + 1] - planned[i] for i in range(len(planned) - 1)]
+        out.update({"slip_abs_p50": round(sorted(rel)[len(rel) // 2], 1), "slip_abs_max": round(max(rel), 1),
+                    "keys_over_100ms": sum(1 for s in rel if s > 100), "slip_last": round(slip[-1], 1),
+                    "compressions": sum(1 for a, b in zip(gaps_p, gaps_q) if b >= 40 and a < 0.5 * b)})
+    mg = [moves[i + 1] - moves[i] for i in range(len(moves) - 1)]
+    out.update({"mousemoves": len(moves), "mouse_gap_max": round(max(mg), 1) if mg else None,
+                "mouse_bursts_under_2ms": sum(1 for g in mg if g < 2), "clicks": len(clicks)})
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -34,10 +72,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):  # noqa: N802
-        q = parse_qs(urlsplit(self.path).query)
-        key = (q.get("b", [""])[0], q.get("i", [""])[0])
-        ARRIVED.setdefault(key, time.time() * 1000)
-        body = b"<!doctype html><title>p</title><body>p</body>"
+        if self.path.startswith("/type"):
+            body = TYPE_PAGE
+        else:
+            q = parse_qs(urlsplit(self.path).query)
+            key = (q.get("b", [""])[0], q.get("i", [""])[0])
+            ARRIVED.setdefault(key, time.time() * 1000)
+            body = b"<!doctype html><title>p</title><body>p</body>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(body)))
@@ -159,6 +200,34 @@ async def work(page, port, tag):
     return goto, ev
 
 
+async def typing(page, port, arm):
+    """A click into a field (with the cursor's path when humanised) and the fixed text: ours through press_sequentially, which
+    follows the core's plan; stock through the same plan driven by hand (it has none of its own: only the runner's delay)."""
+    plan = typing_plan()
+    await page.goto("http://127.0.0.1:%d/type" % port, wait_until="load", timeout=30000)
+    m0 = time.monotonic()
+    if arm == "stock":
+        await page.mouse.move(10, 10)
+        await page.click("#f")
+        for (dwell, gap), ch in zip(plan, TEXT):
+            if ch == "@":
+                await page.keyboard.down("Shift")
+            await page.keyboard.down(ch)
+            await asyncio.sleep(dwell / 1000)
+            await page.keyboard.up(ch)
+            if ch == "@":
+                await page.keyboard.up("Shift")
+            await asyncio.sleep(gap / 1000)
+    else:
+        await page.locator("#f").click()
+        await page.locator("#f").press_sequentially(TEXT)
+    took = time.monotonic() - m0
+    keys, ups, moves, clicks = await page.evaluate("[window.__k, window.__u, window.__m, window.__c]")
+    rep = typing_report(arm, keys, ups, moves, clicks, plan)
+    rep["typing_wall_ms"] = round(took * 1000)
+    return rep
+
+
 async def serve_endpoint(binary):
     proc = await asyncio.create_subprocess_exec(sys.executable, __file__, "serve", binary,
                                                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -173,7 +242,7 @@ async def serve_endpoint(binary):
 
 def serve_one(binary):
     from invisible_playwright._juggler.remote import launch_server
-    server = launch_server(headless=True, binary_path=binary, seed=42, humanize=False)
+    server = launch_server(headless=True, binary_path=binary, seed=42, humanize=True)
     print("ENDPOINT " + server.ws_endpoint, flush=True)
     try:
         sys.stdin.read()
@@ -186,7 +255,7 @@ async def one_browser(arm, binary, port, tag):
     t0 = time.monotonic()
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
-        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=False, headless=True)
+        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True)
         browser = await cm.__aenter__()
         close = lambda: cm.__aexit__(None, None, None)
     elif arm == "remote":
@@ -213,6 +282,10 @@ async def one_browser(arm, binary, port, tag):
     if row["launch_ms"] > SLOW_MS:
         SLOW.append(("launch", tag, t0, time.monotonic()))
     row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag)
+    try:
+        row["typing"] = await typing(page, port, arm)
+    except Exception as exc:   # noqa: BLE001
+        row["typing"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
     t1 = time.monotonic()
     await close()
     row["close_ms"] = round((time.monotonic() - t1) * 1000)

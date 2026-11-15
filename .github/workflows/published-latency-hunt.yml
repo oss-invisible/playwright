@@ -94,7 +94,16 @@ jobs:
                     % (arm, len(r), crashes, q([x["launch_ms"] for x in r], .5), q([x["launch_ms"] for x in r], .95), q([x["close_ms"] for x in r], .5), q([x["close_ms"] for x in r], .95),
                        q(ev, .5), q(ev, .95), max(ev) if ev else None, sum(1 for e in ev if e > 300), len(ev), q(gr, .5), q(gr, .9), max((g for g in gr if g is not None), default=None),
                        q([x["cpu_s_per_browser"] for x in r], .5)))
+              ty = [x.get("typing") or {} for x in r]
+              ok = [t for t in ty if "slip_abs_max" in t]
+              errs = [t.get("error") for t in ty if t.get("error")]
+              print("HUNTTYPING %-8s typed %d of %d | key slip vs plan: p50 of browsers %s, max %s | keys over 100 ms %d of %d | compressions %d | mouse: longest gap %s ms, bursts <2 ms %d, clicks %d | errors %s"
+                    % (arm, len(ok), len(ty), q([t["slip_abs_p50"] for t in ok], .5), max((t["slip_abs_max"] for t in ok), default=None),
+                       sum(t["keys_over_100ms"] for t in ok), sum(t["keys_planned"] for t in ok), sum(t["compressions"] for t in ok),
+                       max((t["mouse_gap_max"] or 0 for t in ty if "mousemoves" in t), default=None), sum(t.get("mouse_bursts_under_2ms", 0) for t in ty),
+                       sum(t.get("clicks", 0) for t in ty), errs[:2]))
           PY
+          grep -h "HUNTSLOW" "$RUNNER_TEMP/rows.log" | cut -c1-900 || true
       - name: Close every Firefox left
         if: always()
         run: |
