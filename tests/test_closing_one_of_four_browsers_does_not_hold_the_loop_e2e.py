@@ -160,8 +160,9 @@ _CLIENT = textwrap.dedent("""
         await control.finish()
 
         # The second control: a loop that is LATE without being held. The sentinel's next wake is 300 ms away, so the loop waits in its
-        # selector (as when the machine does not schedule it), and 150 ms in it runs 15 ms of a callback that was due then, while the
-        # sentinel is still about 145 ms late (far from Windows' 15.6 ms timer ticks). Only those 15 ms are the loop's thread at work: the lateness before them must not count.
+        # selector (as when the machine does not schedule it), and 150 ms in it runs 45 ms of a callback that was due then, while the
+        # sentinel is still about 145 ms late. Only those 45 ms are the loop's thread at work (45, not less: a watcher on Windows sleeps
+        # in 15.6 ms ticks and would not see a shorter one): the 145 ms before them must not count.
         unscheduled = Instrument()
         await unscheduled.start()
         await asyncio.sleep(0.05)
@@ -169,7 +170,7 @@ _CLIENT = textwrap.dedent("""
         loop = asyncio.get_running_loop()
 
         def burst():
-            end = time.monotonic() + 0.015
+            end = time.monotonic() + 0.045
             while time.monotonic() < end:
                 pass
         loop.call_later(0.15, burst)
@@ -280,12 +281,14 @@ def test_the_instrument_sees_a_loop_that_is_held(report):
 
 @pytest.mark.wall_clock
 def test_the_instrument_does_not_charge_a_loop_the_machine_did_not_schedule(report):
-    """The second control: a loop that waited 150 ms in its selector and then ran a 15 ms callback was not held by anybody.
+    """The second control: a loop that waited 150 ms in its selector and then ran a 45 ms callback was held for those 45 ms, not 195.
     Charging it the whole lateness made a loaded Windows runner fail the bound below with 94 ms and nothing on the loop's thread
     (candidate 43727128285)."""
     unscheduled = report["unscheduled"]
     assert unscheduled["gap"] > 0.25, "the sentinel was not late: %r" % unscheduled
-    assert unscheduled["held"] < 0.03, "a loop late by the machine, not by a call, was charged %.0f ms" % (unscheduled["held"] * 1000)
+    assert unscheduled["held"] < 0.09, (
+        "a loop late by the machine for ~145 ms, then running a 45 ms callback, was charged %.0f ms: only the 45 ms the thread ran may count"
+        % (unscheduled["held"] * 1000))
 
 
 @pytest.mark.wall_clock
