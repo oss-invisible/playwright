@@ -11,15 +11,31 @@ checkout).
 
 Each browser prints one HUNTROW JSON line: launch_ms, close_ms, eval_ms (100 round trips of evaluate("1+1")), goto_req_ms (10 gotos:
 the client's goto call -> the request arriving at the local server), cpu_s (CPU seconds of the browser's processes during the work).
+The launch is split in launch() / new_context / new_page / first load, each with its time and the CPU of the Firefox parent
+processes during it (enter_ms, ctx_ms, new_page_ms, first_load_ms and *_cpu_s). For one browser per process of the inproc arms,
+every evaluate is stamped along its whole path (HUNTEVAL), see install_evalsplit.
+
+    python hunt_published_latency.py retail N ROUND FIREFOX_BINARY [close_after_s]
+
+  retail     the real Firefox 159 (not Playwright), headed, N together, a fresh profile each, started with a page of the local server
+             that sends a beacon on load; closed normally close_after_s after its first load. HUNTROW: start_to_load_ms,
+             start_to_window_ms, close_ms (close -> every process of its tree gone), session_s, parent CPU; HUNTSHUT: the lines of
+             the shutdown log with their time against the close.
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
+import re
+import shutil
+import signal
 import socket
 import socketserver
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +44,8 @@ from urllib.parse import parse_qs, urlsplit
 import psutil
 
 ARRIVED = {}
+#: tag -> wall ms at which the retail page's onload beacon reached the server.
+BEACONS = {}
 EVALS = 100
 GOTOS = 10
 SEED = 42
@@ -96,7 +114,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         # Through the hunt's proxy the request line carries the absolute URI.
-        if urlsplit(self.path).path.startswith("/type"):
+        path = urlsplit(self.path).path
+        if path.startswith("/beacon"):
+            # The retail page's onload: the server's arrival time is the first-page-loaded instant.
+            BEACONS.setdefault(parse_qs(urlsplit(self.path).query).get("b", [""])[0], time.time() * 1000)
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if path.startswith("/retail"):
+            tag = re.sub(r"[^\w-]", "", parse_qs(urlsplit(self.path).query).get("b", [""])[0])
+            body = ("<!doctype html><title>r</title><body>r<script>addEventListener('load',()=>{new Image().src='/beacon?b=" + tag
+                    + "&t='+Date.now()})</script></body>").encode()
+        elif path.startswith("/type"):
             body = TYPE_PAGE
         else:
             q = parse_qs(urlsplit(self.path).query)
@@ -124,6 +155,22 @@ def engine_cpu():
     return out
 
 
+def parent_cpu():
+    """CPU seconds (user + system) of the Firefox PARENT processes under this one (the sum of every ff:parent; the content,
+    GPU and utility processes are left out)."""
+    total = 0.0
+    for p in psutil.Process().children(recursive=True):
+        try:
+            if "firefox" in p.name().lower() and "-contentproc" not in p.cmdline():
+                t = p.cpu_times()
+                total += t.user + t.system
+        except psutil.Error:
+            pass
+    return total
+
+
+#: Whether this process stamps the evaluates of its browser number 0 (the inproc arms; set by main).
+TRACE_EVAL = False
 SLOW = []          # (kind, tag, t0, t1) in time.monotonic(): every event over SLOW_MS
 SLOW_MS = 1000
 #: The late arm (HUNT_TYPE_LATE_S): typing waits until every browser of the process launched, plus this many seconds.
@@ -332,7 +379,169 @@ class StackSampler:
 SAMPLER = StackSampler()
 
 
-async def work(page, port, tag):
+# ---- the path of one evaluate, stamped (inproc arms, one browser per process: the one whose tag ends in -0) -----------------------
+#: Set only around the evaluate loop of the traced browser; every wrapper below does nothing unless it is on AND the call carries a record.
+EV_ON = {"on": False}
+#: The record of the evaluate the current task is making (the contextvar travels with the task, so the transport's send sees it).
+EV_CUR = contextvars.ContextVar("hunt_ev", default=None)
+#: The server's worker thread (the one that runs `Server.handle`, and with it the core's pipe write) carries the record here.
+EV_TLS = threading.local()
+EV_BY_MSG = {}      # (id of the JugglerServer, the client's message id) -> EvalRec
+EV_CORE = {}        # (id of the core's Connection, the engine command id) -> EvalRec
+#: The engine's replies start with the id: Dispatcher.js sends JSON.stringify({id, sessionId, result}).
+EV_ID_RE = re.compile(rb'^\{\s*"id"\s*:\s*(\d+)')
+EVAL_OUT = []       # (tag, segments) of the traced browsers, printed by main as HUNTEVAL
+EV_SEGMENTS = ("call_to_send", "send_to_pickup", "pickup_to_pipe", "pipe_to_reply_read", "read_to_ready", "ready_to_reply",
+               "reply_to_loop", "dispatch", "resolve_to_return")
+
+
+class EvalRec:
+    """The instants (time.perf_counter, one clock for every thread) of one page.evaluate: the user's call, the client's transport.send
+    (on the loop), the worker thread picking the message up (Server.handle), the engine commands written (after os.write) and the
+    replies read by the reader thread (entry of _deliver), the end of that delivery (the waiter woken), the worker's reply(), the loop
+    running the client's dispatch (entry and exit), the user's await returning."""
+    __slots__ = ("t_call", "t_send", "t_handle", "writes", "reads", "t_deliver_end", "t_reply", "t_dispatch", "t_dispatch_end",
+                 "t_return")
+
+    def __init__(self):
+        self.t_call = self.t_send = self.t_handle = self.t_deliver_end = self.t_reply = None
+        self.t_dispatch = self.t_dispatch_end = self.t_return = None
+        self.writes, self.reads = [], []
+
+
+def eval_segments(recs):
+    """Per consecutive segment, the ms of every evaluate whose stamps are all there. The engine's own time (receive -> reply) cannot
+    be separated: the published engine's Juggler has no timing option (Dispatcher.js only dumps errors), so pipe_to_reply_read is the
+    engine plus the two pipe hops (first command written -> last reply read)."""
+    out = {name: [] for name in EV_SEGMENTS}
+    out["total"], out["cmds"] = [], []
+    missing = 0
+    for r in recs:
+        if None in (r.t_call, r.t_send, r.t_handle, r.t_deliver_end, r.t_reply, r.t_dispatch, r.t_dispatch_end, r.t_return) \
+                or not r.writes or not r.reads:
+            missing += 1
+            continue
+        pts = [r.t_call, r.t_send, r.t_handle, r.writes[0], r.reads[-1], r.t_deliver_end, r.t_reply, r.t_dispatch, r.t_dispatch_end,
+               r.t_return]
+        for name, a, b in zip(EV_SEGMENTS, pts, pts[1:]):
+            out[name].append(round((b - a) * 1000, 3))
+        out["total"].append(round((r.t_return - r.t_call) * 1000, 3))
+        out["cmds"].append(len(r.writes))
+    out["missing"] = missing
+    return out
+
+
+def install_evalsplit():
+    """HUNT: stamp the path of one evaluate through the published code, without changing what it does. Wrapped, each by the name the
+    published code calls it with:
+      invisible_playwright._juggler.transport.InProcessTransport.send   the client hands the message to the server (queue.put)
+      invisible_playwright._juggler.dispatcher.Server.handle            the worker thread `juggler-N` picks it up
+      invisible_core.juggler.connection.Connection._write               the engine command written to the pipe (after os.write)
+      invisible_core.juggler.connection.Connection._deliver             the reader thread has an engine reply (entry and exit)
+      invisible_playwright._juggler.transport.InProcessTransport.reply / reply_error   the worker posts the reply to the loop
+      invisible_playwright._pw._impl._connection.Connection.dispatch    the loop delivers the reply (entry and exit: future resolved)
+    """
+    import importlib
+    pc = time.perf_counter
+
+    def patch(owner, name, make):
+        real = getattr(owner, name, None)
+        if real is None or getattr(real, "_hunt", False):
+            return
+        wrapped = make(real)
+        wrapped._hunt = True
+        setattr(owner, name, wrapped)
+
+    def make_send(real):
+        def send(self, message):
+            if EV_ON["on"]:
+                rec = EV_CUR.get()
+                if rec is not None:
+                    if rec.t_send is None:
+                        rec.t_send = pc()
+                    EV_BY_MSG[(id(self._server), message.get("id"))] = rec
+            return real(self, message)
+        return send
+
+    def make_handle(real):
+        def handle(self, message):
+            rec = EV_BY_MSG.get((id(self), message.get("id"))) if EV_BY_MSG else None
+            if rec is None:
+                return real(self, message)
+            if rec.t_handle is None:
+                rec.t_handle = pc()
+            EV_TLS.rec = rec
+            try:
+                return real(self, message)
+            finally:
+                EV_TLS.rec = None
+        return handle
+
+    def make_write(real):
+        def _write(self, msg):
+            rec = getattr(EV_TLS, "rec", None)
+            if rec is None:
+                return real(self, msg)
+            EV_CORE[(id(self), msg.get("id"))] = rec     # before the write: the reply may beat the line after it
+            try:
+                return real(self, msg)
+            finally:
+                rec.writes.append(pc())
+        return _write
+
+    def make_deliver(real):
+        def _deliver(self, raw):
+            if not EV_CORE:
+                return real(self, raw)
+            m = EV_ID_RE.match(raw[:64])
+            rec = EV_CORE.pop((id(self), int(m.group(1))), None) if m else None
+            if rec is None:
+                return real(self, raw)
+            t = pc()
+            try:
+                return real(self, raw)
+            finally:
+                rec.reads.append(t)
+                rec.t_deliver_end = pc()
+        return _deliver
+
+    def make_reply(real):
+        def reply(self, msg_id, *a, **k):
+            rec = EV_BY_MSG.get((id(self._server), msg_id)) if EV_BY_MSG else None
+            if rec is not None:
+                rec.t_reply = pc()
+            return real(self, msg_id, *a, **k)
+        return reply
+
+    def make_dispatch(real):
+        def dispatch(self, msg):
+            rec = None
+            if EV_BY_MSG and msg.get("id"):
+                rec = EV_BY_MSG.pop((id(getattr(getattr(self, "_transport", None), "_server", None)), msg.get("id")), None)
+            if rec is None:
+                return real(self, msg)
+            rec.t_dispatch = pc()
+            try:
+                return real(self, msg)
+            finally:
+                rec.t_dispatch_end = pc()
+        return dispatch
+
+    for mod, cls, name, make in (
+            ("invisible_playwright._juggler.transport", "InProcessTransport", "send", make_send),
+            ("invisible_playwright._juggler.dispatcher", "Server", "handle", make_handle),
+            ("invisible_core.juggler.connection", "Connection", "_write", make_write),
+            ("invisible_core.juggler.connection", "Connection", "_deliver", make_deliver),
+            ("invisible_playwright._juggler.transport", "InProcessTransport", "reply", make_reply),
+            ("invisible_playwright._juggler.transport", "InProcessTransport", "reply_error", make_reply),
+            ("invisible_playwright._pw._impl._connection", "Connection", "dispatch", make_dispatch)):
+        try:
+            patch(getattr(importlib.import_module(mod), cls), name, make)
+        except Exception as exc:   # noqa: BLE001
+            PROBE.append(("probe-error evalsplit %s.%s" % (cls, name), "", 0, 0, repr(exc)[:200]))
+
+
+async def work(page, port, tag, trace=False):
     goto = []
     for i in range(GOTOS):
         t0, m0 = time.time() * 1000, time.monotonic()
@@ -342,12 +551,30 @@ async def work(page, port, tag):
         if arrived and arrived - t0 > SLOW_MS:
             SLOW.append(("goto->request", tag, m0, m0 + (arrived - t0) / 1000))
     ev = []
-    for _ in range(EVALS):
-        t0 = time.monotonic()
-        await page.evaluate("1 + 1")
-        ev.append(round((time.monotonic() - t0) * 1000, 2))
-        if ev[-1] > SLOW_MS:
-            SLOW.append(("evaluate", tag, t0, time.monotonic()))
+    recs = []
+    if trace:
+        EV_ON["on"] = True
+    try:
+        for _ in range(EVALS):
+            rec = None
+            if trace:
+                rec = EvalRec()
+                EV_CUR.set(rec)
+                rec.t_call = time.perf_counter()
+            t0 = time.monotonic()
+            await page.evaluate("1 + 1")
+            ev.append(round((time.monotonic() - t0) * 1000, 2))
+            if rec is not None:
+                rec.t_return = time.perf_counter()
+                EV_CUR.set(None)
+                recs.append(rec)
+            if ev[-1] > SLOW_MS:
+                SLOW.append(("evaluate", tag, t0, time.monotonic()))
+    finally:
+        if trace:
+            EV_ON["on"] = False
+            EV_CUR.set(None)
+            EVAL_OUT.append((tag, eval_segments(recs)))
     return goto, ev
 
 
@@ -416,6 +643,7 @@ def serve_one(binary):
 
 async def one_browser(arm, binary, port, tag):
     row = {"arm": arm, "tag": tag}
+    c_start = await asyncio.to_thread(parent_cpu)
     t0 = time.monotonic()
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
@@ -449,17 +677,46 @@ async def one_browser(arm, binary, port, tag):
         async def close(browser=browser, pw=pw):
             await browser.close()
             await pw.stop()
+    # The launch in four segments, each with its time and the CPU of the Firefox parent processes (every browser of this process
+    # added: exact for one browser per process) during it. A CPU read takes tens of ms on Windows (the process list): it is taken in
+    # a thread, and its time is taken out of the segment times and of launch_ms.
+    reads = {"ms": 0.0}
+
+    async def cpu_mark():
+        r0 = time.monotonic()
+        c = await asyncio.to_thread(parent_cpu)
+        reads["ms"] += (time.monotonic() - r0) * 1000
+        return c
+    c_enter = await cpu_mark()
+    row["enter_cpu_s"] = round(c_enter - c_start, 3)
+    t_ctx = time.monotonic()
+    ctx = await browser.new_context()
+    row["ctx_ms"] = round((time.monotonic() - t_ctx) * 1000)
+    c_ctx = await cpu_mark()
+    row["ctx_cpu_s"] = round(c_ctx - c_enter, 3)
     t_np = time.monotonic()
-    page = await browser.new_page()
+    page = await ctx.new_page()
     row["new_page_ms"] = round((time.monotonic() - t_np) * 1000)
-    row["launch_ms"] = round((time.monotonic() - t0) * 1000)
+    t_np_end = time.monotonic()
+    # launch_ms is what it always was (the start of the launch to the end of new_page), less the CPU reads made in between.
+    row["launch_ms"] = round((t_np_end - t0) * 1000 - reads["ms"])
     LAUNCHED["n"] += 1
     if LAUNCHED["n"] >= LAUNCHED["of"]:
         LAUNCHED["t"] = time.monotonic()
         LAUNCHED["event"].set()
     if row["launch_ms"] > SLOW_MS:
         SLOW.append(("launch", tag, t0, time.monotonic()))
-    row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag)
+    c_np = await cpu_mark()
+    row["new_page_cpu_s"] = round(c_np - c_ctx, 3)
+    reads_before_load = reads["ms"]
+    t_fl = time.monotonic()
+    await page.goto("http://127.0.0.1:%d/first?b=%s" % (port, tag), wait_until="load", timeout=30000)
+    row["first_load_ms"] = round((time.monotonic() - t_fl) * 1000)
+    row["to_first_load_ms"] = round((time.monotonic() - t0) * 1000 - reads_before_load)
+    c_fl = await cpu_mark()
+    row["first_load_cpu_s"] = round(c_fl - c_np, 3)
+    row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag, trace=(arm == "inproc" and TRACE_EVAL
+                                                                          and int(tag.rsplit("-", 1)[1]) == 0))
     try:
         row["typing"] = await typing(page, port, arm, TEXTS[int(tag.rsplit("-", 1)[1]) % len(TEXTS)])
     except Exception as exc:   # noqa: BLE001
@@ -527,6 +784,27 @@ def install_probes():
         timed(geo, "prepare_session_geo", "geo.prepare_session_geo")
     except Exception as exc:   # noqa: BLE001
         PROBE.append(("probe-error geo", "", 0, 0, repr(exc)[:200]))
+    # The first round's prepare_session_geo took 3.8 s with discover_egress_ip at 0.1-0.4 s, and the probe on
+    # `_geoip_db.ensure_geoip_mmdb` never fired: `_geo` imports it by name from `invisible_core.download` (a re-export), inside the
+    # function, so the copy to wrap is `download.ensure_geoip_mmdb`. Every helper prepare_session_geo calls, by the name `_geo` uses:
+    # the mmdb (location, check of the latest tag, download), the reader (open + lookup), the language decision, the position.
+    try:
+        geo = importlib.import_module("invisible_core._geo")
+        for name in ("_geo_record", "ip_to_timezone", "ip_to_coordinates", "ip_to_country", "position_to_declare", "_decide",
+                     "_geoip_database", "_egress_country"):
+            timed(geo, name, "geo." + name)
+        udp = importlib.import_module("invisible_core._udp_exit")
+        for name in ("stun_servers", "start_measurement", "remember"):
+            timed(udp, name, "udp_exit." + name)
+        timed(importlib.import_module("invisible_core.download"), "ensure_geoip_mmdb", "download.ensure_geoip_mmdb")
+        gdb = importlib.import_module("invisible_core._geoip_db")
+        for name in ("_cached_geoip_mmdb", "_check_is_due", "_resolve_latest_geoip_tag", "_latest_geoip_tag_api",
+                     "_download_geoip_tag", "_record_check", "_prune_old_geoip_tags"):
+            timed(gdb, name, "geoip_db." + name)
+        import requests
+        timed(requests, "head", "requests.head")       # the permalink HEAD of _resolve_latest_geoip_tag
+    except Exception as exc:   # noqa: BLE001
+        PROBE.append(("probe-error geo helpers", "", 0, 0, repr(exc)[:200]))
     for mod, attrs in (("invisible_core._geoip_db", ["ensure_geoip_mmdb"]),
                        ("invisible_core.juggler._profile", ["remove_profile"]),
                        ("invisible_core.process", ["reap_session", "find_processes", "terminate"])):
@@ -611,13 +889,20 @@ async def main(arm, n, rnd, binary):
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     port = httpd.server_address[1]
-    sampler = CpuSampler()
-    sampler.t.start()
-    SAMPLER.start()
+    # HUNT_NO_SAMPLER=1 (the inproc4quiet arm): none of the hunt's own polling threads (StackSampler, CpuSampler), so the cost of the
+    # polling on the evaluate round trip can be read against the arm that has them. The CPU per browser is then None.
+    quiet = os.environ.get("HUNT_NO_SAMPLER") == "1"
+    sampler = None if quiet else CpuSampler()
+    if sampler is not None:
+        sampler.t.start()
+        SAMPLER.start()
     if arm in ("inproc", "remote") and os.environ.get("HUNT_PROBES") == "1":
         install_probes()
+    global TRACE_EVAL
     if arm == "inproc":
         install_key_probe()
+        install_evalsplit()
+        TRACE_EVAL = True
     global PROXY_PORT
     if os.environ.get("HUNT_PROXY") == "1":
         proxy = ThreadingProxy(("127.0.0.1", 0), ProxyHandler)
@@ -626,7 +911,7 @@ async def main(arm, n, rnd, binary):
     LAUNCHED.update({"of": n, "event": asyncio.Event()})
     t0, t_mono0 = time.time(), time.monotonic()
     rows = await asyncio.gather(*(one_browser(arm, binary, port, "%s-%s-%d" % (arm, rnd, i)) for i in range(n)), return_exceptions=True)
-    cpu = sampler.total()
+    cpu = sampler.total() if sampler is not None else None
     match_sends(rows)
     for r in rows:
         if isinstance(r, dict) and "raw" in (r.get("typing") or {}):
@@ -640,8 +925,11 @@ async def main(arm, n, rnd, binary):
         if isinstance(r, Exception):
             print("HUNTROW " + json.dumps({"arm": arm, "round": rnd, "crash": repr(r)[:800]}), flush=True)
             continue
-        r.update({"round": rnd, "n": n, "os": sys.platform, "wall_s": round(time.time() - t0, 1), "cpu_s_per_browser": round(cpu / n, 2)})
+        r.update({"round": rnd, "n": n, "os": sys.platform, "wall_s": round(time.time() - t0, 1),
+                  "cpu_s_per_browser": round(cpu / n, 2) if cpu is not None else None})
         print("HUNTROW " + json.dumps(r), flush=True)
+    for tag, segs in EVAL_OUT:
+        print("HUNTEVAL " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "tag": tag, "segs": segs}), flush=True)
     SAMPLER.stop.set()
     for name, thread, start, ms, extra in PROBE:
         print("HUNTPROBE " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "name": name, "thread": thread,
@@ -652,7 +940,357 @@ async def main(arm, n, rnd, binary):
     httpd.shutdown()
 
 
+# ---- the retail reference: the real Firefox, not Playwright --------------------------------------------------------------------------
+IS_WIN = sys.platform == "win32"
+#: What the shutdown log is searched for (AsyncShutdown's own lines and the phases' names).
+SHUT_RE = re.compile(r"asyncshutdown|shutdown|quit-application|profile-before-change|profile-change|xpcom-will|barrier|blocker", re.I)
+USER_JS = 'user_pref("toolkit.asyncshutdown.log", true);\nuser_pref("browser.dom.window.dump.enabled", true);\n'
+
+
+def ppid_map():
+    """{pid: parent pid} of every process, from one snapshot (psutil's own call, the one `children()` uses)."""
+    try:
+        return psutil._psplatform.ppid_map()
+    except Exception:   # noqa: BLE001
+        out = {}
+        for p in psutil.process_iter():
+            try:
+                out[p.pid] = p.ppid()
+            except psutil.Error:
+                pass
+        return out
+
+
+def visible_windows():
+    """Windows: (pid, window class) of every visible top-level window."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    out = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            out.append((pid.value, cls.value))
+        return True
+    user32.EnumWindows(each, 0)
+    return out
+
+
+def now_ms():
+    return time.time() * 1000
+
+
+class RetailBrowser:
+    """One retail Firefox: started on a fresh profile, watched every 20 ms by a thread of its own (its window, its process tree, its
+    log), closed normally, and timed until every process of its tree is gone."""
+
+    def __init__(self, tag, binary, work):
+        self.tag, self.binary = tag, binary
+        self.profile = os.path.join(work, tag)
+        os.makedirs(self.profile)
+        with open(os.path.join(self.profile, "user.js"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(USER_JS)
+        self.logpath = os.path.join(work, tag + ".log")
+        self.proc = None
+        self.t_start = None
+        self.procs = {}            # pid -> psutil.Process of every process seen in the tree (the launcher too, when there is one)
+        self.names = {}
+        self.exit_ms = {}          # pid -> ms after the close at which it was found gone
+        self.window_ms = self.window_pid = self.window_class = None
+        self.window_note = None
+        self.seen_vis = {}         # Windows: pid -> (first wall ms seen with a visible top-level window, class)
+        self.next_tree = 0
+        self.t_close = None
+        self.cpu_last = None
+        self.log_matches = []      # (wall ms, line)
+        self.log_lines = 0
+        self.log_bytes = 0
+        self._log_buf = b""
+        self.finished = threading.Event()
+        self.row = {}
+        self.error = None
+
+    # -- the watcher thread
+    def watch(self):
+        logf = None
+        try:
+            logf = open(self.logpath, "rb")
+        except OSError:
+            pass
+        while not self.finished.is_set():
+            try:
+                t = now_ms()
+                if self.window_ms is None:
+                    self.poll_window(t)
+                if t >= self.next_tree:
+                    self.refresh_tree()
+                    self.next_tree = t + 100
+                if logf is not None:
+                    self.tail_log(logf)
+                if self.t_close is not None:
+                    self.sample_cpu()
+                if self.proc is not None:
+                    self.proc.poll()    # reaps the child: a zombie would look alive on Linux
+            except Exception as exc:   # noqa: BLE001
+                self.error = self.error or "%s: %s" % (type(exc).__name__, str(exc)[:160])
+            time.sleep(0.02)
+        if logf is not None:
+            try:
+                self.tail_log(logf)
+                logf.close()
+            except OSError:
+                pass
+
+    def refresh_tree(self):
+        pm = ppid_map()
+        kids = {}
+        for pid, pp in pm.items():
+            kids.setdefault(pp, []).append(pid)
+        tree = set(self.procs) | {self.proc.pid}
+        stack = list(tree)
+        while stack:
+            cur = stack.pop()
+            for c in kids.get(cur, ()):
+                if c not in tree:
+                    tree.add(c)
+                    stack.append(c)
+        for pid in tree:
+            if pid not in self.procs:
+                try:
+                    p = psutil.Process(pid)
+                    self.names[pid] = p.name()
+                    self.procs[pid] = p
+                except psutil.Error:
+                    pass
+        if IS_WIN and self.window_ms is None:
+            self.match_windows()
+
+    def match_windows(self):
+        hits = [(self.seen_vis[pid][0], pid) for pid in list(self.procs) if pid in self.seen_vis]
+        if hits:
+            ms, pid = min(hits)
+            self.window_ms, self.window_pid, self.window_class = ms, pid, self.seen_vis[pid][1]
+
+    def poll_window(self, t):
+        """The top-level window: Windows, EnumWindows + IsWindowVisible + GetWindowThreadProcessId, matched with the process tree
+        (a window seen before its pid joined the tree keeps its first-seen time); Linux, `xdotool search --onlyvisible --pid`."""
+        if IS_WIN:
+            for pid, cls in visible_windows():
+                self.seen_vis.setdefault(pid, (t, cls))
+            self.match_windows()
+            return
+        if self.window_note:
+            return
+        cands = {self.proc.pid} | {pid for pid, nm in list(self.names.items()) if nm.startswith("firefox")}
+        for pid in cands:
+            try:
+                r = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(pid)], capture_output=True, text=True, timeout=5)
+            except FileNotFoundError:
+                self.window_note = "xdotool is not installed"
+                return
+            except subprocess.TimeoutExpired:
+                continue
+            if r.stdout.strip():
+                self.window_ms, self.window_pid, self.window_class = now_ms(), pid, None
+                return
+
+    def tail_log(self, logf):
+        data = logf.read()
+        if not data:
+            return
+        self.log_bytes += len(data)
+        self._log_buf += data
+        *lines, self._log_buf = self._log_buf.split(b"\n")
+        t = now_ms()
+        for raw in lines:
+            self.log_lines += 1
+            text = raw.decode("utf-8", "replace").rstrip("\r")
+            if SHUT_RE.search(text):
+                self.log_matches.append((t, text))
+
+    def main_pid(self):
+        return self.window_pid or (self.proc.pid if self.proc is not None else None)
+
+    def sample_cpu(self):
+        try:
+            t = psutil.Process(self.main_pid()).cpu_times()
+            self.cpu_last = t.user + t.system
+        except psutil.Error:
+            pass
+
+    def alive_procs(self):
+        out = []
+        for pid, p in list(self.procs.items()):
+            try:
+                if p.is_running() and (IS_WIN or p.status() != psutil.STATUS_ZOMBIE):
+                    out.append(pid)
+            except psutil.Error:
+                pass
+        return out
+
+    # -- the session
+    def session(self, port, close_after):
+        row = self.row
+        try:
+            self.log = open(self.logpath, "wb")
+            self.t_start = now_ms()
+            url = "http://127.0.0.1:%d/retail?b=%s" % (port, self.tag)
+            self.proc = subprocess.Popen([self.binary, "-no-remote", "-new-instance", "-profile", self.profile, url],
+                                         stdout=self.log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            try:
+                self.procs[self.proc.pid] = psutil.Process(self.proc.pid)
+                self.names[self.proc.pid] = self.procs[self.proc.pid].name()
+            except psutil.Error:
+                pass
+            self.watcher = threading.Thread(target=self.watch, daemon=True, name="hunt-watch-" + self.tag)
+            self.watcher.start()
+            deadline = time.monotonic() + 120
+            while self.tag not in BEACONS and time.monotonic() < deadline and self.proc.poll() is None:
+                time.sleep(0.02)
+            loaded = BEACONS.get(self.tag)
+            row["start_to_load_ms"] = round(loaded - self.t_start, 1) if loaded else None
+            row["cpu_at_load_s"] = self._cpu_now()
+            if loaded:
+                while now_ms() < loaded + close_after * 1000 and self.proc.poll() is None:
+                    time.sleep(0.05)
+            row["start_to_window_ms"] = round(self.window_ms - self.t_start, 1) if self.window_ms else None
+            row["window_class"] = self.window_class
+            row["window_note"] = self.window_note
+            row["cpu_at_close_s"] = self._cpu_now()
+            row["tree_cpu_at_close_s"] = self._tree_cpu()
+            row["procs_at_close"] = len(self.alive_procs())
+            row["exited_before_close"] = self.proc.poll() is not None
+            self.close()
+        except Exception as exc:   # noqa: BLE001
+            self.error = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+        finally:
+            self.finished.set()
+            try:
+                self.watcher.join(3)      # its last read of the log is part of the report
+            except (AttributeError, RuntimeError):
+                pass
+            try:
+                self.log.close()
+            except (AttributeError, OSError):
+                pass
+
+    def _cpu_now(self):
+        try:
+            t = psutil.Process(self.main_pid()).cpu_times()
+            return round(t.user + t.system, 3)
+        except (psutil.Error, TypeError):
+            return None
+
+    def _tree_cpu(self):
+        total = 0.0
+        for pid in self.alive_procs():
+            try:
+                t = self.procs[pid].cpu_times()
+                total += t.user + t.system
+            except psutil.Error:
+                pass
+        return round(total, 3)
+
+    def close(self):
+        """A normal close: Windows `taskkill /PID <the process with the window>` without /F (WM_CLOSE), Linux SIGTERM to the process
+        started. close_ms is from the command's return to the instant no process of the tree is alive."""
+        row = self.row
+        target = self.main_pid()
+        c0 = now_ms()
+        if IS_WIN:
+            r = subprocess.run(["taskkill", "/PID", str(target)], capture_output=True, text=True, timeout=30)
+            row["close_cmd"] = [r.returncode, (r.stdout + r.stderr).strip()[:140]]
+        else:
+            try:
+                os.kill(self.proc.pid, signal.SIGTERM)
+                row["close_cmd"] = [0, "SIGTERM %d" % self.proc.pid]
+            except OSError as exc:
+                row["close_cmd"] = [1, repr(exc)[:140]]
+        self.t_close = now_ms()
+        row["close_cmd_ms"] = round(self.t_close - c0, 1)
+        row["session_s"] = round((self.t_close - self.t_start) / 1000, 2)
+        deadline = self.t_close + 120000
+        gone = None
+        while now_ms() < deadline:
+            alive = set(self.alive_procs())
+            t = now_ms()
+            for pid in list(self.procs):
+                if pid not in alive and pid not in self.exit_ms:
+                    self.exit_ms[pid] = round(t - self.t_close, 1)
+            if not alive:
+                gone = t
+                break
+            time.sleep(0.02)
+        if gone is None:
+            row["close_timeout"] = True
+            row["close_ms"] = None
+            for pid in self.alive_procs():
+                try:
+                    self.procs[pid].kill()
+                except psutil.Error:
+                    pass
+        else:
+            row["close_ms"] = round(gone - self.t_close, 1)
+        main_exit = self.exit_ms.get(target)
+        row["close_main_ms"] = main_exit
+        last = sorted(((ms, self.names.get(pid, "?")) for pid, ms in self.exit_ms.items()), reverse=True)[:4]
+        row["last_exits"] = [[nm, ms] for ms, nm in last]
+        row["procs_seen"] = len(self.procs)
+        row["parent_cpu_s"] = round(self.cpu_last, 3) if self.cpu_last is not None else row.get("cpu_at_close_s")
+
+
+def retail_main(n, rnd, binary, close_after):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    work = tempfile.mkdtemp(prefix="hunt-retail-")
+    browsers = [RetailBrowser("retail-%s-%d" % (rnd, i), binary, work) for i in range(n)]
+    t0 = time.time()
+    threads = [threading.Thread(target=b.session, args=(port, close_after), daemon=True) for b in browsers]
+    for t in threads:
+        t.start()
+    stop = time.monotonic() + close_after + 400
+    for t in threads:
+        t.join(max(1.0, stop - time.monotonic()))
+    for b in browsers:
+        b.finished.set()
+        for pid in b.alive_procs():
+            try:
+                b.procs[pid].kill()
+            except psutil.Error:
+                pass
+    for b in browsers:
+        r = b.row
+        if b.error or not r:
+            print("HUNTROW " + json.dumps({"arm": "retail", "round": rnd, "tag": b.tag, "crash": (b.error or "no result")[:800]}), flush=True)
+            continue
+        r.update({"arm": "retail", "tag": b.tag, "round": rnd, "n": n, "os": sys.platform, "close_after_s": close_after,
+                  "wall_s": round(time.time() - t0, 1), "log_bytes": b.log_bytes, "log_lines": b.log_lines, "watch_error": b.error})
+        print("HUNTROW " + json.dumps(r), flush=True)
+        # The shutdown log: each matching line with its time against the close (negative: before it). First 25 and last 15 when more
+        # than 40, the line truncated.
+        found = b.log_matches
+        if len(found) > 40:
+            found = found[:25] + found[-15:]
+        for t, text in found:
+            print("HUNTSHUT " + json.dumps({"arm": "retail", "round": rnd, "tag": b.tag, "os": sys.platform,
+                                            "t_ms": round(t - b.t_close, 1) if b.t_close else None, "line": text[:160]}), flush=True)
+        if not b.log_bytes:
+            print("HUNTSHUT " + json.dumps({"arm": "retail", "round": rnd, "tag": b.tag, "os": sys.platform, "t_ms": None,
+                                            "line": "(the browser wrote nothing to stdout/stderr)"}), flush=True)
+    httpd.shutdown()
+    shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
+    if sys.argv[1] == "retail":
+        retail_main(int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5]) if len(sys.argv) > 5 else 20.0)
+        sys.exit(0)
     if sys.argv[1] == "serve":
         serve_one(sys.argv[2])
         sys.exit(0)
