@@ -18,6 +18,12 @@ selector (the machine did not run the loop: on a loaded host an idle loop is 100
 doing and is not counted) or INSIDE something (held). The instrument is the one of the core's
 `tests/test_a_close_does_not_hold_the_loop.py`. A control with the same instrument holds the loop on purpose first, so a watcher
 that could not see a held loop does not pass the test for nothing.
+
+Nothing here is judged by how long it took (that is a verdict on the runner: a loop that a starved machine runs late is late without
+a defect). The loop is held when its thread was SEEN inside a step of the close that waits (`_close_loop_verdicts.blocked_by`), and the
+other browsers keep answering when, in the order of the events, a call of each began and ended while the close was in flight and
+while the removal of the closing browser's profile was held until every one of them had answered (a removal made on the loop would
+wait for the answers that only the loop can read). The milliseconds are printed, never judged.
 """
 from __future__ import annotations
 
@@ -28,6 +34,13 @@ import sys
 import textwrap
 
 import pytest
+
+from _close_loop_verdicts import (
+    blind_instrument_problem,
+    charged_more_than_ran_problem,
+    close_on_the_loop_problem,
+    others_answered_problem,
+)
 
 pytestmark = pytest.mark.e2e
 
@@ -48,6 +61,10 @@ _CLIENT = textwrap.dedent("""
 
         def __init__(self):
             self.gaps, self.holes, self.held = [], [], 0.0
+            #: The longest stretch the watcher saw the main thread running something without a pause in the selector, and every
+            #: frame that was on its stack in those samples (file:function -> samples, and the innermost frames of the first stack
+            #: it was seen in): WHERE the thread was, which is the cause, where `held` only says for how long.
+            self.busy_run, self.inside = 0.0, {}
             self.beat = [time.monotonic()]
             self.stop = asyncio.Event()
             self.over = threading.Event()
@@ -86,6 +103,19 @@ _CLIENT = textwrap.dedent("""
                 "others": {names.get(i, str(i)): "".join(traceback.format_stack(f)[-3:])
                            for i, f in frames.items() if i != main_id and i != threading.get_ident()}}
 
+        def note(self, frame):
+            names = []
+            while frame is not None:
+                names.append("%s:%s" % (frame.f_code.co_filename.replace(os.sep, "/"), frame.f_code.co_name))
+                frame = frame.f_back
+            names.reverse()
+            for name in names:
+                entry = self.inside.get(name)
+                if entry is None:
+                    self.inside[name] = {"n": 1, "stack": names[-6:]}
+                else:
+                    entry["n"] += 1
+
         def watcher(self):
             # Only the part of a lateness during which the loop's thread was RUNNING counts. A loop the machine did not schedule waits in
             # the selector and then, once woken, runs the callbacks that queued meanwhile (the pingers' replies): counting the whole
@@ -97,11 +127,14 @@ _CLIENT = textwrap.dedent("""
                 now = time.monotonic()
                 late = now - self.beat[0]
                 level = int(late / 0.03)
-                if self.idle(sys._current_frames().get(main_id)):
+                frame = sys._current_frames().get(main_id)
+                if self.idle(frame):
                     busy_since = None
                 else:
                     if busy_since is None:
                         busy_since = now
+                    self.busy_run = max(self.busy_run, now - busy_since)
+                    self.note(frame)
                     held = now - max(self.beat[0], busy_since)
                     if held > 0.03:
                         self.held = max(self.held, held)
@@ -136,7 +169,8 @@ _CLIENT = textwrap.dedent("""
             self._real.clear()
 
         def report(self):
-            return {"held": self.held, "gap": max(self.gaps), "holes": self.holes[:4], "on_the_loop": sorted(set(self.on_the_loop))}
+            return {"held": self.held, "busy_run": self.busy_run, "inside": self.inside, "gap": max(self.gaps),
+                    "holes": self.holes[:4], "on_the_loop": sorted(set(self.on_the_loop))}
 
 
     def engines():
@@ -150,15 +184,27 @@ _CLIENT = textwrap.dedent("""
         return out
 
 
-    async def pinger(page, record, closing):
+    async def pinger(page, record, closing, gate, records):
+        # A call counts as answered DURING the close when it began after the close began and ended before it ended, and as answered
+        # DURING THE REMOVAL when it began after the removal of the profile did: the order of the events, not how long it took.
         while not record["stop"]:
+            while_closing = closing.is_set()
             started = time.monotonic()
             await page.evaluate("1 + 1")
             took = time.monotonic() - started
-            if closing.is_set():
-                record["answers"] += 1
-                record["slowest"] = max(record["slowest"], took)
+            if while_closing and closing.is_set():
+                record["inside"] += 1
+                record["slowest"] = max(record["slowest"], took)      # printed, never judged
+                since = gate["since"]
+                if since is not None and started >= since and gate["released_by"] is None:
+                    record["during_removal"] += 1
+                    if all(r["during_removal"] >= 1 for r in records):
+                        gate["all_answered"].set()
             await asyncio.sleep(0.02)
+
+
+    def hold_the_loop(seconds):
+        time.sleep(seconds)
 
 
     async def main():
@@ -166,7 +212,7 @@ _CLIENT = textwrap.dedent("""
         control = Instrument()
         await control.start()
         await asyncio.sleep(0.05)
-        time.sleep(0.4)
+        hold_the_loop(0.4)
         await asyncio.sleep(0.05)
         await control.finish()
 
@@ -191,10 +237,25 @@ _CLIENT = textwrap.dedent("""
         # A slow disk: removing a profile takes 150 ms more (a scanner of files at work, a spinning disk, a loaded runner). On a fast
         # disk the removal of a profile is a few ms and a close made on the loop hides in the noise; with a disk that is slow the
         # wait is what the loop pays, wherever it is made. Every thread pays it the same.
+        #
+        # And the first removal inside the close waits until every other browser has answered a call that began after it did (30 s
+        # at most, the deadline of a hang): the removal that runs in a thread of its own lets the loop serve them and goes on at once;
+        # one that runs ON the loop stops the only thread that could read their answers, and goes on only at the deadline. How the
+        # hold ended (`released_by`) is the verdict; a slow machine only makes the answers come later.
         real_rmtree = shutil.rmtree
+        gate = {"since": None, "released_by": None, "all_answered": threading.Event()}
+        gate_lock = threading.Lock()
 
         def slow_rmtree(*x, **k):
             time.sleep(0.15)
+            first = False
+            if closing.is_set():
+                with gate_lock:
+                    if gate["since"] is None:
+                        gate["since"], first = time.monotonic(), True
+            if first:
+                answered = gate["all_answered"].wait(30)
+                gate["released_by"] = "answered" if answered else "deadline"
             return real_rmtree(*x, **k)
 
         shutil.rmtree = slow_rmtree
@@ -211,9 +272,9 @@ _CLIENT = textwrap.dedent("""
         closing, records = asyncio.Event(), []
         tasks = []
         for page in pages[1:]:
-            record = {"stop": False, "answers": 0, "slowest": 0.0}
+            record = {"stop": False, "inside": 0, "during_removal": 0, "slowest": 0.0}
             records.append(record)
-            tasks.append(asyncio.create_task(pinger(page, record, closing)))
+            tasks.append(asyncio.create_task(pinger(page, record, closing, gate, records)))
         await asyncio.sleep(0.5)
 
         instrument = Instrument()
@@ -229,7 +290,8 @@ _CLIENT = textwrap.dedent("""
             "took": took, "launched": launched,
             "control": control.report(),
             "unscheduled": unscheduled.report(),
-            "answers": [r["answers"] for r in records], "slowest": [r["slowest"] for r in records],
+            "others": [{"inside": r["inside"], "during_removal": r["during_removal"], "slowest": r["slowest"]} for r in records],
+            "gate": {"reached": gate["since"] is not None, "released_by": gate["released_by"]},
         })
         # The other three still work after it.
         shutil.rmtree = real_rmtree
@@ -280,37 +342,52 @@ def report(firefox_binary, tmp_path_factory):
     return json.loads(lines[-1][len("REPORT "):])
 
 
+#: The function the client holds its loop in on purpose (the control), in the script the test writes.
+_HOLDER = (("/client.py", ("hold_the_loop",)),)
+
+
 @pytest.mark.wall_clock
 def test_the_instrument_sees_a_loop_that_is_held(report):
-    """The control: the loop held on purpose for 400 ms is seen as held. Without this, a watcher that could not tell a held loop from
-    a starved one would pass the test below for nothing."""
+    """The control: the loop held on purpose for 400 ms is seen as held, and seen INSIDE the function that holds it. Without this, a
+    watcher that could not tell a held loop from a starved one, or could not read where the thread was, would pass the test below for
+    nothing."""
     control = report["control"]
     assert control["held"] > 0.3, (
         "the watcher did not see a loop held for 400 ms: held %.0f ms" % (control["held"] * 1000))
     assert "sleep" in control["on_the_loop"]
+    assert blind_instrument_problem(control["inside"], _HOLDER) is None, blind_instrument_problem(control["inside"], _HOLDER)
 
 
 @pytest.mark.wall_clock
 def test_the_instrument_does_not_charge_a_loop_the_machine_did_not_schedule(report):
     """The second control: a loop that waited 150 ms in its selector and then ran a 45 ms callback was held for those 45 ms, not 195.
-    Charging it the whole lateness made a loaded Windows runner fail the bound below with 94 ms and nothing on the loop's thread
-    (candidate 43727128285)."""
+    Charging it the whole lateness made a loaded Windows runner fail a bound of 90 ms with 94 ms and nothing on the loop's thread
+    (candidate 43727128285). What is charged is judged against what the same samples saw run, not against a number of milliseconds:
+    a held time greater than the longest stretch the thread was seen running counted a wait that was not the loop's."""
     unscheduled = report["unscheduled"]
     assert unscheduled["gap"] > 0.25, "the sentinel was not late: %r" % unscheduled
-    assert unscheduled["held"] < 0.09, (
-        "a loop late by the machine for ~145 ms, then running a 45 ms callback, was charged %.0f ms: only the 45 ms the thread ran may count"
-        % (unscheduled["held"] * 1000))
+    assert charged_more_than_ran_problem(unscheduled["held"], unscheduled["busy_run"]) is None, charged_more_than_ran_problem(
+        unscheduled["held"], unscheduled["busy_run"])
+
+
+def test_the_removal_of_the_profile_ran_inside_the_close(report):
+    """The slow disk of the client is only a stimulus if the removal of the profile ran, through `shutil.rmtree`, while the first
+    browser closed: the hold of the removal until the others answer is made there. Without this a close that removed nothing through it
+    would pass the test of the others by not being gated."""
+    assert report["gate"]["reached"], "no `shutil.rmtree` ran while the first browser closed: %r" % report["gate"]
 
 
 @pytest.mark.wall_clock
 def test_closing_one_of_four_browsers_does_not_hold_the_loop(report):
-    """Four browsers, one closes: the loop of the program is not held for 50 ms, counting only the time its thread is running."""
+    """Four browsers, one closes: the thread that runs the loop of the program is never seen inside a step of the close that waits
+    (the shutdown of the server, the join of its workers, the reaping of the tree, the removal of the profile)."""
     assert report["launched"] >= 4, "fewer than four engines were running before the close: %r" % report["launched"]
     assert report["took"] > 0.3, "the close finished before the engine could have exited: nothing was waited for"
-    assert report["held"] < 0.05, (
-        "the loop was held for %.0f ms while one of four browsers closed (the close took %.0f ms; the longest wake was %.0f ms late; "
-        "calls made by the loop's own thread: %s). Where the threads were while it was late:\n%s"
-        % (report["held"] * 1000, report["took"] * 1000, report["gap"] * 1000, report["on_the_loop"], _holes(report)))
+    problem = close_on_the_loop_problem(report["inside"])
+    assert problem is None, (
+        "%s\n(printed, not judged: the loop was held %.0f ms while one of four browsers closed, the close took %.0f ms, the longest "
+        "wake was %.0f ms late; calls made by the loop's own thread: %s). Where the threads were while it was late:\n%s"
+        % (problem, report["held"] * 1000, report["took"] * 1000, report["gap"] * 1000, report["on_the_loop"], _holes(report)))
 
 
 def test_no_blocking_step_of_the_close_runs_on_the_loop_s_thread(report):
@@ -319,12 +396,13 @@ def test_no_blocking_step_of_the_close_runs_on_the_loop_s_thread(report):
     assert report["on_the_loop"] == [], "the loop's own thread made these calls while it awaited the close: %s" % report["on_the_loop"]
 
 
-@pytest.mark.wall_clock
 def test_the_other_three_keep_answering_during_the_close(report):
-    """A call on each of the other three browsers is answered while the first one closes, and the three are alive after."""
-    assert len(report["answers"]) == 3
-    assert all(n >= 3 for n in report["answers"]), "the others stopped answering during the close: %r" % report["answers"]
-    assert max(report["slowest"]) < 2.0, "a call of another browser waited %.1f s during the close" % max(report["slowest"])
+    """Each of the other three browsers answers a call that began and ended while the first one closes, the removal of the first one's
+    profile is held until every one of them has answered, and the three are alive after. The order of the events decides; the
+    seconds a call took are printed."""
+    problem = others_answered_problem(report["others"], report["gate"])
+    assert problem is None, "%s\n(printed, not judged: the slowest call of each browser inside the close, in s: %s)" % (
+        problem, [round(r["slowest"], 3) for r in report["others"]])
     assert report["texts"] == ["browser 1", "browser 2", "browser 3"]
 
 
