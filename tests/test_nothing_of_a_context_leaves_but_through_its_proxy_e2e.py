@@ -82,10 +82,12 @@ from _witness import Witness
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
 
-#: How long the page waits for the browser to try the target, in milliseconds (the ICE agent retransmits STUN and TURN at 0, 0.1, 0.3, 0.7 s...).
+#: How long the test leaves the probe alive AFTER the road it was meant to take has been seen (or, with no such road to see, after it started), in milliseconds:
+#: the window in which a road around the proxy would show (the ICE agent retransmits STUN and TURN at 0, 0.1, 0.3, 0.7 s...). It looks for something that must
+#: NOT happen, so a slow machine can only make it weaker, never red; the page does not hold the probe with a timer of its own, so the probe is alive for the whole of it.
 WAIT_MS = {"fetch": 2500, "websocket": 2500, "stun": 5000, "turn_udp": 5000, "turn_tcp": 5000, "turns_tcp": 5000}
 #: How long to wait, in seconds, for the proxy or the DoH to have been handed what the probe asked for.
-EVIDENCE_SECONDS = 20
+EVIDENCE_SECONDS = 30
 #: The lab's own prefs, on top of the DoH provider of ``PREFS``. Every name of a probe is answered with the address of THIS host (the witness), and on
 #: a LAN or a runner that is an RFC 1918 address: the engine's DoH client DROPS such an answer unless ``network.trr.allow-rfc1918`` is true
 #: (TRR.cpp / DNSPacket.cpp: ``aAllowRFC1918 || !addr.IsIPAddrLocal()``), so the name would resolve to nothing and the probe would never connect
@@ -143,10 +145,10 @@ WINDOW_CASES = [WindowCase(w, p) for w in ("iframe", "popup") for p in ("socks5"
 CONTROL_CASES = [WindowCase("attached", p) for p in ("socks5", "http")]
 #: The two ICE servers of a window case, by name: the STUN server over UDP and the TURN server over TCP.
 ICE_KINDS = ("stun", "turn")
-#: How long the page waits for the gathering to end, in milliseconds (the witness answers nothing: the ICE agent retries until this ends).
-GATHER_MS = 6000
-#: How long the page waits for a closed popup to say ``closed``, in milliseconds.
-CLOSED_MS = 5000
+#: How long the page waits for the gathering of a window's PeerConnection to start, in milliseconds (the deadline of the wait: a healthy run takes a few hundred).
+GATHER_MS = 30000
+#: How long the page waits for a closed popup to say ``closed``, in milliseconds (the deadline of the wait).
+CLOSED_MS = 30000
 
 #: What each case is expected to do, by engine. "green" is the contract; "RED" names the road that leaves the proxy. Held by
 #: test_the_egress_sink_helpers.py (every id is a case, and a RED has its reason).
@@ -194,24 +196,27 @@ EXPECTED_OCSP: Dict[str, Dict[str, str]] = {
 #: How long the negative control waits for an OCSP request that must not come, in seconds (the soft-fail timeout of the engine is 2 s).
 OCSP_SETTLE_SECONDS = 4
 
-_FETCH_JS = """async ([host, port, waitMs]) => {
+#: The probes START the thing and leave it alive (the page holds no timer of its own that would end it): the test waits for the road it was meant to take, leaves the
+#: window of ``WAIT_MS``, then ends it with ``_STOP_JS``.
+_FETCH_JS = """([host, port]) => {
   fetch('http://' + host + ':' + port + '/f', {mode: 'no-cors'}).catch(() => {});
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
 }"""
 
-_WEBSOCKET_JS = """async ([host, port, waitMs]) => {
-  try { const ws = new WebSocket('ws://' + host + ':' + port + '/s'); ws.onerror = () => {}; } catch (e) {}
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
+_WEBSOCKET_JS = """([host, port]) => {
+  try { window.__ws = new WebSocket('ws://' + host + ':' + port + '/s'); window.__ws.onerror = () => {}; } catch (e) {}
+}"""
+
+_STOP_JS = """() => {
+  try { if (window.__pc) window.__pc.close(); } catch (e) {}
+  try { if (window.__ws) window.__ws.close(); } catch (e) {}
 }"""
 
 
 def _ice_js(url_expression):
-    return """async ([host, port, waitMs]) => {
-  const pc = new RTCPeerConnection({iceServers: [{urls: [%s], username: 'u', credential: 'p'}]});
+    return """async ([host, port]) => {
+  const pc = window.__pc = new RTCPeerConnection({iceServers: [{urls: [%s], username: 'u', credential: 'p'}]});
   pc.createDataChannel('d');
   await pc.setLocalDescription(await pc.createOffer());
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
-  pc.close();
 }""" % url_expression
 
 
@@ -275,11 +280,13 @@ _WINDOW_ICE_JS = """async ([how, stunHost, turnHost, port, gatherMs, closedMs]) 
   } catch (e) { out.error = String(e && e.name ? e.name + ': ' + e.message : e); }
   if (pc) {
     try {
+      // until the gathering has STARTED (the state leaves 'new'), for gatherMs; the PeerConnection stays alive (window.__pc) and the test closes it after it has
+      // seen the road it was meant to take
+      window.__pc = pc;
       const t0 = Date.now();
-      while (pc.iceGatheringState !== 'complete' && Date.now() - t0 < gatherMs) await sleep(100);
+      while (pc.iceGatheringState === 'new' && Date.now() - t0 < gatherMs) await sleep(50);
       out.state = pc.iceGatheringState;
       out.started = out.state !== 'new';
-      pc.close();
     } catch (e) { out.error = (out.error ? out.error + '; ' : '') + String(e && e.name ? e.name + ': ' + e.message : e); }
   }
   return out;
@@ -393,9 +400,11 @@ def test_a_probe_of_a_context_leaves_only_through_its_proxy(case, firefox_binary
     with _launch(firefox_binary) as browser:
         context, page = _page_in(browser, proxy=proxy.proxy)
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
-        page.evaluate(PROBE_JS[case.kind], [host, port, WAIT_MS[case.kind]])
+        page.evaluate(PROBE_JS[case.kind], [host, port])
         done = _the_work_was_done(case, lab, doh, proxy)
         reached = ds.wait_until(done, EVIDENCE_SECONDS) if done else None
+        ds.wait_until(lambda: False, WAIT_MS[case.kind] / 1000.0)        # the window of a road around the proxy, with the probe alive
+        page.evaluate(_STOP_JS)
         context.close()
     watcher.stop()
 
@@ -423,8 +432,9 @@ def test_the_same_probe_with_no_proxy_is_heard_by_the_witness(kind, firefox_bina
     with _launch(firefox_binary) as browser:
         page = browser.new_context(ignore_https_errors=True).new_page()
         page.goto("about:blank")
-        page.evaluate(PROBE_JS[kind], [lab.witness.address, lab.witness.port, WAIT_MS[kind]])
+        page.evaluate(PROBE_JS[kind], [lab.witness.address, lab.witness.port])
         reached = ds.wait_until(lambda: lab.witness.heard()["tcp" if case.tcp else "udp"], EVIDENCE_SECONDS)
+        page.evaluate(_STOP_JS)
     watcher.stop()
     assert reached, "no proxy, and the %s probe by IP did not reach the witness at %s: %s" % (kind, lab.witness.target, lab.witness.heard())
 
@@ -466,7 +476,7 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
         if case.window == "popup":
             page.evaluate(_POPUP_BUTTON_JS)
-            page.click("#open-dead", timeout=10000)
+            page.click("#open-dead", timeout=30000)
         outcome = page.evaluate(_WINDOW_ICE_JS, [case.window, stun_host, turn_host, port, GATHER_MS, CLOSED_MS])
         if outcome["started"]:
             def done() -> bool:
@@ -475,6 +485,8 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
                     return _was_handed(case, proxy, turn_host, port)
                 return (lab.witness.address, port) in proxy.connects and bool(doh.queries_for(stun_host, QTYPE_A))
             reached = ds.wait_until(done, EVIDENCE_SECONDS)
+            ds.wait_until(lambda: False, WAIT_MS["turn_tcp"] / 1000.0)    # the window of a road around the proxy, with the PeerConnection alive
+        page.evaluate(_STOP_JS)
         context.close()
     watcher.stop()
     return proxy, outcome, reached

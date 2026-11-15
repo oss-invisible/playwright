@@ -277,10 +277,10 @@ _PROBE_JS = r"""async (stun) => {
   const cands = [];
   pc.addEventListener('icecandidate', e => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); });
   await pc.setLocalDescription(await pc.createOffer({offerToReceiveAudio:1, offerToReceiveVideo:1}));
-  // until the gather says it is complete (what the page reads is the whole of it), or 25 s: the deadline of the wait, not a
+  // until the gather says it is complete (what the page reads is the whole of it), or 30 s: the deadline of the wait, not a
   // window the verdict depends on
   await new Promise(resolve => {
-    const timer = setTimeout(resolve, 25000);
+    const timer = setTimeout(resolve, 30000);
     const done = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); } };
     pc.addEventListener('icegatheringstatechange', done);
     done();
@@ -402,7 +402,7 @@ _RELAY_PROBE_JS = r"""async (stun) => {
   pc.addEventListener('icecandidateerror', e => { errors.push({code: e.errorCode, text: e.errorText, url: e.url}); at.error = Math.round(performance.now() - t0); });
   await pc.setLocalDescription(await pc.createOffer());
   await new Promise(resolve => {
-    const timer = setTimeout(resolve, 25000);
+    const timer = setTimeout(resolve, 30000);
     pc.addEventListener('icegatheringstatechange', () => {
       if (pc.iceGatheringState === 'complete') { at.complete = Math.round(performance.now() - t0); clearTimeout(timer); resolve(); }
     });
@@ -667,6 +667,7 @@ def test_the_turn_over_tcp_of_a_context_goes_through_the_proxy_of_that_context(m
     from invisible_core import _geo
 
     from _socks_servers import coherent
+    from _waits import wait_until
     host = this_host_address()
     turn_host, turn_port = "198.51.100.9", 3478
     with coherent(exit_ip="203.0.113.7", user="alice", password="s3cret", relay_host=host) as session,             coherent(exit_ip="198.51.100.77", user="bob", password="hunter2", relay_host=host) as context:
@@ -675,13 +676,15 @@ def test_the_turn_over_tcp_of_a_context_goes_through_the_proxy_of_that_context(m
         with _launch_behind(session, binary_path=binary, extra_prefs=extra_prefs) as browser:
             page = browser.new_context(proxy=context.proxy).new_page()
             page.goto("about:blank")
+            # the page starts the ICE agent and leaves it alive; it is closed AFTER the gateway of the context has been handed the TURN address (a
+            # condition with a deadline, not 6 s of a timer of the page: an agent closed first would never have tried the server on a slow machine)
             page.evaluate("""async (turn) => {
-              const pc = new RTCPeerConnection({iceServers: [{urls: [turn], username: 'u', credential: 'p'}]});
+              const pc = window.__pc = new RTCPeerConnection({iceServers: [{urls: [turn], username: 'u', credential: 'p'}]});
               pc.createDataChannel('');
               await pc.setLocalDescription(await pc.createOffer());
-              await new Promise(r => setTimeout(r, 6000));
-              pc.close();
             }""", f"turn:{turn_host}:{turn_port}?transport=tcp")
+            wait_until(lambda: (turn_host, turn_port) in context.connects, 30, lambda: page.wait_for_timeout(50))
+            page.evaluate("() => window.__pc.close()")
         in_context = [c for c in context.connects if c == (turn_host, turn_port)]
         in_session = [c for c in session.connects if c == (turn_host, turn_port)]
     assert in_context and not in_session, (
@@ -725,7 +728,7 @@ def _gather_where_the_udp_is_dropped(gateway, monkeypatch, measured):
     protocols = sorted({c["proto"].upper() for c in candidates(res["candidates"]) if c["typ"] == "host"})
     assert protocols == ["TCP", "UDP"], f"host candidates of a retail on a network that drops UDP: {res['candidates']}"
     # The floor only (an error that comes at once is a request that was never sent); a slow machine can only stretch nICEr's
-    # 11.1-11.3 s, and the page waits 25 s for the end of the gather.
+    # 11.1-11.3 s, and the page waits 30 s for the end of the gather.
     assert res["at_ms"]["error"] >= 10_000, (
         f"the 701 of the UDP request came at {res['at_ms']['error']} ms; nICEr's time on a network that drops UDP is 11.1-11.3 s")
 
