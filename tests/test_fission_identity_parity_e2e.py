@@ -61,7 +61,7 @@ from urllib.parse import urlsplit
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _fission_frames import TRIALS, other_process_proved, ticks_inside  # noqa: E402
+from _fission_frames import PROOF_SECONDS, TRIALS, other_process_proved, ticks_inside  # noqa: E402
 from _servers import LocalServer  # noqa: E402
 
 SEED = 4242
@@ -542,10 +542,10 @@ SPIN_PROBE_JS = """(spin) => new Promise(resolve => {
   const ticks = [];
   const id = setInterval(() => ticks.push(Date.now()), 10);
   const done = (spun) => { clearInterval(id); removeEventListener('message', on); resolve([ticks, spun]); };
-  const on = e => { if (e.data && e.data.fission_spun) setTimeout(() => done(e.data.fission_spun), 200); };
+  const on = e => { if (e.data && e.data.fission_spun) done(e.data.fission_spun); };
   addEventListener('message', on);
   document.getElementById('oop2').contentWindow.postMessage({fission_busy: spin}, '*');
-  setTimeout(() => done(null), 8000);
+  setTimeout(() => done(null), 30000);
 })"""
 
 
@@ -570,11 +570,14 @@ def _run(binary: str, seed: int, strategy: int) -> dict:
             # strategy 1: until one spin shows ticks inside it (a healthy machine needs one). strategy 0: all of
             # them, and none may show a tick inside (the proof of one process is the absence, every time)
             trials = []
-            for _ in range(TRIALS):
-                ticks, spun = page.evaluate(SPIN_PROBE_JS, SPIN_MS)
-                trials.append((ticks, spun))
-                if strategy == 1 and other_process_proved(trials):
-                    break
+            if strategy == 1:
+                # spins until one shows ticks inside it, for 30 s (a loaded machine starves the top for a whole spin now and then)
+                end = time.monotonic() + PROOF_SECONDS
+                while not other_process_proved(trials) and time.monotonic() < end:
+                    trials.append(tuple(page.evaluate(SPIN_PROBE_JS, SPIN_MS)))
+            else:
+                for _ in range(TRIALS):
+                    trials.append(tuple(page.evaluate(SPIN_PROBE_JS, SPIN_MS)))
     finally:
         server.shutdown()
     return {"results": results, "spin_trials": trials, "port": port}

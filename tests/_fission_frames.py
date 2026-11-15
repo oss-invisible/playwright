@@ -161,7 +161,7 @@ def launch(binary, humanize=False, **kwargs):
 def new_page(browser, **context_kwargs):
     context = browser.new_context(**context_kwargs)
     page = context.new_page()
-    page.set_default_timeout(8000)
+    page.set_default_timeout(30000)
     page.set_default_navigation_timeout(30000)
     return context, page
 
@@ -180,13 +180,13 @@ def spin_trial(observer, frame, spin_ms=SPIN_MS):
         while (performance.now() < end) { /* spin */ }
         window.__spin = [start, Date.now()];
     }, 50); }""", spin_ms)
-    observer.page.wait_for_timeout(spin_ms + 800)
-    ticks = observer.evaluate("() => { clearInterval(window.__tick); return window.__ticks; }")
+    # until the frame says its spin is over (a condition with a deadline, not spin_ms + 800 ms): the ticks of the whole spin are in the list by then
     window = wait_for_value(observer.page, lambda: frame.evaluate("window.__spin"))
+    ticks = observer.evaluate("() => { clearInterval(window.__tick); return window.__ticks; }")
     return ticks, window
 
 
-def wait_for_value(page, read, seconds=20.0):
+def wait_for_value(page, read, seconds=30.0):
     """``read()`` once it is not None, with the client's events being read; None if it never is."""
     end = time.monotonic() + seconds
     value = read()
@@ -222,21 +222,29 @@ def other_process_proved(trials):
     return any(ticks_inside(ticks, window) >= INSIDE_TICKS for ticks, window in trials)
 
 
+#: The spins of the proof that two frames share ONE process (``test_fission_identity_parity_e2e.py`` strategy 0): a frame that shares the observer's process shows no
+#: tick inside, in any spin (the absence is the proof), so a fixed number of spins is enough to say it, and there is no clock in it.
 TRIALS = 6
+#: The proof of ANOTHER process is one spin with ticks inside it, and a loaded machine starves the observer for a whole spin now and then: the spins go on until
+#: one shows them, within this many seconds (the deadline of the wait; no healthy run comes near it).
+PROOF_SECONDS = 30.0
 
 
-def assert_other_process(observer, frame):
+def assert_other_process(observer, frame, seconds=PROOF_SECONDS, clock=time.monotonic):
     """``frame`` runs in a process of its own, not the one of ``observer``: the observer's timer ticks while the frame
-    spins. Up to ``TRIALS`` spins (the first that shows ticks inside it is enough; a healthy machine needs one)."""
+    spins. Spins until one shows ticks inside it (a healthy machine needs one), for ``seconds``."""
     trials = []
-    for _ in range(TRIALS):
+    end = clock() + seconds
+    while True:
         trials.append(spin_trial(observer, frame))
         if other_process_proved(trials):
             return
+        if clock() >= end:
+            break
     assert False, (
         "the frame at %s shares the process of the observer at %s: in %d spins of %d ms the observer's 10 ms timer never "
         "ticked inside a spin (a frame of another process leaves it free; here: ticks inside, ticks in all, spin ms) %s" % (
-            frame.url, observer.url, TRIALS, SPIN_MS,
+            frame.url, observer.url, len(trials), SPIN_MS,
             [(ticks_inside(t, w), len(t), (w[1] - w[0]) if w else None) for t, w in trials]))
 
 

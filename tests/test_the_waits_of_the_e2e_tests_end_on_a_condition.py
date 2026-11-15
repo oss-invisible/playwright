@@ -256,8 +256,9 @@ def test_a_frame_that_shares_the_process_keeps_the_assertion_red_and_one_that_do
         url = "http://localhost:1/grid"
 
     monkeypatch.setattr(ff, "spin_trial", lambda observer, frame: _same_process_trial(2500))
+    seconds = iter(range(0, 10_000, 7))              # a clock that moves 7 s at each look, so the 30 s of the proof are spent without waiting
     with pytest.raises(AssertionError) as red:
-        ff.assert_other_process(Observer(), Frame())
+        ff.assert_other_process(Observer(), Frame(), clock=lambda: next(seconds))
     assert "shares the process of the observer" in str(red.value) and "(0, " in str(red.value)
     calls = []
 
@@ -268,3 +269,20 @@ def test_a_frame_that_shares_the_process_keeps_the_assertion_red_and_one_that_do
     monkeypatch.setattr(ff, "spin_trial", starved_then_healthy)
     ff.assert_other_process(Observer(), Frame())
     assert len(calls) == 3
+    # a machine that starves the observer for more spins than the fixed count of the old proof is still waited for, until the deadline
+    calls.clear()
+
+    def starved_for_a_long_time(observer, frame):
+        calls.append(1)
+        return _other_process_trial(starved=len(calls) <= 2 * ff.TRIALS)
+
+    monkeypatch.setattr(ff, "spin_trial", starved_for_a_long_time)
+    ff.assert_other_process(Observer(), Frame(), clock=lambda: 0)
+    assert len(calls) == 2 * ff.TRIALS + 1
+
+
+def test_the_proof_of_another_process_has_no_fixed_pause_and_no_fixed_count():
+    import inspect
+    spin = inspect.getsource(ff.spin_trial)
+    assert "wait_for_timeout" not in spin, "the spin is waited for as a condition (its end), not for spin_ms + 800 ms"
+    assert "range(TRIALS)" not in inspect.getsource(ff.assert_other_process), "the proof of another process is waited for until a deadline"
