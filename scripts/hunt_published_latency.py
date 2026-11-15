@@ -76,11 +76,12 @@ async def work(page, port, tag):
 
 async def serve_endpoint(binary):
     proc = await asyncio.create_subprocess_exec(sys.executable, __file__, "serve", binary,
-                                                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+                                                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     while True:
         line = (await asyncio.wait_for(proc.stdout.readline(), 120)).decode().strip()
         if not line:
-            raise RuntimeError("the server process ended before it served")
+            err = (await proc.stderr.read()).decode(errors="replace")[-600:]
+            raise RuntimeError("the server process ended before it served: " + err)
         if line.startswith("ENDPOINT "):
             return proc, line.split(" ", 1)[1]
 
@@ -161,7 +162,7 @@ async def main(arm, n, rnd, binary):
     cpu = sampler.total()
     for r in rows:
         if isinstance(r, Exception):
-            print("HUNTROW " + json.dumps({"arm": arm, "round": rnd, "crash": repr(r)[:200]}), flush=True)
+            print("HUNTROW " + json.dumps({"arm": arm, "round": rnd, "crash": repr(r)[:800]}), flush=True)
             continue
         r.update({"round": rnd, "n": n, "os": sys.platform, "wall_s": round(time.time() - t0, 1), "cpu_s_per_browser": round(cpu / n, 2)})
         print("HUNTROW " + json.dumps(r), flush=True)

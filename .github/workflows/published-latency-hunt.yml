@@ -48,8 +48,10 @@ jobs:
         run: |
           echo "FF_AFTER=$(cd "$RUNNER_TEMP" && "$PY_AFTER" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
           echo "FF_BEFORE=$(cd "$RUNNER_TEMP" && "$PY_BEFORE" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
-      - name: Six rounds, the five arms in rotating order
+      - name: Six rounds, the arms in rotating order
         continue-on-error: true
+        env:
+          ONLY_ARMS: "remote stock"
         timeout-minutes: 70
         run: |
           set +e
@@ -66,8 +68,10 @@ jobs:
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
           ARMS=(inproc4 one remote stock before)
+          if [ -n "$ONLY_ARMS" ]; then read -ra ARMS <<< "$ONLY_ARMS"; fi
+          N=${#ARMS[@]}
           for r in 0 1 2 3 4 5; do
-            for k in 0 1 2 3 4; do a=${ARMS[$(( (k + r) % 5 ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"; done
+            for k in $(seq 0 $((N-1))); do a=${ARMS[$(( (k + r) % N ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"; done
           done
           true
       - name: The table
