@@ -10,8 +10,9 @@ THE RULES (a stable name each; ``CLASS`` is the letter of the audit of the e2e t
 
 * ``sleep`` (A): ``time.sleep``, ``asyncio.sleep`` (not ``sleep(0)``), ``.wait_for_timeout(``. A fixed pause and then a read judges the speed of the machine.
 * ``js-timer`` (A): ``setTimeout(`` / ``setInterval(`` in a string of the test (a page of the test): when the verdict depends on when it fires, it judges the machine.
-* ``bound`` (B): ``assert <something that is a duration> < <a constant>`` (``<=`` too): an absolute upper bound on a time. A bound against a value measured in the same
-  run (``took <= control * 3``) is not flagged, and neither is a lower bound (it cannot fail because the machine is slow).
+* ``bound`` (B): ``assert <something that is a duration> < <an absolute limit>`` (``<=`` too): an upper bound on a time. An absolute limit is a number, a name in capitals,
+  a variable NAMED a limit (``limit_s``, ``max_ms``), or anything an absolute slack is added to (``rtt_ms + 250``, ``control + 0.5``). A bound against a value measured in the
+  same run and scaled (``took <= control * 3``) is not flagged, and neither is a lower bound (it cannot fail because the machine is slow).
 * ``port`` (C): a port written as a number in a ``bind``, a ``*Server((addr, N))``, a ``port=N``, a ``"...port": N`` or a ``NAME_PORT = N`` (N not 0). Two workers that
   run at once, or a port someone else holds, make it red.
 * ``env`` (C): ``os.environ`` written (``[k] = v``, ``pop``, ``setdefault``, ``update``, ``del``, ``putenv``): ``monkeypatch.setenv`` undoes itself, this does not.
@@ -49,7 +50,9 @@ POST_PUBLICATION = ("test_release_e2e.py", "test_upgrade_e2e.py")
 COUNTING = {"_processes.py", "_waits.py"}
 
 _DURATION_WORDS = {"took", "elapsed", "seconds", "secs", "sec", "duration", "wall", "latency", "ms", "held", "late", "waited", "wait", "slowest",
-                   "longest", "spent", "rtt", "cpu", "lag", "stall", "delay"}
+                   "longest", "spent", "rtt", "cpu", "lag", "stall", "delay", "opened"}
+#: A variable that is named a limit (``limit``, ``max_ms``, ``deadline_s``) is a constant of the test even when it is not written in capitals.
+_LIMIT_WORDS = {"limit", "limits", "bound", "ceiling", "budget", "timeout", "threshold", "max", "maximum", "allowed", "slack", "margin", "cap"}
 _CLOCKS = {"monotonic", "perf_counter", "time", "process_time", "time_ns", "monotonic_ns", "perf_counter_ns"}
 _DEADLINE_NAMES = re.compile(r"(deadline|until|give_?up|stop_at|expires?|budget|limit|timeout|end_at)", re.I)
 _POLLING_FUNCTIONS = re.compile(r"^(_?pump\w*|_?pause\w*|_?wait\w*|\w*wait_for\w*|\w*_until|_?poll\w*|_?settle\w*|_?spin\w*)$")
@@ -131,6 +134,22 @@ def _is_constant_number(node: ast.AST) -> bool:
         return _is_constant_number(node.operand)
     if isinstance(node, ast.BinOp):
         return _is_constant_number(node.left) and _is_constant_number(node.right)
+    return False
+
+
+def _is_an_absolute_limit(node: ast.AST) -> bool:
+    """What an upper bound on a duration is held to be absolute by: a constant (:func:`_is_constant_number`), a variable that is NAMED a limit (``limit_s``, ``max_ms``),
+    or anything with an absolute slack added to it or taken from it (``rtt_ms + 250``, ``control + 0.5``: a stall of the machine longer than the slack is red whatever
+    the control was). A product (``control * 3``) is relative: it grows with a measure of the same run."""
+    if _is_constant_number(node):
+        return True
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return bool(_identifier_words(node) & _LIMIT_WORDS)
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, (ast.Add, ast.Sub)) and any(
+                isinstance(side, ast.Constant) and isinstance(side.value, (int, float)) and not isinstance(side.value, bool) for side in (node.left, node.right)):
+            return True
+        return _is_an_absolute_limit(node.left) and _is_an_absolute_limit(node.right)
     return False
 
 
@@ -404,8 +423,8 @@ class _Reader(ast.NodeVisitor):
                 continue
             left = sub.left
             for op, right in zip(sub.ops, sub.comparators):
-                upper = (isinstance(op, (ast.Lt, ast.LtE)) and _is_constant_number(right) and _is_a_duration(left)) \
-                    or (isinstance(op, (ast.Gt, ast.GtE)) and _is_constant_number(left) and _is_a_duration(right))
+                upper = (isinstance(op, (ast.Lt, ast.LtE)) and _is_an_absolute_limit(right) and _is_a_duration(left)) \
+                    or (isinstance(op, (ast.Gt, ast.GtE)) and _is_an_absolute_limit(left) and _is_a_duration(right))
                 if upper:
                     self.add("bound", node, ast.unparse(sub)[:80])
                 if isinstance(op, (ast.Eq, ast.NotEq)) and self.file not in COUNTING:
@@ -482,8 +501,11 @@ GATE_FILE = TESTS / "gates" / "e2e_clock_exceptions.json"
 #:   test server's loop.
 #: * ``virtual-port``: a port number that is never bound: the gateway of the test answers for it by name.
 #: * ``post-publication``: the round after a publication (``tests/_post_publication.py``).
-#: * ``hang-detector``: a limit as high as the product's own timeout, or a wait with no clock whose end is an event of the test's own server; it ends a hang, it judges no speed.
-KINDS = ("negative-window", "stimulus", "instrument", "virtual-port", "post-publication", "hang-detector")
+#: * ``hang-detector``: the deadline of a wait for a thing that must happen (a timer, a step or a limit of 30 s or more that ends the wait of a condition), a limit as high as
+#:   the product's own timeout, or a wait with no clock whose end is an event of the test's own server; it ends a hang, it judges no speed.
+#: * ``cpu-budget``: a bound on the CPU seconds of a process (user + kernel), not on a time that passes: a machine that is slow or stops stretches the clock and not the CPU,
+#:   and the bound has a margin measured on the runner (it is not a structure, so the reason says the numbers).
+KINDS = ("negative-window", "stimulus", "instrument", "virtual-port", "post-publication", "hang-detector", "cpu-budget")
 
 #: What a ``debt`` item says, by rule: why the occurrence can be red for a reason that is nobody's fault, and what replaces it.
 DEBT_REASON = {

@@ -174,6 +174,19 @@ def test_an_absolute_upper_bound_is_refused_and_a_lower_bound_is_not():
     assert rules_of(fake("def test_x(count):\n    assert count < 4\n")) == [], "not a duration"
 
 
+def test_a_limit_that_is_a_named_variable_or_has_a_slack_added_is_refused_and_a_relative_one_is_not():
+    assert rules_of(fake("def test_x(took, limit_s):\n    assert took < limit_s\n")) == ["bound"], "a limit is a limit when it is not written in capitals"
+    assert rules_of(fake("def test_x(elapsed, max_ms):\n    assert elapsed <= max_ms\n")) == ["bound"]
+    assert rules_of(fake("def test_x(limit_s, took):\n    assert limit_s > took\n")) == ["bound"]
+    assert rules_of(fake("def test_x(wait, rtt_ms):\n    assert wait < rtt_ms + 250\n")) == ["bound"], "an absolute slack added to a measure is an absolute limit"
+    assert rules_of(fake("def test_x(took, control):\n    assert took <= control + 0.5\n")) == ["bound"]
+    assert rules_of(fake("def test_x(res):\n    assert res['opened'] < 3000\n")) == ["bound"], "the time a connection took to open is a duration"
+    assert rules_of(fake("def test_x(took, control):\n    assert took <= control * 3\n")) == [], "a factor of a measure of the same run is relative"
+    assert rules_of(fake("def test_x(took, control):\n    assert took <= control\n")) == []
+    assert rules_of(fake("def test_x(took, control):\n    assert took >= control - 0.5\n")) == [], "a lower bound with a slack cannot fail because the machine is slow"
+    assert rules_of(fake("import time\n\ndef test_x(ready, deadline):\n    assert time.monotonic() < deadline, 'never'\n")) == [], "a point in time that ends a wait is no limit on a duration"
+
+
 def test_a_real_url_is_refused_and_a_local_one_is_not():
     assert rules_of(fake("def test_x(page):\n    page.goto('https://example.com/')\n")) == ["net"]
     assert rules_of(fake("import urllib.request\n\ndef test_x():\n    urllib.request.urlopen('http://127.0.0.1:1/')\n")) == ["net"]
