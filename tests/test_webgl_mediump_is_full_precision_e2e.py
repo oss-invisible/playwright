@@ -157,7 +157,7 @@ def arithmetic_problems(bits: list) -> list:
 
 
 def test_mediump_computes_at_32_bit(firefox_binary, engine_at_least):
-    engine_at_least("firefox-65")
+    engine_at_least("firefox-66")
     from invisible_playwright import InvisiblePlaywright
 
     texels = _texels()
