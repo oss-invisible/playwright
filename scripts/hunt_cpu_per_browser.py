@@ -20,6 +20,7 @@ served by an http server inside the client process:
          pref does not change the isolation the cfg picked; it is passed so that both arms are launched with Fission asked for.
   ours_swwr  ours with gfx.webrender.software=true passed ONLY here, through extra_prefs (a hunt-side switch, the product is untouched):
          would software WebRender on the VM cost as little as stock's fallback does?
+  ours_nomsaa  ours with webgl.msaa-samples=0 and webgl.msaa-force=false passed ONLY here (scripts/hunt_msaa.py): without the forced multisample.
   ours_vmretail  ours made to take the retail decisions of the VM: the feature-status declaration of the core with the compositing features
          replaced by what stock decides on this runner, gfx.webrender.software=true, gfx.webrender.software.d3d11=false, webgl.angle.force-warp=true
          (scripts/hunt_vmretail.py; the list is printed there and in `support`).
@@ -60,9 +61,11 @@ from pathlib import Path
 
 BROWSERS = int(os.environ.get("HUNT_BROWSERS", "4"))   # only the hunt's GPU-process profile shortens the loop; every other step leaves these alone
 ROUNDS = int(os.environ.get("HUNT_ROUNDS", "10"))
-ARMS = ["ours", "ours_swwr", "ours_vmretail", "stock", "stockheaded"]
+ARMS = ["ours", "ours_swwr", "ours_vmretail", "ours_nomsaa", "stock", "stockheaded"]
 #: prefs an arm passes through extra_prefs: the only place they are added, the hunt and never the product
-ARM_PREFS = {"ours_swwr": {"gfx.webrender.software": True}}
+ARM_PREFS = {"ours_swwr": {"gfx.webrender.software": True},
+             # ours_nomsaa: the multisample the core forces (webgl.msaa-samples=4, webgl.msaa-force=true) switched off, by the hunt only
+             "ours_nomsaa": {"webgl.msaa-samples": 0, "webgl.msaa-force": False}}
 #: ours_vmretail: the prefs are BUILT in the run (scripts/hunt_vmretail.py build reads the retail decisions of the VM from stock and writes this file)
 VMRETAIL_FILE = os.environ.get("HUNT_VMRETAIL_PREFS", "")
 
