@@ -641,6 +641,99 @@ def serve_one(binary):
         server.close()
 
 
+# ---- the shutdown arms (shut20 / shut70 / shut180): one browser per process, its output kept with the time of each line --------------
+#: (wall ms, text) of every line the engine printed, recorded by the replacement of ProcessOutput._pump (HUNT_SHUT=1).
+ENGINE_LINES = []
+#: Seconds after the start of the launch at which the browser is closed (HUNT_SESSION_S); 0 = right after the typing.
+SESSION_S = float(os.environ.get("HUNT_SESSION_S") or 0)
+SHUT_PREFS = {"toolkit.asyncshutdown.log": True, "browser.dom.window.dump.enabled": True}
+
+
+def install_output_capture():
+    """HUNT: the core's ProcessOutput._pump (invisible_core/juggler/connection.py, published 64.73.0) replaced by a copy of its body
+    that also records each line with its wall time in ENGINE_LINES. Everything else it does is the same: the kept lines, the
+    readiness marker, the notifications, the end of the stream."""
+    from invisible_core.juggler import connection as cmod
+    real = cmod.ProcessOutput._pump
+    if getattr(real, "_hunt", False):
+        return
+
+    def _pump(self) -> None:
+        try:
+            for raw in iter(self._stream.readline, b""):
+                text = raw.decode("utf-8", "replace").rstrip("\r\n")
+                ENGINE_LINES.append((time.time() * 1000, text))
+                with self._cv:
+                    if text.strip():
+                        self._lines.append(text)
+                    if cmod._READY in text:
+                        self._ready = True
+                    self._cv.notify_all()
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self._cv:
+                self._eof = True
+                self._cv.notify_all()
+    _pump._hunt = True
+    cmod.ProcessOutput._pump = _pump
+
+
+class ExitWatch(threading.Thread):
+    """After the close starts: the wall time at which every direct child of this process (the engine's parent) is gone, and the time
+    at which every process of its tree is. Polled every 10 ms on the Process objects taken before the close."""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="hunt-exitwatch")
+        me = psutil.Process()
+        self.main = me.children()
+        self.tree = me.children(recursive=True)
+        self.main_gone = self.tree_gone = None
+
+    @staticmethod
+    def alive(p):
+        try:
+            return p.is_running() and (sys.platform == "win32" or p.status() != psutil.STATUS_ZOMBIE)
+        except psutil.Error:
+            return False
+
+    def run(self):
+        stop = time.time() + 90
+        while time.time() < stop:
+            if self.main_gone is None and not any(self.alive(p) for p in self.main):
+                self.main_gone = time.time() * 1000
+            if not any(self.alive(p) for p in self.tree):
+                self.tree_gone = time.time() * 1000
+                if self.main_gone is None:
+                    self.main_gone = self.tree_gone
+                return
+            time.sleep(0.01)
+
+
+def shut_report(lines, t_close, main_gone=None, tree_gone=None):
+    """From the lines of an engine's output (wall ms, text), the close's start (wall ms) and when its main process and its whole tree
+    were gone: (a) the close -> the quit (the first "Starting phase" line after the close: AsyncShutdown, with its log on, prints
+    "DEBUG: Starting phase <topic>" as the first phase starts) and (b) the quit -> the main process gone, -> the tree gone; and the
+    lines to show: the matching ones from the close on (capped at 160) plus the "Adding blocker" lines before it (capped at 80),
+    each with its time against the close (t_ms) and against the quit (q_ms)."""
+    quit_t = next((t for t, text in lines if t >= t_close and "Starting phase" in text), None)
+    out = {"close_wall_ms": round(t_close, 1), "a_close_to_quit_ms": round(quit_t - t_close, 1) if quit_t else None,
+           "close_to_main_gone_ms": round(main_gone - t_close, 1) if main_gone else None,
+           "b_quit_to_main_gone_ms": round(main_gone - quit_t, 1) if quit_t and main_gone else None,
+           "b_quit_to_tree_gone_ms": round(tree_gone - quit_t, 1) if quit_t and tree_gone else None,
+           "shut_lines": len(lines)}
+    after = [(t, x) for t, x in lines if t >= t_close and SHUT_RE.search(x)][:160]
+    before = [(t, x) for t, x in lines if t < t_close and "Adding blocker" in x][:80]
+    shown = [(round(t - t_close, 1), round(t - quit_t, 1) if quit_t else None, x) for t, x in before + after]
+    return out, shown
+
+
+def print_shut(arm, rnd, tag, shown):
+    for t_ms, q_ms, text in shown:
+        print("HUNTSHUT " + json.dumps({"arm": arm, "round": rnd, "tag": tag, "os": sys.platform, "t_ms": t_ms, "q_ms": q_ms,
+                                        "line": text[:160]}), flush=True)
+
+
 async def one_browser(arm, binary, port, tag):
     row = {"arm": arm, "tag": tag}
     c_start = await asyncio.to_thread(parent_cpu)
@@ -648,6 +741,8 @@ async def one_browser(arm, binary, port, tag):
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
         extra = json.loads(os.environ.get("HUNT_EXTRA_PREFS") or "{}") or None
+        if os.environ.get("HUNT_SHUT") == "1":
+            extra = {**(extra or {}), **SHUT_PREFS}
         more = {}
         if os.environ.get("HUNT_TIMEZONE"):
             more["timezone"] = os.environ["HUNT_TIMEZONE"]
@@ -721,9 +816,21 @@ async def one_browser(arm, binary, port, tag):
         row["typing"] = await typing(page, port, arm, TEXTS[int(tag.rsplit("-", 1)[1]) % len(TEXTS)])
     except Exception as exc:   # noqa: BLE001
         row["typing"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+    if SESSION_S:
+        # The shutdown arms: idle until the session is SESSION_S old (from the start of the launch), then close.
+        await asyncio.sleep(max(0.0, t0 + SESSION_S - time.monotonic()))
+    row["session_s_at_close"] = round(time.monotonic() - t0, 2)
+    watch = None
+    if os.environ.get("HUNT_SHUT") == "1":
+        watch = ExitWatch()
+        watch.start()
+        row["close_wall_ms"] = time.time() * 1000
     t1 = time.monotonic()
     await close()
     row["close_ms"] = round((time.monotonic() - t1) * 1000)
+    if watch is not None:
+        await asyncio.to_thread(watch.join, 95)
+        row["_main_gone"], row["_tree_gone"] = watch.main_gone, watch.tree_gone
     if row["close_ms"] > SLOW_MS:
         SLOW.append(("close", tag, t1, time.monotonic()))
     return row
@@ -903,6 +1010,8 @@ async def main(arm, n, rnd, binary):
         install_key_probe()
         install_evalsplit()
         TRACE_EVAL = True
+        if os.environ.get("HUNT_SHUT") == "1":
+            install_output_capture()
     global PROXY_PORT
     if os.environ.get("HUNT_PROXY") == "1":
         proxy = ThreadingProxy(("127.0.0.1", 0), ProxyHandler)
@@ -927,7 +1036,14 @@ async def main(arm, n, rnd, binary):
             continue
         r.update({"round": rnd, "n": n, "os": sys.platform, "wall_s": round(time.time() - t0, 1),
                   "cpu_s_per_browser": round(cpu / n, 2) if cpu is not None else None})
+        shown = []
+        if r.get("close_wall_ms"):
+            # One browser per process: every line the engine printed is this browser's.
+            fields, shown = shut_report(ENGINE_LINES, r["close_wall_ms"], r.pop("_main_gone", None), r.pop("_tree_gone", None))
+            r.update(fields)
+            r["engine_lines_total"] = len(ENGINE_LINES)
         print("HUNTROW " + json.dumps(r), flush=True)
+        print_shut(arm, rnd, r["tag"], shown)
     for tag, segs in EVAL_OUT:
         print("HUNTEVAL " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "tag": tag, "segs": segs}), flush=True)
     SAMPLER.stop.set()
@@ -943,7 +1059,7 @@ async def main(arm, n, rnd, binary):
 # ---- the retail reference: the real Firefox, not Playwright --------------------------------------------------------------------------
 IS_WIN = sys.platform == "win32"
 #: What the shutdown log is searched for (AsyncShutdown's own lines and the phases' names).
-SHUT_RE = re.compile(r"asyncshutdown|shutdown|quit-application|profile-before-change|profile-change|xpcom-will|barrier|blocker", re.I)
+SHUT_RE = re.compile(r"asyncshutdown|shutdown|quit|phase|profile-before-change|profile-change|xpcom|barrier|blocker", re.I)
 USER_JS = 'user_pref("toolkit.asyncshutdown.log", true);\nuser_pref("browser.dom.window.dump.enabled", true);\n'
 
 
@@ -1249,7 +1365,9 @@ class RetailBrowser:
                     pass
         else:
             row["close_ms"] = round(gone - self.t_close, 1)
+        self.gone_wall = gone
         main_exit = self.exit_ms.get(target)
+        self.main_gone_wall = self.t_close + main_exit if main_exit is not None else None
         row["close_main_ms"] = main_exit
         last = sorted(((ms, self.names.get(pid, "?")) for pid, ms in self.exit_ms.items()), reverse=True)[:4]
         row["last_exits"] = [[nm, ms] for ms, nm in last]
@@ -1284,15 +1402,13 @@ def retail_main(n, rnd, binary, close_after):
             continue
         r.update({"arm": "retail", "tag": b.tag, "round": rnd, "n": n, "os": sys.platform, "close_after_s": close_after,
                   "wall_s": round(time.time() - t0, 1), "log_bytes": b.log_bytes, "log_lines": b.log_lines, "watch_error": b.error})
+        # The shutdown log, see shut_report: against the close (t_ms) and against the quit (q_ms).
+        shown = []
+        if b.t_close:
+            fields, shown = shut_report(b.log_matches, b.t_close, getattr(b, "main_gone_wall", None), getattr(b, "gone_wall", None))
+            r.update(fields)
         print("HUNTROW " + json.dumps(r), flush=True)
-        # The shutdown log: each matching line with its time against the close (negative: before it). First 25 and last 15 when more
-        # than 40, the line truncated.
-        found = b.log_matches
-        if len(found) > 40:
-            found = found[:25] + found[-15:]
-        for t, text in found:
-            print("HUNTSHUT " + json.dumps({"arm": "retail", "round": rnd, "tag": b.tag, "os": sys.platform,
-                                            "t_ms": round(t - b.t_close, 1) if b.t_close else None, "line": text[:160]}), flush=True)
+        print_shut("retail", rnd, b.tag, shown)
         if not b.log_bytes:
             print("HUNTSHUT " + json.dumps({"arm": "retail", "round": rnd, "tag": b.tag, "os": sys.platform, "t_ms": None,
                                             "line": "(the browser wrote nothing to stdout/stderr)"}), flush=True)

@@ -6,7 +6,9 @@
 # the machine), one (1 browser per process, 4 processes at once), remote (launch_server), stock (Playwright's Firefox),
 # retail1 / retail4 / retail4late (the official Firefox 159, headed, no Playwright: 1 browser, 4 together closed 20 s after their
 # first load, 4 together closed 70 s after it).
-# Time: about 8 minutes a round on Windows (late about 90 s, retail4late about 100 s, the other arms 15-45 s), six rounds, about 50
+# This push is the shutdown hunt (arms shut20 shut70 shut180 retail1 retail4late retail1long, 4 rounds, about 11 minutes a round on
+# Windows, about 45 minutes in all); the full list is in a comment in the run step. The earlier estimate for the full list: about 8
+# minutes a round on Windows (late about 90 s, retail4late about 100 s, the other arms 15-45 s), six rounds, about 50
 # minutes against the 70 of the step; the loop starts no arm after 63 minutes.
 name: published latency hunt
 on:
@@ -83,6 +85,7 @@ jobs:
         continue-on-error: true
         env:
           HUNT_PROBES: "1"
+          ROUNDS: "4"
         timeout-minutes: 70
         run: |
           set +e
@@ -112,16 +115,25 @@ jobs:
               stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | keep stock ;;
               one)     for k in 0 1 2 3; do "$PY_AFTER" $S inproc 1 "$2-$k" "$FF_AFTER" > "$RUNNER_TEMP/one-$k.log" 2>&1 & done; wait
                        cat "$RUNNER_TEMP"/one-*.log | keep one ;;
+              shut20)  HUNT_SHUT=1 HUNT_SESSION_S=20 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut20 ;;
+              shut70)  HUNT_SHUT=1 HUNT_SESSION_S=70 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut70 ;;
+              shut180) HUNT_SHUT=1 HUNT_SESSION_S=180 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut180 ;;
               retail1) retail 1 "$2" 20 | keep retail1 ;;
+              retail1long) retail 1 "$2" 180 | keep retail1long ;;
               retail4) retail 4 "$2" 20 | keep retail4 ;;
               retail4late) retail 4 "$2" 70 | keep retail4late ;;
             esac
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
-          ARMS=(inproc4 inproc4quiet inproc4tz inproc4px late solo one remote stock retail1 retail4 retail4late)
+          # The full list (the default when the focused one below is removed):
+          #   inproc4 inproc4quiet inproc4tz inproc4px late solo one remote stock retail1 retail4 retail4late
+          # The shutdown hunt: why our engine on Windows does not exit within the core's 5 s after a long session. shut20/70/180 are
+          # ours (one browser per process, idle until the session is 20/70/180 s old, then closed, the engine's shutdown log timed),
+          # the retail ones are the real Firefox closed by its window after 20 s / 70 s (4 together) / 180 s.
+          ARMS=(shut20 shut70 shut180 retail1 retail4late retail1long)
           if [ -n "$ONLY_ARMS" ]; then read -ra ARMS <<< "$ONLY_ARMS"; fi
           N=${#ARMS[@]}
-          for r in 0 1 2 3 4 5; do
+          for r in $(seq 0 $((${ROUNDS:-6}-1))); do
             for k in $(seq 0 $((N-1))); do
               if [ "$SECONDS" -gt 3780 ]; then echo "time guard: no new arm after $SECONDS s"; break 2; fi
               a=${ARMS[$(( (k + r) % N ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"
@@ -143,7 +155,7 @@ jobs:
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
           def trio(v):
               return "p50 %s p95 %s max %s" % (q(v, .5), q(v, .95), max((x for x in v if x is not None), default=None))
-          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock"):
+          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180"):
               if not rows.get(arm):
                   continue
               r = [x for x in rows.get(arm, []) if "crash" not in x]
@@ -186,7 +198,7 @@ jobs:
                       print("HUNTKEYWORST %-12s timeStamp slip %.0f ms | previous and this key [planned, sent, answered, timeStamp, handler]: %s" % (arm, slip, pair))
           # The retail Firefox 159: from the process start to the first page loaded (the onload beacon at the server), to the first
           # visible top-level window, the normal close to every process of the tree gone, the session and the parent's CPU.
-          for arm in ("retail1", "retail4", "retail4late"):
+          for arm in ("retail1", "retail4", "retail4late", "retail1long"):
               all_r = rows.get(arm, [])
               r = [x for x in all_r if "crash" not in x]
               if not all_r:
@@ -216,15 +228,68 @@ jobs:
               print("HUNTEVALSPLIT %-12s traced browsers %d, evaluates %d, incomplete %d, engine commands per evaluate p50 %s | p50/p95 ms: %s"
                     % (arm, trace_n[arm], len(s.get("total", [])), missing.get(arm, 0), q(s.get("cmds", []), .5),
                        " | ".join("%s %s/%s" % (n, q(s.get(n, []), .5), q(s.get(n, []), .95)) for n in names)))
-          # The lines of the shutdown log (retail), grouped: how many browsers printed it, when against the close (ms, p50).
-          groups = {}
+          # ---- The shutdown hunt. Two numbers per close: (a) the close -> the quit (the first "Starting phase" line of the engine's
+          # AsyncShutdown log after the close started: Services.startup.quit has run), (b) the quit -> the main process gone (and the
+          # whole tree gone). Then the phases and the blockers by name, with their time against the quit (the time held in (b)).
+          SH = ("shut20", "shut70", "shut180", "retail1", "retail4late", "retail1long")
+          probes, shut = {}, {}
           for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTPROBE \[(\w+)\] (.*)", line.strip())
+              if m:
+                  d = json.loads(m.group(2))
+                  probes.setdefault((m.group(1), d["name"]), []).append(d["ms"])
+                  continue
               m = re.match(r"HUNTSHUT \[(\w+)\] (.*)", line.strip())
               if m:
                   d = json.loads(m.group(2))
-                  groups.setdefault((m.group(1), re.sub(r"\d+", "#", d["line"])[:110]), []).append(d["t_ms"])
-          for (arm, text), ts in sorted(groups.items(), key=lambda kv: (kv[0][0], q(kv[1], .5) if q(kv[1], .5) is not None else 1e12))[:80]:
-              print("HUNTSHUTSUM %-12s n %3d | ms against the close p50 %s p95 %s | %s" % (arm, len(ts), q(ts, .5), q(ts, .95), text))
+                  shut.setdefault(m.group(1), {}).setdefault((d["round"], d["tag"]), []).append((d["t_ms"], d.get("q_ms"), d["line"]))
+          def pmx(arm, name):
+              v = probes.get((arm, name), [])
+              return "%s/%s" % (q(v, .5), max(v) if v else None)
+          for arm in SH:
+              if not rows.get(arm):
+                  continue
+              r = [x for x in rows[arm] if "crash" not in x]
+              print("HUNTSHUTCLOSE %-11s closes %d crashes %d | session s at close p50 %s | close ms %s | (a) close->quit ms %s | (b) quit->main gone ms %s | (b) quit->tree gone ms %s | close->main gone p50 %s | quit not seen %d | Connection.close p50/max %s | EngineTree.end %s | EngineTree.wait_job_empty %s | SessionFiles.remove %s"
+                    % (arm, len(r), len(rows[arm]) - len(r), q([x.get("session_s_at_close", x.get("session_s")) for x in r], .5), trio([x.get("close_ms") for x in r]),
+                       trio([x.get("a_close_to_quit_ms") for x in r]), trio([x.get("b_quit_to_main_gone_ms") for x in r]), trio([x.get("b_quit_to_tree_gone_ms") for x in r]),
+                       q([x.get("close_to_main_gone_ms") for x in r], .5), sum(1 for x in r if x.get("a_close_to_quit_ms") is None),
+                       pmx(arm, "Connection.close"), pmx(arm, "EngineTree.end"), pmx(arm, "EngineTree.wait_job_empty"), pmx(arm, "SessionFiles.remove")))
+          phase_re = re.compile(r"(Starting|Finished) phase (\S+)")
+          add_re = re.compile(r"Adding blocker (.+) for phase (\S+)")
+          done_re = re.compile(r"Completed blocker (.+) for phase (\S+)")
+          for arm in SH:
+              closes = shut.get(arm, {})
+              if not closes:
+                  continue
+              ph, bl = {}, {}
+              for key, ls in closes.items():
+                  for t_ms, qv, text in ls:
+                      m = phase_re.search(text)
+                      if m and qv is not None and t_ms >= 0:
+                          ph.setdefault(m.group(2), {"Starting": [], "Finished": []})[m.group(1)].append(qv)
+                          continue
+                      m = add_re.search(text)
+                      if m:
+                          bl.setdefault((m.group(2), m.group(1)), {"add": set(), "done": {}})["add"].add(key)
+                          continue
+                      m = done_re.search(text)
+                      if m and qv is not None:
+                          bl.setdefault((m.group(2), m.group(1)), {"add": set(), "done": {}})["done"][key] = qv
+              for phase, v in sorted(ph.items(), key=lambda kv: q(kv[1]["Starting"], .5) if kv[1]["Starting"] else 1e12):
+                  print("HUNTPHASE %-11s %-34s closes %d | starts at quit+ms p50 %s max %s | finished at quit+ms p50 %s p95 %s max %s (finished in %d)"
+                        % (arm, phase, len(v["Starting"]), q(v["Starting"], .5), max(v["Starting"], default=None), q(v["Finished"], .5), q(v["Finished"], .95),
+                           max(v["Finished"], default=None), len(v["Finished"])))
+              ranked = sorted(bl.items(), key=lambda kv: -(max(kv[1]["done"].values()) if kv[1]["done"] else 1e12))[:40]
+              for (phase, name), v in ranked:
+                  done = list(v["done"].values())
+                  print("HUNTBLOCKER %-11s %-30s %-40s added in %d of %d closes, completed in %d, never completed in %d | completed at quit+ms (held in b) p50 %s p95 %s max %s"
+                        % (arm, phase, name[:40], len(v["add"]), len(closes), len(done), len(v["add"] - set(v["done"])), q(done, .5), q(done, .95), max(done, default=None)))
+              # The lines of the close with the longest (b), in order: the raw story.
+              slow = sorted((x for x in rows[arm] if "crash" not in x), key=lambda x: -(x.get("b_quit_to_main_gone_ms") or x.get("close_ms") or 0))[:1]
+              for x in slow:
+                  for t_ms, qv, text in closes.get((x["round"], x["tag"]), [])[:150]:
+                      print("HUNTSHUTRAW %-11s %s %s | close%+.0f ms quit%+.0f ms | %s" % (arm, x["round"], x["tag"], t_ms, qv if qv is not None else float("nan"), text[:140]))
           PY
           python - "$RUNNER_TEMP/rows.log" <<'PY2'
           import json, re, sys
