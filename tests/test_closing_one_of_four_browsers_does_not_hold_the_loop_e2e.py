@@ -87,24 +87,13 @@ _CLIENT = textwrap.dedent("""
                            for i, f in frames.items() if i != main_id and i != threading.get_ident()}}
 
         def watcher(self):
-            # Only the part of a lateness during which the loop's thread was RUNNING counts. A loop the machine did not schedule waits in
-            # the selector and then, once woken, runs the callbacks that queued meanwhile (the pingers' replies): counting the whole
-            # lateness at that moment charged the machine's 90 ms to whoever ran first (candidate 43727128285, Windows: 94 ms, the main
-            # thread in `self._selector.select`, no blocking call on it). `busy_since` is when the thread last left the selector.
-            looked, busy_since = 0, None
+            looked = 0
             while not self.over.is_set():
                 time.sleep(0.003)
-                now = time.monotonic()
-                late = now - self.beat[0]
+                late = time.monotonic() - self.beat[0]
                 level = int(late / 0.03)
-                if self.idle(sys._current_frames().get(main_id)):
-                    busy_since = None
-                else:
-                    if busy_since is None:
-                        busy_since = now
-                    held = now - max(self.beat[0], busy_since)
-                    if held > 0.03:
-                        self.held = max(self.held, held)
+                if late > 0.03 and not self.idle(sys._current_frames().get(main_id)):
+                    self.held = max(self.held, late)
                 if level > looked:
                     self.holes.append({"late_ms": round(late * 1000), **self.stacks()})
                 looked = level
