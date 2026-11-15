@@ -269,7 +269,7 @@ def test_no_orphan_prefs_in_baseline():
 # ──────────────────────────────────────────────────────────────────────────
 #  Fake-proxy infrastructure for e2e: a tiny TCP-only SOCKS5 server (Socks5TcpOnly, in _socks_servers.py).
 # ──────────────────────────────────────────────────────────────────────────
-# Same per-event probe CreepJS runs (kept tiny; raw string = one escape level). Its STUN server is an argument: a test names one of its own
+# The per-event probe a fingerprinting page runs (kept tiny; raw string = one escape level). Its STUN server is an argument: a test names one of its own
 # (a server on this host, or a number nothing answers), never a public one.
 _PROBE_JS = r"""async (stun) => {
   const pc = new RTCPeerConnection({iceCandidatePoolSize:1, iceServers:[{urls:[stun]}]});
