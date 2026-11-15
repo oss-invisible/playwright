@@ -2,7 +2,7 @@ name: ocsp native hunt
 on:
   push:
     branches: [hunt/ocsp-native-after-eof]
-    paths: [tests/_lab_pki.py, .github/workflows/ocsp-native-hunt.yml]
+    paths: [tests/_lab_pki.py, tests/_egress_sink.py, tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py, .github/workflows/ocsp-native-hunt.yml]
 env:
   GITHUB_TOKEN: ${{ github.token }}
 concurrency:
@@ -15,7 +15,7 @@ jobs:
       max-parallel: 4
       matrix:
         os: [windows-2022, ubuntu-24.04]
-        drop: [none, alternate]
+        close: [wait, fast]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     defaults:
@@ -40,26 +40,27 @@ jobs:
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database
         run: python scripts/ci_lab_geoip.py build
-      - name: 30 runs of the OCSP case by name, the TLS server dropping ${{ matrix.drop }}
+      - name: 30 runs of the OCSP case by name, the context closed ${{ matrix.close }}
         env:
-          HUNT_TLS_DROP: ${{ matrix.drop }}
+          HUNT_CLOSE: ${{ matrix.close }}
           MOZ_CRASHREPORTER_DISABLE: "1"
         run: |
           set +e +o pipefail
           NODE='tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py::test_the_ocsp_request_of_a_trusted_page_leaves_only_through_the_proxy[name]'
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo rm -rf /opt/ff && sudo cp -a "$(dirname "$FF")" /opt/ff && sudo chown -R root:root /opt/ff && sudo chmod -R go+rX /opt/ff
-            RUN="sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR INVPW_REQUIRE_TRAP=1 PATH=$PATH INVPW_BINARY_PATH=/opt/ff/$(basename "$FF") HUNT_TLS_DROP=$HUNT_TLS_DROP"
+            RUN="sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR INVPW_REQUIRE_TRAP=1 PATH=$PATH INVPW_BINARY_PATH=/opt/ff/$(basename "$FF") HUNT_CLOSE=$HUNT_CLOSE"
           else
             RUN="env INVPW_BINARY_PATH=$FF"
           fi
           for i in $(seq 1 30); do
-            out=$($RUN python -m pytest "$NODE" -m e2e -o addopts='' -q -p no:cacheprovider -p no:rerunfailures 2>&1 || true)
-            if echo "$out" | grep -q " 1 passed"; then verdict=pass; else verdict=FAIL; fi
+            out=$($RUN python -m pytest "$NODE" -m e2e -o addopts='' -q -p no:cacheprovider -p no:rerunfailures -s 2>&1 || true)
+            if echo "$out" | grep -qE "(^| )1 passed"; then verdict=pass; else verdict=FAIL; fi
             hs=$(echo "$out" | grep -o "handshakes \[[^]]*\]" | head -1)
             why=$(echo "$out" | grep -oE "AssertionError: [^(]{0,160}" | head -1)
-            echo "HUNTROW os=$RUNNER_OS drop=$HUNT_TLS_DROP rep=$i verdict=$verdict $hs $why"
-            if [ "$i" = 1 ] || { [ "$verdict" = FAIL ] && [ -z "$why" ]; } && [ "$i" -le 3 ]; then echo "$out" | tail -40 | sed 's/^/HUNTOUT /'; fi
+            echo "HUNTROW os=$RUNNER_OS close=$HUNT_CLOSE rep=$i verdict=$verdict $hs $why"
+            echo "$out" | grep -E "^HUNT(CLOSE|LOG|STATE)" | sed "s/^/R$i /"
+            if [ "$verdict" = FAIL ] && [ -z "$why" ]; then echo "$out" | tail -25 | sed 's/^/HUNTOUT /'; fi
           done
       - name: Close every Firefox left
         if: always()

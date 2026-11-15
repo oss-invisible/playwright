@@ -29,7 +29,7 @@ import secrets
 import sys
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
-MOZ_LOG = "sync,nsHostResolver:5"
+MOZ_LOG = "timestamp,sync,nsHostResolver:5"  # hunt: timestamps
 LOG_FILE_NAME = "moz-%PID.log"
 
 _NATIVE = re.compile(r"Calling getaddrinfo for host \[([^\]]+)\]")

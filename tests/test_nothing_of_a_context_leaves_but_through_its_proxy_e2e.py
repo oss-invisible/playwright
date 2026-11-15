@@ -63,6 +63,8 @@ import dataclasses
 import os
 from typing import Callable, Dict, Optional
 
+import time
+
 import pytest
 
 from invisible_playwright import InvisiblePlaywright
@@ -664,9 +666,23 @@ def test_the_ocsp_request_of_a_trusted_page_leaves_only_through_the_proxy(
                 detail = "status=%s text=%r" % (response.status if response else None, page.evaluate("() => document.body.innerText")[:40])
             except Exception as exc:  # noqa: BLE001 - the message of the failed assertion below carries it
                 detail = "goto error: %s" % str(exc).splitlines()[0][:200]
-            reached = ds.wait_until(lambda: (address, ocsp_responder.port) in proxy.connects, EVIDENCE_SECONDS)
+            if os.environ.get("HUNT_CLOSE") == "fast":
+                reached = False
+            else:
+                reached = ds.wait_until(lambda: (address, ocsp_responder.port) in proxy.connects, EVIDENCE_SECONDS)
+            import datetime as _dt
+            print("HUNTCLOSE begin %s" % _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f"))
             context.close()
+            print("HUNTCLOSE end %s" % _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f"))
+            if os.environ.get("HUNT_CLOSE") == "fast":
+                time.sleep(6)
+                reached = (address, ocsp_responder.port) in proxy.connects
         watcher.stop()
+        from _egress_sink import _lines as _hunt_lines
+        for _l in _hunt_lines(engine_log):
+            if ocsp_name in _l or "stealth.contexts" in _l:
+                print("HUNTLOG " + _l.rstrip()[:300])
+        print("HUNTSTATE handshakes=%s reached=%s gateway_connects=%d" % (server.handshakes[:6], reached, len(proxy.connects)))
 
         sink = EgressSink(lab.witness, watcher, engine_log, lab.nonce, trap)
         why = (_why(doh, proxy) + "\n  case ocsp-%s: page %s (%s), OCSP URL %s, responder at %s, handshakes %s"
