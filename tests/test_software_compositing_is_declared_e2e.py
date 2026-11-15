@@ -216,7 +216,8 @@ PARENT_CPU_LIMIT_LINUX_S = 3.5
 def test_the_gpu_process_is_idle_on_a_fixed_scene(firefox_binary, capsys):
     import os
 
-    from _cpu_by_type import CpuSampler
+    from _cpu_by_type import CpuSampler, engine_processes
+    from _waits import watch
     from invisible_playwright import InvisiblePlaywright
 
     server, base = _a_page_server(SCENE)
@@ -224,6 +225,12 @@ def test_the_gpu_process_is_idle_on_a_fixed_scene(firefox_binary, capsys):
     try:
         with InvisiblePlaywright(binary_path=firefox_binary, **LAUNCH) as browser:
             page = browser.new_page()
+            # The sampling begins when the engine has a content process: one that is born after the start is counted from
+            # zero, but a tree that is seen before it has one gave "seen: ['parent']" twice. Waited for with a deadline, and
+            # what the tree held at each look is in the message if it never comes.
+            tree = watch(lambda: tuple(sorted({kind for kind, _cpu in engine_processes(os.getpid()).values()})),
+                         lambda kinds: "parent" in kinds and "tab" in kinds, 30, lambda: page.wait_for_timeout(100))
+            assert tree.ok, "no content process (`tab`) of the engine below the test process within 30 s; types seen: %s" % tree.render()
             sampler = CpuSampler(os.getpid())
             sampler.begin()
             try:
