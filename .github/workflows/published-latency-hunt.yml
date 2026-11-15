@@ -46,7 +46,7 @@ jobs:
           "$RUNNER_TEMP/after/$BIN/python" -m pip install -q --upgrade pip
           "$RUNNER_TEMP/after/$BIN/python" -m pip install -q "invisible-playwright==0.52.1" psutil websockets "playwright==$(cat scripts/playwright_pin.txt)"
           "$RUNNER_TEMP/after/$BIN/python" -c "import importlib.metadata as m; print('after', m.version('invisible-playwright'), m.version('invisible-core'))"
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb xdotool; "$RUNNER_TEMP/after/$BIN/python" -m playwright install --with-deps firefox; else "$RUNNER_TEMP/after/$BIN/python" -m playwright install firefox; fi
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb xdotool wmctrl openbox; "$RUNNER_TEMP/after/$BIN/python" -m playwright install --with-deps firefox; else "$RUNNER_TEMP/after/$BIN/python" -m playwright install firefox; fi
           echo "PY_AFTER=$RUNNER_TEMP/after/$BIN/python" >> "$GITHUB_ENV"
       - name: The engine the venv fetches
         run: |
@@ -93,7 +93,9 @@ jobs:
           retail() {
             if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
             if [ "$RUNNER_OS" = "Linux" ]; then
-              xvfb-run -a -s "-screen 0 1280x1024x24" "$PY_AFTER" $S retail "$1" "$2" "$FF_RETAIL" "$3" 2>&1
+              # A window manager in the virtual display, so the retail browser can be closed as a person closes it (wmctrl ->
+              # _NET_CLOSE_WINDOW -> WM_DELETE_WINDOW); without one only a signal is left, which is not a normal quit.
+              xvfb-run -a -s "-screen 0 1280x1024x24" sh -c 'openbox > /dev/null 2>&1 & sleep 1; exec "$0" "$@"' "$PY_AFTER" $S retail "$1" "$2" "$FF_RETAIL" "$3" 2>&1
             else
               "$PY_AFTER" $S retail "$1" "$2" "$FF_RETAIL" "$3" 2>&1
             fi

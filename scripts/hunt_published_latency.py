@@ -1097,6 +1097,7 @@ class RetailBrowser:
                 continue
             if r.stdout.strip():
                 self.window_ms, self.window_pid, self.window_class = now_ms(), pid, None
+                self.x_window = r.stdout.split()[0]
                 return
 
     def tail_log(self, logf):
@@ -1140,7 +1141,11 @@ class RetailBrowser:
             self.log = open(self.logpath, "wb")
             self.t_start = now_ms()
             url = "http://127.0.0.1:%d/retail?b=%s" % (port, self.tag)
-            self.proc = subprocess.Popen([self.binary, "-no-remote", "-new-instance", "-profile", self.profile, url],
+            # Windows: the launcher process hands over to the browser and exits at once (the first run of this arm saw every
+            # browser "exit before close", no window, the close timing out); -wait-for-browser keeps it until the browser ends,
+            # with the browser as its child, so the tree is followed. The browser itself is the retail one either way.
+            extra = ["-wait-for-browser"] if sys.platform == "win32" else []
+            self.proc = subprocess.Popen([self.binary, *extra, "-no-remote", "-new-instance", "-profile", self.profile, url],
                                          stdout=self.log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
             try:
                 self.procs[self.proc.pid] = psutil.Process(self.proc.pid)
@@ -1205,10 +1210,18 @@ class RetailBrowser:
         if IS_WIN:
             r = subprocess.run(["taskkill", "/PID", str(target)], capture_output=True, text=True, timeout=30)
             row["close_cmd"] = [r.returncode, (r.stdout + r.stderr).strip()[:140]]
+        elif getattr(self, "x_window", None):
+            # Linux: SIGTERM is not a normal close (the first run saw the browser gone in 65 ms with no shutdown phase logged).
+            # A window manager's close (_NET_CLOSE_WINDOW, what the title bar's button sends) is.
+            try:
+                r = subprocess.run(["wmctrl", "-i", "-c", hex(int(self.x_window))], capture_output=True, text=True, timeout=30)
+                row["close_cmd"] = [r.returncode, ("wmctrl " + r.stdout + r.stderr).strip()[:140]]
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                row["close_cmd"] = [1, repr(exc)[:140]]
         else:
             try:
                 os.kill(self.proc.pid, signal.SIGTERM)
-                row["close_cmd"] = [0, "SIGTERM %d" % self.proc.pid]
+                row["close_cmd"] = [0, "SIGTERM %d (no window to close)" % self.proc.pid]
             except OSError as exc:
                 row["close_cmd"] = [1, repr(exc)[:140]]
         self.t_close = now_ms()
