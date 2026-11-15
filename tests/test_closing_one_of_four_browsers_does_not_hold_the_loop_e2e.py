@@ -60,8 +60,8 @@ _CLIENT = textwrap.dedent("""
         async def sentinel(self):
             last = time.monotonic()
             while not self.stop.is_set():
-                await asyncio.sleep(self.pause_once or 0.005)
-                self.pause_once = 0
+                wait, self.pause_once = self.pause_once or 0.005, 0
+                await asyncio.sleep(wait)
                 now = time.monotonic()
                 self.gaps.append(now - last)
                 last = self.beat[0] = now
