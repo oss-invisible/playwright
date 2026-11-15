@@ -35,10 +35,12 @@ RESULT = {}
 def page_html() -> bytes:
     a = (HERE / "hunt_tv_page_bytes_probe.js").read_text(encoding="utf-8")
     b = (HERE / "hunt_tv_text_probe.js").read_text(encoding="utf-8")
-    js = ("(async () => { let keys = null, draws = null, error = null;\n"
+    f = (HERE / "hunt_tv_fallback_probe.js").read_text(encoding="utf-8")
+    js = ("(async () => { let keys = null, draws = null, fallback = null, error = null;\n"
           "try { keys = await (\n" + a + "\n); } catch (e) { error = 'keys: ' + e; }\n"
           "try { draws = await (\n" + b + "\n)(); } catch (e) { error = (error || '') + ' draws: ' + e; }\n"
-          "await fetch('/result', {method: 'POST', body: JSON.stringify({keys, draws, error})}); })();")
+          "try { fallback = await (\n" + f + "\n)(); } catch (e) { error = (error || '') + ' fallback: ' + e; }\n"
+          "await fetch('/result', {method: 'POST', body: JSON.stringify({keys, draws, fallback, error})}); })();")
     return ("<!doctype html><meta charset=utf-8><title>probe</title><body><script>" + js + "</script></body>").encode("utf-8")
 
 
@@ -94,6 +96,12 @@ def run(args) -> int:
             info = json.loads((Path(args.retail_from) / "retail.json").read_text(encoding="utf-8"))
             note = info.get("note", "")
             profile = Path(tempfile.mkdtemp(prefix="hunt-tv-retail-"))
+            if args.retail_prefs:
+                # The rasterisation parameters our engine declares for this seed, given to retail as the prefs Firefox itself reads
+                # (gfxDWriteFonts::UpdateClearTypeVars: prefs over the system): the runner's own ClearType tuning is out of the comparison.
+                prefs = json.loads(args.retail_prefs)
+                (profile / "user.js").write_text("".join('user_pref("%s", %s);\n' % (k, json.dumps(v)) for k, v in prefs.items()), encoding="utf-8")
+                note += " with prefs " + args.retail_prefs
             proc = subprocess.Popen([info["exe"], "-no-remote", "-profile", str(profile), url], stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
@@ -112,7 +120,8 @@ def run(args) -> int:
     data = json.loads(RESULT["body"]) if "body" in RESULT else {"error": "nothing posted in %d s" % WAIT_S}
     keys = data.get("keys") or {}
     doc = {"arm": args.arm, "note": note, "error": data.get("error"),
-           "entries": {k: pb.entry_of(k, v) for k, v in keys.items() if k.startswith(TEXT_KEYS)}, "draws": data.get("draws")}
+           "entries": {k: pb.entry_of(k, v) for k, v in keys.items() if k.startswith(TEXT_KEYS)}, "draws": data.get("draws"),
+           "fallback": data.get("fallback")}
     (args.out / ("%s.json" % args.arm)).write_text(json.dumps(doc, indent=1), encoding="utf-8")
     print("arm %s: %s; error %s" % (args.arm, "draws %d" % len(doc["draws"] or []), doc["error"]))
     return 0
@@ -149,6 +158,12 @@ def compare(args) -> int:
     for key in sorted(set(o["entries"]) | set(r["entries"])):
         eq = json.dumps(o["entries"].get(key), sort_keys=True) == json.dumps(r["entries"].get(key), sort_keys=True)
         print("HUNTTV key %-28s %s" % (key, "equal" if eq else "DIFF"))
+    of = {(x["spec"], x["text"]): x for x in o.get("fallback") or []}
+    rf = {(x["spec"], x["text"]): x for x in r.get("fallback") or []}
+    for k in sorted(set(of) | set(rf)):
+        a, b = of.get(k), rf.get(k)
+        print("HUNTTV fallback %-26s %-6s ours face %s | retail face %s | same raster %s"
+              % (k[0], k[1], a and a["matches"], b and b["matches"], bool(a and b and a["raster"] == b["raster"])))
     bundle = Path(args.binary).parent / "fonts"
     print("HUNTTV fonts: retail C:\\Windows\\Fonts | ours %s" % bundle)
     found = {p.name.lower(): p for p in bundle.rglob("*") if p.is_file()} if bundle.is_dir() else {}
@@ -166,6 +181,7 @@ def main() -> int:
     p.add_argument("--arm", choices=["ours", "retail"], required=True)
     p.add_argument("--binary", default="")
     p.add_argument("--retail-from", default="")
+    p.add_argument("--retail-prefs", default="")
     p.add_argument("--out", type=Path, required=True)
     c = sub.add_parser("compare")
     c.add_argument("dir", type=Path)
