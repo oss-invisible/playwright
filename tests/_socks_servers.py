@@ -174,6 +174,10 @@ class Gateway:
         #: Whether the TCP connections the gateway opens for a CONNECT also leave from ``exit_host`` (as its datagrams do): a server that
         #: is reachable DIRECT then tells a connection of the proxy from a connection of the browser by the source.
         self.tcp_from_exit = tcp_from_exit
+        #: While this Event is set to a cleared state, every answer of the gateway on a control connection waits for it (a
+        #: handshake the test holds, whatever the speed of the machine): None, the default, holds nothing. A test sets it after
+        #: the launch (the core's own probe goes through the gateway before the browser exists) and opens it when it chooses.
+        self.gate: Optional[threading.Event] = None
         #: Whether each chunk of a forwarded TCP stream also waits half the round trip (a far gateway), as the datagrams do.
         self.tcp_data_delay = tcp_data_delay
         self.tcp_exit = tcp_exit
@@ -193,6 +197,9 @@ class Gateway:
         self.associations: List[List[Optional[float]]] = []
         #: Every datagram the relay carried out, as (host as sent, port, address type, seconds from t0).
         self.datagram_log: List[Tuple[str, int, int, float]] = []
+        #: Every datagram the relay carried out, as (host as sent, port, index in ``associations`` of the association it came
+        #: on, seconds from t0): which association carried a datagram, not only when it left.
+        self.datagram_via: List[Tuple[str, int, int, float]] = []
         #: Every datagram the relay carried out, as (host, port, payload).
         self.datagrams: List[Tuple[str, int, bytes]] = []
         #: The local port of the socket each granted association sends from: what a server behind the gateway sees as the port
@@ -249,6 +256,9 @@ class Gateway:
 
     # --- the TCP side --------------------------------------------------------
     def _send(self, c: socket.socket, data: bytes) -> None:
+        gate = self.gate
+        if gate is not None:
+            gate.wait(120)
         if self.rtt:
             time.sleep(self.rtt)
         c.sendall(data)
@@ -438,6 +448,7 @@ class Gateway:
             return
         record: List[Optional[float]] = [time.monotonic() - self.t0, None]
         self.associations.append(record)
+        index = next(i for i, r in enumerate(self.associations) if r is record)
         relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         relay.bind((self.relay_host, 0))
         out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -487,6 +498,7 @@ class Gateway:
                     payload = d[i + 2:]
                     self.datagrams.append((host, dport, payload))
                     self.datagram_log.append((host, dport, atyp, time.monotonic() - self.t0))
+                    self.datagram_via.append((host, dport, index, time.monotonic() - self.t0))
                     routed = self._route(host, dport, atyp, payload, out_port, answer)
                     if routed is None:
                         continue
