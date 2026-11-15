@@ -54,7 +54,14 @@ def test_every_key_and_move_is_born_before_its_handler_runs(firefox_binary):
         # Born BEFORE the handler, always (an order, not a duration) ...
         ages = [r[1] for r in rows]
         assert all(age < 0.0 for age in ages), (kind, rows)
-        # ... and a few ms before, never far in the past: the timer's precision is 1 ms, the session's latency 2 to 30. That is said of the TYPICAL event
-        # (the median of the stream): one event that waited for a machine that stopped for a moment says nothing of when it was born, and a stream
-        # whose typical event is old is the defect.
-        assert -40.0 < statistics.median(ages), (kind, rows)
+        # ... and a few ms before, never far in the past: the timer's precision is 1 ms, the session's latency 2 to 30.
+        if kind in ("keydown", "keyup"):
+            # A key is made in the content process and handed to the page in the same task (the text input processor dispatches
+            # it at once, born `latency` ms in the past): no stall of the machine can come between its birth and its handler, so
+            # EVERY key is held to the bound.
+            assert all(-40.0 < age for age in ages), (kind, rows)
+        else:
+            # A move or a wheel is made in the parent and crosses to the content process: a content process that stops for a
+            # moment ages the event that waits for it, which says nothing of when it was born. Said of the TYPICAL event (the
+            # median of the stream): a stream whose typical event is old is the defect.
+            assert -40.0 < statistics.median(ages), (kind, rows)
