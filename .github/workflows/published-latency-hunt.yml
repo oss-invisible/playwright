@@ -50,22 +50,25 @@ jobs:
           echo "FF_BEFORE=$(cd "$RUNNER_TEMP" && "$PY_BEFORE" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: Six rounds, the arms in rotating order
         continue-on-error: true
+        env:
+          HUNT_PROBES: "1"
         timeout-minutes: 70
         run: |
           set +e
           S=scripts/hunt_published_latency.py
           run_arm() {
             case "$1" in
-              inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4] /' ;;
-              before)  "$PY_BEFORE" $S inproc 4 "$2" "$FF_BEFORE" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [before] /' ;;
-              remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [remote] /' ;;
-              stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [stock] /' ;;
+              inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4] /' ;;
+              before)  "$PY_BEFORE" $S inproc 4 "$2" "$FF_BEFORE" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [before] /' ;;
+              inproc4np) HUNT_EXTRA_PREFS='{"network.proxy.type": 0}' "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [inproc4np] /' ;;
+              remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [remote] /' ;;
+              stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [stock] /' ;;
               one)     for k in 0 1 2 3; do "$PY_AFTER" $S inproc 1 "$2-$k" "$FF_AFTER" > "$RUNNER_TEMP/one-$k.log" 2>&1 & done; wait
-                       cat "$RUNNER_TEMP"/one-*.log | grep -E '^HUNT(ROW|SLOW)' | sed -E 's/^(HUNT[A-Z]+) /\1 [one] /' ;;
+                       cat "$RUNNER_TEMP"/one-*.log | grep -E '^HUNT(ROW|SLOW|PROBE)' | sed -E 's/^(HUNT[A-Z]+) /\1 [one] /' ;;
             esac
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
-          ARMS=(inproc4 one remote stock before)
+          ARMS=(inproc4 inproc4np one remote stock before)
           if [ -n "$ONLY_ARMS" ]; then read -ra ARMS <<< "$ONLY_ARMS"; fi
           N=${#ARMS[@]}
           for r in 0 1 2 3 4 5; do
@@ -85,7 +88,7 @@ jobs:
           def q(v, p):
               v = sorted(x for x in v if x is not None)
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
-          for arm in ("before", "inproc4", "one", "remote", "stock"):
+          for arm in ("before", "inproc4", "inproc4np", "one", "remote", "stock"):
               r = [x for x in rows.get(arm, []) if "crash" not in x]
               crashes = len(rows.get(arm, [])) - len(r)
               ev = [e for x in r for e in x["eval_ms"]]
@@ -103,6 +106,23 @@ jobs:
                        max((t["mouse_gap_max"] or 0 for t in ty if "mousemoves" in t), default=None), sum(t.get("mouse_bursts_under_2ms", 0) for t in ty),
                        sum(t.get("clicks", 0) for t in ty), errs[:2]))
           PY
+          python - "$RUNNER_TEMP/rows.log" <<'PY2'
+          import json, re, sys
+          probes = {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTPROBE \[(\w+)\] (.*)", line.strip())
+              if m:
+                  d = json.loads(m.group(2)); probes.setdefault((m.group(1), d["name"]), []).append(d)
+          def q(v, p):
+              v = sorted(v); return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          for (arm, name), ds in sorted(probes.items()):
+              ms = [d["ms"] for d in ds]
+              line = "HUNTPROBESUM %-9s %-32s n %3d | ms p50 %s p95 %s max %s" % (arm, name, len(ds), q(ms, .5), q(ms, .95), max(ms))
+              if name == "geo._family_lock":
+                  w = [d["extra"]["waited_ms"] for d in ds]
+                  line += " | held by: %s | waited p50 %s p95 %s max %s" % (sorted({d["thread"] for d in ds})[:4], q(w, .5), q(w, .95), max(w))
+              print(line)
+          PY2
           grep -h "HUNTSLOW" "$RUNNER_TEMP/rows.log" | cut -c1-900 || true
       - name: Close every Firefox left
         if: always()

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -255,7 +256,8 @@ async def one_browser(arm, binary, port, tag):
     t0 = time.monotonic()
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
-        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True)
+        extra = json.loads(os.environ.get("HUNT_EXTRA_PREFS") or "{}") or None
+        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True, extra_prefs=extra)
         browser = await cm.__aenter__()
         close = lambda: cm.__aexit__(None, None, None)
     elif arm == "remote":
@@ -294,6 +296,96 @@ async def one_browser(arm, binary, port, tag):
     return row
 
 
+PROBE = []   # (name, thread, start monotonic, duration ms, extra)
+
+
+def install_probes():
+    """HUNT: time the suspects inside the published packages of this process, without changing what they do.
+    - the module lock of the egress discovery (_geo._family_lock): for each acquire, the waiting and the holding, and the holder;
+    - the steps of a close and of a launch: Connection.close, SessionFiles.remove, remove_profile, reap_session, EngineTree.end /
+      wait_job_empty, discover_egress_ip, ensure_geoip_mmdb, wait_for_ready, prepare_session_geo."""
+    import functools
+    import importlib
+
+    def timed(owner, name, label):
+        real = getattr(owner, name, None)
+        if real is None or getattr(real, "_hunt", False):
+            return
+
+        @functools.wraps(real)
+        def call(*a, **k):
+            t = time.monotonic()
+            try:
+                return real(*a, **k)
+            finally:
+                PROBE.append((label, threading.current_thread().name, t, round((time.monotonic() - t) * 1000, 1), None))
+        call._hunt = True
+        setattr(owner, name, call)
+
+    try:
+        geo = importlib.import_module("invisible_core._geo")
+
+        class TimedLock:
+            def __init__(self, real):
+                self.real = real
+
+            def __enter__(self):
+                t = time.monotonic()
+                self.real.acquire()
+                self.got = time.monotonic()
+                self.waited = round((self.got - t) * 1000, 1)
+                return self
+
+            def __exit__(self, *exc):
+                held = round((time.monotonic() - self.got) * 1000, 1)
+                PROBE.append(("geo._family_lock", threading.current_thread().name, self.got, held, {"waited_ms": self.waited}))
+                self.real.release()
+
+            def acquire(self, *a, **k):
+                return self.real.acquire(*a, **k)
+
+            def release(self):
+                return self.real.release()
+        geo._family_lock = TimedLock(geo._family_lock)
+        timed(geo, "discover_egress_ip", "geo.discover_egress_ip")
+        timed(geo, "prepare_session_geo", "geo.prepare_session_geo")
+    except Exception as exc:   # noqa: BLE001
+        PROBE.append(("probe-error geo", "", 0, 0, repr(exc)[:200]))
+    for mod, attrs in (("invisible_core._geoip_db", ["ensure_geoip_mmdb"]),
+                       ("invisible_core.juggler._profile", ["remove_profile"]),
+                       ("invisible_core.process", ["reap_session"])):
+        try:
+            m = importlib.import_module(mod)
+            for a in attrs:
+                timed(m, a, mod.rsplit(".", 1)[-1] + "." + a)
+        except Exception as exc:   # noqa: BLE001
+            PROBE.append(("probe-error " + mod, "", 0, 0, repr(exc)[:200]))
+    for mod, cls, attrs in (("invisible_core.juggler.connection", "Connection", ["close", "startup_send"]),
+                            ("invisible_core.juggler._profile", "SessionFiles", ["remove", "__init__"]),
+                            ("invisible_core.process", "EngineTree", ["end", "wait_job_empty", "release"])):
+        try:
+            c = getattr(importlib.import_module(mod), cls)
+            for a in attrs:
+                timed(c, a, cls + "." + a)
+        except Exception as exc:   # noqa: BLE001
+            PROBE.append(("probe-error " + cls, "", 0, 0, repr(exc)[:200]))
+    try:
+        conn = importlib.import_module("invisible_core.juggler.connection")
+        timed(conn, "wait_for_ready", "connection.wait_for_ready")
+        timed(conn, "launch", "connection.launch")
+    except Exception as exc:   # noqa: BLE001
+        PROBE.append(("probe-error connection", "", 0, 0, repr(exc)[:200]))
+    # The wrapper imports some of these by name: rebind its copies too.
+    for mod in ("invisible_playwright.async_api", "invisible_playwright._session", "invisible_playwright._juggler.server"):
+        try:
+            m = importlib.import_module(mod)
+            for name in ("prepare_session_geo", "remove_profile"):
+                if hasattr(m, name):
+                    timed(m, name, mod.rsplit(".", 1)[-1] + "." + name)
+        except Exception:   # noqa: BLE001
+            pass
+
+
 class CpuSampler:
     """The last CPU seconds seen of every engine process under this one, sampled every 0.2 s for the whole round: a process that
     ends between two samples loses at most 0.2 s of its CPU."""
@@ -320,7 +412,9 @@ async def main(arm, n, rnd, binary):
     sampler = CpuSampler()
     sampler.t.start()
     SAMPLER.start()
-    t0 = time.time()
+    if arm in ("inproc", "remote") and os.environ.get("HUNT_PROBES") == "1":
+        install_probes()
+    t0, t_mono0 = time.time(), time.monotonic()
     rows = await asyncio.gather(*(one_browser(arm, binary, port, "%s-%s-%d" % (arm, rnd, i)) for i in range(n)), return_exceptions=True)
     cpu = sampler.total()
     for r in rows:
@@ -330,6 +424,9 @@ async def main(arm, n, rnd, binary):
         r.update({"round": rnd, "n": n, "os": sys.platform, "wall_s": round(time.time() - t0, 1), "cpu_s_per_browser": round(cpu / n, 2)})
         print("HUNTROW " + json.dumps(r), flush=True)
     SAMPLER.stop.set()
+    for name, thread, start, ms, extra in PROBE:
+        print("HUNTPROBE " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "name": name, "thread": thread,
+                                         "t": round(start - t_mono0, 3), "ms": ms, "extra": extra}), flush=True)
     for kind, tag, a, b in SLOW:
         print("HUNTSLOW " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "kind": kind, "tag": tag, "ms": round((b - a) * 1000),
                                         **SAMPLER.explain(a, b)}), flush=True)
