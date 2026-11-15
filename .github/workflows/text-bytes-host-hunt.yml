@@ -1,0 +1,77 @@
+name: text bytes host hunt
+on:
+  push:
+    branches: [hunt/text-bytes-host]
+    paths: [scripts/hunt_text_bytes.py, .github/workflows/text-bytes-host-hunt.yml]
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+concurrency:
+  group: text-bytes-host-hunt
+  cancel-in-progress: true
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {leg: w2022, runner: windows-2022, extra: none}
+          - {leg: w2025, runner: windows-2025, extra: none}
+          - {leg: w2022-dejavu, runner: windows-2022, extra: dejavu}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+      - name: Fetch our published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: One system font more (DejaVu Sans, installed for all users)
+        if: matrix.extra == 'dejavu'
+        shell: pwsh
+        run: |
+          python -m pip install matplotlib
+          $src = python -c "import matplotlib, os; print(os.path.join(os.path.dirname(matplotlib.__file__), 'mpl-data', 'fonts', 'ttf', 'DejaVuSans.ttf'))"
+          Copy-Item $src "C:\Windows\Fonts\DejaVuSans.ttf"
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts" -Name "DejaVu Sans (TrueType)" -Value "DejaVuSans.ttf" -PropertyType String -Force | Out-Null
+          "installed: " + (Get-Item "C:\Windows\Fonts\DejaVuSans.ttf").Length
+      - name: The host (Windows build, DirectWrite, the font files the probe names)
+        shell: pwsh
+        run: |
+          $cv = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+          $out = [ordered]@{ build = "$($cv.CurrentBuild).$($cv.UBR)"; product = $cv.ProductName }
+          foreach ($dll in "DWrite.dll", "d2d1.dll", "gdi32full.dll", "fontsub.dll") {
+            $p = "C:\Windows\System32\$dll"
+            if (Test-Path $p) { $out[$dll] = "$((Get-Item $p).VersionInfo.FileVersion) $((Get-FileHash $p -Algorithm SHA256).Hash.Substring(0,16))" }
+          }
+          $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+          $out["registry_fonts"] = @($reg.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" }).Count
+          $out["fonts_dir_files"] = @(Get-ChildItem C:\Windows\Fonts -File).Count
+          foreach ($f in "arial.ttf","arialbd.ttf","times.ttf","segoeui.ttf","segoeuii.ttf","calibri.ttf","consola.ttf","verdana.ttf","tahoma.ttf","georgia.ttf","seguiemj.ttf","msyh.ttc","YuGothR.ttc","cour.ttf","timesi.ttf") {
+            $p = "C:\Windows\Fonts\$f"
+            $out["font:$f"] = if (Test-Path $p) { "$((Get-Item $p).VersionInfo.FileVersion) $((Get-FileHash $p -Algorithm SHA256).Hash.Substring(0,16))" } else { "absent" }
+          }
+          $out | ConvertTo-Json | Tee-Object "$env:RUNNER_TEMP\host.json"
+      - name: Two runs of the probe, seed 42
+        env:
+          MOZ_CRASHREPORTER_DISABLE: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/host.json" "$RUNNER_TEMP/out/host.json"
+          for i in 1 2; do python scripts/hunt_text_bytes.py "$FF" "$RUNNER_TEMP/out/probe-$i.json"; done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: { name: "text-bytes-${{ matrix.leg }}", path: "${{ runner.temp }}/out" }
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
