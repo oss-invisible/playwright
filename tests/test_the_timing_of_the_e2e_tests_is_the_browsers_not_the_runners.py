@@ -199,3 +199,88 @@ def test_a_frame_that_is_painted_late_is_waited_for_and_one_never_painted_is_red
     with pytest.raises(AssertionError) as red:
         module.painted_shot(_Page(), lambda: b"png", [((5, 5), pink)], seconds=0.3)
     assert "never painted" in str(red.value) and "(255, 255, 255)" in str(red.value)
+
+
+# ---------------------------------------------------------------------------
+# the road of a TURN server written as a name costs rounds of the gateway
+# ---------------------------------------------------------------------------
+
+RTT = 0.13
+TURN_BORN = 10.0
+#: #0 the core's probe, #1 and #2 the pool of the engine (granted before the birth), #3 .. #5 made after it, one after the other
+TURN_ASSOCIATIONS = [[0.1, 0.3], [9.0, 9.26], [9.1, 9.36], [10.1, 10.36], [10.4, 10.66], [10.7, 10.96]]
+
+
+def _turn(allocated_rounds, connect=10.02, via=1, associations=TURN_ASSOCIATIONS, rounds=None, born=TURN_BORN):
+    from _e2e_verdicts import TURN_CHAIN_ROUNDS, turn_chain_problem
+    allocated = None if allocated_rounds is None else connect + allocated_rounds * RTT
+    return turn_chain_problem(born, [connect], allocated, RTT, associations, [("198.51.100.7", 3478, via, connect + 0.3)],
+                              "198.51.100.7", TURN_CHAIN_ROUNDS if rounds is None else rounds)
+
+
+def test_a_road_that_costs_what_the_design_costs_is_green_at_the_speed_of_any_machine():
+    assert _turn(4.5) is None
+    assert _turn(6.95) is None                                     # the rounds of the design and one more: the edge
+    # the machine took five seconds to ask the DoH at all, and the browser is slow in everything it does before the first CONNECT:
+    # no round of the gateway is in that time, so it is not counted
+    assert _turn(4.5, connect=15.0) is None
+
+
+def test_gateway_handshakes_that_wait_for_each_other_are_red_even_when_the_machine_is_quick():
+    # the associations made one after the other after the birth (2 rounds each), the Allocate waiting for the last: 11 rounds
+    problem = _turn(4.5 + 3 * 2, via=5)
+    assert problem and "rounds of the gateway" in problem and "a handshake waited for another" in problem
+
+
+def test_one_round_more_than_the_design_allows_is_red_and_the_edge_is_not():
+    assert _turn(7.0 - 0.05) is None
+    problem = _turn(7.0 + 0.1)
+    assert problem and "7.1 rounds" in problem
+    assert _turn(8.0, rounds=7) is None and _turn(8.1, rounds=7)       # the design says how many: it is a parameter, not a clock
+
+
+def test_an_allocation_on_an_association_made_after_the_birth_is_red_within_the_budget_too():
+    problem = _turn(4.5, via=3)
+    assert problem and "a cold association" in problem and "association #3" in problem
+
+
+def test_an_allocation_that_never_came_is_red():
+    assert "never answered an Allocate" in _turn(None)
+
+
+def test_the_road_is_counted_from_the_birth_when_the_doh_connection_of_the_page_was_kept():
+    from _e2e_verdicts import turn_chain_problem
+    # no CONNECT to the DoH after the birth (the connection that loaded the page answered the question): counted from the birth
+    assert turn_chain_problem(TURN_BORN, [3.0], TURN_BORN + 3.0 * RTT, RTT, TURN_ASSOCIATIONS,
+                              [("198.51.100.7", 3478, 1, 10.2)], "198.51.100.7") is None
+    assert "rounds of the gateway" in turn_chain_problem(TURN_BORN, [3.0], TURN_BORN + 7.5 * RTT, RTT, TURN_ASSOCIATIONS,
+                                                         [("198.51.100.7", 3478, 1, 10.2)], "198.51.100.7")
+
+
+def test_the_chain_stamps_the_connects_to_the_doh_and_only_those():
+    import _turn_chain as chain_mod
+    from _doh_servers import DOH_BOOTSTRAP
+    from test_the_udp_chain_helper import _socks_connect
+    with chain_mod.Chain(rtt_ms=0, relay_host="127.0.0.1") as chain:
+        assert chain.doh_connect_at == []
+        s, code = _socks_connect(chain, "192.0.2.77", 9)             # refused: no DoH
+        s.close()
+        assert chain.doh_connect_at == []
+        s, code = _socks_connect(chain, DOH_BOOTSTRAP, 443)
+        s.close()
+        assert code == 0 and len(chain.doh_connect_at) == 1 and 0 <= chain.doh_connect_at[0] < 30
+
+
+def test_the_turn_page_reports_its_birth_reads_a_srflx_after_its_tick_and_has_an_empty_twin():
+    import _turn_chain as chain_mod
+    page = chain_mod.PAGE_HTML
+    assert "window.__result.born = Date.now()" in page[:page.index("new RTCPeerConnection")]
+    handler = page[page.index("pc.onicecandidate"):]
+    guard = handler[:handler.index("clearInterval(tick)")]
+    assert "status !== 'PENDING' ||" not in guard and "window.__result.late = status !== 'PENDING'" in guard
+    assert "window.__result.posted = true" in handler
+    with chain_mod.Chain(rtt_ms=0, relay_host="127.0.0.1") as chain:
+        assert chain.page.warm_url.endswith(chain_mod.WARM_PATH)
+        import urllib.request
+        body = urllib.request.urlopen("http://127.0.0.1:%d%s" % (chain.page.port, chain_mod.WARM_PATH), timeout=10).read()
+        assert b"RTCPeerConnection" not in body and b"warm" in body

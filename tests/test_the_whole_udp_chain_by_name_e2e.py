@@ -3,7 +3,8 @@
 A page asks for a TURN allocation at a server written as a NAME (`turn:turn.relay-only.test:3478`), as the real leak-test pages
 do: no STUN, so a server-reflexive candidate can only be born from a successful allocation. Its logic is the logic of such a page:
 a tick of 2 seconds from the start of the page that marks TIMEOUT, cleared the moment the srflx arrives (before the POST made for
-it, so the verdict does not depend on the POST coming back within the tick); the server compares the address of that srflx with the source the TURN server saw for the allocation.
+it); the server compares the address of that srflx with the source the TURN server saw for the allocation. The tick is the model of
+the page and decides nothing here: the verdict is read off the stamps of the gateway, the DoH and the TURN server (see below).
 
 The only road to anything is a gateway at 130 ms of round trip (every step of its control connection, every datagram, every
 chunk of a tunnel): the TURN server is at an unroutable documentation address that only the gateway maps to it; the names (the
@@ -16,7 +17,11 @@ What the product must do, to be what a retail Firefox is with no proxy at all (t
   * the name of the ICE server is resolved by the DoH of Firefox (`network.trr.mode` 3, found with no DNS at 162.159.61.4),
     whose request leaves THROUGH the proxy of the context: a SOCKS5 CONNECT to 162.159.61.4:443; no local resolution;
   * the UDP to the address the DoH gave leaves through the gateway's relay (address type 1);
-  * and all of it, with the DoH and the handshakes of the associations the browser needs, fits in the tick of the page.
+  * and all of it costs a number of ROUNDS of the gateway (a round is one round trip of it, 130 ms here), not a number of
+    milliseconds: from the first CONNECT to the DoH after the birth of the PeerConnection to the Allocate the TURN server answered
+    with credentials, `TURN_CHAIN_ROUNDS` and one more at most, and the Allocate leaves on an association made BEFORE the birth
+    (`_e2e_verdicts.turn_chain_problem`). A handshake that waits for another, or an association made from scratch, adds rounds
+    on every machine; a slow machine adds none. The page is waited for until its srflx is posted (30 s), not until its tick.
 
 It fails on an engine that does not keep this (the one of the wrong candidate), and says WHY: the explanation lists what the
 DoH, the gateway, the TURN server and the page each saw. The engine refuses to resolve a name that is not a literal behind a
@@ -32,7 +37,9 @@ import pytest
 
 import _turn_chain as chain_mod
 from _doh_servers import DOH_PROVIDER_PREFS
+from _e2e_verdicts import turn_chain_problem
 from _udp_line import declared_udp, egress_by_proxy, measure_servers
+from _waits import wait_until
 
 pytestmark = pytest.mark.e2e
 
@@ -103,20 +110,40 @@ def _walk(gateway, firefox_binary, engine_at_least, prefs):
                              proxy=gateway.proxy, udp_stun_servers=measure_servers(gateway),
                              extra_prefs={**prefs, **DOH_PROVIDER_PREFS}) as browser:
         page = browser.new_context(ignore_https_errors=True).new_page()
+        # An empty page first, through the proxy: Firefox learns the proxy there and its pool makes the associations. The
+        # PeerConnection is born once the gateway has granted one (the first granted is the core's own probe, no association of the
+        # engine), so "ready before the birth" is a fact of the road and not a race with the load of the machine.
+        page.goto(gateway.page.warm_url, wait_until="domcontentloaded", timeout=60000)
+        wait_until(lambda: len([a for a in gateway.associations if a[1] is not None]) >= 2, 30, lambda: page.wait_for_timeout(50))
         page.goto(gateway.page.url, wait_until="domcontentloaded", timeout=60000)
+        # The tick of the page is its model and decides nothing: the page is waited for until it has posted its srflx (30 s).
         try:
-            page.wait_for_function("window.__done === true", timeout=9000)
+            page.wait_for_function("window.__result.posted === true", timeout=30000)
         except Exception:   # noqa: BLE001
             pass
         try:
-            page.wait_for_function("window.__result.candidates.some(c => c.indexOf(' typ relay ') >= 0)", timeout=3000)
+            page.wait_for_function("window.__result.candidates.some(c => c.indexOf(' typ relay ') >= 0)", timeout=30000)
         except Exception:   # noqa: BLE001
             pass
         result = page.evaluate("window.__result")
+        # what the road looked like, read before anything else asks the gateway for an association (the declared_udp below does)
+        t0, wall0 = gateway.t0, gateway.wall0
+        born = (result.get("born") or wall0 * 1000.0) / 1000.0 - wall0     # the asserts below name a page that never ran
+        associations = [list(a) for a in gateway.associations]
+        via = list(gateway.datagram_via)
+        connect_at = list(gateway.doh_connect_at)
+        allocated_at = gateway.turn.allocations[0][3] - t0 if gateway.turn.allocations else None
     declared = declared_udp(gateway.proxy, measure_servers(gateway))
     assert declared == "coherent", "the core did not measure the chain's UDP coherent (%s): the engine would not use the relay" % declared + gateway.explain(result)
     ok = result.get("status") == "DONE" and gateway.page.verdicts and gateway.page.verdicts[-1]["ok"]
-    assert ok, "the page did not get a server-reflexive candidate that the TURN server saw, before its tick of 2 s:" + gateway.explain(result)
+    assert ok, "the page did not get a server-reflexive candidate that the TURN server saw (the page was waited for 30 s):" + gateway.explain(result)
+    problem = turn_chain_problem(born, connect_at, allocated_at, gateway.rtt, associations, via, chain_mod.TURN_IP)
+    seen = ("the page's tick of 2 s %s; associations %s; datagrams to the TURN server %s; CONNECTs to the DoH at %s s; the PeerConnection "
+            "born at %.3f s; the allocation at %s s" % (
+                "had passed (the srflx was late)" if result.get("late") else "had not passed", associations,
+                [d for d in via if d[0] == chain_mod.TURN_IP], [round(t, 3) for t in connect_at], born,
+                None if allocated_at is None else round(allocated_at, 3)))
+    assert problem is None, "%s; %s%s" % (problem, seen, gateway.explain(result))
     # what the PAGE reads: a server-reflexive candidate that is the gateway's exit, and the relay of the TURN server it asked
     srflx = (result.get("srflx") or "").split()
     assert len(srflx) > 5 and srflx[4] == gateway.exit_ip, "the srflx of the page is not the exit of the gateway %s: %r" % (gateway.exit_ip, result.get("srflx"))

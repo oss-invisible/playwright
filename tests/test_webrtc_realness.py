@@ -277,7 +277,14 @@ _PROBE_JS = r"""async () => {
   const cands = [];
   pc.addEventListener('icecandidate', e => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); });
   await pc.setLocalDescription(await pc.createOffer({offerToReceiveAudio:1, offerToReceiveVideo:1}));
-  await new Promise(r => setTimeout(r, 3500));
+  // until the gather says it is complete (what the page reads is the whole of it), or 25 s: the deadline of the wait, not a
+  // window the verdict depends on
+  await new Promise(resolve => {
+    const timer = setTimeout(resolve, 25000);
+    const done = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); } };
+    pc.addEventListener('icegatheringstatechange', done);
+    done();
+  });
   const sdp = (pc.localDescription && pc.localDescription.sdp) || '';
   try { pc.close(); } catch(e) {}
   return { candidates: cands, sdp };
@@ -407,7 +414,7 @@ _ICE_IDS = ["ice_in_the_socket_process", "the_caller_asks_for_ice_in_the_content
             "the_caller_asks_for_no_socket_process_and_the_lock_wins"]
 
 
-def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_ms, page_first_ms=None):
+def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_ms):
     """Launch the default engine behind a local gateway with coherent UDP, `rtt_ms` away, gather with a STUN server only
     its relay reaches, and say whether the page's request took the relay and what the gather looked like."""
     binary = _e2e_binary()
@@ -415,7 +422,7 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
         pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
     from invisible_core import _geo
 
-    from _socks_servers import STUN_NUMBER, STUN_PORT, WEB_ADDRESS, coherent
+    from _socks_servers import STUN_NUMBER, STUN_PORT, coherent
     stun = f"stun:{STUN_NUMBER}:{STUN_PORT}"
     user, password = credentials or (None, None)
     # The relay sits on the address of this host, as a real gateway's does: the engine's ICE sockets are bound to an
@@ -428,12 +435,7 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
         extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True, **ice_prefs}
         with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
             page = browser.new_context().new_page()
-            if page_first_ms is None:
-                page.goto("about:blank")
-            else:
-                # A page that is loaded through the gateway, and a while later asks for WebRTC.
-                page.goto("http://%s/" % WEB_ADDRESS)       # by address: the browser resolves names itself
-                page.wait_for_timeout(page_first_ms)
+            page.goto("about:blank")
             res = page.evaluate(_RELAY_PROBE_JS, stun)
         carried = [(host, port) for host, port, _payload in gateway.datagrams]
         stun_requests = gateway.stun.requests
@@ -498,7 +500,7 @@ def test_a_gateway_that_is_far_away_still_gives_the_page_a_srflx_born_through_it
 
 
 _START_A_GATHER_JS = r"""async (stun) => {
-  const g = window.__gather = {host: null, srflx: null, complete: false, candidates: [], errors: []};
+  const g = window.__gather = {host: null, srflx: null, complete: false, candidates: [], errors: [], born: Date.now()};
   const t0 = performance.now();
   const pc = window.__pc = new RTCPeerConnection({iceServers: [{urls: [stun]}]});
   pc.createDataChannel('');
@@ -564,27 +566,50 @@ def test_the_first_candidate_of_a_gather_does_not_wait_for_a_gateway_that_is_far
         "the srflx was not born through the relay once the gateway was let go. " + seen)
 
 
-@pytest.mark.wall_clock  # its verdict compares two durations (near and far): the e2e run gives it the machine alone
 @pytest.mark.e2e
 @pytest.mark.usefixtures("the_udp_line")
 def test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_to_the_server(monkeypatch):
-    """⛔ THE KNOWN-BAD INPUT: a gateway 250 ms away, a page loaded through it, and two seconds later the page asks for
-    WebRTC. Next to a gateway the srflx comes at once; behind this one it may come later by the road itself, the round
-    trip of the relay to the STUN server and back, and by nothing else: the connect, the greeting, the authentication and
-    the ASSOCIATE of each socket (about 0.56 s against the real driver) are made before the page asks, when the proxy
-    of the context is first used, not after. A target without the proxy has no such cost to show."""
-    rtt_ms = 250
-    near_ok, near_verdict, near = _gather_behind_a_coherent_gateway(
-        monkeypatch, ("alice", "s3cret"), {}, 0, page_first_ms=2000)
-    far_ok, far_verdict, far = _gather_behind_a_coherent_gateway(
-        monkeypatch, ("alice", "s3cret"), {}, rtt_ms, page_first_ms=2500)
-    print(f"[page first] near {near}, {rtt_ms} ms away {far}")
-    assert near_ok, near_verdict
-    assert far_ok, far_verdict
-    assert far["host"] - near["host"] <= 100, f"the host candidate waited: {far_verdict}"
-    assert far["srflx"] - near["srflx"] <= rtt_ms + 250, (
-        f"the srflx came {far['srflx']} ms after the offer behind a gateway {rtt_ms} ms away, {near['srflx']} ms next to "
-        f"it: more than the road to the server ({rtt_ms} ms). {far_verdict}")
+    """⛔ THE KNOWN-BAD INPUT: a gateway 250 ms away, a page loaded through it, and a while later the page asks for WebRTC.
+    The connect, the greeting, the authentication and the ASSOCIATE of each socket (about 0.56 s against the real driver) are made
+    before the page asks, when the proxy of the context is first used, not after: the STUN request of the page leaves on an
+    association the gateway had granted before the PeerConnection was born, and the host candidate does not wait for the srflx.
+    Both are facts the gateway and the page record, whatever the speed of the machine (a comparison with the same gather next to a
+    gateway was a comparison of two launches of a browser): the gateway says which association carried the datagram, and the
+    page orders its candidates. The page waits until the gateway has granted an association of the engine (30 s), not 2.5 s."""
+    binary = _e2e_binary()
+    if not binary:
+        pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
+    from invisible_core import _geo
+
+    from _e2e_verdicts import cold_association_problem
+    from _socks_servers import STUN_NUMBER, STUN_PORT, WEB_ADDRESS, coherent
+    from _waits import wait_until, watch
+    stun = f"stun:{STUN_NUMBER}:{STUN_PORT}"
+    with coherent(user="alice", password="s3cret", relay_host=this_host_address(), rtt_ms=250) as gateway:
+        monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
+        extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True}
+        with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
+            page = browser.new_context().new_page()
+            page.goto("http://%s/" % WEB_ADDRESS)       # by address: the browser resolves names itself
+            # the pool makes its associations: wait until the gateway has granted one of the engine's (the first granted is the
+            # core's probe); the verdict names what it saw if none came
+            wait_until(lambda: len([a for a in gateway.associations if a[1] is not None]) >= 2, 30,
+                       lambda: page.wait_for_timeout(50))
+            page.evaluate(_START_A_GATHER_JS, stun)
+            srflx = watch(lambda: page.evaluate("window.__gather.srflx"), lambda at: at is not None, 30,
+                          lambda: page.wait_for_timeout(50))
+            gather = page.evaluate("window.__gather")
+        associations = [list(a) for a in gateway.associations]
+        via = list(gateway.datagram_via)
+        born = gather["born"] / 1000.0 - gateway.wall0
+    seen = (f"candidates: {gather['candidates']}; ICE errors: {gather['errors']}; associations (start, end) seen by the gateway: "
+            f"{associations}; datagrams and the association each left on: {via}; srflx looks: {srflx.render()}")
+    assert srflx.ok, "no srflx within 30 s behind a gateway 250 ms away. " + seen
+    problem = cold_association_problem(associations, via, STUN_NUMBER, born)
+    assert problem is None, f"{problem}. {seen}"
+    assert gather["host"] is not None and gather["host"] < gather["srflx"], (
+        f"the host candidate (at {gather['host']} ms) did not come before the srflx ({gather['srflx']} ms): it waited for the "
+        f"road to the server. {seen}")
 
 
 @pytest.mark.e2e
