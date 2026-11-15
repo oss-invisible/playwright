@@ -50,7 +50,7 @@ import socket
 import struct
 import threading
 import time
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 #: The name the product's STUN probe sends through the relay. The relay maps it
 #: to the fake STUN server; every other destination is forwarded for real.
@@ -178,6 +178,18 @@ class Gateway:
         #: handshake the test holds, whatever the speed of the machine): None, the default, holds nothing. A test sets it after
         #: the launch (the core's own probe goes through the gateway before the browser exists) and opens it when it chooses.
         self.gate: Optional[threading.Event] = None
+        #: The same hold, one control connection at a time: ``hold(index, kind)`` is asked before each answer of the gateway on a
+        #: control connection, with the ``index`` of that connection in ``accepted`` and what it asked for (``kind``: None while only the
+        #: greeting is known, then ``"connect"``, ``"associate"`` or ``"other"``), and returns the Event the answer waits for (or None: no
+        #: hold). A test holds the handshakes it chooses (the ASSOCIATEs begun from an instant on, one connection by its index) and
+        #: lets every other one run, whatever the speed of the machine; None, the default, holds nothing.
+        self.hold: Optional[Callable[[int, Optional[str]], Optional[threading.Event]]] = None
+        #: Every request the gateway read on a control connection, in order, as (seconds from t0, index of the connection in
+        #: ``accepted``, kind, detail): ``"greeting"`` when the connection was accepted (the first bytes of the client), then
+        #: ``"connect"`` (detail ``host:port``), ``"associate"`` (detail ``association #n`` of ``associations``, ``refused`` when
+        #: UDP is refused) or ``"other"``. The EXCHANGES of a road, counted by what the gateway saw and not by how long they took.
+        self.requests: List[Tuple[float, int, str, str]] = []
+        self._local = threading.local()
         #: Whether each chunk of a forwarded TCP stream also waits half the round trip (a far gateway), as the datagrams do.
         self.tcp_data_delay = tcp_data_delay
         self.tcp_exit = tcp_exit
@@ -255,10 +267,20 @@ class Gateway:
         self.close()
 
     # --- the TCP side --------------------------------------------------------
+    def _request(self, kind: str, detail: str = "") -> None:
+        """Record a request of the client on the control connection of this thread, and what it asked for (``hold`` is told)."""
+        self._local.kind = None if kind == "greeting" else kind
+        self.requests.append((time.monotonic() - self.t0, getattr(self._local, "index", -1), kind, detail))
+
     def _send(self, c: socket.socket, data: bytes) -> None:
         gate = self.gate
         if gate is not None:
             gate.wait(120)
+        hold = self.hold
+        if hold is not None:
+            held = hold(getattr(self._local, "index", -1), getattr(self._local, "kind", None))
+            if held is not None:
+                held.wait(120)
         if self.rtt:
             time.sleep(self.rtt)
         c.sendall(data)
@@ -269,8 +291,16 @@ class Gateway:
                 conn, _ = self._listener.accept()
             except OSError:
                 return
+            index = len(self.accepted)
             self.accepted.append(time.monotonic() - self.t0)
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._run, args=(conn, index), daemon=True).start()
+
+    def _run(self, conn: socket.socket, index: int) -> None:
+        """One control connection: remembers its index (for ``hold`` and ``requests``), then serves it."""
+        self._local.index = index
+        self._local.kind = None
+        self.requests.append((self.accepted[index], index, "greeting", ""))
+        self._handle(conn)
 
     def _greet(self, c: socket.socket) -> bool:
         ver, n = _recv_exact(c, 2)
@@ -319,10 +349,12 @@ class Gateway:
             ver, cmd, _rsv = _recv_exact(c, 3)
             host, port = self._read_address(c)
             if cmd == 1:
+                self._request("connect", "%s:%d" % (host, port))
                 self._connect(c, host, port)
             elif cmd == 3:
                 self._associate(c)
             else:
+                self._request("other", "command %d" % cmd)
                 self._send(c, self._reply(7))
         except (OSError, ConnectionError):
             pass
@@ -444,11 +476,13 @@ class Gateway:
     def _associate(self, c: socket.socket) -> None:
         self.associates += 1
         if self.udp == "refuse":
+            self._request("associate", "refused")
             self._send(c, self._reply(7))
             return
         record: List[Optional[float]] = [time.monotonic() - self.t0, None]
         self.associations.append(record)
         index = next(i for i, r in enumerate(self.associations) if r is record)
+        self._request("associate", "association #%d" % index)
         relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         relay.bind((self.relay_host, 0))
         out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

@@ -40,7 +40,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 
-from _doh_servers import DOH_TARGETS, DohGateway, FakeDoh
+from _doh_servers import DohGateway, FakeDoh
 from _host_address import this_host_address
 from _socks_servers import WHOAMI4, Gateway
 
@@ -113,6 +113,8 @@ def _message(mtype: int, tid: bytes, attrs: bytes, key: Optional[bytes] = None) 
 
 class TurnServer:
     """UDP TURN server on 127.0.0.1. ``seen`` is every datagram as (source ip, source port, STUN type), in order;
+    ``requests`` the same datagrams as (monotonic time, transaction id, STUN type, carries credentials): a retransmission has the
+    transaction id of the request it repeats, so the TRANSACTIONS of a road are the distinct ids (:meth:`transactions`);
     ``allocations`` the successful Allocates as (source ip, source port, username, time)."""
 
     def __init__(self) -> None:
@@ -121,8 +123,17 @@ class TurnServer:
         self.address: Tuple[str, int] = self.sock.getsockname()
         self.seen: List[Tuple[str, int, int]] = []
         self.allocations: List[Tuple[str, int, str, float]] = []
+        self.requests: List[Tuple[float, bytes, int, bool]] = []
         self._closed = False
         threading.Thread(target=self._serve, daemon=True).start()
+
+    def transactions(self, mtype: int = 0x0003) -> List[Tuple[float, bytes, int, bool]]:
+        """The first datagram of each transaction of type ``mtype`` (Allocate by default), in order: a retransmission is not another one."""
+        first: Dict[bytes, Tuple[float, bytes, int, bool]] = {}
+        for request in list(self.requests):
+            if request[2] == mtype:
+                first.setdefault(request[1], request)
+        return sorted(first.values(), key=lambda r: r[0])
 
     def close(self) -> None:
         self._closed = True
@@ -139,6 +150,7 @@ class TurnServer:
             mtype, tid = struct.unpack("!H", data[:2])[0], data[8:20]
             self.seen.append((src[0], src[1], mtype))
             attrs = _attrs(data)
+            self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
             if mtype == 0x0003:                                   # Allocate
                 if 0x0008 not in attrs or 0x0006 not in attrs:   # no credentials: 401 with a realm and a nonce
                     err = _attr(0x0009, b"\x00\x00\x04\x01Unauthorized") + _attr(0x0014, REALM.encode()) + _attr(0x0015, NONCE.encode())
@@ -184,8 +196,6 @@ class Chain(DohGateway):
         self.turn = TurnServer()
         self.doh = FakeDoh({TURN_NAME: TURN_IP, PAGE_NAME: "127.0.0.1"})
         self.page = Page(self)
-        #: When each CONNECT to the DoH arrived, seconds from ``t0`` (the clock of ``associations`` and ``datagram_via``).
-        self.doh_connect_at: List[float] = []
         super().__init__("chain", self.doh, udp="relay", tcp_exit=exit_host, udp_exit=exit_host,
                          relay_host=relay_host, rtt_ms=rtt_ms,
                          exit_host=exit_host, tcp_data_delay=True)
@@ -197,8 +207,6 @@ class Chain(DohGateway):
         self.page.close()
 
     def _connect(self, c, host, port) -> None:
-        if (host, port) in DOH_TARGETS:
-            self.doh_connect_at.append(time.monotonic() - self.t0)
         if host.lower() in self.whoami_names and port == WHOAMI4[1]:
             Gateway._connect(self, c, host, port)       # the answer of "what is my address"
             return

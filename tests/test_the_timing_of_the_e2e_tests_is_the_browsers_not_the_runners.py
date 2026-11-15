@@ -4,7 +4,10 @@ Each test below (no browser, no sleep that decides anything) runs the judgement 
 red and the case it must call green:
 
 * the first STUN datagram of a PeerConnection is judged by WHICH association carried it, and the gateway says which;
-* a handshake the test holds (`Gateway.gate`) answers nothing until the test lets it go;
+* a handshake the test holds (`Gateway.gate` for all of them, `Gateway.hold` for the ones it chooses) answers nothing until the test
+  lets it go;
+* the road of a TURN server written as a name is judged by an ORDER (the Allocate was answered while the later handshakes were held)
+  and by a COUNT (the exchanges the gateway, the DoH and the TURN server recorded), never by a duration;
 * the page of the key-delay test and of the typing-pause test stamp each event with `event.timeStamp` (the browser's own
   creation time), not with `performance.now()` read when the handler happens to run;
 * the pages of the `networkidle` cases of `test_a_page_that_moves_on_e2e.py` have no timer: they move from inside `load`
@@ -115,6 +118,62 @@ def test_a_gateway_with_no_gate_holds_nothing():
         t.close()
 
 
+def _associate(port):
+    t = _hello(port)
+    assert t.recv(2) == b"\x05\x00"
+    t.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+    return t
+
+
+def test_a_gateway_holds_one_handshake_by_its_connection_and_what_it_asked_for_and_the_others_run():
+    from _socks_servers import WEB_ADDRESS
+    with coherent() as gateway:
+        held = threading.Event()
+        gateway.hold = lambda index, kind: held if kind == "associate" and index == 0 else None
+        first = _associate(gateway.port)                    # connection 0: its greeting is answered, its ASSOCIATE is held
+        assert wait_until(lambda: any(r[2] == "associate" for r in gateway.requests), 10, lambda: time.sleep(0.01))
+        first.settimeout(0.4)
+        with pytest.raises(socket.timeout):                 # a window of observation: it can only hide a failure, never make one
+            first.recv(10)
+        # the others are not held, with the first one still held: a CONNECT, and another ASSOCIATE (what a road that does not wait for
+        # a handshake does), each read with a long timeout that decides nothing
+        second = _hello(gateway.port)
+        second.settimeout(10)
+        assert second.recv(2) == b"\x05\x00"
+        second.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(WEB_ADDRESS) + struct.pack("!H", 80))
+        assert second.recv(10)[1] == 0
+        third = _associate(gateway.port)
+        third.settimeout(10)
+        assert third.recv(10)[1] == 0
+        assert gateway.associations[0][1] is None            # the held one is still not answered
+        held.set()
+        first.settimeout(10)
+        assert first.recv(10)[1] == 0
+        assert [r[1:3] for r in gateway.requests if r[2] != "greeting"] == [(0, "associate"), (1, "connect"), (2, "associate")]
+        assert [r[2] for r in gateway.requests].count("greeting") == 3
+        for t in (first, second, third):
+            t.close()
+
+
+def test_a_gateway_holds_the_greeting_of_one_connection_when_it_is_asked_to_and_not_the_others():
+    with coherent() as gateway:
+        held = threading.Event()
+        gateway.hold = lambda index, kind: held if index == 1 and kind is None else None
+        a = _hello(gateway.port)
+        assert wait_until(lambda: len(gateway.accepted) == 1, 10, lambda: time.sleep(0.01))
+        b = _hello(gateway.port)                            # connection 1: its greeting is held
+        a.settimeout(10)
+        assert a.recv(2) == b"\x05\x00"
+        b.settimeout(0.4)
+        with pytest.raises(socket.timeout):
+            b.recv(2)
+        held.set()
+        b.settimeout(10)
+        assert b.recv(2) == b"\x05\x00"
+        a.close()
+        b.close()
+
+
 # ---------------------------------------------------------------------------
 # the pages stamp events with the browser's time
 # ---------------------------------------------------------------------------
@@ -214,73 +273,179 @@ def test_a_frame_that_is_painted_late_is_waited_for_and_one_never_painted_is_red
 
 
 # ---------------------------------------------------------------------------
-# the road of a TURN server written as a name costs rounds of the gateway
+# the road of a TURN server written as a name: an order and a count, never a duration
 # ---------------------------------------------------------------------------
 
-RTT = 0.13
+from _e2e_verdicts import (held_handshake_problem, turn_chain_problem, turn_exchanges, turn_exchanges_most,  # noqa: E402
+                           turn_exchanges_problem)
+
 TURN_BORN = 10.0
-#: #0 the core's probe, #1 and #2 the pool of the engine (granted before the birth), #3 .. #5 made after it, one after the other
-TURN_ASSOCIATIONS = [[0.1, 0.3], [9.0, 9.26], [9.1, 9.36], [10.1, 10.36], [10.4, 10.66], [10.7, 10.96]]
+HOST = "198.51.100.7"
+#: #0 the core's probe, #1 and #2 the pool of the engine (granted before the birth), #3 begun after it (held by the test)
+TURN_ASSOCIATIONS = [[0.1, 0.3], [9.0, 9.26], [9.1, 9.36], [10.1, None]]
+#: what the gateway read: the pool's two ASSOCIATEs before the birth, then the CONNECT to the DoH that carries the question
+REQUESTS = [(9.0, 1, "associate", "association #1"), (9.1, 2, "associate", "association #2"),
+            (10.02, 3, "connect", "192.0.2.53:443"), (10.1, 4, "associate", "association #3")]
+QUESTIONS = [("turn.relay-only.test", 1)]
+#: the Allocate without credentials (answered 401), then the one with them: two transactions
+ALLOCATES = [(10.5, b"\x01" * 12, 3, False), (10.8, b"\x02" * 12, 3, True)]
+VIA = [(HOST, 3478, 1, 10.5), (HOST, 3478, 1, 10.8)]
 
 
-def _turn(allocated_rounds, connect=10.02, via=1, associations=TURN_ASSOCIATIONS, rounds=None, born=TURN_BORN):
-    from _e2e_verdicts import TURN_CHAIN_ROUNDS, turn_chain_problem
-    allocated = None if allocated_rounds is None else connect + allocated_rounds * RTT
-    return turn_chain_problem(born, [connect], allocated, RTT, associations, [("198.51.100.7", 3478, via, connect + 0.3)],
-                              "198.51.100.7", TURN_CHAIN_ROUNDS if rounds is None else rounds)
+def _scaled(k, requests, allocates, associations, via):
+    """The same road on a machine k times slower: every stamp is k times later. An order and a count do not notice."""
+    return ([[None if t is None else t * k for t in a] for a in associations],
+            [(r[0] * k,) + tuple(r[1:]) for r in requests],
+            [(a[0] * k,) + tuple(a[1:]) for a in allocates],
+            [v[:3] + (v[3] * k,) for v in via])
 
 
-def test_a_road_that_costs_what_the_design_costs_is_green_at_the_speed_of_any_machine():
-    assert _turn(4.5) is None
-    assert _turn(6.95) is None                                     # the rounds of the design and one more: the edge
-    # the machine took five seconds to ask the DoH at all, and the browser is slow in everything it does before the first CONNECT:
-    # no round of the gateway is in that time, so it is not counted
-    assert _turn(4.5, connect=15.0) is None
+def _road(k=1.0, allocated=10.8, released=11.5, held=(10.1,), requests=REQUESTS, questions=QUESTIONS, allocates=ALLOCATES,
+          via=VIA, auth=False):
+    associations, requests, allocates, via = _scaled(k, requests, allocates, TURN_ASSOCIATIONS, via)
+    return turn_chain_problem(TURN_BORN * k, None if allocated is None else allocated * k, released * k, [h * k for h in held], requests,
+                              questions, allocates, associations, via, HOST, auth)
 
 
-def test_gateway_handshakes_that_wait_for_each_other_are_red_even_when_the_machine_is_quick():
-    # the associations made one after the other after the birth (2 rounds each), the Allocate waiting for the last: 11 rounds
-    problem = _turn(4.5 + 3 * 2, via=5)
-    assert problem and "rounds of the gateway" in problem and "a handshake waited for another" in problem
+def test_a_road_that_costs_what_the_protocols_cost_is_green_at_the_speed_of_any_machine():
+    for k in (1.0, 0.01, 40.0, 5000.0):      # a quick one, and a machine so slow that every stamp is five thousand times later
+        assert _road(k) is None, k
+    assert turn_exchanges(TURN_BORN, 10.8, REQUESTS, QUESTIONS, ALLOCATES) == (turn_exchanges_most(), [])      # exactly the protocols' five
+    # the connection that loaded the page still carries the question: no CONNECT after the birth, three exchanges
+    kept = [r for r in REQUESTS if r[2] != "connect"]
+    assert _road(requests=kept) is None and turn_exchanges(TURN_BORN, 10.8, kept, QUESTIONS, ALLOCATES)[0] == 3
+    # nothing was held (no association was begun after the pool was ready): nothing to wait for
+    assert _road(held=()) is None
 
 
-def test_one_round_more_than_the_design_allows_is_red_and_the_edge_is_not():
-    assert _turn(7.0 - 0.05) is None
-    problem = _turn(7.0 + 0.1)
-    assert problem and "7.1 rounds" in problem
-    assert _turn(8.0, rounds=7) is None and _turn(8.1, rounds=7)       # the design says how many: it is a parameter, not a clock
+def test_the_most_the_road_may_cost_is_five_exchanges_and_six_with_a_user_and_a_password():
+    assert turn_exchanges_most() == 5 and turn_exchanges_most(auth=True) == 6      # 2 + 1 + 2, and the sub-negotiation of RFC 1929
+    assert turn_exchanges(TURN_BORN, 10.8, REQUESTS, QUESTIONS, ALLOCATES, auth=True)[0] == 6
+    assert _road(auth=True) is None
 
 
-def test_an_allocation_on_an_association_made_after_the_birth_is_red_within_the_budget_too():
-    problem = _turn(4.5, via=3)
+def test_handshakes_that_wait_for_each_other_are_red_even_when_the_machine_is_quick():
+    # the Allocate was answered only after the test let the held handshakes go: it was waiting for one
+    problem = _road(allocated=11.6, released=11.5, held=(10.1, 10.4, 10.7))
+    assert problem and "after the 3 held association handshake(s)" in problem and "one handshake waits for another" in problem
+    for k in (0.001, 1.0, 5000.0):
+        assert _road(k, allocated=11.6, released=11.5), k
+    # and one that never came at all
+    assert "never answered an Allocate" in _road(allocated=None)
+
+
+def test_the_held_verdict_is_an_order_of_two_stamps_not_a_distance_between_them():
+    assert held_handshake_problem(11.499, 11.5, [10.1]) is None
+    assert held_handshake_problem(11.5, 11.5, [10.1]) is None        # at the same instant: not after
+    assert held_handshake_problem(11.501, 11.5, [10.1])
+    assert held_handshake_problem(1e-6, 1e6, [10.1]) is None         # however late the let-go
+
+
+def test_one_exchange_more_than_the_protocols_ask_for_is_red_and_at_the_most_is_not():
+    # a second question for the name (an AAAA nobody needs)
+    problem = _road(questions=QUESTIONS + [("turn.relay-only.test", 28)])
+    assert problem and "6 exchanges" in problem and "5 at most" in problem and "2 DoH questions" in problem
+    # a second CONNECT: the DoH connection made again for the question
+    again = REQUESTS + [(10.05, 5, "connect", "192.0.2.53:443")]
+    problem = _road(requests=again)
+    assert problem and "7 exchanges" in problem and "2 SOCKS5 control connections" in problem
+    # a third Allocate transaction (a transaction id that is not a retransmission)
+    problem = _road(allocates=ALLOCATES + [(10.7, b"\x03" * 12, 3, True)])
+    assert problem and "6 exchanges" in problem and "3 Allocate transactions" in problem
+    # none of those is a matter of speed
+    for k in (0.01, 5000.0):
+        assert _road(k, questions=QUESTIONS * 2), k
+
+
+def test_the_exchanges_are_the_ones_between_the_birth_and_the_allocation_and_an_association_is_none_of_them():
+    # before the birth: the DoH connection of the page; after the allocation: the POST of the page
+    around = [(9.5, 0, "connect", "192.0.2.53:443"), (11.9, 9, "connect", "127.0.0.1:8000")] + REQUESTS
+    assert turn_exchanges_problem(TURN_BORN, 10.8, around, QUESTIONS, ALLOCATES) is None
+    # a later Allocate is not on the road, and another type of transaction (a Refresh) is not an Allocate
+    late = ALLOCATES + [(12.0, b"\x04" * 12, 3, True), (10.7, b"\x05" * 12, 4, True)]
+    assert turn_exchanges_problem(TURN_BORN, 10.8, REQUESTS, QUESTIONS, [a for a in late if a[2] == 3]) is None
+    # five associations begun after the birth cost the road nothing it counts (the held test and the cold check judge them)
+    pool = REQUESTS + [(10.2 + i / 10, 20 + i, "associate", "association #%d" % (4 + i)) for i in range(5)]
+    assert turn_exchanges_problem(TURN_BORN, 10.8, pool, QUESTIONS, ALLOCATES) is None
+
+
+def test_an_allocation_on_an_association_made_after_the_birth_is_red_too():
+    problem = _road(via=[(HOST, 3478, 3, 10.5), (HOST, 3478, 3, 10.8)])
     assert problem and "a cold association" in problem and "association #3" in problem
 
 
-def test_an_allocation_that_never_came_is_red():
-    assert "never answered an Allocate" in _turn(None)
+def test_the_turn_server_counts_transactions_and_a_retransmission_is_not_another():
+    import hashlib
+    import _turn_chain as chain_mod
+    server = chain_mod.TurnServer()
+    try:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.settimeout(5)
+        first = struct.pack("!HHI", 0x0003, 8, chain_mod.MAGIC) + b"\x07" * 12 + struct.pack("!HH", 0x0019, 4) + b"\x11\x00\x00\x00"
+        for _ in range(3):                                     # the request, and the retransmissions ICE makes of it
+            udp.sendto(first, server.address)
+            udp.recvfrom(65536)
+        key = hashlib.md5(b"u:" + chain_mod.REALM.encode() + b":" + chain_mod.PASSWORD.encode(), usedforsecurity=False).digest()
+        body = (chain_mod._attr(0x0019, b"\x11\x00\x00\x00") + chain_mod._attr(0x0006, b"u") +
+                chain_mod._attr(0x0014, chain_mod.REALM.encode()) + chain_mod._attr(0x0015, chain_mod.NONCE.encode()))
+        udp.sendto(chain_mod._message(0x0003, b"\x08" * 12, body, key), server.address)
+        udp.recvfrom(65536)
+        udp.close()
+        assert len(server.seen) == 4
+        assert [(t[1], t[2], t[3]) for t in server.transactions()] == [(b"\x07" * 12, 0x0003, False), (b"\x08" * 12, 0x0003, True)]
+    finally:
+        server.close()
 
 
-def test_the_road_is_counted_from_the_birth_when_the_doh_connection_of_the_page_was_kept():
-    from _e2e_verdicts import turn_chain_problem
-    # no CONNECT to the DoH after the birth (the connection that loaded the page answered the question): counted from the birth
-    assert turn_chain_problem(TURN_BORN, [3.0], TURN_BORN + 3.0 * RTT, RTT, TURN_ASSOCIATIONS,
-                              [("198.51.100.7", 3478, 1, 10.2)], "198.51.100.7") is None
-    assert "rounds of the gateway" in turn_chain_problem(TURN_BORN, [3.0], TURN_BORN + 7.5 * RTT, RTT, TURN_ASSOCIATIONS,
-                                                         [("198.51.100.7", 3478, 1, 10.2)], "198.51.100.7")
+def test_a_client_that_walks_the_road_by_the_protocols_spends_exactly_the_exchanges_the_verdict_allows():
+    """The number is the protocols', not a slack: a plain client (no browser) that takes an association, resolves the name through the
+    DoH and asks for the Allocate twice (the first request three times: ICE retransmits) is judged green and spends all of it."""
+    import hashlib
+    import _turn_chain as chain_mod
+    from _doh_servers import QTYPE_A
+    from test_the_udp_chain_helper import _resolve_through_doh, _socks_associate, _via
+    with chain_mod.Chain(rtt_ms=0, relay_host="127.0.0.1") as chain:
+        t, relay = _socks_associate(chain)                    # the pool: before the birth
+        born = time.monotonic() - chain.t0
+        _resolve_through_doh(chain, chain_mod.TURN_NAME)
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.settimeout(5)
+        alloc = struct.pack("!HHI", 0x0003, 8, chain_mod.MAGIC) + b"\x01" * 12 + struct.pack("!HH", 0x0019, 4) + b"\x11\x00\x00\x00"
+        for _ in range(3):
+            _via(u, relay, chain_mod.TURN_IP, chain_mod.TURN_PORT, alloc)
+        key = hashlib.md5(b"u:" + chain_mod.REALM.encode() + b":" + chain_mod.PASSWORD.encode(), usedforsecurity=False).digest()
+        body = (chain_mod._attr(0x0019, b"\x11\x00\x00\x00") + chain_mod._attr(0x0006, b"u") +
+                chain_mod._attr(0x0014, chain_mod.REALM.encode()) + chain_mod._attr(0x0015, chain_mod.NONCE.encode()))
+        answer = _via(u, relay, chain_mod.TURN_IP, chain_mod.TURN_PORT, chain_mod._message(0x0003, b"\x02" * 12, body, key))
+        assert struct.unpack("!H", answer[:2])[0] == 0x0103
+        u.close()
+        t.close()
+        allocated_at = chain.turn.allocations[0][3] - chain.t0
+        questions = [(q.name, q.qtype) for q in chain.doh.queries if q.name == chain_mod.TURN_NAME]
+        allocates = [(a[0] - chain.t0,) + tuple(a[1:]) for a in chain.turn.transactions()]
+        assert questions == [(chain_mod.TURN_NAME, QTYPE_A)] and len(chain.turn.seen) == 4 and len(allocates) == 2
+        requests = list(chain.requests)
+        assert [r[2] for r in requests] == ["greeting", "associate", "greeting", "connect"]
+        assert requests[3][3].startswith("192.0.2.53:")
+        assert turn_exchanges(born, allocated_at, requests, questions, allocates) == (turn_exchanges_most(), [])
+        assert turn_exchanges_problem(born, allocated_at, requests, questions, allocates) is None
 
 
-def test_the_chain_stamps_the_connects_to_the_doh_and_only_those():
+def test_the_gateway_logs_the_greeting_the_connect_and_the_associate_of_each_connection_and_only_those():
     import _turn_chain as chain_mod
     from _doh_servers import DOH_BOOTSTRAP
     from test_the_udp_chain_helper import _socks_connect
     with chain_mod.Chain(rtt_ms=0, relay_host="127.0.0.1") as chain:
-        assert chain.doh_connect_at == []
-        s, code = _socks_connect(chain, "192.0.2.77", 9)             # refused: no DoH
+        assert chain.requests == []
+        s, code = _socks_connect(chain, "192.0.2.77", 9)             # refused: not the DoH, and still a CONNECT the gateway read
         s.close()
-        assert chain.doh_connect_at == []
+        assert code == 2
         s, code = _socks_connect(chain, DOH_BOOTSTRAP, 443)
         s.close()
-        assert code == 0 and len(chain.doh_connect_at) == 1 and 0 <= chain.doh_connect_at[0] < 30
+        assert code == 0
+        kinds = [(r[1], r[2], r[3]) for r in chain.requests]
+        assert kinds == [(0, "greeting", ""), (0, "connect", "192.0.2.77:9"), (1, "greeting", ""), (1, "connect", DOH_BOOTSTRAP + ":443")]
+        assert all(0 <= r[0] < 30 for r in chain.requests)
 
 
 def test_the_turn_page_reports_its_birth_reads_a_srflx_after_its_tick_and_has_an_empty_twin():
