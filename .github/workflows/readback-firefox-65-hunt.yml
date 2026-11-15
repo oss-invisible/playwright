@@ -1,0 +1,100 @@
+# HUNT ONLY, never merged. The readback cost and bytes of the firefox-65 candidate (feder-cr/firefox_antidetect_patch run 43737560012: the WebGL projection made
+# fast) against the published firefox-64, same core, same seed, same probe (scripts/hunt_readback_probe.js), on windows-2022. Rounds in alternated order.
+name: readback firefox-65 hunt
+on:
+  push:
+    branches: [hunt/readback-firefox-65]
+    paths: [scripts/hunt_readback.py, scripts/hunt_readback_probe.js, .github/workflows/readback-firefox-65-hunt.yml]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: readback-firefox-65-hunt
+  cancel-in-progress: true
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+jobs:
+  hunt:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+      INVISIBLE_CORE_AUTOFIX: "off"
+      INVISIBLE_CORE_PIN: allow
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install the wrapper and psutil
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]" psutil
+          python -m pip install "invisible-core==64.73.0"   # the core the firefox-65 candidate ran with, for both engines
+      - name: The published firefox-64 binary
+        run: echo "FF_OLD=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The firefox-65 candidate binary (artifact asset-win-x86_64 of run 43737560012), and its seal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/cand" && cd "$RUNNER_TEMP/cand"
+          gh run download 43737560012 -R feder-cr/firefox_antidetect_patch -n asset-win-x86_64 -D .
+          unzip -q ./*.zip -d ff
+          echo "FF_NEW=$(cd ff && pwd -W)/firefox.exe" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          python -m invisible_core seal --binary "$(cd "$RUNNER_TEMP/cand/ff" && pwd -W)/firefox.exe" --tag firefox-65-candidate -o "$RUNNER_TEMP/seal-65.json"
+      - name: The GeoIP database
+        run: python scripts/ci_lab_geoip.py build
+      - name: Rounds (old, new, new, old)
+        continue-on-error: true
+        timeout-minutes: 35
+        run: |
+          set +e
+          run_old() { taskkill //F //IM firefox.exe //T > /dev/null 2>&1; python -u scripts/hunt_readback.py run --arm ours --binary "$FF_OLD" --out "$RUNNER_TEMP/rb/$1-old"; }
+          run_new() { taskkill //F //IM firefox.exe //T > /dev/null 2>&1; INVISIBLE_SEAL_FILE="$RUNNER_TEMP/seal-65.json" python -u scripts/hunt_readback.py run --arm ours --binary "$FF_NEW" --out "$RUNNER_TEMP/rb/$1-new"; }
+          run_old r1; run_new r1; run_new r2; run_old r2
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1; true
+      - name: Old against new, per content
+        if: always()
+        run: |
+          python - "$RUNNER_TEMP/rb" <<'PY'
+          import json, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          def load(tag):
+              out = []
+              for r in ("r1", "r2"):
+                  f = root / ("%s-%s" % (r, tag)) / "ours.json"
+                  out.append(json.loads(f.read_text(encoding="utf-8")).get("probe") if f.is_file() else None)
+              return out
+          old, new = load("old"), load("new")
+          def get(d, *ks):
+              for k in ks:
+                  d = (d or {}).get(k) if isinstance(d, dict) else None
+              return d
+          print("CONTENT    | readPixels ms p50 old r1/r2 -> new r1/r2 | toDataURL ms p50 old -> new | readPixels hash old/new | toDataURL pixels hash old/new | 2D hash")
+          for c in ("flat", "halves", "triangle", "gradient", "noise"):
+              rp = lambda runs: "/".join(str(get(x, "contents", c, "webgl", "readPixels_ms_p50")) for x in runs)
+              td = lambda runs: "/".join(str(get(x, "contents", c, "webgl", "toDataURL_ms_p50")) for x in runs)
+              hs = lambda runs, k: {get(x, "contents", c, "webgl", k) for x in runs}
+              h2 = lambda runs: {get(x, "contents", c, "canvas2d", "pixels_hash") for x in runs}
+              print("HUNTRB %-9s| %s -> %s | %s -> %s | %s %s %s | %s %s %s | %s"
+                    % (c, rp(old), rp(new), td(old), td(new),
+                       hs(old, "pixels_hash"), "==" if hs(old, "pixels_hash") == hs(new, "pixels_hash") else "!=", hs(new, "pixels_hash"),
+                       hs(old, "toDataURL_pixels_hash"), "==" if hs(old, "toDataURL_pixels_hash") == hs(new, "toDataURL_pixels_hash") else "!=", hs(new, "toDataURL_pixels_hash"),
+                       "same" if h2(old) == h2(new) else "DIFF"))
+          so, sn = {get(x, "scene", "pixels_hash") for x in old}, {get(x, "scene", "pixels_hash") for x in new}
+          print("HUNTRB scene diagonal edges: old %s new %s -> %s" % (so, sn, "same" if so == sn else "DIFF"))
+          PY
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: "readback-firefox-65-${{ github.run_id }}", path: "${{ runner.temp }}/rb" }

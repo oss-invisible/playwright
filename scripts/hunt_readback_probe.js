@@ -96,8 +96,12 @@
       const rp = await reps(5, () => gl.readPixels(0, 0, N, N, gl.RGBA, gl.UNSIGNED_BYTE, px));
       const td = await reps(3, () => c.toDataURL("image/png"));
       const one = await reps(5, () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4)));
+      // The pixels the PNG of toDataURL decodes to (the PNG itself carries a deBG chunk new in every session, so its bytes are not compared).
+      const img = new Image(); img.src = c.toDataURL("image/png"); await img.decode();
+      const c2 = document.createElement("canvas"); c2.width = N; c2.height = N; const g2 = c2.getContext("2d"); g2.drawImage(img, 0, 0);
+      const dp = new Uint8Array(g2.getImageData(0, 0, N, N).data.buffer);
       (result.contents[kind] = result.contents[kind] || {}).webgl = { readPixels_first_ms: r3(rp[0]), readPixels_ms_p50: r3(q(rp.slice(1), 0.5)), toDataURL_ms_p50: r3(q(td, 0.5)),
-        readPixels_1px_ms_p50: r3(q(one, 0.5)), pixels_hash: hash(px) };
+        readPixels_1px_ms_p50: r3(q(one, 0.5)), pixels_hash: hash(px), toDataURL_pixels_hash: hash(dp) };
       c.remove();
     });
     await step("2d " + kind, async () => {
