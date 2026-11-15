@@ -282,11 +282,27 @@ def match_sends(rows):
             t["raw"][5] = found[0]
 
 
+SURVIVORS_SEEN = set()
+
+
+def note_survivor(pid, cmd):
+    """Print once the full command line of a process Firefox starts to outlive itself (the sender of the shutdown pings), so the real
+    line of each OS is on record."""
+    if pid not in SURVIVORS_SEEN:
+        SURVIVORS_SEEN.add(pid)
+        print("HUNTSURVIVOR " + json.dumps({"os": sys.platform, "pid": pid, "cmdline": cmd[:6]}), flush=True)
+
+
 def proc_kind(p):
     try:
         name = p.name().lower()
         if "firefox" in name or "plugin-container" in name:
             cmd = p.cmdline()
+            # The shutdown-ping sender is firefox(.exe) --backgroundtask pingsender (seen on Windows runners): until this it was
+            # counted as a second "ff:parent".
+            if any(a.lstrip("-/").lower() == "backgroundtask" for a in cmd[1:]):
+                note_survivor(p.pid, cmd)
+                return "ff:backgroundtask"
             return "ff:" + (cmd[-1] if "-contentproc" in cmd else "parent")
         return name
     except psutil.Error:
@@ -335,9 +351,15 @@ class StackSampler:
             # The pingsender outlives the browser and may leave our tree when its parent exits: look for it machine-wide.
             for p in psutil.process_iter(["name"]):
                 try:
-                    if "pingsender" in (p.info["name"] or "").lower() and p.pid not in row:
+                    nm = (p.info["name"] or "").lower()
+                    if p.pid in row or not ("pingsender" in nm or "firefox" in nm):
+                        continue
+                    kind = "pingsender" if "pingsender" in nm else proc_kind(p)
+                    if kind in ("pingsender", "ff:backgroundtask"):
+                        if kind == "pingsender":
+                            note_survivor(p.pid, p.cmdline())
                         t = p.cpu_times()
-                        row[p.pid] = ("pingsender", t.user + t.system)
+                        row[p.pid] = (kind, t.user + t.system)
                 except psutil.Error:
                     pass
             self.cpu.append((now, row))

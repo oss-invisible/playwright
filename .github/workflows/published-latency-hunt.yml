@@ -91,7 +91,7 @@ jobs:
           set +e
           S=scripts/hunt_published_latency.py
           # What an arm prints: its HUNT lines, each tagged with the arm.
-          keep() { grep -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT)' | sed -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          keep() { grep -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR)' | sed -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
           # The retail arms: N browsers, round, seconds after the first load before the normal close (Linux headed under xvfb).
           retail() {
             if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
@@ -308,6 +308,7 @@ jobs:
                   line += " | held by: %s | waited p50 %s p95 %s max %s" % (sorted({d["thread"] for d in ds})[:4], q(w, .5), q(w, .95), max(w))
               print(line)
           PY2
+          grep -h "HUNTSURVIVOR" "$RUNNER_TEMP/rows.log" | sed -E 's/"pid": [0-9]+, //' | sort -u | head -20 || true
           grep -h "HUNTSLOW" "$RUNNER_TEMP/rows.log" | cut -c1-900 || true
           # The geo helpers of the first launch of the first round (the first arm, inproc4, all four browsers): what prepare_session_geo
           # spent its time on (t = seconds from the start of that process, ms = how long, thread).
