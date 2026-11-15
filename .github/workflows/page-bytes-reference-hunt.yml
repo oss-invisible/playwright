@@ -1,0 +1,92 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# page-bytes-reference-hunt.yml - HUNT ONLY, never merged: record the "before" reference of what a page reads, per operating system.
+#
+# The e2e tests/test_software_compositing_is_declared_e2e.py (branch tests/software-compositing-declared) compares what a page reads (the
+# probe tests/page_bytes_probe.js: canvas 2D, WebGL 1 and 2, WebGPU, text, the declared values) with tests/data/page_bytes_<os>.json. That
+# reference is the bytes of the engine BEFORE the core declares software compositing, so it must be recorded with the core the release
+# branch pins today (invisible-core 64.71.0), by a run of GitHub and not by hand.
+#
+# One job per system (windows-2022, ubuntu-24.04 under xvfb as e2e.yml runs it), two at a time: install this checkout (the core of its pin),
+# fetch the published engine, launch the browser twice with the persona of the test (seed 42, en-US, Europe/Rome), read the probe, and write
+# page_bytes_<os>.json with every key that is equal in both launches; a key that is not is listed apart (unstable.json, summary.txt, the job
+# summary) and left out. The log carries the reference between RECORD-BEGIN <os> and RECORD-END; the artifact holds the file to copy into
+# tests/data/ and the raw values of each launch.
+#
+# Nothing of the product is changed. Starts on a push to its own branch only.
+# ─────────────────────────────────────────────────────────────────────────────
+name: page bytes reference hunt
+
+on:
+  push:
+    branches: [hunt/page-bytes-reference]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: page-bytes-reference-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+# Engine and GeoIP downloads go through the release API with this token (as in e2e.yml).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: "hunt (${{ matrix.os }}, page bytes of the core 64.71.0, 2 launches)"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install the wrapper (and its core, by the pin of this checkout)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          # Playwright ONLY as a system tool, for `playwright install-deps firefox` on Linux (as e2e.yml does).
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The core is the one this reference is for (invisible-core 64.71.0, the pin of the release branch)
+        run: |
+          PIN=$(grep -oE 'invisible_core==[0-9.]+' pyproject.toml | head -1 | cut -d= -f3)
+          GOT=$(python -c "from importlib.metadata import version; print(version('invisible-core'))")
+          echo "pyproject pins invisible-core $PIN, installed $GOT"
+          test "$PIN" = "$GOT"
+          test "$GOT" = "64.71.0"
+      - name: System deps (xvfb + Firefox runtime libs)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Record the page bytes (2 launches)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; else RUN=""; fi
+          $RUN python -u scripts/hunt_page_bytes_reference.py --binary "$FF" --launches 2 --out "$RUNNER_TEMP/pbref"
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true; else pkill -9 firefox || true; fi
+      - name: Upload the reference
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: page-bytes-reference-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pbref
+          if-no-files-found: warn
+          retention-days: 14
