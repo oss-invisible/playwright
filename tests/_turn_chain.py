@@ -308,9 +308,12 @@ document.addEventListener('DOMContentLoaded', () => {
     mark('srflx');
     window.__result.srflx = e.candidate.candidate;
     const r = await fetch('/verdict', {method: 'POST', body: JSON.stringify({srflx: e.candidate.candidate})});
+    const ok = (await r.json()).ok;
+    // `posted` and the final status are set in one step, after the last await: a test that waits for `posted` and reads the status never reads
+    // the one of a page whose verdict has not been read yet (PENDING or the tick's TIMEOUT).
     mark('posted');
     window.__result.posted = true;
-    finish((await r.json()).ok ? 'DONE' : 'REFUSED');
+    finish(ok ? 'DONE' : 'REFUSED');
   };
   pc.createOffer().then((o) => pc.setLocalDescription(o));
 });

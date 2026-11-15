@@ -448,6 +448,17 @@ def test_the_gateway_logs_the_greeting_the_connect_and_the_associate_of_each_con
         assert all(0 <= r[0] < 30 for r in chain.requests)
 
 
+def test_a_connection_that_opened_after_the_retry_is_red_on_a_page_that_ran_and_not_on_one_the_machine_stopped():
+    from _e2e_verdicts import opened_at_the_retry_problem
+    assert opened_at_the_retry_problem(60, 12) is None
+    assert opened_at_the_retry_problem(2999, 5) is None
+    assert opened_at_the_retry_problem(3100, 40) is not None, "the slow road: the page ran all along and the connection opened at the retry"
+    assert "3100" in opened_at_the_retry_problem(3100, 40)
+    assert opened_at_the_retry_problem(3100, 2400) is None, "the page's own loop stopped for 2.4 s: the machine, not the road"
+    assert opened_at_the_retry_problem(9000, 999) is not None
+    assert opened_at_the_retry_problem(9000, 1000) is None
+
+
 def test_the_turn_page_reports_its_birth_reads_a_srflx_after_its_tick_and_has_an_empty_twin():
     import _turn_chain as chain_mod
     page = chain_mod.PAGE_HTML
@@ -456,6 +467,8 @@ def test_the_turn_page_reports_its_birth_reads_a_srflx_after_its_tick_and_has_an
     guard = handler[:handler.index("clearInterval(tick)")]
     assert "status !== 'PENDING' ||" not in guard and "window.__result.late = status !== 'PENDING'" in guard
     assert "window.__result.posted = true" in handler
+    assert "await" not in handler[handler.index("window.__result.posted = true"):], "the status is final in the step that says `posted`: a read made at that moment sees DONE"
+    assert handler.index("(await r.json()).ok") < handler.index("window.__result.posted = true")
     with chain_mod.Chain(rtt_ms=0, relay_host="127.0.0.1") as chain:
         assert chain.page.warm_url.endswith(chain_mod.WARM_PATH)
         import urllib.request
