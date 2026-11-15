@@ -194,7 +194,7 @@ def test_create_is_announced_BEFORE_anything_can_name_the_object():
 # ── with a browser, through the public API ──────────────────────────────────
 
 @pytest.mark.e2e
-def test_the_public_API_drives_a_page_WITHOUT_node(firefox_binary):
+def test_the_public_API_drives_a_page_WITHOUT_node(firefox_binary, monkeypatch):
     """⛔ THE TEST THIS WHOLE SUBSYSTEM EXISTS FOR.
 
     Nothing below mentions `_juggler`. It is the ordinary user-facing API, and
@@ -203,7 +203,7 @@ def test_the_public_API_drives_a_page_WITHOUT_node(firefox_binary):
     823 generated methods and the sync facade are all working against a
     different object underneath - which is the entire claim of the detachment.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -223,19 +223,18 @@ def test_the_public_API_drives_a_page_WITHOUT_node(firefox_binary):
             box = page.query_selector("#b").bounding_box()
             assert box and box["width"] > 0
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_the_public_API_reads_MANY_elements_without_node(firefox_binary):
+def test_the_public_API_reads_MANY_elements_without_node(firefox_binary, monkeypatch):
     """`query_selector_all`, `count` and `eval_on_selector_all`.
 
     ⛔ Each handle holds a DOM node alive until it is disposed, so a page with a
     thousand matches leaks a thousand nodes. That is a property of the protocol,
     not of this test, and it is written down where the handles are made.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -257,17 +256,16 @@ def test_the_public_API_reads_MANY_elements_without_node(firefox_binary):
             assert page.eval_on_selector_all(
                 "li.x", "(els, n) => els.length * n", 2) == 6
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_the_public_API_WAITS_for_an_element_that_arrives_late(firefox_binary):
+def test_the_public_API_WAITS_for_an_element_that_arrives_late(firefox_binary, monkeypatch):
     """⛔ THE POINT OF `wait_for_selector`, and the reason it cannot go through
     the retry loop: that loop disposes what it resolves on every turn, so it
     would hand back a handle it has just released - and a released handle does
     not raise, it answers wrong. The element below arrives 1 s after the test asks for it."""
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -296,12 +294,11 @@ def test_the_public_API_WAITS_for_an_element_that_arrives_late(firefox_binary):
             assert handle is not None
             assert handle.text_content() == "arrived"
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_going_BACK_then_FORWARD_leaves_the_page_readable(firefox_binary):
+def test_going_BACK_then_FORWARD_leaves_the_page_readable(firefox_binary, monkeypatch):
     """⛔ TWO MOVEMENTS, AND A READ FROM THE PAGE. One of each is what the two
     earlier tests did, and between them they missed the defect entirely.
 
@@ -319,7 +316,7 @@ def test_going_BACK_then_FORWARD_leaves_the_page_readable(firefox_binary):
     different and still valid reason. The three ways of being green stop looking
     alike.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -348,12 +345,11 @@ def test_going_BACK_then_FORWARD_leaves_the_page_readable(firefox_binary):
             page.reload()
             assert page.locator("#t").inner_text() == "hello"
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_going_back_over_a_page_the_script_left_without_a_gesture(firefox_binary):
+def test_going_back_over_a_page_the_script_left_without_a_gesture(firefox_binary, monkeypatch):
     """`go_back` goes back like `history.back()`, not like the Back button.
 
     Firefox's Back button skips history entries the person never interacted
@@ -366,7 +362,7 @@ def test_going_back_over_a_page_the_script_left_without_a_gesture(firefox_binary
     under load. Playwright's `go_back` is `history.back()`: it goes to the
     previous entry, gesture or not.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -386,40 +382,36 @@ def test_going_back_over_a_page_the_script_left_without_a_gesture(firefox_binary
             assert page.url == url, "go_back stayed on %s" % page.url
             assert page.locator("#t").inner_text() == "hello"
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_set_content_runs_in_the_MAIN_world_without_node(firefox_binary):
+def test_set_content_runs_in_the_MAIN_world_without_node(firefox_binary, monkeypatch):
     """⛔ THE KNOWN-BAD OF `set_content`. Run from the utility world it answers
     `The operation is insecure` EVERY time: that world has an extended
     principal, and Gecko requires `document.open()` to run under a principal
     equal to the document's. The fork already fixed this inside the driver; the
     Python server has to get it right for the same reason, not by luck.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     from invisible_playwright import InvisiblePlaywright
-    try:
-        with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
-                                 headless=True) as browser:
-            page = browser.new_page()
-            page.set_content("<html><head><title>written</title></head>"
-                             "<body><p id=w>from set_content</p></body></html>")
-            assert page.title() == "written"
-            assert page.text_content("#w") == "from set_content"
-            # And an apostrophe in the html must not close the JavaScript
-            # literal it travels inside: that is the 2026-08-24 defect.
-            page.set_content("<p id=q>it's fine</p>")
-            assert page.text_content("#q") == "it's fine"
-    finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
+    with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
+                             headless=True) as browser:
+        page = browser.new_page()
+        page.set_content("<html><head><title>written</title></head>"
+                         "<body><p id=w>from set_content</p></body></html>")
+        assert page.title() == "written"
+        assert page.text_content("#w") == "from set_content"
+        # And an apostrophe in the html must not close the JavaScript
+        # literal it travels inside: that is the 2026-08-24 defect.
+        page.set_content("<p id=q>it's fine</p>")
+        assert page.text_content("#q") == "it's fine"
 
 
 @pytest.mark.e2e
-def test_the_public_API_selects_and_checks_without_node(firefox_binary):
+def test_the_public_API_selects_and_checks_without_node(firefox_binary, monkeypatch):
     """`select_option` and `check`, through the generated API."""
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -439,7 +431,6 @@ def test_the_public_API_selects_and_checks_without_node(firefox_binary):
             page.uncheck("#c")
             assert not page.is_checked("#c")
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
@@ -461,7 +452,7 @@ SHADOW = b"""<!doctype html><html><head><title>shadow</title></head><body>
 
 
 @pytest.mark.e2e
-def test_locators_reach_INSIDE_a_closed_shadow_root(firefox_binary):
+def test_locators_reach_INSIDE_a_closed_shadow_root(firefox_binary, monkeypatch):
     """⛔ Side A of the closed-shadow-root research, verified on the product.
 
     The engine patch lives in `Element::GetShadowRootForBindings` and is gated
@@ -469,7 +460,7 @@ def test_locators_reach_INSIDE_a_closed_shadow_root(firefox_binary):
     page does not. This asserts the automation half; the test below asserts
     the half that matters more - that the page gained nothing.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(SHADOW))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -484,12 +475,11 @@ def test_locators_reach_INSIDE_a_closed_shadow_root(firefox_binary):
             assert page.text_content("#deep") == "two levels down", (
                 "a root nested inside a closed root was not reached")
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_the_PAGE_still_sees_nothing_of_a_closed_root(firefox_binary):
+def test_the_PAGE_still_sees_nothing_of_a_closed_root(firefox_binary, monkeypatch):
     """⛔ THE HALF THAT MATTERS MORE, and it is the known-bad of the engine
     patch. A real Firefox NEVER hands a closed root to content: if our build
     did, `!!el.shadowRoot` on a closed host would be a one-line detector that
@@ -497,7 +487,7 @@ def test_the_PAGE_still_sees_nothing_of_a_closed_root(firefox_binary):
 
     So the assertion is not "automation works" but "the page is unchanged".
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(SHADOW))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -522,12 +512,11 @@ def test_the_PAGE_still_sees_nothing_of_a_closed_root(firefox_binary):
             ) == '<div id="host"></div>', (
                 "the page's own serialisation changed")
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_content_SERIALISES_shadow_roots_including_closed_ones(firefox_binary):
+def test_content_SERIALISES_shadow_roots_including_closed_ones(firefox_binary, monkeypatch):
     """⛔ Side B of the research, and what forking the client unlocked.
 
     Upstream serialises with `documentElement.outerHTML`, which walks the light
@@ -535,7 +524,7 @@ def test_content_SERIALISES_shadow_roots_including_closed_ones(firefox_binary):
     divergence is real and complete - open, closed, and a root NESTED inside a
     closed one, which is where a depth-one walk would look right and be wrong.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(SHADOW))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -564,7 +553,6 @@ def test_content_SERIALISES_shadow_roots_including_closed_ones(firefox_binary):
             assert "shadowrootmode" not in own, (
                 "the page can serialise its own shadow roots: %s" % own[:200])
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
@@ -581,13 +569,13 @@ NOISY = b"""<!doctype html><html><head><title>events</title></head><body>
 
 
 @pytest.mark.e2e
-def test_console_messages_reach_the_page_listener(firefox_binary):
+def test_console_messages_reach_the_page_listener(firefox_binary, monkeypatch):
     """⛔ `console` and `pageError` are emitted on the CONTEXT, not on the
     Page, and `_browser_context.py` re-emits them on the page it finds in
     `params["page"]`. Emitting them on the Page produces no error at all: the
     handler simply never runs, and the user concludes their page prints
     nothing."""
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(NOISY))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -612,15 +600,14 @@ def test_console_messages_reach_the_page_listener(firefox_binary):
             assert "warning" in kinds or "warn" in kinds, (
                 "the message type was lost: %s" % kinds)
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_an_uncaught_error_reaches_the_pageerror_listener(firefox_binary):
+def test_an_uncaught_error_reaches_the_pageerror_listener(firefox_binary, monkeypatch):
     """A page that throws must reach `page.on("pageerror")`, with the message
     intact - that is the only way a caller learns the site broke."""
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(NOISY))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -638,13 +625,12 @@ def test_an_uncaught_error_reaches_the_pageerror_listener(firefox_binary):
             assert "undefinedFunctionCall" in " ".join(errors), (
                 "the message was lost: %s" % errors)
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
 def test_a_dialog_can_be_ANSWERED_and_not_answering_hangs_the_page(
-        firefox_binary):
+        firefox_binary, monkeypatch):
     """⛔ THE ONE OBJECT WHERE FORGETTING IS A HANG, NOT A LEAK. A dialog
     blocks the content process inside `window.alert`, so an unanswered one
     makes every later command time out with no hint about the cause.
@@ -653,7 +639,7 @@ def test_a_dialog_can_be_ANSWERED_and_not_answering_hangs_the_page(
     that safety net only works if the event ARRIVES - which is what this
     asserts. The second half then checks the explicit path.
     """
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(NOISY))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -677,17 +663,16 @@ def test_a_dialog_can_be_ANSWERED_and_not_answering_hangs_the_page(
             # answered, this would time out instead of returning.
             assert page.title() == "events"
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_an_unanswered_dialog_is_dismissed_by_the_client(firefox_binary):
+def test_an_unanswered_dialog_is_dismissed_by_the_client(firefox_binary, monkeypatch):
     """⛔ The known-bad of the wiring above: with NO listener the client
     dismisses on its own, and the page keeps running. If the event never
     reached the client, this would hang - so a green here proves the event
     arrives even when nobody visibly consumes it."""
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(NOISY))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -701,7 +686,6 @@ def test_an_unanswered_dialog_is_dismissed_by_the_client(firefox_binary):
             assert page.title() == "events", (
                 "the page is stuck: the dialog event never reached the client")
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
@@ -721,8 +705,8 @@ def test_clearing_cookies_with_a_FILTER_is_refused_not_widened():
 
 
 @pytest.mark.e2e
-def test_cookies_round_trip_through_the_public_API(firefox_binary):
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+def test_cookies_round_trip_through_the_public_API(firefox_binary, monkeypatch):
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -740,17 +724,16 @@ def test_cookies_round_trip_through_the_public_API(firefox_binary):
             context.clear_cookies()
             assert not [c for c in context.cookies() if c["name"] == "a"]
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_a_screenshot_comes_back_as_real_png_bytes(firefox_binary):
+def test_a_screenshot_comes_back_as_real_png_bytes(firefox_binary, monkeypatch):
     """⛔ THE MAGIC NUMBER, not the length. A screenshot that is the string
     "None" or a base64 blob nobody decoded is still bytes and still non-empty:
     the only assertion that separates a real image from a plausible one is the
     PNG signature."""
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -765,13 +748,12 @@ def test_a_screenshot_comes_back_as_real_png_bytes(firefox_binary):
                 "not a PNG: first bytes are %r" % shot[:12])
             assert len(shot) > 1000, len(shot)
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 
 @pytest.mark.e2e
-def test_the_viewport_can_be_resized(firefox_binary):
-    os.environ[factory.CHOICE_ENV] = factory.JUGGLER
+def test_the_viewport_can_be_resized(firefox_binary, monkeypatch):
+    monkeypatch.setenv(factory.CHOICE_ENV, factory.JUGGLER)
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -785,7 +767,6 @@ def test_the_viewport_can_be_resized(firefox_binary):
             assert page.evaluate("() => window.innerWidth") == 640
             assert page.evaluate("() => window.innerHeight") == 480
     finally:
-        os.environ.pop(factory.CHOICE_ENV, None)
         srv.shutdown()
 
 

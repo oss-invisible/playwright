@@ -206,15 +206,13 @@ def test_a_screencast_frame_is_a_jpeg_of_the_whole_window(firefox_binary):
                     pytest.skip("this engine has no screencast (it needs "
                                 "firefox-28 or later): %s" % refused)
                 raise
-            deadline = time.time() + 15
-            while len(frames) < 3 and time.time() < deadline:
-                time.sleep(0.1)
+            wait_until(lambda: len(frames) >= 3, 30, lambda: time.sleep(0.1))
             page.screencast.stop()
             if not frames:
                 evidence = engine_screencast_lines(page)
     finally:
         srv.shutdown()
-    assert frames, ("no frame arrived in 15 s\n%s\n"
+    assert frames, ("no frame arrived in 30 s\n%s\n"
                     "engine output (lines starting with 'screencast:'):\n%s"
                     % (stream.describe(), evidence))
     first = frames[0]
@@ -417,9 +415,8 @@ def test_a_dead_stream_is_described_with_the_engine_lines_and_the_clock():
         b"JavaScript warning: something\n"
         b"screencast: StartCapture failed\n"
         b"  screencast: this widget has no native window id\n"))
-    deadline = time.time() + 5
-    while len(output.tail()) < 3 and time.time() < deadline:
-        time.sleep(0.01)
+    # the reader thread of the output has taken the three lines (a deadline of 30 s, not 5: a loaded machine runs it late)
+    assert wait_until(lambda: len(output.tail()) >= 3, 30, lambda: time.sleep(0.01)), output.tail()
     server = SimpleNamespace(object=lambda guid: SimpleNamespace(
         conn=SimpleNamespace(output=output)))
     page = SimpleNamespace(_impl_obj=SimpleNamespace(

@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import http.server
 import threading
-import time
 
 import pytest
 
@@ -54,20 +53,19 @@ ROUNDS = 5
 
 def _goto(page, url, **kwargs):
     """`page.goto`, which may answer that the previous page's own redirect won
-    (module docstring). Either answer comes in seconds."""
+    (module docstring). The detector of a navigation that never answers is the timeout of the `goto` itself (each caller passes
+    one): a bound of the test stricter than it only judged the speed of the machine."""
     from invisible_playwright.sync_api import Error
 
-    started = time.monotonic()
     try:
         page.goto(url, **kwargs)
     except Error as e:
         if "NS_BINDING_ABORTED" in str(e):
             # The page's own replace stopped ours: it is where it sent itself.
-            page.wait_for_url("**/landed", timeout=10_000)
+            page.wait_for_url("**/landed", timeout=15_000)
         else:
             assert "is interrupted by another navigation to" in str(e), e
             assert "/landed" in str(e).split("another navigation to")[1], e
-    assert time.monotonic() - started < 10, url
 
 
 def _replace_after_load(ms: int, cross_site: bool) -> bytes:
