@@ -124,7 +124,7 @@ def test_the_conftest_declares_the_exit_of_the_lab():
 #  Known-bad inputs: each rule refuses its own case
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------
 def test_a_sleep_then_an_assert_is_refused():
-    source = fake("import time\n\n@pytest.mark.e2e\ndef test_x(page):\n    page.click('#go')\n    time.sleep(0.5)\n    assert page.title() == 'done'\n")
+    source = fake("import time\n\n" "@pytest.mark.e2e\ndef test_x(page):\n    page.click('#go')\n    time.sleep(0.5)\n    assert page.title() == 'done'\n")
     assert rules_of(source) == ["sleep"]
     found = clocks.analyze(source, "test_fake_e2e.py")[0]
     assert (found.scope, found.nth, found.line) == ("test_x", 1, 10)
@@ -276,7 +276,7 @@ def test_a_wait_without_a_deadline_or_a_condition_is_not_a_polling_step():
 
 
 def test_a_unit_test_and_a_fake_clock_are_not_read():
-    assert rules_of("import pytest\nimport time\n\n@pytest.mark.unit\ndef test_x():\n    time.sleep(0.1)\n", "test_unit_fake.py") == []
+    assert rules_of("import pytest\nimport time\n\n" "@pytest.mark.unit\ndef test_x():\n    time.sleep(0.1)\n", "test_unit_fake.py") == []
     assert rules_of("import time\n\ndef test_x():\n    time.sleep(0.1)\n", "test_no_marker.py") == [], "a file with no e2e marker is not an e2e file"
     source = fake("class Clock:\n    def sleep(self, seconds):\n        self.now += seconds\n\ndef test_x():\n    clock = Clock()\n    assert clock\n")
     assert rules_of(source) == [], "a definition of sleep is not a call"
@@ -320,8 +320,8 @@ def test_a_file_with_every_violation_is_red_and_one_that_waits_on_conditions_is_
 
 
 def test_a_conftest_without_the_declared_exit_is_refused():
-    assert [v.rule for v in clocks.analyze_conftest("import pytest\n\n@pytest.fixture\ndef x():\n    pass\n")] == ["egress"]
-    wrong_scope = "import pytest\n\n@pytest.fixture(autouse=True)\ndef _the_lab_declares_the_exit():\n    _lab_egress.install(None, None)\n"
+    assert [v.rule for v in clocks.analyze_conftest("import pytest\n\n" "@pytest.fixture\ndef x():\n    pass\n")] == ["egress"]
+    wrong_scope = "import pytest\n\n" "@pytest.fixture(autouse=True)\ndef _the_lab_declares_the_exit():\n    _lab_egress.install(None, None)\n"
     assert [v.rule for v in clocks.analyze_conftest(wrong_scope)] == ["egress"], "a function-scoped fixture is too late for the module browsers"
 
 
