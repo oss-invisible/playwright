@@ -59,6 +59,7 @@ jobs:
             hs=$(echo "$out" | grep -o "handshakes \[[^]]*\]" | head -1)
             why=$(echo "$out" | grep -oE "AssertionError: [^(]{0,160}" | head -1)
             echo "HUNTROW os=$RUNNER_OS drop=$HUNT_TLS_DROP rep=$i verdict=$verdict $hs $why"
+            if [ "$i" = 1 ] || { [ "$verdict" = FAIL ] && [ -z "$why" ]; } && [ "$i" -le 3 ]; then echo "$out" | tail -40 | sed 's/^/HUNTOUT /'; fi
           done
       - name: Close every Firefox left
         if: always()
