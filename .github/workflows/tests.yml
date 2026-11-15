@@ -186,6 +186,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # main, for the tests that compare a list of this change with the list of main (tests/test_the_e2e_tests_do_not_wait_on_clocks.py: the debt of
+      # the e2e tests only shrinks). The checkout is one commit deep; without this the comparison has nothing to read and the test says so.
+      - name: main, to compare the lists that may only shrink
+        shell: bash
+        run: git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
+
       - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
