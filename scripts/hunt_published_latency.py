@@ -32,6 +32,9 @@ EVALS = 100
 GOTOS = 10
 SEED = 42
 TEXT = "someone@example.com"
+#: Browser i of a process types TEXTS[i]: same length and shape, a different first letter, so the keys the client sent name the
+#: browser they went to (exact pairing by identity, no estimate).
+TEXTS = ["someone@example.com", "tomeone@example.com", "pomeone@example.com", "lomeone@example.com"]
 #: The page stamps every keydown and keyup with two clocks, the event's birth (performance.timeOrigin + event.timeStamp) and the
 #: handler (performance.timeOrigin + performance.now()); every mousemove and click with the handler's.
 TYPE_PAGE = (b"<!doctype html><html><body style='margin:0'><div style='height:300px'></div><input id=f style='margin-left:300px'>"
@@ -40,10 +43,10 @@ TYPE_PAGE = (b"<!doctype html><html><body style='margin:0'><div style='height:30
              b"document.addEventListener('mousemove',e=>__m.push(T()),true);document.addEventListener('click',e=>__c.push(T()),true);</script></body></html>")
 
 
-def typing_plan():
+def typing_plan(text=TEXT):
     """The core's plan for the session's first field: (dwell, gap) per character, for the persona of SEED and typing nonce 1."""
     from invisible_core.juggler._behaviour import TypingPersona, plan_typing
-    return plan_typing(TEXT, TypingPersona.from_seed(SEED), nonce=1)
+    return plan_typing(text, TypingPersona.from_seed(SEED), nonce=1)
 
 
 def _against_plan(times, planned, prefix):
@@ -213,34 +216,23 @@ def install_key_probe():
 
 
 def match_sends(rows):
-    """Give each browser of our arms the keydowns its own keyboard sent: the assignment of keyboards to browsers that puts every
-    keydown's answer closest to the page's timeStamp of the same key (brute force: at most 4 browsers per process)."""
-    import itertools
+    """Give each browser of our arms the keydowns its own keyboard sent, by identity: the characters a keyboard sent spell the text
+    that only that browser typed."""
     groups = {}
     for kid, verb, key, t, r in KEYSENDS:
         if verb == "down" and key != "Shift":
-            groups.setdefault(kid, []).append((t, r))
-    raws = [(i, r["typing"]["raw"]) for i, r in enumerate(rows) if isinstance(r, dict) and "raw" in (r.get("typing") or {})]
-    need = [(i, raw) for i, raw in raws if raw[5] is None]
-    gl = list(groups.values())
-    if not need or not gl:
-        return
-
-    def cost(raw, g):
-        ts = [x[1] for x in raw[0] if x[0] != "Shift"]
-        if len(ts) != len(g):
-            return 1e12
-        d = sorted(abs(a - r) for a, (_t, r) in zip(ts, g))
-        return d[len(d) // 2]
-    best = None
-    for perm in itertools.permutations(range(len(gl)), min(len(need), len(gl))):
-        c = sum(cost(raw, gl[j]) for (_i, raw), j in zip(need, perm))
-        if best is None or c < best[0]:
-            best = (c, perm)
-    for (i, raw), j in zip(need, best[1]):
-        if cost(raw, gl[j]) < 1e12:
-            raw[5] = gl[j]
-            rows[i]["typing"]["match_ms"] = round(cost(raw, gl[j]), 1)
+            groups.setdefault(kid, []).append((key, t, r))
+    by_text = {}
+    for g in groups.values():
+        by_text.setdefault("".join(k for k, _t, _r in g), []).append([(t, r) for _k, t, r in g])
+    for r in rows:
+        t = r.get("typing") if isinstance(r, dict) else None
+        if not t or "raw" not in t or t["raw"][5] is not None:
+            continue
+        found = by_text.get(t["text"], [])
+        t["paired"] = len(found)
+        if len(found) == 1:
+            t["raw"][5] = found[0]
 
 
 def proc_kind(p):
@@ -359,10 +351,10 @@ async def work(page, port, tag):
     return goto, ev
 
 
-async def typing(page, port, arm):
+async def typing(page, port, arm, text=TEXT):
     """A click into a field (with the cursor's path when humanised) and the fixed text: ours through press_sequentially, which
     follows the core's plan; stock through the same plan driven by hand (it has none of its own: only the runner's delay)."""
-    plan = typing_plan()
+    plan = typing_plan(text)
     await page.goto("http://127.0.0.1:%d/type" % port, wait_until="load", timeout=30000)
     if TYPE_LATE_S:
         # The late arm: typing starts TYPE_LATE_S after the last browser of this process finished launching (browsers settled).
@@ -377,7 +369,7 @@ async def typing(page, port, arm):
     if arm == "stock":
         await page.mouse.move(10, 10)
         await page.click("#f")
-        for (dwell, gap), ch in zip(plan, TEXT):
+        for (dwell, gap), ch in zip(plan, text):
             if ch == "@":
                 await page.keyboard.down("Shift")
             ts = time.time() * 1000
@@ -390,13 +382,13 @@ async def typing(page, port, arm):
             await asyncio.sleep(gap / 1000)
     else:
         await page.locator("#f").click()
-        await page.locator("#f").press_sequentially(TEXT)
+        await page.locator("#f").press_sequentially(text)
     took = time.monotonic() - m0
     cpu1 = psutil.cpu_times()
     tot = sum(cpu1) - sum(cpu0)
     keys, ups, moves, clicks = await page.evaluate("[window.__k, window.__u, window.__m, window.__c]")
     # The report is made in main(), once the client's sends of our arms are matched to their browser.
-    return {"raw": [keys, ups, moves, clicks, plan, sends or None], "typing_wall_ms": round(took * 1000),
+    return {"text": text, "raw": [keys, ups, moves, clicks, plan, sends or None], "typing_wall_ms": round(took * 1000),
             "machine_cpu_busy_pct": round(100 * (1 - (cpu1.idle - cpu0.idle) / tot), 1) if tot > 0 else None}
 
 
@@ -465,7 +457,7 @@ async def one_browser(arm, binary, port, tag):
         SLOW.append(("launch", tag, t0, time.monotonic()))
     row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag)
     try:
-        row["typing"] = await typing(page, port, arm)
+        row["typing"] = await typing(page, port, arm, TEXTS[int(tag.rsplit("-", 1)[1]) % len(TEXTS)])
     except Exception as exc:   # noqa: BLE001
         row["typing"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
     t1 = time.monotonic()
