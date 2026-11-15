@@ -41,10 +41,12 @@ class Stream:
         self.frames = []
         self.started = None   # when `start()` returned, i.e. the reply was handled
         self.first = None     # when the first frame reached the handler
+        self.arrivals = []    # when each frame reached the handler (time.monotonic), in order
 
         def on_frame(frame):
             if self.first is None:
                 self.first = time.monotonic()
+            self.arrivals.append(time.monotonic())
             self.frames.append(frame)
 
         self.on_frame = on_frame
@@ -59,6 +61,14 @@ class Stream:
         if self.first is None or self.started is None:
             return None
         return self.first - self.started
+
+    def rate(self, arrivals=None):
+        """Frames a second between the first frame and the last one of ``arrivals`` (default: all so far), or None with
+        fewer than two frames or no time between them. A rate of the frames that came, whatever the time they took to start."""
+        stamps = list(self.arrivals if arrivals is None else arrivals)
+        if len(stamps) < 2 or stamps[-1] <= stamps[0]:
+            return None
+        return (len(stamps) - 1) / (stamps[-1] - stamps[0])
 
     def describe(self):
         delay = self.first_after_start()
