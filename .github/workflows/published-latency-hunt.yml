@@ -39,7 +39,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then BIN=Scripts; else BIN=bin; fi
           for v in after before; do python -m venv "$RUNNER_TEMP/$v"; done
           "$RUNNER_TEMP/after/$BIN/python" -m pip install -q --upgrade pip
-          "$RUNNER_TEMP/after/$BIN/python" -m pip install -q "invisible-playwright==0.52.1" psutil "playwright==$(cat scripts/playwright_pin.txt)"
+          "$RUNNER_TEMP/after/$BIN/python" -m pip install -q "invisible-playwright==0.52.1" psutil websockets "playwright==$(cat scripts/playwright_pin.txt)"
           "$RUNNER_TEMP/before/$BIN/python" -m pip install -q --upgrade pip
           "$RUNNER_TEMP/before/$BIN/python" -m pip install -q "invisible-playwright==0.52.0" psutil
           for v in after before; do "$RUNNER_TEMP/$v/$BIN/python" -c "import importlib.metadata as m; print('$v', m.version('invisible-playwright'), m.version('invisible-core'))"; done
@@ -99,6 +99,8 @@ jobs:
               crashes = len(rows.get(arm, [])) - len(r)
               ev = [e for x in r for e in x["eval_ms"]]
               gr = [g for x in r for g in x["goto_req_ms"]]
+              print("HUNTLAUNCHSPLIT %-8s launch() p50 %s p95 %s max %s | new_page p50 %s p95 %s max %s" % (arm, q([x.get("enter_ms") for x in r], .5), q([x.get("enter_ms") for x in r], .95),
+                    max((x.get("enter_ms") or 0 for x in r), default=None), q([x.get("new_page_ms") for x in r], .5), q([x.get("new_page_ms") for x in r], .95), max((x.get("new_page_ms") or 0 for x in r), default=None)))
               print("HUNTTABLE %-8s browsers %3d crashes %d | launch ms p50 %s p95 %s | close ms p50 %s p95 %s | eval ms p50 %s p95 %s max %s >300ms %d of %d | goto->request ms p50 %s p90 %s max %s | cpu s/browser p50 %s"
                     % (arm, len(r), crashes, q([x["launch_ms"] for x in r], .5), q([x["launch_ms"] for x in r], .95), q([x["close_ms"] for x in r], .5), q([x["close_ms"] for x in r], .95),
                        q(ev, .5), q(ev, .95), max(ev) if ev else None, sum(1 for e in ev if e > 300), len(ev), q(gr, .5), q(gr, .9), max((g for g in gr if g is not None), default=None),
@@ -151,7 +153,7 @@ jobs:
       - name: Close every Firefox left
         if: always()
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true; else pkill -9 -f firefox > /dev/null 2>&1 || true; fi
           echo done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()

@@ -427,6 +427,7 @@ async def one_browser(arm, binary, port, tag):
             more["proxy"] = {"server": "http://127.0.0.1:%d" % PROXY_PORT}
         cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True, extra_prefs=extra, **more)
         browser = await cm.__aenter__()
+        row["enter_ms"] = round((time.monotonic() - t0) * 1000)
         close = lambda: cm.__aexit__(None, None, None)
     elif arm == "remote":
         from playwright.async_api import async_playwright
@@ -443,11 +444,14 @@ async def one_browser(arm, binary, port, tag):
         from playwright.async_api import async_playwright
         pw = await async_playwright().start()
         browser = await pw.firefox.launch(headless=True)
+        row["enter_ms"] = round((time.monotonic() - t0) * 1000)
 
         async def close(browser=browser, pw=pw):
             await browser.close()
             await pw.stop()
+    t_np = time.monotonic()
     page = await browser.new_page()
+    row["new_page_ms"] = round((time.monotonic() - t_np) * 1000)
     row["launch_ms"] = round((time.monotonic() - t0) * 1000)
     LAUNCHED["n"] += 1
     if LAUNCHED["n"] >= LAUNCHED["of"]:
@@ -525,13 +529,39 @@ def install_probes():
         PROBE.append(("probe-error geo", "", 0, 0, repr(exc)[:200]))
     for mod, attrs in (("invisible_core._geoip_db", ["ensure_geoip_mmdb"]),
                        ("invisible_core.juggler._profile", ["remove_profile"]),
-                       ("invisible_core.process", ["reap_session"])):
+                       ("invisible_core.process", ["reap_session", "find_processes", "terminate"])):
         try:
             m = importlib.import_module(mod)
             for a in attrs:
                 timed(m, a, mod.rsplit(".", 1)[-1] + "." + a)
         except Exception as exc:   # noqa: BLE001
             PROBE.append(("probe-error " + mod, "", 0, 0, repr(exc)[:200]))
+    # _profile imports find_processes and terminate by name: its copies are the ones SessionFiles.remove calls.
+    try:
+        prof = importlib.import_module("invisible_core.juggler._profile")
+        for a in ("find_processes", "terminate"):
+            if hasattr(prof, a):
+                timed(prof, a, "_profile." + a)
+    except Exception as exc:   # noqa: BLE001
+        PROBE.append(("probe-error _profile", "", 0, 0, repr(exc)[:200]))
+    # Every command to the engine that took over 100 ms, by method: where the launch spends what connection.launch does not.
+    try:
+        cmod = importlib.import_module("invisible_core.juggler.connection")
+        real_send = cmod.Connection.send
+        if not getattr(real_send, "_hunt", False):
+            @functools.wraps(real_send)
+            def send(self, method, *a, **k):
+                t = time.monotonic()
+                try:
+                    return real_send(self, method, *a, **k)
+                finally:
+                    ms = round((time.monotonic() - t) * 1000, 1)
+                    if ms > 100:
+                        PROBE.append(("send " + str(method), threading.current_thread().name, t, ms, None))
+            send._hunt = True
+            cmod.Connection.send = send
+    except Exception as exc:   # noqa: BLE001
+        PROBE.append(("probe-error send", "", 0, 0, repr(exc)[:200]))
     for mod, cls, attrs in (("invisible_core.juggler.connection", "Connection", ["close", "startup_send"]),
                             ("invisible_core.juggler._profile", "SessionFiles", ["remove", "__init__"]),
                             ("invisible_core.process", "EngineTree", ["end", "wait_job_empty", "release"])):
