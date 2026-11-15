@@ -134,7 +134,9 @@ def test_a_gateway_without_udp_resolves_the_ice_name_then_ends_in_701(firefox_bi
     assert [e["code"] for e in res["errors"]] == [701], "the STUN request must end in ONE ICE error 701" + why
     protocols = sorted({c["proto"].upper() for c in cands if c["typ"] == "host"})
     assert protocols == ["TCP", "UDP"], "host candidates of a retail with UDP blocked: UDP and TCP" + why
-    assert 10_000 <= res["at_ms"]["error"] <= 13_000, (
+    # The floor only: an error that comes at once is a name that was never resolved, and nICEr's own time on a network that
+    # drops UDP (11.1-11.3 s) can only be stretched by a slow machine, so no ceiling short of the page's own wait (25 s).
+    assert res["at_ms"]["error"] >= 10_000, (
         "the 701 came at %s ms; nICEr's time on a network that drops UDP is 11.1-11.3 s (an immediate error means the "
         "name was never resolved)" % res["at_ms"]["error"] + why)
     assert "complete" in res["at_ms"], "the gather did not end by itself" + why

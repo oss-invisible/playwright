@@ -497,7 +497,25 @@ def test_a_gateway_that_is_far_away_still_gives_the_page_a_srflx_born_through_it
     assert took_the_relay, "the page's STUN request did not take the relay. " + verdict
 
 
-@pytest.mark.wall_clock  # its verdict compares two durations (near and far): the e2e run gives it the machine alone
+_START_A_GATHER_JS = r"""async (stun) => {
+  const g = window.__gather = {host: null, srflx: null, complete: false, candidates: [], errors: []};
+  const t0 = performance.now();
+  const pc = window.__pc = new RTCPeerConnection({iceServers: [{urls: [stun]}]});
+  pc.createDataChannel('');
+  pc.addEventListener('icecandidate', e => {
+    if (!e.candidate || !e.candidate.candidate) return;
+    g.candidates.push(e.candidate.candidate);
+    const typ = (e.candidate.candidate.match(/ typ (\w+)/) || [])[1];
+    if (typ === 'host' && g.host === null) g.host = Math.round(performance.now() - t0);
+    if (typ === 'srflx' && g.srflx === null) g.srflx = Math.round(performance.now() - t0);
+  });
+  pc.addEventListener('icecandidateerror', e => g.errors.push({code: e.errorCode, text: e.errorText, url: e.url}));
+  pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') g.complete = true; });
+  await pc.setLocalDescription(await pc.createOffer());
+  return true;
+}"""
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize("ice_prefs", _ICE_PREFS, ids=_ICE_IDS)
 @pytest.mark.usefixtures("the_udp_line")
@@ -505,20 +523,45 @@ def test_the_first_candidate_of_a_gather_does_not_wait_for_a_gateway_that_is_far
     """⛔ THE KNOWN-BAD INPUT: a gateway 250 ms away. The layer made its associations one after the other on the thread of
     the ICE sockets, a connect, a greeting, an authentication and the ASSOCIATE each, so the first candidate of the page
     came out after about twelve round trips (host candidate at 2.3 s on Linux and 3.0 s on Windows, against well under a
-    second next to the gateway), and a page that times `icecandidate` reads it. A candidate does not wait for the proxy:
-    the host candidate of the far gather comes within a round trip and a quarter of a second of the near one, and the
-    srflx within the handshake (four round trips) and a STUN request (one) of its host candidate."""
-    rtt_ms = 250
-    near_ok, near_verdict, near = _gather_behind_a_coherent_gateway(monkeypatch, ("alice", "s3cret"), ice_prefs, 0)
-    far_ok, far_verdict, far = _gather_behind_a_coherent_gateway(monkeypatch, ("alice", "s3cret"), ice_prefs, rtt_ms)
-    print(f"[first candidate] near {near}, {rtt_ms} ms away {far}")
-    assert near_ok, near_verdict
-    assert far_ok, far_verdict
-    assert far["host"] - near["host"] <= rtt_ms + 250, (
-        f"the first candidate waited for the gateway: host candidate at {far['host']} ms behind a gateway {rtt_ms} ms away, "
-        f"{near['host']} ms next to it. {far_verdict}")
-    assert far["srflx"] - far["host"] <= 5 * rtt_ms + 250, (
-        f"the srflx came {far['srflx'] - far['host']} ms after the host candidate. {far_verdict}")
+    second next to the gateway), and a page that times `icecandidate` reads it. A candidate does not wait for the proxy.
+
+    The gateway here is not far, it is HELD: from the moment the page asks for the gather, every answer of the gateway on a
+    control connection waits for the test (`Gateway.gate`). The host candidate has to come while the gateway has answered
+    nothing, which no speed of the machine changes (a host candidate that waits for the gateway never comes, and the test
+    is red at its deadline); then the gateway is let go and the srflx has to be born through its relay."""
+    binary = _e2e_binary()
+    if not binary:
+        pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
+    from invisible_core import _geo
+
+    from _socks_servers import STUN_NUMBER, coherent
+    from _waits import watch
+    stun = f"stun:{STUN_NUMBER}:{STUN_PORT}"
+    with coherent(user="alice", password="s3cret", relay_host=this_host_address()) as gateway:
+        monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
+        extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True, **ice_prefs}
+        with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
+            page = browser.new_context().new_page()
+            page.goto("about:blank")
+            granted_before = len([a for a in gateway.associations if a[1] is not None])
+            gateway.gate = threading.Event()           # held: nothing the gateway answers reaches the engine from here on
+            try:
+                page.evaluate(_START_A_GATHER_JS, stun)
+                host = watch(lambda: page.evaluate("window.__gather.host"), lambda at: at is not None, 30,
+                             lambda: page.wait_for_timeout(50))
+                granted_while_held = len([a for a in gateway.associations if a[1] is not None]) - granted_before
+            finally:
+                gateway.gate.set()
+            srflx = watch(lambda: page.evaluate("window.__gather.srflx"), lambda at: at is not None, 30,
+                          lambda: page.wait_for_timeout(50))
+            res = page.evaluate("window.__gather")
+        carried = [(host_, port) for host_, port, _payload in gateway.datagrams]
+        seen = (f"candidates: {res['candidates']}; ICE errors: {res['errors']}; associations granted while the gateway was held: "
+                f"{granted_while_held}; datagrams the relay carried: {carried}; host candidate looks: {host.render()}; "
+                f"srflx looks: {srflx.render()}")
+    assert host.ok, "the first candidate waited for the gateway: no host candidate while the gateway answered nothing. " + seen
+    assert srflx.ok and (STUN_NUMBER, STUN_PORT) in carried, (
+        "the srflx was not born through the relay once the gateway was let go. " + seen)
 
 
 @pytest.mark.wall_clock  # its verdict compares two durations (near and far): the e2e run gives it the machine alone
@@ -645,7 +688,9 @@ def _gather_where_the_udp_is_dropped(gateway, monkeypatch, measured):
     # an immediate error, never a candidate that nothing allocated.
     protocols = sorted({c["proto"].upper() for c in candidates(res["candidates"]) if c["typ"] == "host"})
     assert protocols == ["TCP", "UDP"], f"host candidates of a retail on a network that drops UDP: {res['candidates']}"
-    assert 10_000 <= res["at_ms"]["error"] <= 13_000, (
+    # The floor only (an error that comes at once is a request that was never sent); a slow machine can only stretch nICEr's
+    # 11.1-11.3 s, and the page waits 25 s for the end of the gather.
+    assert res["at_ms"]["error"] >= 10_000, (
         f"the 701 of the UDP request came at {res['at_ms']['error']} ms; nICEr's time on a network that drops UDP is 11.1-11.3 s")
 
 
