@@ -183,8 +183,10 @@ def test_a_second_goto_to_a_third_site_interrupts_the_first_and_lands(firefox_bi
         return first, second, page.url
 
     first, second, url = _run(firefox_binary, scenario)
-    assert first is not None and "is interrupted by another navigation" in first, first
-    assert second is None, second
+    # what the server had been asked for: whether the second goto's request left at all, or waited behind the held response
+    asked = sorted(sites["arrived"])
+    assert first is not None and "is interrupted by another navigation" in first, (first, asked)
+    assert second is None, (second, asked)
     assert url == "http://c.test:" + url.split(":")[2], url
 
 
