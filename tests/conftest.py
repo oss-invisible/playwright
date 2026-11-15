@@ -151,6 +151,41 @@ def _offline_session_geo(request, monkeypatch):
     monkeypatch.setattr(_session, "session_geo", lambda *_a, **_k: geo)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _the_lab_declares_the_exit(request, tmp_path_factory):
+    """Where an e2e launch leaves from is DECLARED, not asked of three services of the internet.
+
+    A launch with no proxy asks the core's ``discover_egress_ip`` for its exit, which asks api.ipify.org, icanhazip.com and checkip.amazonaws.com: a
+    third party in every one of the 222 launches that name neither ``timezone=`` nor ``proxy=``. For a session in which an e2e test is selected, the
+    question with no proxy is answered the exit of the lab (``tests/_lab_egress.py``), and the GeoIP database is the lab's when no leg set one. SESSION
+    scope, because the module-scoped browsers of several files launch before any function-scoped fixture; a test that replaces the question (an exit
+    behind its own gateway) does it with ``monkeypatch`` and goes back to this answer. A session with no e2e test selected is left as it is: the unit
+    tests of the discovery call the real function."""
+    if not any(item.get_closest_marker("e2e") is not None for item in request.session.items):
+        yield None
+        return
+    import _lab_egress
+
+    with pytest.MonkeyPatch.context() as patch:
+        yield _lab_egress.install(patch, tmp_path_factory.mktemp("lab-geoip"))
+
+
+@pytest.fixture
+def local_egress_echo(monkeypatch):
+    """The REAL discovery of the exit, for the test that must prove it, against an echo service of its own on loopback: the three services of the
+    product are replaced by one that answers :data:`_lab_egress.LAB_EGRESS_IP` and counts its questions. Nothing goes to the internet."""
+    from invisible_core import _geo
+
+    import _lab_egress
+
+    current = _geo.discover_egress_ip
+    monkeypatch.setattr(_geo, "discover_egress_ip", getattr(current, "original", current))
+    echo = _lab_egress.EchoService()
+    monkeypatch.setattr(_geo, "_IP_ECHO_ENDPOINTS", (echo.url,))
+    yield echo
+    echo.close()
+
+
 @pytest.fixture
 def deterministic_rng():
     """Seeded RNG for reproducible tests."""
