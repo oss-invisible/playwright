@@ -31,7 +31,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from _host_address import this_host_address
-from _socks_servers import MEASURE_NUMBER, STUN_PORT, Socks5TcpOnly
+from _socks_servers import MEASURE_NUMBER, STUN_NUMBER, STUN_PORT, Socks5TcpOnly
 from _udp_line import bench_report, declared_udp, declared_udp_or_absent, egress_by_proxy, measure_servers
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -269,10 +269,10 @@ def test_no_orphan_prefs_in_baseline():
 # ──────────────────────────────────────────────────────────────────────────
 #  Fake-proxy infrastructure for e2e: a tiny TCP-only SOCKS5 server (Socks5TcpOnly, in _socks_servers.py).
 # ──────────────────────────────────────────────────────────────────────────
-# Same per-event probe CreepJS runs (kept tiny; raw string = one escape level).
-_PROBE_JS = r"""async () => {
-  const pc = new RTCPeerConnection({iceCandidatePoolSize:1, iceServers:[{urls:[
-    'stun:stun4.l.google.com:19302','stun:stun3.l.google.com:19302']}]});
+# Same per-event probe CreepJS runs (kept tiny; raw string = one escape level). Its STUN server is an argument: a test names one of its own
+# (a server on this host, or a number nothing answers), never a public one.
+_PROBE_JS = r"""async (stun) => {
+  const pc = new RTCPeerConnection({iceCandidatePoolSize:1, iceServers:[{urls:[stun]}]});
   pc.createDataChannel('');
   const cands = [];
   pc.addEventListener('icecandidate', e => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); });
@@ -336,10 +336,22 @@ def test_the_gather_is_real_without_a_proxy(local_https_page):
     binary = _e2e_binary()
     if not binary:
         pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
-    with _launch(binary_path=binary) as browser:
-        page = browser.new_context().new_page()
-        page.goto(local_https_page, wait_until="domcontentloaded", timeout=60000)
-        res = page.evaluate(_PROBE_JS)
+    from _socks_servers import FakeStun
+
+    # The STUN server is the test's own, on the address of this host (a real one is a third party and the runner's network): the engine's UDP is
+    # real, the server answers with the address it is reached at, and a srflx born from it is judged as before.
+    try:
+        host = this_host_address()
+    except pytest.skip.Exception:       # no default route: the same gather against a server on loopback (no srflx is born from it)
+        host = "127.0.0.1"
+    stun = FakeStun(host, bind_host=host)
+    try:
+        with _launch(binary_path=binary) as browser:
+            page = browser.new_context().new_page()
+            page.goto(local_https_page, wait_until="domcontentloaded", timeout=60000)
+            res = page.evaluate(_PROBE_JS, "stun:%s:%d" % stun.address)
+    finally:
+        stun.close()
     cands = candidates(res["candidates"])
     assert cands, "ICE produced ZERO candidates (blocked)"
     assert host_is_mdns(cands), [c["address"] for c in host_candidates(cands)]
@@ -352,7 +364,7 @@ def test_the_gather_is_real_without_a_proxy(local_https_page):
 
 
 @pytest.mark.e2e
-def test_not_blocked_behind_tcp_only_socks(socks5_tcp_only):
+def test_not_blocked_behind_tcp_only_socks(socks5_tcp_only, local_https_page):
     """Behind a TCP-only SOCKS proxy on a remote origin, ICE must still complete
     (host .local candidates), not return zero candidates: a fully blocked
     WebRTC is itself a tell. The session declares its network from the seed
@@ -361,15 +373,14 @@ def test_not_blocked_behind_tcp_only_socks(socks5_tcp_only):
     if not binary:
         pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
     proxy = {"server": f"socks5://127.0.0.1:{socks5_tcp_only.port}"}
-    try:
-        with _launch(binary_path=binary, proxy=proxy) as browser:
-            page = browser.new_context().new_page()
-            # remote origin loaded THROUGH the local SOCKS proxy (not localhost,
-            # so no proxy-bypass) -> WebRTC proxy config active.
-            page.goto("https://example.com/", wait_until="domcontentloaded", timeout=70000)
-            res = page.evaluate(_PROBE_JS)
-    except Exception as exc:  # network/proxy unavailable in this environment
-        pytest.skip(f"proxy/network path unavailable: {exc!r}")
+    # The page is the test's own, carried THROUGH the proxy (the local address is let through the proxy by the two prefs, as the declared-network tests
+    # do): a real site is a third party, and a proxy or network that fails is a failure here, not a skip. The STUN server is a number nothing answers;
+    # behind a TCP-only proxy no UDP leaves at all.
+    prefs = {"network.proxy.allow_hijacking_localhost": True, "network.proxy.no_proxies_on": ""}
+    with _launch(binary_path=binary, proxy=proxy, extra_prefs=prefs) as browser:
+        page = browser.new_context().new_page()
+        page.goto(local_https_page, wait_until="domcontentloaded", timeout=70000)
+        res = page.evaluate(_PROBE_JS, "stun:%s:%d" % (STUN_NUMBER, STUN_PORT))
     cands = candidates(res["candidates"])
     assert cands, "behind SOCKS the gather returned ZERO candidates (blocked)"
     assert host_is_mdns(cands)
