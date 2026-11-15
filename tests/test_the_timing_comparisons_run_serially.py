@@ -39,11 +39,12 @@ def test_every_test_that_compares_a_near_and_a_far_duration_runs_in_the_serial_g
     assert unserial(FILE.read_text(encoding="utf-8")) == []
 
 
-def test_the_two_known_tests_are_found():
+def test_the_known_test_is_found():
     tree = ast.parse(FILE.read_text(encoding="utf-8"))
     found = sorted(n.name for n in tree.body if isinstance(n, ast.FunctionDef) and _compares_near_and_far(n))
-    assert found == ["test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_to_the_server",
-                     "test_the_first_candidate_of_a_gather_does_not_wait_for_a_gateway_that_is_far_away"], found
+    # The first-candidate test no longer compares a near and a far gather: it holds the far gateway's handshake and waits for the
+    # host candidate (tests/test_the_timing_of_the_e2e_tests_is_the_browsers_not_the_runners.py), so it is not here any more.
+    assert found == ["test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_to_the_server"], found
 
 
 def test_a_comparison_without_the_marker_is_refused():
