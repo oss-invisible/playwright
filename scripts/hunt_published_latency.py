@@ -161,7 +161,7 @@ def parent_cpu():
     total = 0.0
     for p in psutil.Process().children(recursive=True):
         try:
-            if "firefox" in p.name().lower() and "-contentproc" not in p.cmdline():
+            if "firefox" in p.name().lower() and proc_kind(p) == "ff:parent":
                 t = p.cpu_times()
                 total += t.user + t.system
         except psutil.Error:
@@ -666,6 +666,11 @@ def serve_one(binary):
 # ---- the shutdown arms (shut20 / shut70 / shut180): one browser per process, its output kept with the time of each line --------------
 #: (wall ms, text) of every line the engine printed, recorded by the replacement of ProcessOutput._pump (HUNT_SHUT=1).
 ENGINE_LINES = []
+#: Pids of the processes the core spawned (Connection.__init__'s `process`), and the engine's tree at the close.
+ENGINE_PIDS = []
+TREE_PIDS = []
+#: The probes that end an engine's processes: a background task that ends inside one of them was ended by the core.
+BG_PROBES = ("EngineTree.end", "EngineTree.release", "process.terminate", "process.reap_session", "_profile.terminate")
 #: Seconds after the start of the launch at which the browser is closed (HUNT_SESSION_S); 0 = right after the typing.
 SESSION_S = float(os.environ.get("HUNT_SESSION_S") or 0)
 SHUT_PREFS = {"toolkit.asyncshutdown.log": True, "browser.dom.window.dump.enabled": True}
@@ -699,6 +704,16 @@ def install_output_capture():
                 self._cv.notify_all()
     _pump._hunt = True
     cmod.ProcessOutput._pump = _pump
+    # And the pid of the process the core spawned (the real parent of the engine): Connection.__init__ gets it as `process`.
+    real_init = cmod.Connection.__init__
+
+    def __init__(self, *a, **k):
+        real_init(self, *a, **k)
+        proc = k.get("process") if "process" in k else (a[2] if len(a) > 2 else None)
+        pid = getattr(proc, "pid", None)
+        if pid:
+            ENGINE_PIDS.append(pid)
+    cmod.Connection.__init__ = __init__
 
 
 class ExitWatch(threading.Thread):
@@ -708,8 +723,16 @@ class ExitWatch(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="hunt-exitwatch")
         me = psutil.Process()
-        self.main = me.children()
+        # The real parent: the process the core spawned (its pid from Connection.__init__), else the direct children of this process.
+        self.main = []
+        for pid in ENGINE_PIDS:
+            try:
+                self.main.append(psutil.Process(pid))
+            except psutil.Error:
+                pass
+        self.main = self.main or me.children()
         self.tree = me.children(recursive=True)
+        TREE_PIDS.extend(p.pid for p in self.tree)
         self.main_gone = self.tree_gone = None
 
     @staticmethod
@@ -743,11 +766,125 @@ def shut_report(lines, t_close, main_gone=None, tree_gone=None):
            "close_to_main_gone_ms": round(main_gone - t_close, 1) if main_gone else None,
            "b_quit_to_main_gone_ms": round(main_gone - quit_t, 1) if quit_t and main_gone else None,
            "b_quit_to_tree_gone_ms": round(tree_gone - quit_t, 1) if quit_t and tree_gone else None,
+           "c_main_to_tree_gone_ms": round(tree_gone - main_gone, 1) if main_gone and tree_gone else None,
            "shut_lines": len(lines)}
     after = [(t, x) for t, x in lines if t >= t_close and SHUT_RE.search(x)][:160]
     before = [(t, x) for t, x in lines if t < t_close and "Adding blocker" in x][:80]
     shown = [(round(t - t_close, 1), round(t - quit_t, 1) if quit_t else None, x) for t, x in before + after]
     return out, shown
+
+
+def is_bg(arg):
+    return arg.lstrip("-/").lower() == "backgroundtask"
+
+
+class SurvivorWatch(threading.Thread):
+    """Every `firefox --backgroundtask ...` process on the machine (the sender of the shutdown pings is one), born after `since` (wall
+    ms): scanned every 200 ms, every 20 ms once `fast` is set (the close). Each is followed by a waiter thread that gets its end time
+    and, where the OS gives it (Windows: any process; POSIX: only a child), its exit code. `roots_fn()` gives {pid: browser tag} of
+    the pids of the browsers' trees (dead ones too); a task is attributed to the browser whose pid is its parent or an ancestor."""
+
+    def __init__(self, since_ms, roots_fn):
+        super().__init__(daemon=True, name="hunt-survivors")
+        self.since, self.roots_fn = since_ms, roots_fn
+        self.found, self.skip = {}, set()
+        self.fast, self.stop_ev = threading.Event(), threading.Event()
+
+    def run(self):
+        while not self.stop_ev.is_set():
+            try:
+                self.scan()
+            except Exception:   # noqa: BLE001
+                pass
+            time.sleep(0.02 if self.fast.is_set() else 0.2)
+
+    def attribute(self, ppid):
+        roots = self.roots_fn()
+        cur, pm = ppid, None
+        for _ in range(8):
+            if cur in roots:
+                return roots[cur]
+            if pm is None:
+                pm = ppid_map()
+            cur = pm.get(cur)
+            if not cur:
+                break
+        return None
+
+    def scan(self):
+        for p in psutil.process_iter(["name"]):
+            if p.pid in self.found or p.pid in self.skip or "firefox" not in (p.info["name"] or "").lower():
+                continue
+            try:
+                born = p.create_time() * 1000
+                if born < self.since:
+                    self.skip.add(p.pid)
+                    continue
+                cmd = p.cmdline()
+                if not any(is_bg(a) for a in cmd[1:]):
+                    self.skip.add(p.pid)
+                    continue
+                rec = {"pid": p.pid, "ppid": p.ppid(), "born_wall": born, "cmd": [a[:80] for a in cmd[:4]], "end_wall": None,
+                       "end_mono": None, "rc": None}
+                rec["attrib"] = self.attribute(rec["ppid"])
+            except psutil.Error:
+                continue
+            self.found[p.pid] = rec
+            threading.Thread(target=self._wait, args=(p, rec), daemon=True, name="hunt-survivor-wait").start()
+
+    @staticmethod
+    def _wait(p, rec):
+        try:
+            rc = p.wait(timeout=120)
+        except psutil.TimeoutExpired:
+            rc = "timeout"
+        except psutil.Error:
+            rc = None
+        rec["end_wall"], rec["end_mono"], rec["rc"] = time.time() * 1000, time.monotonic(), rc
+
+    def finish(self, grace=20.0):
+        """The records, once every task found has ended (at most `grace` s) and a last second has been scanned."""
+        self.fast.set()
+        time.sleep(1.0)
+        end = time.monotonic() + grace
+        while time.monotonic() < end and any(r["end_wall"] is None for r in list(self.found.values())):
+            time.sleep(0.05)
+        self.stop_ev.set()
+        return list(self.found.values())
+
+
+def bg_report(recs, t_close, arm, rnd, tag):
+    """The background tasks of one browser, each with its birth against the close start, its lifetime and how it ended: rc 0 = by
+    itself; another rc (a kill is 1 on Windows, -9 on POSIX) = killed; rc unreadable (POSIX, not our child) = killed when the end
+    falls inside a core probe that ends processes (BG_PROBES), else unknown."""
+    out = []
+    for r in sorted(recs, key=lambda r: r["born_wall"]):
+        ended_in = None
+        if r["end_mono"] is not None:
+            for label, _thread, start, ms, _extra in PROBE:
+                if label in BG_PROBES and start - 0.05 <= r["end_mono"] <= start + ms / 1000 + 0.05:
+                    ended_in = label
+                    break
+        rc = r["rc"]
+        if rc == 0:
+            by = "self"
+        elif isinstance(rc, int):
+            by = "killed(rc=%s)" % rc
+        elif rc == "timeout":
+            by = "alive at +120 s"
+        else:
+            by = ("killed?(%s)" % ended_in) if ended_in else "unknown"
+        out.append({"arm": arm, "round": rnd, "tag": tag, "os": sys.platform, "pid": r["pid"], "ppid": r["ppid"],
+                    "attrib": r["attrib"] or "assumed", "born_ms": round(r["born_wall"] - t_close, 1),
+                    "life_ms": round(r["end_wall"] - r["born_wall"], 1) if r["end_wall"] else None,
+                    "end_ms": round(r["end_wall"] - t_close, 1) if r["end_wall"] else None,
+                    "cmd": r["cmd"], "rc": rc, "ended_by": by, "ended_in": ended_in})
+    return out
+
+
+def print_bg(rows):
+    for d in rows:
+        print("HUNTBGTASK " + json.dumps(d), flush=True)
 
 
 def print_shut(arm, rnd, tag, shown):
@@ -758,6 +895,10 @@ def print_shut(arm, rnd, tag, shown):
 
 async def one_browser(arm, binary, port, tag):
     row = {"arm": arm, "tag": tag}
+    sv = None
+    if os.environ.get("HUNT_SHUT") == "1":
+        sv = SurvivorWatch(time.time() * 1000, lambda: {pid: tag for pid in set(ENGINE_PIDS) | set(TREE_PIDS)})
+        sv.start()
     c_start = await asyncio.to_thread(parent_cpu)
     t0 = time.monotonic()
     if arm == "inproc":
@@ -846,6 +987,8 @@ async def one_browser(arm, binary, port, tag):
     if os.environ.get("HUNT_SHUT") == "1":
         watch = ExitWatch()
         watch.start()
+        sv.fast.set()
+        row["parent_pids"] = [p.pid for p in watch.main]
         row["close_wall_ms"] = time.time() * 1000
     t1 = time.monotonic()
     await close()
@@ -853,6 +996,7 @@ async def one_browser(arm, binary, port, tag):
     if watch is not None:
         await asyncio.to_thread(watch.join, 95)
         row["_main_gone"], row["_tree_gone"] = watch.main_gone, watch.tree_gone
+        row["_bg"] = await asyncio.to_thread(sv.finish)
     if row["close_ms"] > SLOW_MS:
         SLOW.append(("close", tag, t1, time.monotonic()))
     return row
@@ -1064,8 +1208,11 @@ async def main(arm, n, rnd, binary):
             fields, shown = shut_report(ENGINE_LINES, r["close_wall_ms"], r.pop("_main_gone", None), r.pop("_tree_gone", None))
             r.update(fields)
             r["engine_lines_total"] = len(ENGINE_LINES)
+        bgs = bg_report(r.pop("_bg", []), r["close_wall_ms"], arm, rnd, r["tag"]) if r.get("close_wall_ms") else []
+        r["bg_n"] = len(bgs)
         print("HUNTROW " + json.dumps(r), flush=True)
         print_shut(arm, rnd, r["tag"], shown)
+        print_bg(bgs)
     for tag, segs in EVAL_OUT:
         print("HUNTEVAL " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "tag": tag, "segs": segs}), flush=True)
     SAMPLER.stop.set()
@@ -1363,6 +1510,9 @@ class RetailBrowser:
             except OSError as exc:
                 row["close_cmd"] = [1, repr(exc)[:140]]
         self.t_close = now_ms()
+        if RETAIL_SV is not None:
+            RETAIL_SV.fast.set()
+        row["parent_pid"], row["parent_is_window_owner"] = target, self.window_pid is not None
         row["close_cmd_ms"] = round(self.t_close - c0, 1)
         row["session_s"] = round((self.t_close - self.t_start) / 1000, 2)
         deadline = self.t_close + 120000
@@ -1397,19 +1547,26 @@ class RetailBrowser:
         row["parent_cpu_s"] = round(self.cpu_last, 3) if self.cpu_last is not None else row.get("cpu_at_close_s")
 
 
+RETAIL_SV = None
+
+
 def retail_main(n, rnd, binary, close_after):
+    global RETAIL_SV
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     port = httpd.server_address[1]
     work = tempfile.mkdtemp(prefix="hunt-retail-")
     browsers = [RetailBrowser("retail-%s-%d" % (rnd, i), binary, work) for i in range(n)]
     t0 = time.time()
+    RETAIL_SV = SurvivorWatch(t0 * 1000, lambda: {pid: b.tag for b in browsers for pid in list(b.procs)})
+    RETAIL_SV.start()
     threads = [threading.Thread(target=b.session, args=(port, close_after), daemon=True) for b in browsers]
     for t in threads:
         t.start()
     stop = time.monotonic() + close_after + 400
     for t in threads:
         t.join(max(1.0, stop - time.monotonic()))
+    bg_all = RETAIL_SV.finish()
     for b in browsers:
         b.finished.set()
         for pid in b.alive_procs():
@@ -1429,11 +1586,18 @@ def retail_main(n, rnd, binary, close_after):
         if b.t_close:
             fields, shown = shut_report(b.log_matches, b.t_close, getattr(b, "main_gone_wall", None), getattr(b, "gone_wall", None))
             r.update(fields)
+        mine = [x for x in bg_all if x["attrib"] == b.tag or (x["attrib"] is None and n == 1)]
+        bgs = bg_report(mine, b.t_close, "retail", rnd, b.tag) if b.t_close else []
+        r["bg_n"] = len(bgs)
         print("HUNTROW " + json.dumps(r), flush=True)
         print_shut("retail", rnd, b.tag, shown)
+        print_bg(bgs)
         if not b.log_bytes:
             print("HUNTSHUT " + json.dumps({"arm": "retail", "round": rnd, "tag": b.tag, "os": sys.platform, "t_ms": None,
                                             "line": "(the browser wrote nothing to stdout/stderr)"}), flush=True)
+    stray = [x for x in bg_all if x["attrib"] is None and n > 1]
+    if stray:
+        print_bg(bg_report(stray, min((b.t_close for b in browsers if b.t_close), default=t0 * 1000), "retail", rnd, "unattributed"))
     httpd.shutdown()
     shutil.rmtree(work, ignore_errors=True)
 

@@ -91,7 +91,7 @@ jobs:
           set +e
           S=scripts/hunt_published_latency.py
           # What an arm prints: its HUNT lines, each tagged with the arm.
-          keep() { grep -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR)' | sed -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          keep() { grep -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK)' | sed -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
           # The retail arms: N browsers, round, seconds after the first load before the normal close (Linux headed under xvfb).
           retail() {
             if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
@@ -232,12 +232,16 @@ jobs:
           # AsyncShutdown log after the close started: Services.startup.quit has run), (b) the quit -> the main process gone (and the
           # whole tree gone). Then the phases and the blockers by name, with their time against the quit (the time held in (b)).
           SH = ("shut20", "shut70", "shut180", "retail1", "retail4late", "retail1long")
-          probes, shut = {}, {}
+          probes, shut, bgt = {}, {}, {}
           for line in open(sys.argv[1], encoding="utf-8"):
               m = re.match(r"HUNTPROBE \[(\w+)\] (.*)", line.strip())
               if m:
                   d = json.loads(m.group(2))
                   probes.setdefault((m.group(1), d["name"]), []).append(d["ms"])
+                  continue
+              m = re.match(r"HUNTBGTASK \[(\w+)\] (.*)", line.strip())
+              if m:
+                  bgt.setdefault(m.group(1), []).append(json.loads(m.group(2)))
                   continue
               m = re.match(r"HUNTSHUT \[(\w+)\] (.*)", line.strip())
               if m:
@@ -250,11 +254,31 @@ jobs:
               if not rows.get(arm):
                   continue
               r = [x for x in rows[arm] if "crash" not in x]
-              print("HUNTSHUTCLOSE %-11s closes %d crashes %d | session s at close p50 %s | close ms %s | (a) close->quit ms %s | (b) quit->main gone ms %s | (b) quit->tree gone ms %s | close->main gone p50 %s | quit not seen %d | Connection.close p50/max %s | EngineTree.end %s | EngineTree.wait_job_empty %s | SessionFiles.remove %s"
+              print("HUNTSHUTCLOSE %-11s closes %d crashes %d | session s at close p50 %s | close ms %s | (a) close->quit ms %s | (b) quit->main gone ms %s | (b) quit->tree gone ms %s | (c) real parent gone->tree gone ms %s | close->real parent gone p50 %s | quit not seen %d | Connection.close p50/max %s | EngineTree.end %s | EngineTree.wait_job_empty %s | SessionFiles.remove %s"
                     % (arm, len(r), len(rows[arm]) - len(r), q([x.get("session_s_at_close", x.get("session_s")) for x in r], .5), trio([x.get("close_ms") for x in r]),
                        trio([x.get("a_close_to_quit_ms") for x in r]), trio([x.get("b_quit_to_main_gone_ms") for x in r]), trio([x.get("b_quit_to_tree_gone_ms") for x in r]),
-                       q([x.get("close_to_main_gone_ms") for x in r], .5), sum(1 for x in r if x.get("a_close_to_quit_ms") is None),
+                       trio([x.get("c_main_to_tree_gone_ms") for x in r]), q([x.get("close_to_main_gone_ms") for x in r], .5), sum(1 for x in r if x.get("a_close_to_quit_ms") is None),
                        pmx(arm, "Connection.close"), pmx(arm, "EngineTree.end"), pmx(arm, "EngineTree.wait_job_empty"), pmx(arm, "SessionFiles.remove")))
+          # The background tasks (firefox --backgroundtask ..., the shutdown-ping sender): per close how many, when born against the close
+          # start, how long they lived and how they ended.
+          for arm in SH:
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if not r:
+                  continue
+              ts = bgt.get(arm, [])
+              per = {}
+              for t in ts:
+                  per[(t["round"], t["tag"])] = per.get((t["round"], t["tag"]), 0) + 1
+              counts = [per.get((x["round"], x["tag"]), 0) for x in r]
+              ended = {}
+              for t in ts:
+                  k = re.sub(r"rc=-?\d+", "rc=N", t["ended_by"])
+                  ended[k] = ended.get(k, 0) + 1
+              print("HUNTBGSUM %-11s closes %d | tasks %d, per close p50 %s max %s, closes with none %d | born ms against the close p50 %s p95 %s | life ms p50 %s p95 %s max %s | ended by: %s | ended inside the core's cleanup %d | attributed by ancestry %d, assumed %d | parent pids %s | cmd %s"
+                    % (arm, len(r), len(ts), q(counts, .5), max(counts, default=None), sum(1 for c in counts if c == 0), q([t["born_ms"] for t in ts], .5), q([t["born_ms"] for t in ts], .95),
+                       q([t["life_ms"] for t in ts], .5), q([t["life_ms"] for t in ts], .95), max((t["life_ms"] for t in ts if t["life_ms"] is not None), default=None),
+                       ended, sum(1 for t in ts if t.get("ended_in")), sum(1 for t in ts if t["attrib"] != "assumed"), sum(1 for t in ts if t["attrib"] == "assumed"),
+                       sorted({str(x.get("parent_pids") or x.get("parent_pid")) for x in r})[:3], [" ".join(t["cmd"][1:4])[:70] for t in ts[:1]]))
           phase_re = re.compile(r"(Starting|Finished) phase (\S+)")
           add_re = re.compile(r"Adding blocker (.+) for phase (\S+)")
           done_re = re.compile(r"Completed blocker (.+) for phase (\S+)")
