@@ -222,8 +222,20 @@ class TlsPage:
         self.body = body
         outer = self
 
+        drop = os.environ.get("HUNT_TLS_DROP", "none")   # hunt only: none | first | alternate
+        seen = [0]
+
         class Handler(http.server.BaseHTTPRequestHandler):
             def setup(self):
+                seen[0] += 1
+                if drop == "alternate" and seen[0] % 2 == 1 or drop == "first" and seen[0] == 1:
+                    outer.handshakes.append("dropped by the server before the handshake")
+                    try:
+                        self.request.recv(1)          # the ClientHello has started to arrive
+                    except OSError:
+                        pass
+                    self.request.close()
+                    raise ConnectionAbortedError("hunt: dropped")
                 try:
                     self.request = context.wrap_socket(self.request, server_side=True)
                     outer.handshakes.append("ok")
