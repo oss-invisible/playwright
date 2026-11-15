@@ -15,7 +15,7 @@ jobs:
       max-parallel: 8
       matrix:
         os: [windows-2022, ubuntu-24.04]
-        delay: ['0.3', '0.8', '1.5', '3']
+        delay: ['0']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     defaults:
@@ -40,21 +40,21 @@ jobs:
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database
         run: python scripts/ci_lab_geoip.py build
-      - name: 30 runs of the OCSP case by name, the second handshake late by ${{ matrix.delay }} s, context closed fast
+      - name: 10 runs: a redirect a closed context still follows
         env:
           HUNT_CLOSE: fast
           HUNT_SECOND_DELAY: ${{ matrix.delay }}
           MOZ_CRASHREPORTER_DISABLE: "1"
         run: |
           set +e +o pipefail
-          NODE='tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py::test_the_ocsp_request_of_a_trusted_page_leaves_only_through_the_proxy[name]'
+          NODE='tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py::test_hunt_a_redirect_a_closed_context_still_follows_is_resolved_through_its_proxy'
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo rm -rf /opt/ff && sudo cp -a "$(dirname "$FF")" /opt/ff && sudo chown -R root:root /opt/ff && sudo chmod -R go+rX /opt/ff
             RUN="sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR INVPW_REQUIRE_TRAP=1 PATH=$PATH INVPW_BINARY_PATH=/opt/ff/$(basename "$FF") HUNT_CLOSE=$HUNT_CLOSE HUNT_SECOND_DELAY=$HUNT_SECOND_DELAY"
           else
             RUN="env INVPW_BINARY_PATH=$FF"
           fi
-          for i in $(seq 1 30); do
+          for i in $(seq 1 10); do
             out=$($RUN python -m pytest "$NODE" -m e2e -o addopts='' -q -p no:cacheprovider -p no:rerunfailures -s 2>&1 || true)
             if echo "$out" | grep -qE "(^| )1 passed"; then verdict=pass; else verdict=FAIL; fi
             hs=$(echo "$out" | grep -o "handshakes \[[^]]*\]" | head -1)

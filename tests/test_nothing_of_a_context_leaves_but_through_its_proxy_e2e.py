@@ -754,3 +754,61 @@ def test_a_page_of_an_issuer_the_engine_does_not_trust_makes_no_ocsp_request(fir
         assert ocsp_responder.requests == [], "an untrusted issuer made an OCSP request: %s" % ocsp_responder.requests
     finally:
         server.close()
+
+
+# ------------------------------------------------------------------------------------- hunt: a lookup of a context that has closed
+def test_hunt_a_redirect_a_closed_context_still_follows_is_resolved_through_its_proxy(firefox_binary, lab, doh, gateway, trap, watcher, engine_log):
+    """HUNT ONLY. The page sends a beacon when it is hidden; the server answers it 2 s later with a redirect to ANOTHER name, so that name is
+    looked up after the context has closed. A context with a proxy keeps it for its requests in flight (GoneContexts); does its resolver too?"""
+    import datetime as _dt
+    import threading as _th
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    first, second = "beacon-%s.lab.test" % lab.nonce, "late-%s.lab.test" % lab.nonce
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _answer(self):
+            hits.append((self.path, _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f")))
+            if self.path.startswith("/page"):
+                body = ("<!doctype html><title>beacon</title><script>addEventListener('pagehide', () => "
+                        "navigator.sendBeacon('/b', 'x'));</script>").encode()
+                self.send_response(200); self.send_header("Content-Type", "text/html"); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            elif self.path.startswith("/b"):
+                time.sleep(2)
+                self.send_response(307); self.send_header("Location", "http://%s:%d/c" % (second, port))
+                self.send_header("Content-Length", "0"); self.end_headers()
+            else:
+                self.send_response(204); self.end_headers()
+
+        do_GET = do_POST = _answer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    _th.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        doh.names[first] = "127.0.0.1"
+        doh.names[second] = "127.0.0.1"
+        proxy = gateway("gw-context")
+        with _launch(firefox_binary) as browser:
+            context = browser.new_context(proxy=proxy.proxy)
+            page = context.new_page()
+            page.goto("http://%s:%d/page" % (first, port), wait_until="load", timeout=30000)
+            print("HUNTCLOSE begin %s" % _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f"))
+            context.close()
+            print("HUNTCLOSE end %s" % _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S.%f"))
+            time.sleep(6)
+        watcher.stop()
+        from _egress_sink import _lines as _hunt_lines
+        for _l in _hunt_lines(engine_log):
+            if lab.nonce in _l and ("Resolving host" in _l or "effectiveTRRmode" in _l or "getaddrinfo" in _l):
+                print("HUNTLOG " + _l.rstrip()[:300])
+        print("HUNTSTATE hits=%s" % hits)
+        sink = EgressSink(lab.witness, watcher, engine_log, lab.nonce, trap)
+        assert any(h[0].startswith("/c") for h in hits), "the redirect was not followed after the close: %s" % hits
+        assert sink.leak_problems() == [], "; ".join(sink.leak_problems())
+    finally:
+        server.shutdown()
