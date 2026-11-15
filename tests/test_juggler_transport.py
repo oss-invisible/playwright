@@ -21,6 +21,7 @@ from invisible_core.juggler.connection import EventListeners, ProtocolError
 
 from _servers import LocalServer
 from _browser_census import closes_with_the_test
+from _waits import wait_until
 
 PAGE = b"""<!doctype html><html><head><title>seam</title></head><body>
 <button id=b onclick="this.dataset.n=(+(this.dataset.n||0)+1)">press</button>
@@ -265,7 +266,7 @@ def test_the_public_API_WAITS_for_an_element_that_arrives_late(firefox_binary):
     """⛔ THE POINT OF `wait_for_selector`, and the reason it cannot go through
     the retry loop: that loop disposes what it resolves on every turn, so it
     would hand back a handle it has just released - and a released handle does
-    not raise, it answers wrong. The element below arrives 3 s after the test schedules it."""
+    not raise, it answers wrong. The element below arrives 1 s after the test asks for it."""
     os.environ[factory.CHOICE_ENV] = factory.JUGGLER
     srv = LocalServer(("127.0.0.1", 0), _serve(PAGE))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -276,19 +277,22 @@ def test_the_public_API_WAITS_for_an_element_that_arrives_late(firefox_binary):
                                  headless=True) as browser:
             page = browser.new_page()
             page.goto(url)
-            # The late element is the test's own, scheduled HERE, 3 s from now. The page's #slow comes from a timer started at its
-            # load, and on a Windows runner more than 800 ms can pass between the load and the first read (CI of 13/11, run
-            # 43383366904). Nothing of the page adds #later, so only this timer can. 3 s, not 800 ms: the absent check is two round
-            # trips (the reply of evaluate, then query_selector), and on a Windows runner each took up to 0.4-0.5 s (run 43389137758,
-            # 40 runs: evaluate up to 422 ms, query_selector up to 516 ms), so 800 ms was crossed once in 20 (run 43387760051).
+            # The late element is the test's own: the page only holds the function that adds it, and the test calls that
+            # AFTER it has seen the element absent. A timer started before the check judged the speed of the machine: the
+            # check is two round trips, up to 0.4-0.5 s each on a Windows runner (run 43389137758), and a delay of 800 ms was
+            # crossed once in 20 (run 43387760051); an element that arrives before the check turns the test red with
+            # "it proves nothing". Now nothing arrives until the check is done, however long it took.
             page.evaluate("""() => {
                 const box = document.createElement('div');
                 document.body.appendChild(box);
-                setTimeout(() => { box.innerHTML = '<span id=later>arrived</span>'; }, 3000);
+                window.__showLater = () => setTimeout(() => {
+                    box.innerHTML = '<span id=later>arrived</span>';
+                }, 1000);
             }""")
             assert page.query_selector("#later") is None, (
                 "the element was already there: the test proves nothing")
-            handle = page.wait_for_selector("#later", timeout=15000)
+            page.evaluate("() => window.__showLater()")
+            handle = page.wait_for_selector("#later", timeout=30000)
             assert handle is not None
             assert handle.text_content() == "arrived"
     finally:
@@ -595,7 +599,10 @@ def test_console_messages_reach_the_page_listener(firefox_binary):
             seen = []
             page.on("console", lambda m: seen.append((m.type, m.text)))
             page.goto(url)
-            page.wait_for_timeout(500)
+            # the two messages of the page are waited for (30 s is a deadline no healthy run comes near), not slept for
+            wait_until(lambda: any("first line" in text for _, text in seen)
+                       and any(kind in ("warning", "warn") for kind, _ in seen),
+                       30, lambda: page.wait_for_timeout(50))
             assert seen, "no console message arrived at all"
             kinds = {t for t, _ in seen}
             texts = " | ".join(text for _, text in seen)
@@ -626,7 +633,7 @@ def test_an_uncaught_error_reaches_the_pageerror_listener(firefox_binary):
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.goto(url)
             page.click("#boom")
-            page.wait_for_timeout(600)
+            wait_until(lambda: errors, 30, lambda: page.wait_for_timeout(50))
             assert errors, "the uncaught error never arrived"
             assert "undefinedFunctionCall" in " ".join(errors), (
                 "the message was lost: %s" % errors)
@@ -664,7 +671,7 @@ def test_a_dialog_can_be_ANSWERED_and_not_answering_hangs_the_page(
             page.on("dialog", answer)
             page.goto(url)
             page.click("#alert")
-            page.wait_for_timeout(600)
+            wait_until(lambda: seen, 30, lambda: page.wait_for_timeout(50))
             assert seen == [("alert", "are you sure")], seen
             # And the page is still alive: if the dialog had not been
             # answered, this would time out instead of returning.
