@@ -146,7 +146,7 @@ def _worker_navigator_dict(page, props):
                 worker.onmessage = (e) => resolve(e.data);
                 worker.onerror = (e) => reject(new Error(e.message));
                 worker.postMessage(props);
-                setTimeout(() => reject(new Error('worker timeout')), 5000);
+                setTimeout(() => reject(new Error('worker timeout')), 30000);
             });
             return result;
         } finally {

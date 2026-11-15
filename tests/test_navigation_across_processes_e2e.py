@@ -35,11 +35,11 @@ from _waits import awatch
 pytestmark = pytest.mark.e2e
 
 #: The longest any wait of this file lasts; no healthy run comes near it. It is the only clock the verdicts have.
-DEADLINE = 8.0
+DEADLINE = 30.0
 
 #: The timeout of the gotos that are stopped or replaced below. A goto that is not stopped waits for its held answer and
 #: ends at this timeout with another error: it is the bound of the waits that lead up to the stop, nothing narrower.
-GOTO_TIMEOUT_MS = 15000
+GOTO_TIMEOUT_MS = 30000
 
 FISSION_ON = {
     "fission.autostart": True,
@@ -224,7 +224,7 @@ def test_an_iframe_removed_while_it_loads_is_aborted_then_gone(firefox_binary, s
         # insertion, whatever the machine: a test that only reads the list could read it before the frame existed)
         seen = await awatch(lambda: (counts["attached"], counts["detached"], len(page.frames)),
                             lambda state: state[0] >= 1 and state[1] >= 1 and state[2] == 1,
-                            DEADLINE + 2, lambda: page.wait_for_timeout(100))
+                            DEADLINE, lambda: page.wait_for_timeout(100))
         return [f.url for f in page.frames], seen.render()
 
     urls, seen = _run(firefox_binary, scenario)

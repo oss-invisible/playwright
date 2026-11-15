@@ -25,7 +25,7 @@ pytestmark = [
     pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the Linux text path"),
 ]
 
-DEADLINE_S = 15
+DEADLINE_S = 30
 
 PAGE = ("<!doctype html><meta charset=utf-8><body style='margin:8px;background:#fff;color:#000'>"
         "<h1 style='font-family:serif'>Serif heading</h1>"

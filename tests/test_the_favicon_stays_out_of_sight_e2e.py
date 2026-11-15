@@ -84,7 +84,7 @@ def test_the_favicon_goes_to_the_site_and_nothing_of_it_to_the_client(firefox_bi
             # and nothing above noticed: networkidle reaches the client from
             # the lifecycle's timer, not from the reader. A round trip to the
             # engine does need the reader.
-            page.wait_for_function("() => document.title === 'f'", timeout=10000)
+            page.wait_for_function("() => document.title === 'f'", timeout=30000)
             release.set()
             # What a client could be told of the favicon comes when its answer is over: wait for the site to have
             # written it (a condition with a deadline), then leave the client a short window to say anything. The

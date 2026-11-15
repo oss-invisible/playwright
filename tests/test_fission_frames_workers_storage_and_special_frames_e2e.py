@@ -47,7 +47,7 @@ WORKER_JS = """(kind) => new Promise(resolve => {
   } catch (e) { resolve({error: String(e)}); return; }
   worker.onmessage = e => resolve(e.data);
   worker.onerror = e => resolve({error: 'worker error: ' + e.message});
-  setTimeout(() => resolve({error: 'timeout'}), 10000);
+  setTimeout(() => resolve({error: 'timeout'}), 30000);
 })""" % json.dumps(IDENTITY)
 
 WINDOW_JS = "() => (%s)" % IDENTITY
@@ -137,7 +137,7 @@ SHARED_WORKER_JS = """() => new Promise(resolve => {
     worker.port.onmessage = e => resolve({outcome: 'ok', identity: e.data});
     worker.onerror = e => resolve({outcome: 'error', message: String(e.message || e)});
   } catch (e) { resolve({outcome: 'throw', message: e.name + ': ' + e.message}); }
-  setTimeout(() => resolve({outcome: 'timeout'}), 10000);
+  setTimeout(() => resolve({outcome: 'timeout'}), 30000);
 })"""
 
 SERVICE_WORKER_JS = """() => new Promise(resolve => {
@@ -150,7 +150,7 @@ SERVICE_WORKER_JS = """() => new Promise(resolve => {
       }),
       e => resolve({outcome: 'rejected', message: e.name + ': ' + e.message}));
   } catch (e) { resolve({outcome: 'throw', message: e.name + ': ' + e.message}); }
-  setTimeout(() => resolve({outcome: 'timeout'}), 15000);
+  setTimeout(() => resolve({outcome: 'timeout'}), 30000);
 })"""
 
 

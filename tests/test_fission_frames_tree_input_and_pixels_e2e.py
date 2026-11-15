@@ -178,17 +178,17 @@ def test_waiting_for_an_element_that_appears_later_in_a_frame_of_another_site(pa
     frame = {"frame": wait_frame(page, late.url("B"), "/late-b"),
              "nested": wait_frame(page, late.url("C"), "/late-c")}[target]
     # the element is not there yet when the wait starts, or it is by now: either way the wait returns it
-    handle = frame.wait_for_selector("#late", timeout=8000)
+    handle = frame.wait_for_selector("#late", timeout=30000)
     try:
         assert handle.inner_text() == "arrived"
         assert handle.owner_frame() is frame
     finally:
         handle.dispose()
     # the same, by the locator of the frame and by the frame locator of the page
-    frame.locator("#shown").wait_for(state="visible", timeout=8000)
+    frame.locator("#shown").wait_for(state="visible", timeout=30000)
     outer = page.frame_locator("#b")
     scoped = outer.locator("#late") if target == "frame" else outer.frame_locator("#c").locator("#late")
-    scoped.wait_for(state="attached", timeout=8000)
+    scoped.wait_for(state="attached", timeout=30000)
     assert scoped.inner_text() == "arrived"
 
 

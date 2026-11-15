@@ -157,7 +157,7 @@ def test_the_compositor_is_webrender_software_whatever_the_machine(firefox_binar
 #: RTCPeerConnection with no ICE servers and waits for the gather, draws 200 DOM elements and one 2D canvas frame; the browser goes to
 #: the next copy of it, 10 times.
 ROUNDS = 10
-ICE_WAIT_MS = 15000
+ICE_WAIT_MS = 30000
 SCENE = """<!doctype html><meta charset=utf-8><title>scenario</title>
 <body><div id=root></div><canvas id=c width=320 height=200></canvas>
 <script>

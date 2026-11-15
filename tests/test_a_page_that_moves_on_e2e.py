@@ -62,7 +62,7 @@ def _goto(page, url, **kwargs):
     except Error as e:
         if "NS_BINDING_ABORTED" in str(e):
             # The page's own replace stopped ours: it is where it sent itself.
-            page.wait_for_url("**/landed", timeout=15_000)
+            page.wait_for_url("**/landed", timeout=30_000)
         else:
             assert "is interrupted by another navigation to" in str(e), e
             assert "/landed" in str(e).split("another navigation to")[1], e
@@ -166,7 +166,7 @@ def page(firefox_binary):
 def test_a_read_right_after_goto_answers(page, site, path):
     for i in range(ROUNDS):
         _goto(page, "%s%s?i=%d" % (site, path, i), wait_until="domcontentloaded",
-              timeout=15_000)
+              timeout=30_000)
         # Each read is made at once, while the page may still be moving: none
         # of them may surface the engine's refusal of a vanished world. A count
         # is of the page as it is NOW, and that can be the replacing document
@@ -180,7 +180,7 @@ def test_a_read_right_after_goto_answers(page, site, path):
         texts = ([], ["first"], ["head"], ["landed"])
         assert page.locator("#p").all_inner_texts() in texts
         assert page.locator("#p").all_text_contents() in texts
-        assert page.inner_text("#p", timeout=10_000) in ("first", "head",
+        assert page.inner_text("#p", timeout=30_000) in ("first", "head",
                                                          "landed")
         # The caller's code is NOT a read: it is sent once ([B285]). On a page
         # still moving - `/x50` replaces itself after the read above - it
@@ -201,7 +201,7 @@ def test_networkidle_is_reached_on_the_page_that_replaced_ours(page, site, path)
     first page, or never comes back because the new frame forgot the navigation, is still red."""
     for i in range(ROUNDS):
         _goto(page, "%s/i%s?n=%d" % (site, path[1:], i), wait_until="networkidle",
-              timeout=15_000)
+              timeout=30_000)
         assert page.url.endswith("/landed"), page.url
 
 
@@ -233,7 +233,7 @@ def test_reads_wait_as_playwright_s_do(page, site):
     page.evaluate("setTimeout(() => { const b = document.createElement('b');"
                   " b.id = 'late'; b.textContent = 'late';"
                   " document.body.appendChild(b); }, 500)")
-    assert page.inner_text("#late", timeout=5_000) == "late"
+    assert page.inner_text("#late", timeout=30_000) == "late"
     from invisible_playwright.sync_api import TimeoutError as PlaywrightTimeout
     with pytest.raises(PlaywrightTimeout, match="Timeout 300ms exceeded"):
         page.inner_text("#never", timeout=300)

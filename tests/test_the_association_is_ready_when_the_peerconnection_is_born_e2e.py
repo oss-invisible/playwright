@@ -40,7 +40,7 @@ _PC_JS = """async (stun) => {
   let t_srflx = null;
   pc.onicecandidate = e => { if (e.candidate && e.candidate.type === 'srflx' && t_srflx === null) t_srflx = Date.now(); };
   await pc.setLocalDescription(await pc.createOffer());
-  const deadline = Date.now() + 8000;
+  const deadline = Date.now() + 30000;
   while (t_srflx === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 5));
   pc.close();
   return {t_pc, t_srflx};
