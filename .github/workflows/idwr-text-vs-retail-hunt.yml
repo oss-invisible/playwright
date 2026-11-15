@@ -5,7 +5,7 @@ name: idwr text vs retail hunt
 on:
   push:
     branches: [hunt/idwr-text-vs-retail]
-    paths: [scripts/hunt_text_vs_retail.py, scripts/hunt_tv_text_probe.js, scripts/hunt_tv_fallback_probe.js, .github/workflows/idwr-text-vs-retail-hunt.yml]
+    paths: [scripts/hunt_text_raster_cause.py, .github/workflows/idwr-text-vs-retail-hunt.yml]
 permissions:
   contents: read
   actions: read
@@ -51,21 +51,15 @@ jobs:
         run: python scripts/ci_lab_geoip.py build
       - name: Retail Firefox 159.0 (Mozilla's installer, checked against SHA256SUMS)
         run: python -u scripts/hunt_first_run.py fetch-retail --out "$RUNNER_TEMP/retail"
-      - name: Both arms, then the comparison
+      - name: Where the +-1 falls with the same font file, and the rendering settings of each browser
         continue-on-error: true
-        timeout-minutes: 20
+        timeout-minutes: 15
         run: |
           set +e
           PREFS=$(python -c "import json; from invisible_core._fpforge import generate_profile; f = generate_profile(seed=42).font; print(json.dumps({'gfx.font_rendering.cleartype_params.gamma': f.cleartype_gamma, 'gfx.font_rendering.cleartype_params.enhanced_contrast': f.cleartype_contrast, 'gfx.font_rendering.cleartype_params.cleartype_level': f.cleartype_level, 'gfx.font_rendering.cleartype_params.pixel_structure': f.cleartype_pixel_structure, 'gfx.font_rendering.cleartype_params.rendering_mode': f.cleartype_rendering_mode}))")
-          echo "the seed 42 rasterisation prefs given to retail: $PREFS"
-          python -u scripts/hunt_text_vs_retail.py run --arm ours --binary "$FF" --out "$RUNNER_TEMP/tv"
-          cp "$RUNNER_TEMP/tv/ours.json" "$RUNNER_TEMP/tv-plain/ours.json" 2>/dev/null || { mkdir -p "$RUNNER_TEMP/tv-plain"; cp "$RUNNER_TEMP/tv/ours.json" "$RUNNER_TEMP/tv-plain/ours.json"; }
-          python -u scripts/hunt_text_vs_retail.py run --arm retail --retail-from "$RUNNER_TEMP/retail" --retail-prefs "$PREFS" --out "$RUNNER_TEMP/tv"
-          python -u scripts/hunt_text_vs_retail.py run --arm retail --retail-from "$RUNNER_TEMP/retail" --out "$RUNNER_TEMP/tv-plain"
-          echo "=== retail WITH the seed's rasterisation prefs"
-          python -u scripts/hunt_text_vs_retail.py compare "$RUNNER_TEMP/tv" --binary "$FF"
-          echo "=== retail with the runner's own settings"
-          python -u scripts/hunt_text_vs_retail.py compare "$RUNNER_TEMP/tv-plain" --binary "$FF" | grep -E "draws equal|fallback"
+          python -u scripts/hunt_text_raster_cause.py run --arm ours --binary "$FF" --out "$RUNNER_TEMP/tv"
+          python -u scripts/hunt_text_raster_cause.py run --arm retail --retail-from "$RUNNER_TEMP/retail" --retail-prefs "$PREFS" --out "$RUNNER_TEMP/tv"
+          python -u scripts/hunt_text_raster_cause.py compare "$RUNNER_TEMP/tv"
           true
       - name: Close every Firefox left
         if: always()
