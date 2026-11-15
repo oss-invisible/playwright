@@ -12,10 +12,10 @@ jobs:
   hunt:
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
         os: [windows-2022, ubuntu-24.04]
-        close: [wait, fast]
+        delay: ['0.3', '0.8', '1.5', '3']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     defaults:
@@ -40,16 +40,17 @@ jobs:
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database
         run: python scripts/ci_lab_geoip.py build
-      - name: 30 runs of the OCSP case by name, the context closed ${{ matrix.close }}
+      - name: 30 runs of the OCSP case by name, the second handshake late by ${{ matrix.delay }} s, context closed fast
         env:
-          HUNT_CLOSE: ${{ matrix.close }}
+          HUNT_CLOSE: fast
+          HUNT_SECOND_DELAY: ${{ matrix.delay }}
           MOZ_CRASHREPORTER_DISABLE: "1"
         run: |
           set +e +o pipefail
           NODE='tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py::test_the_ocsp_request_of_a_trusted_page_leaves_only_through_the_proxy[name]'
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo rm -rf /opt/ff && sudo cp -a "$(dirname "$FF")" /opt/ff && sudo chown -R root:root /opt/ff && sudo chmod -R go+rX /opt/ff
-            RUN="sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR INVPW_REQUIRE_TRAP=1 PATH=$PATH INVPW_BINARY_PATH=/opt/ff/$(basename "$FF") HUNT_CLOSE=$HUNT_CLOSE"
+            RUN="sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR INVPW_REQUIRE_TRAP=1 PATH=$PATH INVPW_BINARY_PATH=/opt/ff/$(basename "$FF") HUNT_CLOSE=$HUNT_CLOSE HUNT_SECOND_DELAY=$HUNT_SECOND_DELAY"
           else
             RUN="env INVPW_BINARY_PATH=$FF"
           fi
@@ -58,7 +59,7 @@ jobs:
             if echo "$out" | grep -qE "(^| )1 passed"; then verdict=pass; else verdict=FAIL; fi
             hs=$(echo "$out" | grep -o "handshakes \[[^]]*\]" | head -1)
             why=$(echo "$out" | grep -oE "AssertionError: [^(]{0,160}" | head -1)
-            echo "HUNTROW os=$RUNNER_OS close=$HUNT_CLOSE rep=$i verdict=$verdict $hs $why"
+            echo "HUNTROW os=$RUNNER_OS delay=$HUNT_SECOND_DELAY rep=$i verdict=$verdict $hs $why"
             echo "$out" | grep -E "^HUNT(CLOSE|LOG|STATE)" | sed "s/^/R$i /"
             if [ "$verdict" = FAIL ] && [ -z "$why" ]; then echo "$out" | tail -25 | sed 's/^/HUNTOUT /'; fi
           done

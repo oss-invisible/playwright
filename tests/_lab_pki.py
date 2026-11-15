@@ -228,6 +228,10 @@ class TlsPage:
         class Handler(http.server.BaseHTTPRequestHandler):
             def setup(self):
                 seen[0] += 1
+                delay = float(os.environ.get("HUNT_SECOND_DELAY", "0") or 0)
+                if delay and seen[0] == 2:
+                    import time as _t
+                    _t.sleep(delay)              # hunt: the second connection's flight (and its certificate) comes late
                 if drop == "alternate" and seen[0] % 2 == 1 or drop == "first" and seen[0] == 1:
                     outer.handshakes.append("dropped by the server before the handshake")
                     try:
