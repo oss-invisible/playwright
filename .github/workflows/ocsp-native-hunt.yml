@@ -53,7 +53,7 @@ jobs:
             RUN="env INVPW_BINARY_PATH=$FF"
           fi
           for i in $(seq 1 30); do
-            out=$($RUN python -m pytest "$NODE" -m e2e -o addopts='' -q -p no:cacheprovider -p no:rerunfailures 2>&1)
+            out=$($RUN python -m pytest "$NODE" -m e2e -o addopts='' -q -p no:cacheprovider -p no:rerunfailures 2>&1 || true)
             if echo "$out" | grep -q " 1 passed"; then verdict=pass; else verdict=FAIL; fi
             hs=$(echo "$out" | grep -o "handshakes \[[^]]*\]" | head -1)
             why=$(echo "$out" | grep -oE "AssertionError: [^(]{0,160}" | head -1)
