@@ -42,11 +42,13 @@ class Stream:
         self.started = None   # when `start()` returned, i.e. the reply was handled
         self.first = None     # when the first frame reached the handler
         self.arrivals = []    # when each frame reached the handler (time.monotonic), in order
+        self.stamps = []      # the engine's `timestamp` of each frame (seconds, stamped in the browser when it sent it)
 
         def on_frame(frame):
             if self.first is None:
                 self.first = time.monotonic()
             self.arrivals.append(time.monotonic())
+            self.stamps.append(frame.get("timestamp") if isinstance(frame, dict) else getattr(frame, "timestamp", None))
             self.frames.append(frame)
 
         self.on_frame = on_frame
@@ -62,10 +64,12 @@ class Stream:
             return None
         return self.first - self.started
 
-    def rate(self, arrivals=None):
-        """Frames a second between the first frame and the last one of ``arrivals`` (default: all so far), or None with
-        fewer than two frames or no time between them. A rate of the frames that came, whatever the time they took to start."""
-        stamps = list(self.arrivals if arrivals is None else arrivals)
+    def rate(self, stamps=None):
+        """Frames a second between the first frame and the last one, on the ENGINE's stamps of the frames (default: all so
+        far), or None with fewer than two stamped frames or no time between them. Not on the times the frames reached this
+        process: a client that stalls receives the frames of the stall in one burst, and a burst is a rate the engine never
+        produced (a cap of 2 fps read as 5). A rate of the frames that came, whatever the time they took to start."""
+        stamps = [s for s in (self.stamps if stamps is None else stamps) if s]
         if len(stamps) < 2 or stamps[-1] <= stamps[0]:
             return None
         return (len(stamps) - 1) / (stamps[-1] - stamps[0])

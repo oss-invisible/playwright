@@ -155,14 +155,26 @@ def test_the_networkidle_pages_of_a_page_that_moves_have_no_timer_in_them():
 def test_the_rate_of_a_screencast_is_that_of_its_frames_from_the_first_to_the_last():
     stream = Stream("x")
     assert stream.rate() is None
-    stream.arrivals = [5.0]
+    stream.stamps = [5.0]
     assert stream.rate() is None
-    stream.arrivals = [100.0 + 0.5 * i for i in range(6)]          # a cap of 2 fps honoured: 5 gaps of 0.5 s
+    stream.stamps = [100.0 + 0.5 * i for i in range(6)]            # a cap of 2 fps honoured: 5 gaps of 0.5 s
     assert stream.rate() == pytest.approx(2.0)
-    stream.arrivals = [100.0 + 0.04 * i for i in range(6)]         # a cap that is not honoured: 25 fps
+    stream.stamps = [100.0 + 0.04 * i for i in range(6)]           # a cap that is not honoured: 25 fps
     assert stream.rate() == pytest.approx(25.0) and stream.rate() > 2 * 2
     # a machine that took ten seconds to deliver the first frame does not change the rate of the ones that came
-    stream.arrivals = [110.0 + 0.5 * i for i in range(6)]
+    stream.stamps = [110.0 + 0.5 * i for i in range(6)]
+    assert stream.rate() == pytest.approx(2.0)
+
+
+def test_the_rate_is_read_on_the_engines_stamps_not_on_when_a_stalled_client_heard_the_frames():
+    """The known-bad input: a cap of 2 fps honoured by the engine, heard by a client that stalled for 2 s and then
+    received four frames at once. On the arrival times that reads 5 fps, above the ceiling of 4 (red with no defect);
+    on the engine's stamps it is 2."""
+    stream = Stream("x")
+    for i, heard in enumerate([102.0, 102.0, 102.0, 102.0, 102.5, 103.0]):
+        stream.on_frame({"data": b"", "timestamp": 100.0 + 0.5 * i})
+        stream.arrivals[-1] = heard
+    assert stream.rate(stream.arrivals) == pytest.approx(5.0)         # what the old rate read
     assert stream.rate() == pytest.approx(2.0)
 
 

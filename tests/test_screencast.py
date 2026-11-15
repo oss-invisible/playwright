@@ -374,11 +374,11 @@ def test_asking_for_a_higher_rate_actually_delivers_more_frames(firefox_binary):
         "engine output (lines starting with 'screencast:'):\n%s"
         % (slow, slow_wanted, fast, fast_wanted, slow_stream.describe(), fast_stream.describe(), evidence))
 
-    # The rates are those of the frames that came, from the time of the first to the time of the last: how long the
-    # first took to start, and how long a window was, are no part of them.
+    # The rates are those of the frames that came, from the engine's stamp of the first to that of the last: how long the
+    # first took to start, how long a window was, and a burst a stalled client received at once are no part of them.
     slow_rate, fast_rate = slow_stream.rate(), fast_stream.rate()
     assert slow_rate is not None and fast_rate is not None, "no time between the frames: %s / %s" % (
-        slow_stream.arrivals, fast_stream.arrivals)
+        slow_stream.stamps, fast_stream.stamps)
 
     # The half that does not depend on the machine: a cap only pushes the rate
     # down, so this one is answerable however slow the runner is.
