@@ -58,7 +58,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install --no-deps --force-reinstall "git+https://github.com/oss-invisible/core@65307f59f1245e214c8357593950d5ec929536ac"
-          python -c "import inspect, invisible_core; from invisible_core.testing import e2e; s = inspect.getsource(e2e); print('core', invisible_core.__version__, 'reruns in the runner:', '--reruns' in s, 'no:rerunfailures:', 'no:rerunfailures' in s); assert '--reruns' not in s and 'no:rerunfailures' in s"
+          python -c "import invisible_core; from invisible_core.testing import e2e; c = e2e.command('4', [], junit='x.xml'); print('core', invisible_core.__version__, c); assert not any(a.startswith('--rerun') for a in c) and 'no:rerunfailures' in c, c"
           # ⛔ The playwright package is NO LONGER a product dependency: the
           # client lives in invisible_playwright._pw and the driver in _driver. It
           # is installed here for ONE thing only, the `playwright install-deps
@@ -265,7 +265,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install --no-deps --force-reinstall "git+https://github.com/oss-invisible/core@65307f59f1245e214c8357593950d5ec929536ac"
-          python -c "import inspect, invisible_core; from invisible_core.testing import e2e; s = inspect.getsource(e2e); print('core', invisible_core.__version__, 'reruns in the runner:', '--reruns' in s, 'no:rerunfailures:', 'no:rerunfailures' in s); assert '--reruns' not in s and 'no:rerunfailures' in s"
+          python -c "import invisible_core; from invisible_core.testing import e2e; c = e2e.command('4', [], junit='x.xml'); print('core', invisible_core.__version__, c); assert not any(a.startswith('--rerun') for a in c) and 'no:rerunfailures' in c, c"
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The keyboard shortcut selects all (the browser opens on the runner's desktop, as in e2e-hunt.yml)
@@ -308,7 +308,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install --no-deps --force-reinstall "git+https://github.com/oss-invisible/core@65307f59f1245e214c8357593950d5ec929536ac"
-          python -c "import inspect, invisible_core; from invisible_core.testing import e2e; s = inspect.getsource(e2e); print('core', invisible_core.__version__, 'reruns in the runner:', '--reruns' in s, 'no:rerunfailures:', 'no:rerunfailures' in s); assert '--reruns' not in s and 'no:rerunfailures' in s"
+          python -c "import invisible_core; from invisible_core.testing import e2e; c = e2e.command('4', [], junit='x.xml'); print('core', invisible_core.__version__, c); assert not any(a.startswith('--rerun') for a in c) and 'no:rerunfailures' in c, c"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
       - name: Fetch the published firefox binary
         run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
