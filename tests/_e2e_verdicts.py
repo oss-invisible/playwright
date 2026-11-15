@@ -154,3 +154,20 @@ def turn_chain_problem(born: float, allocated_at: Optional[float], released_at: 
         return problem
     return (turn_exchanges_problem(born, allocated_at, requests, doh_questions, allocates, auth)
             or cold_association_problem(associations, via, host, born))
+
+
+#: The first retry of the mDNS responder: a name that does not come back opens a connection only after it.
+MDNS_RETRY_MS = 3000
+#: A page whose own loop did not run for this long (milliseconds) while it waited was stalled by the machine, not by the product.
+STALL_MS = 1000
+
+
+def opened_at_the_retry_problem(opened_ms: float, stalled_ms: float, retry_ms: float = MDNS_RETRY_MS, stall_ms: float = STALL_MS) -> Optional[str]:
+    """What is wrong with the time a connection took to open, or None. The promise is that it opens before the responder's retry (a name
+    that did not come back is the slow road), and a clock cannot say it alone: a machine that stops for seconds opens late on the best of roads.
+    ``stalled_ms`` is the longest time the page's own loop did not run while it waited, read in the same run; a page that was stopped for
+    ``stall_ms`` or more says nothing of the road, so no time is judged then."""
+    if opened_ms < retry_ms or stalled_ms >= stall_ms:
+        return None
+    return "opened after %d ms, at the responder's retry (%d ms), and the page's own loop was never stopped for %d ms (longest %d ms)" % (
+        opened_ms, retry_ms, stall_ms, stalled_ms)
