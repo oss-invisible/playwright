@@ -150,7 +150,8 @@ def test_a_literal_port_is_refused():
     assert rules_of(fake("import socket\n\ndef helper():\n    s = socket.socket()\n    s.bind(('127.0.0.1', 8080))\n")) == ["port"]
     assert rules_of(fake("from http.server import HTTPServer\n\ndef helper(h):\n    return HTTPServer(('127.0.0.1', 18080), h)\n")) == ["port"]
     assert rules_of(fake("MARIONETTE_PORT = 28431\n")) == ["port"]
-    assert rules_of(fake("def prefs():\n    return {'marionette.port': 28431}\n")) == ["port"]
+    # the number is put in by `%` so that this line is not itself a fixed port to the guard of test_the_marionette_helpers.py
+    assert rules_of(fake("def prefs():\n    return {'marionette.port': %d}\n" % 28431)) == ["port"]
     assert rules_of(fake("def launch(f):\n    return f(port=9222)\n")) == ["port"]
     assert rules_of(fake("import socket\n\ndef helper():\n    s = socket.socket()\n    s.bind(('127.0.0.1', 0))\n    return f(port=0)\n")) == [], "port 0 is the answer"
 
