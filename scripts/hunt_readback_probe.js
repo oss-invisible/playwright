@@ -61,6 +61,34 @@
       verts(gl, QUAD); gl.drawArrays(gl.TRIANGLES, 0, 6); return;
     }
   }
+  // HUNT: what a read of the pixels says about the projection. The projection puts the same low bit on R, G and B of a pixel it
+  // moves; a device's own rounding does not tie the three channels. For the gradient the exact answer is known: a channel is
+  // round(fract((x + .5) / 97) * 255) (unorm conversion, round to nearest), G the same with y and 89, B is 0.5 -> 128.
+  function lowStats(px, kind, flipY) {
+    const n = px.length / 4, pat = new Array(8).fill(0), one = [0, 0, 0];
+    let eq = 0, dev = 0, devEqual = 0;
+    const devHist = {};
+    for (let i = 0; i < n; i++) {
+      const r = px[4 * i], g = px[4 * i + 1], b = px[4 * i + 2];
+      const lr = r & 1, lg = g & 1, lb = b & 1;
+      pat[lr * 4 + lg * 2 + lb]++; one[0] += lr; one[1] += lg; one[2] += lb;
+      if (lr === lg && lg === lb) eq++;
+      if (kind === "gradient") {
+        const x = i % N, yRow = Math.floor(i / N), y = flipY ? yRow : yRow;
+        const er = Math.round(((x + 0.5) / 97 % 1) * 255), eg = Math.round(((y + 0.5) / 89 % 1) * 255), eb = 128;
+        const dr = r - er, dg = g - eg, db = b - eb;
+        if (dr || dg || db) {
+          dev++;
+          if (dr === dg && dg === db) devEqual++;
+          const key = dr + "," + dg + "," + db; devHist[key] = (devHist[key] || 0) + 1;
+        }
+      }
+    }
+    const top = Object.entries(devHist).sort((a, b) => b[1] - a[1]).slice(0, 12);
+    return { pixels: n, lowbit_rgb_equal_frac: +(eq / n).toFixed(5), lowbit_one_frac_rgb: one.map(v => +(v / n).toFixed(5)),
+             lowbit_patterns_rgb: pat, deviating_from_exact: kind === "gradient" ? dev : null,
+             deviation_same_on_rgb: kind === "gradient" ? devEqual : null, deviation_top: kind === "gradient" ? top : null };
+  }
   function draw2D(g, kind) {
     if (kind === "flat") { g.fillStyle = "rgb(51,102,153)"; g.fillRect(0, 0, N, N); return; }
     if (kind === "halves") { g.fillStyle = "#fff"; g.fillRect(0, 0, N, N); g.fillStyle = "rgb(26,128,51)"; g.fillRect(0, 0, N / 2, N); return; }
@@ -101,7 +129,7 @@
       const c2 = document.createElement("canvas"); c2.width = N; c2.height = N; const g2 = c2.getContext("2d"); g2.drawImage(img, 0, 0);
       const dp = new Uint8Array(g2.getImageData(0, 0, N, N).data.buffer);
       (result.contents[kind] = result.contents[kind] || {}).webgl = { readPixels_first_ms: r3(rp[0]), readPixels_ms_p50: r3(q(rp.slice(1), 0.5)), toDataURL_ms_p50: r3(q(td, 0.5)),
-        readPixels_1px_ms_p50: r3(q(one, 0.5)), pixels_hash: hash(px), toDataURL_pixels_hash: hash(dp) };
+        readPixels_1px_ms_p50: r3(q(one, 0.5)), pixels_hash: hash(px), toDataURL_pixels_hash: hash(dp), stats: lowStats(px, kind, false) };
       c.remove();
     });
     await step("2d " + kind, async () => {
@@ -111,7 +139,7 @@
       let d = null;
       const gi = await reps(5, () => { d = g.getImageData(0, 0, N, N); });
       const td = await reps(3, () => c.toDataURL("image/png"));
-      (result.contents[kind] = result.contents[kind] || {}).canvas2d = { getImageData_first_ms: r3(gi[0]), getImageData_ms_p50: r3(q(gi.slice(1), 0.5)), toDataURL_ms_p50: r3(q(td, 0.5)), pixels_hash: hash(new Uint8Array(d.data.buffer)) };
+      (result.contents[kind] = result.contents[kind] || {}).canvas2d = { getImageData_first_ms: r3(gi[0]), getImageData_ms_p50: r3(q(gi.slice(1), 0.5)), toDataURL_ms_p50: r3(q(td, 0.5)), pixels_hash: hash(new Uint8Array(d.data.buffer)), stats: lowStats(new Uint8Array(d.data.buffer), 'none', false) };
     });
   }
 
