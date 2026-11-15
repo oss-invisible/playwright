@@ -18,6 +18,11 @@ THE RULES (a stable name each; ``CLASS`` is the letter of the audit of the e2e t
 * ``env`` (C): ``os.environ`` written (``[k] = v``, ``pop``, ``setdefault``, ``update``, ``del``, ``putenv``): ``monkeypatch.setenv`` undoes itself, this does not.
 * ``net`` (D): a ``http(s)://`` URL of a real host, ``urlopen``, ``requests.get``, a ``pip install``, outside the files of the round after a publication.
 * ``count`` (E): ``assert len(<processes, pids, children>) == N``: a number of processes the product does not promise (``_processes.py`` and ``_waits.py`` are how it is counted).
+* ``timeout`` (F): an explicit deadline under 30 s on a wait for something that MUST happen: ``timeout=`` (``wait_for_*``, ``expect_*``, ``goto``, an action, ``join``, ``urlopen``,
+  ``create_connection``, a subprocess), ``set_default_timeout(...)``, ``set_default_navigation_timeout(...)``, the default of a parameter named ``timeout``. A deadline is the
+  time a healthy run is allowed, and a loaded runner takes longer than a developer's machine: 30 s is the one the whole suite uses (the unit is read from the callee:
+  milliseconds for the Playwright API, seconds for the standard library and for the helpers of ``tests/``). A wait for something that must NOT happen is accepted by its shape
+  (inside ``pytest.raises``, under a ``try`` that swallows the timeout, or a limit that is NAMED ``NEGATIVE_...``); any other is a reviewed ``entries`` item with its reason.
 * ``egress`` (D): the conftest has no autouse session fixture that declares the exit of the lab (tests/_lab_egress.py), so a launch asks three services of the internet.
 
 WHAT IS ACCEPTED WITHOUT A LIST, because it is recognised by its shape: a pause that is the step of a poll with a deadline (a ``while``/``for`` that compares with a clock
@@ -40,7 +45,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 TESTS = Path(__file__).resolve().parent
 
 #: The rule -> the class of the audit.
-CLASS = {"sleep": "A", "js-timer": "A", "bound": "B", "port": "C", "env": "C", "net": "D", "egress": "D", "count": "E"}
+CLASS = {"sleep": "A", "js-timer": "A", "bound": "B", "port": "C", "env": "C", "net": "D", "egress": "D", "count": "E", "timeout": "F"}
 RULES = tuple(CLASS)
 
 #: The files that say what is forbidden (their own patterns would be found) and the files of the round after a publication (``net`` is theirs by design).
@@ -62,6 +67,15 @@ _SERVER_BASE = re.compile(r"(Handler|Server|Protocol)$")
 _TIMER = re.compile(r"\bset(?:Timeout|Interval)\(")
 _URL = re.compile(r"https?://([^\s/:'\"<>)\\]*)(?::[^\s/'\"<>)\\]*)?")
 _SAFE_HOST = re.compile(r"(^|\.)(test|invalid|localhost|example|local)$|^localhost$")
+#: The shortest deadline an e2e test may give to a wait for something that must happen, in seconds.
+MIN_DEADLINE_S = 30
+#: The callees whose ``timeout`` is in SECONDS (the standard library and the helpers of ``tests/``); the Playwright API (``goto``, ``wait_for_*``, ``expect_*``, an action) is in milliseconds.
+_SECONDS_CALLEES = re.compile(r"^(join|acquire|wait|communicate|run|check_call|check_output|call|Popen|urlopen|create_connection|settimeout|get|put|recv|accept|connect|"
+                              r"_?run|_?retry\w*|send|launch\w*|wait_until\w*|wait_procs|wait_for_state|wait_for_new_navigation|\w*_s)$")
+_PLAYWRIGHT_CALLEES = re.compile(r"^(goto|click|dblclick|tap|fill|type|type_text|press|hover|focus|blur|check|uncheck|select_option|set_input_files|set_files|dispatch_event|"
+                                 r"drag_and_drop|screenshot|inner_text|inner_html|text_content|input_value|scroll_into_view_if_needed|go_back|go_forward|reload|"
+                                 r"wait_for\w*|expect_\w+|to_\w+|not_to_\w+|set_default_timeout|set_default_navigation_timeout)$")
+_TIMEOUT_KEYWORD = re.compile(r"(^|_)timeout(_ms|_s)?$")
 _PIP = re.compile(r"\bpip\b.*\binstall\b|\buv\b.*\b(add|pip|install|sync)\b")
 
 
@@ -136,6 +150,56 @@ def _is_constant_number(node: ast.AST) -> bool:
         return _is_constant_number(node.left) and _is_constant_number(node.right)
     return False
 
+_NUMBER_CALLS = {"int": int, "float": float, "min": min, "max": max, "round": round, "abs": abs}
+
+
+def _number(node: ast.AST, names: Dict[str, float]) -> Optional[float]:
+    """The value of an expression made of numbers, of the numbers the module names (``names``) and of ``int``/``min``/``max``...; None for anything else (a parameter, a call)."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, (int, float)) and not isinstance(node.value, bool) else None
+    if isinstance(node, ast.Name):
+        return names.get(node.id)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        value = _number(node.operand, names)
+        return None if value is None else (-value if isinstance(node.op, ast.USub) else value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)):
+        left, right = _number(node.left, names), _number(node.right, names)
+        if left is None or right is None:
+            return None
+        try:
+            return {ast.Add: lambda: left + right, ast.Sub: lambda: left - right, ast.Mult: lambda: left * right,
+                    ast.Div: lambda: left / right, ast.FloorDiv: lambda: left // right}[type(node.op)]()
+        except ZeroDivisionError:
+            return None
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _NUMBER_CALLS and node.args and not node.keywords:
+        values = [_number(a, names) for a in node.args]
+        if all(v is not None for v in values):
+            return _NUMBER_CALLS[node.func.id](*values)  # type: ignore[arg-type]
+    return None
+
+
+#: The objects of the package under test that take a ``timeout`` in SECONDS (the actions and the lifecycle of the driver), where the Playwright API takes milliseconds.
+_SECONDS_RECEIVERS = {"actions", "lifecycle", "lc", "inj", "sess", "session", "conn", "connection", "transport"}
+
+
+def _receiver(node: ast.AST) -> str:
+    """The name at the left end of a call chain (``actions`` of ``actions.click(...)``, ``page`` of ``page.locator(x).click(...)``)."""
+    while isinstance(node, (ast.Attribute, ast.Call, ast.Subscript)):
+        node = node.func if isinstance(node, ast.Call) else node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def _deadline_seconds(value: float, callee: str, keyword: str, receiver: str = "", driver: bool = False) -> float:
+    """A ``timeout`` in seconds: milliseconds for the Playwright API (an object of the driver, ``actions.click`` or ``goto(until=...)``, reads seconds) and for a keyword that says ``_ms``,
+    seconds for the standard library, a keyword that says ``_s`` and the helpers of ``tests/``; any other callee is read by size (a thousand or more is milliseconds)."""
+    if keyword.endswith("_ms"):
+        return value / 1000.0
+    if keyword.endswith("_s") or _SECONDS_CALLEES.match(callee) or ((driver or receiver in _SECONDS_RECEIVERS) and value < 1000):
+        return float(value)
+    if _PLAYWRIGHT_CALLEES.match(callee):
+        return value / 1000.0
+    return value / 1000.0 if value >= 1000 else float(value)
+
 
 def _is_an_absolute_limit(node: ast.AST) -> bool:
     """What an upper bound on a duration is held to be absolute by: a constant (:func:`_is_constant_number`), a variable that is NAMED a limit (``limit_s``, ``max_ms``),
@@ -147,7 +211,7 @@ def _is_an_absolute_limit(node: ast.AST) -> bool:
         return bool(_identifier_words(node) & _LIMIT_WORDS)
     if isinstance(node, ast.BinOp):
         if isinstance(node.op, (ast.Add, ast.Sub)) and any(
-                isinstance(side, ast.Constant) and isinstance(side.value, (int, float)) and not isinstance(side.value, bool) for side in (node.left, node.right)):
+                _is_constant_number(side) for side in (node.left, node.right)):
             return True
         return _is_an_absolute_limit(node.left) and _is_an_absolute_limit(node.right)
     return False
@@ -202,6 +266,13 @@ class _Reader(ast.NodeVisitor):
         for node in tree.body:
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
                 self.module_marks |= _marks(node.value)
+        #: The numbers the module names (``GOTO_MS = 30000``), so that ``timeout=GOTO_MS`` is read as what it is.
+        self.numbers: Dict[str, float] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                value = _number(node.value, self.numbers)
+                if value is not None:
+                    self.numbers[node.targets[0].id] = value
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
                 child._parent = parent  # type: ignore[attr-defined]
@@ -254,6 +325,7 @@ class _Reader(ast.NodeVisitor):
             self.exempt += 1
         for decorator in node.decorator_list:  # type: ignore[attr-defined]
             self.visit(decorator)
+        self._visit_defaults(node)
         for stmt in node.body:  # type: ignore[attr-defined]
             self.visit(stmt)
         for default in list(node.args.defaults) + [d for d in node.args.kw_defaults if d is not None]:  # type: ignore[attr-defined]
@@ -337,6 +409,7 @@ class _Reader(ast.NodeVisitor):
         if self._is_sleep(node, name, leaf) and not self._accepted_pause(node):
             self.add("sleep", node, "%s(%s)" % (name or leaf, ast.unparse(node.args[0]) if node.args else ""))
         self._ports_of(node, name, leaf)
+        self._deadlines_of(node, leaf)
         if name in ("os.environ.pop", "os.environ.setdefault", "os.environ.update", "os.environ.clear", "os.putenv", "os.unsetenv",
                     "environ.pop", "environ.setdefault", "environ.update", "environ.clear"):
             self.add("env", node, name)
@@ -347,6 +420,67 @@ class _Reader(ast.NodeVisitor):
         if not self.post and (name in ("urllib.request.urlopen", "urlopen") or re.match(r"requests\.(get|post|put|head|request|delete)$", name)):
             self.add("net", node, name)
         self.generic_visit(node)
+
+    # -- deadlines ------------------------------------------------------------------------------------------------------------------------------
+    def _deadlines_of(self, node: ast.Call, leaf: str) -> None:
+        """``timeout``: an explicit deadline under :data:`MIN_DEADLINE_S` on a wait for something that must happen."""
+        leaf = node.func.attr if isinstance(node.func, ast.Attribute) else leaf
+        receiver = _receiver(node.func)
+        found: List[Tuple[ast.AST, str]] = []
+        for keyword in node.keywords:
+            if keyword.arg and _TIMEOUT_KEYWORD.search(keyword.arg):
+                found.append((keyword.value, keyword.arg + "="))
+        if leaf in ("set_default_timeout", "set_default_navigation_timeout") and node.args:
+            found.append((node.args[0], ""))
+        for value_node, label in found:
+            value = _number(value_node, self.numbers)
+            if value is None or value <= 0:
+                continue                                        # a variable (its own definition is read), None, or 0 (no deadline at all)
+            driver = any(k.arg == "until" for k in node.keywords)    # ``goto(url, until="load", timeout=30)``: the lifecycle of the driver, in seconds
+            seconds = _deadline_seconds(value, leaf, label.rstrip("=") or "timeout", receiver, driver)
+            if seconds >= MIN_DEADLINE_S or self._is_a_wait_for_nothing(node, value_node):
+                continue
+            self.add("timeout", node, "%s(%s%s)" % (leaf, label, ast.unparse(value_node)))
+
+    def _visit_defaults(self, node: ast.AST) -> None:
+        """The default of a parameter that is a deadline (``def wait(timeout=5)``): every call that leaves it out waits that long."""
+        arguments = node.args  # type: ignore[attr-defined]
+        positional = list(arguments.posonlyargs) + list(arguments.args)
+        pairs = list(zip(positional[len(positional) - len(arguments.defaults):], arguments.defaults)) + [
+            (a, d) for a, d in zip(arguments.kwonlyargs, arguments.kw_defaults) if d is not None]
+        for argument, default in pairs:
+            if not _TIMEOUT_KEYWORD.search(argument.arg):
+                continue
+            value = _number(default, self.numbers)
+            if value is None or value <= 0:
+                continue
+            if _deadline_seconds(value, node.name, argument.arg) < MIN_DEADLINE_S:  # type: ignore[attr-defined]
+                self.add("timeout", default, "def %s(%s=%s)" % (node.name, argument.arg, ast.unparse(default)))  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _is_a_wait_for_nothing(call: ast.Call, limit: ast.AST) -> bool:
+        """A wait for something that must NOT happen, by its shape: a limit NAMED ``NEGATIVE...``; a call inside ``with pytest.raises(...)`` (the call is
+        expected to run out of time); a call in the body of a ``try`` whose handler of a timeout goes on without failing. A slow machine can only make
+        such a window a weaker check, never a red."""
+        if isinstance(limit, ast.Name) and "NEGATIVE" in limit.id.upper():
+            return True
+        child: ast.AST = call
+        parent: Optional[ast.AST] = getattr(call, "_parent", None)
+        while parent is not None and not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if isinstance(parent, (ast.With, ast.AsyncWith)) and child in parent.body:
+                for item in parent.items:
+                    context = item.context_expr
+                    if isinstance(context, ast.Call) and _dotted(context.func).rsplit(".", 1)[-1] == "raises":
+                        return True
+            if isinstance(parent, ast.Try) and child in parent.body:
+                for handler in parent.handlers:
+                    caught = ast.unparse(handler.type) if handler.type is not None else ""
+                    fails = any(isinstance(sub, (ast.Raise, ast.Assert)) or (isinstance(sub, ast.Call) and _dotted(sub.func).rsplit(".", 1)[-1] in ("fail", "skip"))
+                                for sub in ast.walk(handler))
+                    if "Timeout" in caught and not fails:
+                        return True
+            child, parent = parent, getattr(parent, "_parent", None)
+        return False
 
     def _is_sleep(self, node: ast.Call, name: str, leaf: str) -> bool:
         if leaf == "wait_for_timeout":
@@ -417,16 +551,43 @@ class _Reader(ast.NodeVisitor):
                 self.add("port", node, "port=%r" % keyword.value.value)
 
     # -- asserts --------------------------------------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _upper_bounds(test: ast.AST, violated: bool = False) -> List[ast.Compare]:
+        """The comparisons of ``test`` that bound a duration from above by an absolute limit; ``violated``: the test is the condition that is reported
+        (``if took > LIMIT``), not the one that must hold (``assert took < LIMIT``)."""
+        found: List[ast.Compare] = []
+        for sub in ast.walk(test):
+            if not isinstance(sub, ast.Compare):
+                continue
+            left = sub.left
+            for op, right in zip(sub.ops, sub.comparators):
+                above = (isinstance(op, (ast.Lt, ast.LtE)) and _is_an_absolute_limit(right) and _is_a_duration(left)) \
+                    or (isinstance(op, (ast.Gt, ast.GtE)) and _is_an_absolute_limit(left) and _is_a_duration(right))
+                over = (isinstance(op, (ast.Gt, ast.GtE)) and _is_an_absolute_limit(right) and _is_a_duration(left)) \
+                    or (isinstance(op, (ast.Lt, ast.LtE)) and _is_an_absolute_limit(left) and _is_a_duration(right))
+                if over if violated else above:
+                    found.append(sub)
+                left = right
+        return found
+
+    def visit_If(self, node: ast.If) -> None:
+        """``bound`` in a judge that hands its problems back as sentences instead of asserting: ``if wall > first + MARGIN_MS: problems.append(...)`` is the same verdict
+        on the machine as the assert. Only an ``if`` that REPORTS (appends, raises, fails) counts: the other ifs of a test are its logic."""
+        reports = any(isinstance(sub, ast.Raise) or (isinstance(sub, ast.Call) and _dotted(sub.func).rsplit(".", 1)[-1] in ("append", "fail"))
+                      for stmt in node.body for sub in ast.walk(stmt))
+        if reports:
+            for found in self._upper_bounds(node.test, violated=True):
+                self.add("bound", node, ast.unparse(found)[:80])
+        self.generic_visit(node)
+
     def visit_Assert(self, node: ast.Assert) -> None:
+        for found in self._upper_bounds(node.test):
+            self.add("bound", node, ast.unparse(found)[:80])
         for sub in ast.walk(node.test):
             if not isinstance(sub, ast.Compare):
                 continue
             left = sub.left
             for op, right in zip(sub.ops, sub.comparators):
-                upper = (isinstance(op, (ast.Lt, ast.LtE)) and _is_an_absolute_limit(right) and _is_a_duration(left)) \
-                    or (isinstance(op, (ast.Gt, ast.GtE)) and _is_an_absolute_limit(left) and _is_a_duration(right))
-                if upper:
-                    self.add("bound", node, ast.unparse(sub)[:80])
                 if isinstance(op, (ast.Eq, ast.NotEq)) and self.file not in COUNTING:
                     for side in (left, right):
                         if isinstance(side, ast.Call) and _dotted(side.func) in ("len", "sorted") and side.args \
@@ -516,6 +677,7 @@ DEBT_REASON = {
     "env": "os.environ written directly is not undone when the test ends or fails: use monkeypatch.setenv, which restores it.",
     "net": "A real host in a gate is a third party: serve the page and the answer from the test's own server.",
     "count": "The number of processes is not something the product promises: count by site name or against the pool the product keeps (tests/_processes.py, tests/_waits.py).",
+    "timeout": "A deadline under 30 s on a wait for something that must happen is a verdict on the machine: a loaded runner is slower than the one it was written on. Give it 30 s (or the deadline the product itself has), and read the result after it.",
     "egress": "The launch asks three services of the internet where it leaves from: declare the exit (tests/_lab_egress.py).",
 }
 

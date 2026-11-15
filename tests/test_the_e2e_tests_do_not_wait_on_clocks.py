@@ -201,6 +201,52 @@ def test_a_real_url_is_accepted_in_the_files_of_the_round_after_a_publication():
     assert rules_of(source, "test_release_e2e.py") == [] and rules_of(source, "test_upgrade_e2e.py") == []
 
 
+def test_a_deadline_under_thirty_seconds_on_a_wait_for_something_that_must_happen_is_refused():
+    for call in ("page.goto('http://x.test/', timeout=20000)", "page.wait_for_selector('#a', timeout=10000)", "page.locator('#a').click(timeout=5000)",
+                 "page.set_default_timeout(5000)", "page.set_default_navigation_timeout(20000)", "page.wait_for_function('1', timeout=29999)",
+                 "expect(page.locator('#a')).to_be_visible(timeout=500)", "thread.join(timeout=5)", "subprocess.run(cmd, timeout=10)",
+                 "socket.create_connection(addr, timeout=10)", "actions.click('#a', timeout=15)"):
+        assert rules_of(fake("def test_x(page, thread, cmd, addr, actions):\n    %s\n" % call)) == ["timeout"], call
+
+
+def test_a_deadline_of_thirty_seconds_or_more_or_no_deadline_is_accepted():
+    for call in ("page.goto('http://x.test/', timeout=30000)", "page.goto('http://x.test/', timeout=60_000)", "page.wait_for_selector('#a', timeout=30_000)",
+                 "page.set_default_timeout(30000)", "thread.join(timeout=30)", "socket.create_connection(addr, timeout=30)", "subprocess.run(cmd, timeout=300)",
+                 "lifecycle.goto(url, until='load', timeout=30)", "actions.click('#a', timeout=45)", "page.goto(url, timeout=0)", "page.goto(url, timeout=timeout_ms)",
+                 "page.goto(url, timeout=None)", "run(cmd, timeout=1800)"):
+        assert rules_of(fake("def test_x(page, thread, cmd, url, addr, actions, lifecycle, timeout_ms):\n    %s\n" % call)) == [], call
+
+
+def test_a_deadline_that_is_a_named_constant_or_a_default_is_read_as_what_it_is():
+    assert rules_of(fake("GOTO_MS = 20000\n\ndef test_x(page):\n    page.goto('http://x.test/', timeout=GOTO_MS)\n")) == ["timeout"]
+    assert rules_of(fake("LIMIT_S = 10\n\ndef test_x(page):\n    page.goto('http://x.test/', timeout=int(LIMIT_S * 1000))\n")) == ["timeout"]
+    assert rules_of(fake("GOTO_MS = 30000\n\ndef test_x(page):\n    page.goto('http://x.test/', timeout=GOTO_MS)\n")) == []
+    assert rules_of(fake("def wait_until_ready(timeout=5):\n    pass\n")) == ["timeout"], "every call that leaves the deadline out waits that long"
+    assert rules_of(fake("def wait_until_ready(timeout=30.0):\n    pass\n")) == []
+
+
+def test_a_wait_for_something_that_must_not_happen_is_accepted_by_its_shape():
+    """A window in which the call is EXPECTED to run out of time can only be a weaker check on a slow machine, never a red."""
+    raises = fake("def test_x(page):\n    with pytest.raises(Exception):\n        page.click('#a', timeout=500)\n")
+    assert rules_of(raises) == []
+    assert rules_of(fake("NEGATIVE_S = 0.3\n\ndef test_x(actions):\n    actions.click('#a', timeout=NEGATIVE_S)\n")) == []
+    swallowed = fake("def test_x(page):\n    try:\n        page.go_back(timeout=3000)\n    except TimeoutError:\n        pass\n")
+    assert rules_of(swallowed) == []
+    failing = fake("def test_x(page):\n    try:\n        page.go_back(timeout=3000)\n    except TimeoutError:\n        pytest.fail('late')\n")
+    assert rules_of(failing) == ["timeout"], "a timeout that fails the test is a wait for something that must happen"
+    assert rules_of(fake("def test_x(page):\n    with pytest.raises(Exception):\n        pass\n    page.click('#a', timeout=500)\n")) == ["timeout"], "after the block it is a positive wait"
+
+
+def test_a_judge_that_reports_a_duration_over_an_absolute_margin_is_refused_like_an_assert():
+    judge = "def judge(walls_ms):\n    problems = []\n    if walls_ms[1] > walls_ms[0] + MARGIN_MS:\n        problems.append('slow')\n    return problems\n"
+    assert rules_of(fake("MARGIN_MS = 1500\n\n" + judge), "_judge.py") == ["bound"]
+    assert rules_of(fake("def judge(took):\n    if took > 4.0:\n        raise AssertionError('slow')\n"), "_judge.py") == ["bound"]
+    assert rules_of(fake("def judge(took):\n    if 4.0 < took:\n        raise AssertionError('slow')\n"), "_judge.py") == ["bound"]
+    assert rules_of(fake("def judge(took, control):\n    if took > control * 3:\n        raise AssertionError('slow')\n"), "_judge.py") == [], "relative to the same run"
+    assert rules_of(fake("def judge(took):\n    if took > 4.0:\n        print('slow')\n"), "_judge.py") == [], "an if that reports nothing is the logic of the test"
+    assert rules_of(fake("def judge(took):\n    if took < 4.0:\n        raise AssertionError('too fast')\n"), "_judge.py") == [], "a lower bound cannot fail because the machine is slow"
+
+
 def test_a_count_of_processes_is_refused_outside_the_helpers_that_count():
     source = fake("def test_x(pids):\n    assert len(pids) == 1\n")
     assert rules_of(source) == ["count"]
@@ -256,6 +302,7 @@ def test_a_file_with_every_violation_is_red_and_one_that_waits_on_conditions_is_
         "    os.environ['A'] = '1'\n"
         "    s = socket.socket(); s.bind(('127.0.0.1', 8080))\n"
         "    page.goto('https://example.org/')\n"
+        "    page.click('#go', timeout=5000)\n"
         "    time.sleep(1)\n"
         "    assert took < 3\n"
         "    assert len(pids) == 2\n")
