@@ -1,4 +1,4 @@
-name: text bytes host hunt
+name: text bytes host hunt (idwr candidate)
 on:
   push:
     branches: [hunt/text-bytes-host]
@@ -15,9 +15,9 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-          - {leg: w2022, runner: windows-2022, extra: none}
-          - {leg: w2025, runner: windows-2025, extra: none}
-          - {leg: w2022-dejavu, runner: windows-2022, extra: dejavu}
+          - {leg: w2022, runner: windows-2022, extra: none, asset: asset-win-x86_64}
+          - {leg: w2025, runner: windows-2025, extra: none, asset: asset-win-x86_64}
+          - {leg: ubuntu, runner: ubuntu-24.04, extra: none, asset: asset-linux-x86_64}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     defaults:
@@ -32,8 +32,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
-      - name: Fetch our published firefox binary
-        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: Linux display and runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+          sudo apt-get update -q && sudo apt-get install -y -q xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The engine of the idwr candidate (artifact of feder-cr/firefox_antidetect_patch run 43728338511), sealed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/eng" && cd "$RUNNER_TEMP/eng"
+          gh run download 43728338511 -R feder-cr/firefox_antidetect_patch -n ${{ matrix.asset }} -D .
+          ls -la
+          if [ "$RUNNER_OS" = "Windows" ]; then unzip -q ./*.zip -d ff && FF="$(cd ff && pwd -W)/firefox.exe"; else mkdir ff && tar -xzf ./*.tar.gz -C ff && FF="$(find "$PWD/ff" -maxdepth 2 -name firefox -type f | head -1)"; fi
+          echo "FF=$FF" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          python -m invisible_core seal --binary "$FF" --tag firefox-65-candidate -o "$RUNNER_TEMP/seal.json"
+          echo "INVISIBLE_SEAL_FILE=$RUNNER_TEMP/seal.json" >> "$GITHUB_ENV"
       - name: One system font more (DejaVu Sans, installed for all users)
         if: matrix.extra == 'dejavu'
         shell: pwsh
@@ -44,6 +60,7 @@ jobs:
           New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts" -Name "DejaVu Sans (TrueType)" -Value "DejaVuSans.ttf" -PropertyType String -Force | Out-Null
           "installed: " + (Get-Item "C:\Windows\Fonts\DejaVuSans.ttf").Length
       - name: The host (Windows build, DirectWrite, the font files the probe names)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $cv = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
@@ -65,8 +82,11 @@ jobs:
           MOZ_CRASHREPORTER_DISABLE: "1"
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          cp "$RUNNER_TEMP/host.json" "$RUNNER_TEMP/out/host.json"
-          for i in 1 2; do python scripts/hunt_text_bytes.py "$FF" "$RUNNER_TEMP/out/probe-$i.json"; done
+          if [ -f "$RUNNER_TEMP/host.json" ]; then cp "$RUNNER_TEMP/host.json" "$RUNNER_TEMP/out/host.json"; else
+            python -c "import json, platform, sys; json.dump({'os': platform.platform()}, open(sys.argv[1], 'w'))" "$RUNNER_TEMP/out/host.json"; fi
+          python -c "import json, sys; json.dump({'engine': 'idwr candidate, feder-cr/firefox_antidetect_patch run 43728338511', 'asset': sys.argv[1]}, open(sys.argv[2], 'w'))" "${{ matrix.asset }}" "$RUNNER_TEMP/out/engine.json"
+          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; else RUN=""; fi
+          for i in 1 2; do $RUN python scripts/hunt_text_bytes.py "$FF" "$RUNNER_TEMP/out/probe-$i.json"; done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: { name: "text-bytes-${{ matrix.leg }}", path: "${{ runner.temp }}/out" }
       - name: Close every Firefox left
