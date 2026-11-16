@@ -13,6 +13,9 @@
 # This push: Remote Settings log (services.settings.loglevel=debug) from birth to close, ours (ncshut75x4, ncshut150x4: 4 together, closed
 # at 75 s and 150 s of session, close deadline 60 s) and retail (retail4late at 70 s, retail4x150 at 150 s), and the exit probe with the
 # firefox processes left at +1 s and +10 s; Windows only, 4 rounds: about 22 minutes for `ours`, 18 for `retail`.
+# This push: ncshut75x4 (4 together, closed at 75 s of session, the close deadline and the reaper's own at 60 s in this hunt only: the wrapper
+# that widens them was never installed in the earlier runs, see install_close_stamps) against retail4late; Windows, 4 rounds. HUNTCLOSEARGS
+# prints the timeout each Connection.close and each Reaper received.
 name: published latency hunt
 on:
   push:
@@ -37,9 +40,9 @@ jobs:
         part: [ours, retail]
         include:
           - part: ours
-            arms: "exitprobe_after exitprobe_next ncshut75x4 ncshut150x4"
+            arms: "ncshut75x4"
           - part: retail
-            arms: "retail4late retail4x150"
+            arms: "retail4late"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -124,7 +127,7 @@ jobs:
           set +e
           S=scripts/hunt_published_latency.py
           # What an arm prints: its HUNT lines, each tagged with the arm.
-          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK|ALIVE|EXITPROBE|PARENTS)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK|ALIVE|EXITPROBE|PARENTS|CLOSEARGS)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
           # The retail arms: N browsers, round, seconds after the first load before the normal close (Linux headed under xvfb).
           retail() {
             if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
@@ -234,6 +237,11 @@ jobs:
           def q(v, p):
               v = sorted(x for x in v if x is not None)
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          def cnt(v):
+              c = {}
+              for x in v:
+                  c[str(x)] = c.get(str(x), 0) + 1
+              return dict(sorted(c.items(), key=lambda kv: -kv[1])[:8])
           def trio(v):
               return "p50 %s p95 %s max %s" % (q(v, .5), q(v, .95), max((x for x in v if x is not None), default=None))
           for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180", "nclose20", "nclose75", "nclose20x4", "nclose75x4", "ncshut75x4", "ncshut150x4"):
@@ -406,6 +414,16 @@ jobs:
                     % (arm, trio([x.get("tree_cpu_to_parent_exit_s") for x in r]), trio([x.get("tree_cpu_to_parent_exit_s") for x in slow]),
                        trio([x.get("tree_cpu_to_parent_exit_s") for x in fast]), trio([x.get("tree_cpu_to_tree_gone_s") for x in r]),
                        trio([x.get("tree_cpu_to_tree_gone_s") for x in slow]), trio([x.get("tree_cpu_to_tree_gone_s") for x in fast])))
+          # The exit codes of the parents (the engine and a launcher stub, when the core spawns one): the core's own process object, and psutil's wait on
+          # each process classified parent (readable on Windows for any process).
+          for arm in ("ncshut75x4",):
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if r:
+                  pe_rc = [(pid, v.get("rc")) for x in r for pid, v in (x.get("parent_exits") or {}).items()]
+                  print("HUNTPARENTEXIT %-11s closes %d | the core's process returncode %s | parents per close %s | psutil exit codes of the parents %s | parent exit after the close ms (psutil wait) p50 %s max %s"
+                        % (arm, len(r), cnt(x.get("core_process_returncode") for x in r), cnt(len(x.get("parent_exits") or {}) for x in r), cnt(rc for _p, rc in pe_rc),
+                           q([v.get("after_snapshot_ms") for x in r for v in (x.get("parent_exits") or {}).values()], .5),
+                           max((v.get("after_snapshot_ms") or 0 for x in r for v in (x.get("parent_exits") or {}).values()), default=None)))
           # The interpreter's exit after a raise before close() (venvs "after" = published 64.73.0 and "next" = core main + reaper).
           for arm in ("exitprobe_after", "exitprobe_next"):
               r = [x for x in rows.get(arm, []) if "crash" not in x]
@@ -524,6 +542,7 @@ jobs:
           grep -h "HUNTSLOWCLOSE" "$RUNNER_TEMP/rows.log" | cut -c1-1100 | head -40 || true
           grep -h "HUNTALIVE" "$RUNNER_TEMP/rows.log" | cut -c1-500 | head -80 || true
           grep -h "HUNTPARENTS" "$RUNNER_TEMP/rows.log" | cut -c1-1500 | head -12 || true
+          grep -h "HUNTCLOSEARGS" "$RUNNER_TEMP/rows.log" | sed -E 's/^HUNTCLOSEARGS \[[a-z0-9]+\] //; s/"conn": [0-9]+, //; s/"(round|arm)": "?[a-z0-9]*"?, //g' | cut -c1-300 | sort | uniq -c | sort -rn | head -20 || true
           # The geo helpers of the first launch of the first round (the first arm, inproc4, all four browsers): what prepare_session_geo
           # spent its time on (t = seconds from the start of that process, ms = how long, thread).
           grep -hE "HUNTPROBE \[inproc4\] .*\"round\": \"r0\".*\"name\": \"(geo\.|download\.|geoip_db\.|_geoip_db\.|udp_exit\.|requests\.)" "$RUNNER_TEMP/rows.log" | cut -c1-260 | head -150 || true

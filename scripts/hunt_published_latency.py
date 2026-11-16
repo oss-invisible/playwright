@@ -1071,22 +1071,23 @@ def install_close_stamps():
         cmod.os = proxy
         cmod._hunt_os = True
     real_init = cmod.Connection.__init__
-    if not getattr(real_init, "_hunt", False):
+    if not getattr(real_init, "_hunt_ncs", False):
         def __init__(self, *a, **k):
             to_b = k.get("to_browser", a[0] if a else None)
             from_b = k.get("from_browser", a[1] if len(a) > 1 else None)
             FD_WRITE[to_b], FD_READ[from_b] = self, self       # before the reader thread starts
             CONNS.append(self)
             real_init(self, *a, **k)
-        __init__._hunt = True
+        __init__._hunt_ncs = True
         cmod.Connection.__init__ = __init__
     real_close_m = cmod.Connection.close
-    if not getattr(real_close_m, "_hunt", False):
+    if not getattr(real_close_m, "_hunt_ncs", False):
         def close_m(self, *a, **k):
             rec = CONN_REC.get(id(self))
             mine = rec is not None and rec.t_entry is None
             if mine:
                 rec.t_entry = pc()
+            asked = (list(a), dict(k))
             if os.environ.get("HUNT_CLOSE_TIMEOUT"):
                 # The core's own deadline is 5.0 s (the default of `timeout`, also what aclose passes): raised in this hunt only.
                 wide = float(os.environ["HUNT_CLOSE_TIMEOUT"])
@@ -1094,22 +1095,39 @@ def install_close_stamps():
                     a = (wide,) + tuple(a[1:])
                 elif not a and k.get("timeout", 5.0) == 5.0:
                     k["timeout"] = wide
+            effective = a[0] if a else k.get("timeout", 5.0)
+            print("HUNTCLOSEARGS " + json.dumps({**ARM_CTX, "what": "Connection.close", "conn": id(self) % 100000, "mine": mine, "asked": asked,
+                                                 "effective_timeout": effective,
+                                                 "caller": ["%s:%d %s" % (f.filename.replace("\\", "/").rsplit("/", 2)[-1], f.lineno, f.name)
+                                                            for f in traceback.extract_stack(limit=5)[:-1]]}), flush=True)
             try:
                 return real_close_m(self, *a, **k)
             finally:
                 if mine:
                     rec.t_conn_return = pc()
-        close_m._hunt = True
+        close_m._hunt_ncs = True
         cmod.Connection.close = close_m
     real_run = pmod.Reaper.run
-    if not getattr(real_run, "_hunt", False):
+    if not getattr(real_run, "_hunt_ncs", False):
         def run(self):
             try:
                 return real_run(self)
             finally:
                 self.t_done = pc()
-        run._hunt = True
+        run._hunt_ncs = True
         pmod.Reaper.run = run
+    # The reaper's own deadline (Reaper(tree, *, grace, timeout=5.0), handed to EngineTree.end(grace=, timeout=)): raised in this hunt only.
+    real_rinit = pmod.Reaper.__init__
+    if not getattr(real_rinit, "_hunt_ncs", False):
+        def r_init(self, *a, **k):
+            asked = k.get("timeout", 5.0)
+            if os.environ.get("HUNT_CLOSE_TIMEOUT") and asked == 5.0:
+                k["timeout"] = float(os.environ["HUNT_CLOSE_TIMEOUT"])
+            real_rinit(self, *a, **k)
+            print("HUNTCLOSEARGS " + json.dumps({**ARM_CTX, "what": "Reaper.__init__", "grace": k.get("grace"), "timeout_asked": asked,
+                                                 "timeout_effective": self.timeout}), flush=True)
+        r_init._hunt_ncs = True
+        pmod.Reaper.__init__ = r_init
 
 
 def find_conn(browser):
@@ -1168,6 +1186,7 @@ class TreeWatch(threading.Thread):
         self.wall_parent = self.wall_gone = None
         self.cpu_to_parent = self.cpu_to_gone = None
         self.parents = []        # the processes classified "parent" (no -contentproc): pid, parent pid, full command line
+        self.parent_procs, self.exits, self.t_snap = [], {}, now_ms()
         try:
             main = psutil.Process(main_pid)
             for p in [main] + main.children(recursive=True):
@@ -1183,13 +1202,26 @@ class TreeWatch(threading.Thread):
             self.procs[p.pid] = [p, kind[3:] if kind.startswith("ff:") else kind, c, c, True]
             if kind == "ff:parent" and len(self.parents) < 6:
                 self.parents.append({"pid": p.pid, "ppid": p.ppid(), "cmd": p.cmdline(), "created": round(p.create_time() * 1000)})
+                self.parent_procs.append(p)
         except psutil.Error:
             pass
 
     def _cpu(self):
         return sum(v[3] - v[2] for v in list(self.procs.values()))
 
+    def _wait_parent(self, p):
+        """The exit code of a parent where the OS lets psutil read it (Windows: any process; POSIX: only a child, else None)."""
+        try:
+            rc = p.wait(timeout=125)
+        except psutil.TimeoutExpired:
+            rc = "timeout"
+        except psutil.Error:
+            rc = None
+        self.exits[p.pid] = {"rc": rc, "after_snapshot_ms": round(now_ms() - self.t_snap, 1)}
+
     def run(self):
+        for p in self.parent_procs:
+            threading.Thread(target=self._wait_parent, args=(p,), daemon=True, name="hunt-parentwait").start()
         stop = time.monotonic() + 120
         tick = 0
         while time.monotonic() < stop:
@@ -1227,7 +1259,8 @@ class TreeWatch(threading.Thread):
         types = {}
         for v in list(self.procs.values()):
             types[v[1]] = types.get(v[1], 0) + 1
-        return {"tree_types": types, "tree_procs": len(self.procs),
+        return {"tree_types": types, "tree_procs": len(self.procs), "parent_exits": dict(self.exits),
+                "parent_pids_seen": [(x["pid"], x["ppid"]) for x in self.parents],
                 "tree_cpu_to_parent_exit_s": round(self.cpu_to_parent, 3) if self.cpu_to_parent is not None else None,
                 "tree_cpu_to_tree_gone_s": round(self.cpu_to_gone, 3) if self.cpu_to_gone is not None else None}
 
@@ -1699,6 +1732,11 @@ async def _close_browser(arm, port, tag, row, browser, close, t0):
             if tw is not None:
                 await asyncio.to_thread(tw.join, 125)
                 row.update(tw.fields())
+                proc = getattr(rec.conn, "_process", None)
+                try:
+                    row["core_process_returncode"] = getattr(proc, "returncode", None) if getattr(proc, "returncode", None) is not None else proc.poll()
+                except Exception as exc:   # noqa: BLE001
+                    row["core_process_returncode"] = "error %s" % type(exc).__name__
                 lines = ENGINE_LINES_BY.get(id(getattr(rec.conn, "output", None)), [])
                 fields, shown = shut_report(lines, rec.wall_call, rec.wall_parent, tw.wall_gone)
                 row.update(fields)
