@@ -756,6 +756,9 @@ BG_PROBES = ("EngineTree.end", "EngineTree.release", "process.terminate", "proce
 #: Seconds after the start of the launch at which the browser is closed (HUNT_SESSION_S); 0 = right after the typing.
 SESSION_S = float(os.environ.get("HUNT_SESSION_S") or 0)
 SHUT_PREFS = {"toolkit.asyncshutdown.log": True, "browser.dom.window.dump.enabled": True}
+#: HUNT_RS=1: the Remote Settings client's own log (ConsoleAPI prefix "services.settings", dumped to stdout as
+#: "console.debug: services.settings: <message>" while the dump pref is on), from the birth of the browser.
+RS_PREFS = {"services.settings.loglevel": "debug"}
 
 
 def install_output_capture():
@@ -840,6 +843,7 @@ class ExitWatch(threading.Thread):
             time.sleep(0.01)
 
 
+_PHASE_RE = re.compile(r"(Starting|Finished) phase (\S+)")
 _ADD_RE = re.compile(r"Adding blocker (.+) for phase (\S+)")
 _DONE_RE = re.compile(r"Completed blocker (.+) for phase (\S+)")
 
@@ -872,6 +876,12 @@ def shut_report(lines, t_close, main_gone=None, tree_gone=None):
         if m:
             done.add((m.group(2), m.group(1)))
     out["pending_blockers"] = ["%s / %s" % (ph, nm[:50]) for (ph, nm) in added if (ph, nm) not in done][:12]
+    phases = {}
+    for t, x in lines:
+        m = _PHASE_RE.search(x)
+        if m and t >= t_close:
+            phases.setdefault(m.group(2), [None, None])[0 if m.group(1) == "Starting" else 1] = round(t - quit_t, 1) if quit_t else None
+    out["phases"] = phases
     after = [(t, x) for t, x in lines if t >= t_close and SHUT_RE.search(x)][:160]
     before = [(t, x) for t, x in lines if t < t_close and "Adding blocker" in x][:80]
     shown = [(round(t - t_close, 1), round(t - quit_t, 1) if quit_t else None, x) for t, x in before + after]
@@ -1052,6 +1062,7 @@ class TreeWatch(threading.Thread):
         self.procs = {}          # pid -> [Process, type, first cpu, last cpu, alive]
         self.wall_parent = self.wall_gone = None
         self.cpu_to_parent = self.cpu_to_gone = None
+        self.parents = []        # the processes classified "parent" (no -contentproc): pid, parent pid, full command line
         try:
             main = psutil.Process(main_pid)
             for p in [main] + main.children(recursive=True):
@@ -1065,6 +1076,8 @@ class TreeWatch(threading.Thread):
             t = p.cpu_times()
             c = t.user + t.system
             self.procs[p.pid] = [p, kind[3:] if kind.startswith("ff:") else kind, c, c, True]
+            if kind == "ff:parent" and len(self.parents) < 6:
+                self.parents.append({"pid": p.pid, "ppid": p.ppid(), "cmd": p.cmdline(), "created": round(p.create_time() * 1000)})
         except psutil.Error:
             pass
 
@@ -1267,6 +1280,89 @@ def print_bg(rows):
         print("HUNTBGTASK " + json.dumps(d), flush=True)
 
 
+_RS_LINE = re.compile(r"services\.settings: (.*)$")
+_RS_SYNC_START = re.compile(r"^(\S+) (?:local timestamp:|Local DB is empty, pull data from server|Fetch changes from server|was not part of startup bundle)")
+_RS_SYNC_END = re.compile(r"^(\S+) sync status is (\S+)")
+_RS_DUMP_START = re.compile(r"^(\S+) try to restore dump")
+_RS_DUMP_END = re.compile(r"^(\S+) (?:imported \d+ records from dump|no dump available)")
+_IDB_DONE = re.compile(r"Completed blocker RemoteSettingsClient - finish IDB access\.")
+
+
+def rs_report(rs_lines, shut_lines, t_launch, t_close, quit_t=None, exit_t=None):
+    """The Remote Settings client's log (`console.<level>: services.settings: <message>`, with services.settings.loglevel = debug), from
+    the browser's birth to its exit, read as:
+      poll        "Start polling for changes (trigger=..)"  ..  "Polling for changes done (duration=..ms)"
+      bundle      "Download Remote Settings startup changesets bundle."  ..  "Import of changesets bundle done (..)"
+      sync        "<bucket/collection> " + one of "local timestamp:", "Local DB is empty, pull data from server", "Fetch changes from
+                  server", "was not part of startup bundle" (first of them)  ..  "<bucket/collection> sync status is <status>"
+      dump import "<id> try to restore dump"  ..  "<id> imported N records from dump" or "no dump available"
+      attachment  any line naming an attachment (a download or a read), taken as activity within 3 s of the close
+    First sync = the earliest start of a poll, a bundle or a collection's sync, in ms from `t_launch`. At the close instant: what has
+    started and not ended, and when it ended (ms after the close; None = never, before the exit). The finish-IDB blocker's completion
+    ("Completed blocker RemoteSettingsClient - finish IDB access." in the AsyncShutdown log) against the quit."""
+    ev = []
+    for t, x in rs_lines:
+        m = _RS_LINE.search(x)
+        if m:
+            ev.append((t, m.group(1)))
+    syncs, dumps, polls, bundles, attach = {}, {}, [], [], []
+    for t, x in ev:
+        if x.startswith("Start polling for changes"):
+            polls.append([t, None])
+        elif x.startswith("Polling for changes done") and polls and polls[-1][1] is None:
+            polls[-1][1] = t
+        elif x.startswith("Download Remote Settings startup changesets bundle"):
+            bundles.append([t, None])
+        elif x.startswith("Import of changesets bundle done") and bundles and bundles[-1][1] is None:
+            bundles[-1][1] = t
+        elif "ttachment" in x:
+            attach.append(t)
+        else:
+            m = _RS_SYNC_END.match(x)
+            if m:
+                w = syncs.get(m.group(1))
+                if w and w[-1][1] is None:
+                    w[-1][1] = t
+                continue
+            m = _RS_SYNC_START.match(x)
+            if m:
+                w = syncs.setdefault(m.group(1), [])
+                if not w or w[-1][1] is not None:
+                    w.append([t, None])
+                continue
+            m = _RS_DUMP_END.match(x)
+            if m:
+                w = dumps.get(m.group(1))
+                if w and w[-1][1] is None:
+                    w[-1][1] = t
+                continue
+            m = _RS_DUMP_START.match(x)
+            if m:
+                dumps.setdefault(m.group(1), []).append([t, None])
+    starts = [w[0] for ws in syncs.values() for w in ws] + [w[0] for w in polls] + [w[0] for w in bundles]
+    out = {"rs_lines": len(ev), "rs_lines_after_close": sum(1 for t, _x in ev if t >= t_close),
+           "rs_first_poll_ms": round(polls[0][0] - t_launch, 1) if polls and t_launch else None,
+           "rs_first_sync_ms": round(min(starts) - t_launch, 1) if starts and t_launch else None,
+           "rs_polls": len(polls), "rs_collections_n": len(syncs), "rs_collections": sorted(syncs)[:40]}
+
+    def open_at_close(ws):
+        return [w for w in ws if w[0] <= t_close and (w[1] is None or w[1] > t_close)]
+    busy = {"syncs": [k for k, ws in syncs.items() if open_at_close(ws)], "dumps": [k for k, ws in dumps.items() if open_at_close(ws)],
+            "poll": bool(open_at_close(polls)), "bundle": bool(open_at_close(bundles)),
+            "attachment_recent": any(t_close - 3000 <= t <= t_close for t in attach)}
+    out["rs_busy_at_close"] = busy
+    out["rs_busy"] = bool(busy["syncs"] or busy["dumps"] or busy["poll"] or busy["bundle"] or busy["attachment_recent"])
+    pending = open_at_close(polls) + open_at_close(bundles) + [w for ws in syncs.values() for w in open_at_close(ws)] + \
+        [w for ws in dumps.values() for w in open_at_close(ws)]
+    ends = [w[1] for w in pending if w[1] is not None]
+    out["rs_busy_lasts_ms"] = round(max(ends) - t_close, 1) if ends else None
+    out["rs_busy_never_ended"] = sum(1 for w in pending if w[1] is None)
+    idb = next((t for t, x in shut_lines if _IDB_DONE.search(x)), None)
+    out["rs_idb_done_q_ms"] = round(idb - quit_t, 1) if idb is not None and quit_t else None
+    out["rs_idb_done_after_exit"] = bool(idb is not None and exit_t and idb > exit_t)
+    return out
+
+
 def print_shut(arm, rnd, tag, shown):
     for t_ms, q_ms, text in shown:
         print("HUNTSHUT " + json.dumps({"arm": arm, "round": rnd, "tag": tag, "os": sys.platform, "t_ms": t_ms, "q_ms": q_ms,
@@ -1285,11 +1381,12 @@ async def one_browser(arm, binary, port, tag):
         SV_OF[tag] = sv
     c_start = await asyncio.to_thread(parent_cpu)
     t0 = time.monotonic()
+    row["launch_wall_ms"] = time.time() * 1000
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
         extra = json.loads(os.environ.get("HUNT_EXTRA_PREFS") or "{}") or None
         if os.environ.get("HUNT_SHUT") == "1" or os.environ.get("HUNT_NCSHUT") == "1":
-            extra = {**(extra or {}), **SHUT_PREFS}
+            extra = {**(extra or {}), **SHUT_PREFS, **(RS_PREFS if os.environ.get("HUNT_RS") == "1" else {})}
         more = {}
         if os.environ.get("HUNT_TIMEZONE"):
             more["timezone"] = os.environ["HUNT_TIMEZONE"]
@@ -1443,6 +1540,10 @@ async def _close_browser(arm, port, tag, row, browser, close, t0):
                 lines = ENGINE_LINES_BY.get(id(getattr(rec.conn, "output", None)), [])
                 fields, shown = shut_report(lines, rec.wall_call, rec.wall_parent, tw.wall_gone)
                 row.update(fields)
+                if os.environ.get("HUNT_RS") == "1":
+                    quit_t = rec.wall_call + fields["a_close_to_quit_ms"] if fields.get("a_close_to_quit_ms") is not None else None
+                    row.update(rs_report(lines, lines, row.get("launch_wall_ms"), rec.wall_call, quit_t, rec.wall_parent))
+                row["_parents"] = tw.parents
                 row["_shown"] = shown
                 if row.get("nc_parent") is not None and row["nc_parent"] > 4900:
                     row["_slow"] = {"tag": tag, "parent_exit_ms": row["nc_parent"], "last_phase_line": fields.get("last_phase_line"),
@@ -1673,7 +1774,10 @@ async def main(arm, n, rnd, binary):
         r["bg_n"] = len(bgs)
         shown = r.pop("_shown", shown)
         slow = r.pop("_slow", None)
+        parents = r.pop("_parents", None)
         print("HUNTROW " + json.dumps(r), flush=True)
+        if parents is not None:
+            print("HUNTPARENTS " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "tag": r["tag"], "parents": parents}), flush=True)
         print_shut(arm, rnd, r["tag"], shown)
         print_bg(bgs)
         if slow:
@@ -1745,7 +1849,7 @@ class RetailBrowser:
         self.profile = os.path.join(work, tag)
         os.makedirs(self.profile)
         with open(os.path.join(self.profile, "user.js"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(USER_JS)
+            f.write(USER_JS + ('user_pref("services.settings.loglevel", "debug");\n' if os.environ.get("HUNT_RS") == "1" else ""))
         self.logpath = os.path.join(work, tag + ".log")
         self.proc = None
         self.t_start = None
@@ -1759,6 +1863,7 @@ class RetailBrowser:
         self.t_close = None
         self.cpu_last = None
         self.log_matches = []      # (wall ms, line)
+        self.rs_lines = []         # (wall ms, line) of the Remote Settings client's log, all of it
         self.log_lines = 0
         self.log_bytes = 0
         self._log_buf = b""
@@ -1864,6 +1969,8 @@ class RetailBrowser:
             text = raw.decode("utf-8", "replace").rstrip("\r")
             if SHUT_RE.search(text):
                 self.log_matches.append((t, text))
+            if "services.settings:" in text:
+                self.rs_lines.append((t, text))
 
     def main_pid(self):
         return self.window_pid or (self.proc.pid if self.proc is not None else None)
@@ -2062,6 +2169,9 @@ def retail_main(n, rnd, binary, close_after):
         if b.t_close:
             fields, shown = shut_report(b.log_matches, b.t_close, getattr(b, "main_gone_wall", None), getattr(b, "gone_wall", None))
             r.update(fields)
+            if os.environ.get("HUNT_RS") == "1":
+                quit_t = b.t_close + fields["a_close_to_quit_ms"] if fields.get("a_close_to_quit_ms") is not None else None
+                r.update(rs_report(b.rs_lines, b.log_matches, b.t_start, b.t_close, quit_t, getattr(b, "main_gone_wall", None)))
             if (r.get("close_main_ms") or 0) > 4900:
                 tail = [[t, x[:140]] for t, _q, x in shown if 0 <= t <= r["close_main_ms"] + 1][-8:]
                 print("HUNTSLOWCLOSE " + json.dumps({"arm": "retail", "round": rnd, "os": sys.platform, "tag": b.tag,
@@ -2132,8 +2242,26 @@ def exitprobe_outer(rnd, binary, label):
                 left.append(q.pid)
         except psutil.Error:
             pass
-    if timed_out:
-        for q in psutil.Process(p.pid).children(recursive=True) + [psutil.Process(p.pid)]:
+    def ff_left(since):
+        found = {}
+        for q in psutil.process_iter(["name"]):
+            try:
+                if "firefox" in (q.info["name"] or "").lower() and q.create_time() * 1000 >= since:
+                    found[q.pid] = proc_kind(q)
+            except psutil.Error:
+                pass
+        return found
+    kinds_1 = kinds_10 = None
+    if not timed_out:
+        time.sleep(max(0.0, t_exit + 1000 - time.time() * 1000) / 1000)
+        kinds_1 = ff_left(t_start)
+        time.sleep(max(0.0, t_exit + 10000 - time.time() * 1000) / 1000)
+        kinds_10 = ff_left(t_start)
+    if timed_out or kinds_10:
+        victims = [psutil.Process(pid) for pid in (kinds_10 or {})]
+        if timed_out:
+            victims += psutil.Process(p.pid).children(recursive=True) + [psutil.Process(p.pid)]
+        for q in victims:
             try:
                 q.kill()
             except psutil.Error:
@@ -2141,7 +2269,10 @@ def exitprobe_outer(rnd, binary, label):
     th.join(3)
     print("HUNTROW " + json.dumps({"arm": "exitprobe", "label": label, "round": rnd, "os": sys.platform, "returncode": rc, "timed_out": timed_out,
                                    "raised": bool(raised), "exit_after_raise_ms": round(t_exit - raised[0], 1) if raised else None,
-                                   "firefox_left_after_exit": len(left)}), flush=True)
+                                   "firefox_left_after_exit": len(left), "ff_left_1s": len(kinds_1) if kinds_1 is not None else None,
+                                   "ff_left_10s": len(kinds_10) if kinds_10 is not None else None,
+                                   "ff_left_kinds_1s": sorted(kinds_1.values()) if kinds_1 else [],
+                                   "ff_left_kinds_10s": sorted(kinds_10.values()) if kinds_10 else []}), flush=True)
 
 
 if __name__ == "__main__":
