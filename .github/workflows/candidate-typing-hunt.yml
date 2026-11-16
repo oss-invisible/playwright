@@ -1,7 +1,7 @@
 # HUNT ONLY, never merged. Criterion 1b on the GREEN candidate 43785139398 (latitude/firefox-65 a4d3fbd8): what the page sees
 # (event.timeStamp, and the handler's clock) against the core's plan, under load, for the keys and for the mouse (the path before the
-# first click and the click's dwell), in two forms of criterion 1: 4 browsers in one process (inproc4) and 1 browser per process with 4
-# processes at once (one); Linux and Windows. Core = the stroke client (#281, 74018f83), wrapper = release/0.53.0.
+# first click and the click's dwell), in two forms of criterion 1: 4 browsers in one process (inproc4, Windows) and 1 browser per process
+# with 4 processes at once (one, Windows and Linux). Core = the stroke client (#281, 74018f83), wrapper = release/0.53.0.
 name: candidate typing hunt
 on:
   push:
@@ -22,7 +22,9 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        os: [windows-2022, ubuntu-24.04]
+        include:
+          - { os: windows-2022, arms: "one inproc4" }
+          - { os: ubuntu-24.04, arms: "one" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -30,7 +32,7 @@ jobs:
         shell: bash
     env:
       PYTHONUNBUFFERED: "1"
-      ONLY_ARMS: "one inproc4"
+      ONLY_ARMS: ${{ matrix.arms }}
       ROUNDS: "6"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -181,6 +183,11 @@ jobs:
           def q(v, p):
               v = sorted(x for x in v if x is not None)
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          def cnt(v):
+              c = {}
+              for x in v:
+                  c[str(x)] = c.get(str(x), 0) + 1
+              return dict(sorted(c.items(), key=lambda kv: -kv[1])[:8])
           def trio(v):
               return "p50 %s p95 %s max %s" % (q(v, .5), q(v, .95), max((x for x in v if x is not None), default=None))
           for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180", "nclose20", "nclose75", "nclose20x4", "nclose75x4"):
@@ -244,6 +251,37 @@ jobs:
                            sum(v or 0 for v in g("mv_gaps_over_100ms")), sum(v or 0 for v in g("mv_compressions")), q(g("click_dwell"), .5),
                            q([t.get("click_dwell_plan") for t in mt], .5), q(g("click_dwell_slip"), .5), q(slips, .5), max(slips, default=None),
                            q(g("press_settle"), .5), q([t.get("press_settle_plan") for t in mt], .5)))
+          # The mouse against the plan of the stroke client (Page.dispatchMouseEvent through Stroke.send, paired with the browser by the identity of
+          # its core connection: exact, else "unpaired"). Per page mousemove, the nearest plan point after shifting the page's clock onto the
+          # plan's; the gap criterion (the page's gap over the planned gap, by more than 100 ms), bursts (page events within 2 ms where the plan
+          # spaces them), the longest gap (in the plan or not), the compressions (frame coalescing or born close together), the settle.
+          for arm in ("inproc4", "one", "remote"):
+              ty = [x.get("typing") or {} for x in rows.get(arm, []) if "crash" not in x]
+              if not any("mp_pairing" in t for t in ty):
+                  continue
+              print("HUNTMOUSEPAIR %-8s browsers %d | paired exactly %d, unpaired %d | client mouse events p50 %s"
+                    % (arm, len(ty), sum(1 for t in ty if str(t.get("mp_pairing", "")).startswith("exact")), sum(1 for t in ty if t.get("mp_pairing") == "unpaired"),
+                       q([t.get("mp_client_events") for t in ty], .5)))
+              for pre, name in (("", "event.timeStamp"), ("h_", "handler")):
+                  mp = [t for t in ty if pre + "mp_gap_excess_max" in t]
+                  if not mp:
+                      continue
+                  comps = [c for t in mp for c in t.get(pre + "mp_compressions") or []]
+                  print("HUNTMOUSEPLAN %-8s on %-15s browsers %d | offset to the nearest plan point |ms| p50 %s max %s | gap excess over 100 ms: %d gaps in %d browsers, max excess %s | bursts %d | page moves p50 %s of plan moves p50 %s"
+                        % (arm, name, len(mp), q([t[pre + "mp_off_abs_p50"] for t in mp], .5), max(t[pre + "mp_off_abs_max"] for t in mp), sum(t[pre + "mp_gap_viol"] for t in mp),
+                           sum(1 for t in mp if t[pre + "mp_gap_viol"]), max(t[pre + "mp_gap_excess_max"] for t in mp), sum(t[pre + "mp_bursts"] for t in mp),
+                           q([t.get(pre + "mv_n") for t in mp], .5), q([t.get(pre + "mp_plan_moves") for t in mp], .5)))
+                  print("HUNTMOUSELONG %-8s on %-15s longest page gap of each browser: p50 %s max %s ms | its planned gap p50 %s | in the plan (excess <= 100 ms) %d of %d | the plan's own longest gap p50 %s max %s"
+                        % (arm, name, q([t[pre + "mp_longest_gap"] for t in mp], .5), max(t[pre + "mp_longest_gap"] for t in mp), q([t[pre + "mp_longest_gap_planned"] for t in mp], .5),
+                           sum(1 for t in mp if t[pre + "mp_longest_gap_in_plan"]), len(mp), q([t[pre + "mp_plan_max_gap"] for t in mp], .5), max(t[pre + "mp_plan_max_gap"] for t in mp)))
+                  print("HUNTMOUSECOMP %-8s on %-15s compressions %d: %s | examples %s"
+                        % (arm, name, len(comps), cnt(c["class"] for c in comps), [(c["prev_gap"], c["gap"], c["plan_points_between"], c["planned_gap"]) for c in comps[:4]]))
+                  st = [t for t in mp if pre + "mp_settle_page" in t]
+                  print("HUNTMOUSESETTLE %-8s on %-15s settle (last page mousemove -> mousedown) p50 %s min %s max %s ms vs plan p50 %s | the client's own (last move sent -> press sent) p50 %s | last page move is a coalesced one (plan moves after its point > 0): %d of %d | the press against its planned instant p50 %s max %s ms"
+                        % (arm, name, q([t[pre + "mp_settle_page"] for t in st], .5), min((t[pre + "mp_settle_page"] for t in st), default=None), max((t[pre + "mp_settle_page"] for t in st), default=None),
+                           q([t.get("press_settle_plan") for t in st], .5), q([t.get(pre + "mp_settle_client") for t in st], .5),
+                           sum(1 for t in st if t[pre + "mp_last_page_move_plan_moves_after"] > 0), len(st), q([t[pre + "mp_press_offset"] for t in st], .5),
+                           max((t[pre + "mp_press_offset"] for t in st), default=None)))
           # The retail Firefox 159: from the process start to the first page loaded (the onload beacon at the server), to the first
           # visible top-level window, the normal close to every process of the tree gone, the session and the parent's CPU.
           for arm in ("retail1", "retail4", "retail4late", "retail1long"):

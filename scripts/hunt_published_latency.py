@@ -89,7 +89,99 @@ def press_settle_plan_ms():
         return None
 
 
-def mouse_report(ev, dwell_plan, settle_plan=None):
+def _align(page_ts, plan):
+    """The shift s (ms) that puts the page's events on the plan's instants: tried from the first page events against the first plan points,
+    the one with the smallest total distance of every page event to its nearest plan point."""
+    import bisect
+    best = None
+    for a in page_ts[:3]:
+        for b in plan[:5]:
+            sh = a - b
+            cost = 0.0
+            for t in page_ts:
+                x = t - sh
+                k = bisect.bisect_left(plan, x)
+                cost += min(abs(x - plan[j]) for j in (k - 1, k) if 0 <= j < len(plan))
+            if best is None or cost < best[0]:
+                best = (cost, sh)
+    return best[1] if best else 0.0
+
+
+def mouse_vs_plan(ev, sends, i, prefix):
+    """The mouse the page saw against the stroke client's plan. `sends` are the client's Page.dispatchMouseEvent of THIS browser (paired by
+    the identity of its core connection); a stroke's start on the client's clock is the smallest `before - at` of its events, so each event
+    has a planned wall instant. The page does not see every point (the frame coalesces mousemoves): each page mousemove is matched to the
+    NEAREST plan point after shifting the page's clock onto the plan's (the shift that minimises the distances), and
+      offset      = where the page event is against that plan point;
+      gap excess  = (page gap between two consecutive mousemoves) - (the planned gap between their plan points): criterion, over 100 ms;
+      burst       = two page events within 2 ms where the plan spaces them (2 ms or more);
+      longest gap = of the page, its planned gap, whether it was in the plan (excess <= 100 ms);
+      compression = a gap under half the median right after one over 100 ms: plan points merged (>= 3 between: frame coalescing) or
+                    born close together (the plan has them close, or spaces them: a burst);
+      settle      = the page's last mousemove -> the first mousedown against the plan's settle, whether the last page mousemove is a coalesced
+                    one (plan moves after its plan point), and the press's offset against its planned instant."""
+    import bisect
+    strokes = {}
+    for cid, sid, typ, x, y, at, before, after in sends:
+        strokes.setdefault(sid, []).append((typ, at, before, after))
+    plan_moves, plan_downs = [], []
+    last_move_after = None
+    for sid, evs in strokes.items():
+        t0 = min(b - a for _t, a, b, _af in evs)
+        for typ, at, before, after in evs:
+            if typ == "mousemove":
+                plan_moves.append(t0 + at)
+                last_move_after = max(last_move_after or 0, after)
+            elif typ == "mousedown":
+                plan_downs.append((t0 + at, before))
+    plan_moves.sort()
+    page_down = sorted(e[i] for e in ev if e[0] == "mousedown")
+    first_down = page_down[0] if page_down else None
+    page_moves = sorted(e[i] for e in ev if e[0] == "mousemove" and (first_down is None or e[i] <= first_down))
+    out = {}
+    if first_down is not None and plan_downs:
+        plan_moves = [t for t in plan_moves if t <= min(plan_downs)[0] + 1]
+    if len(page_moves) < 3 or len(plan_moves) < 3:
+        out[prefix + "mp_note"] = "too few: page %d, plan %d" % (len(page_moves), len(plan_moves))
+        return out
+    sh = _align(page_moves, plan_moves)
+    js = []
+    for t in page_moves:
+        x = t - sh
+        k = bisect.bisect_left(plan_moves, x)
+        js.append(min((j for j in (k - 1, k) if 0 <= j < len(plan_moves)), key=lambda j: abs(x - plan_moves[j])))
+    offs = [(t - sh) - plan_moves[j] for t, j in zip(page_moves, js)]
+    pg = [b - a for a, b in zip(page_moves, page_moves[1:])]
+    plg = [plan_moves[js[k + 1]] - plan_moves[js[k]] for k in range(len(pg))]
+    excess = [a - b for a, b in zip(pg, plg)]
+    med = sorted(pg)[len(pg) // 2]
+    k_long = max(range(len(pg)), key=lambda k: pg[k])
+    out[prefix + "mp_plan_moves"] = len(plan_moves)
+    out[prefix + "mp_off_abs_p50"] = round(sorted(abs(o) for o in offs)[len(offs) // 2], 1)
+    out[prefix + "mp_off_abs_max"] = round(max(abs(o) for o in offs), 1)
+    out[prefix + "mp_gap_viol"] = sum(1 for e in excess if e > 100)
+    out[prefix + "mp_gap_excess_max"] = round(max(excess), 1)
+    out[prefix + "mp_bursts"] = sum(1 for a, b in zip(pg, plg) if a < 2 and b >= 2)
+    out[prefix + "mp_longest_gap"] = round(pg[k_long], 1)
+    out[prefix + "mp_longest_gap_planned"] = round(plg[k_long], 1)
+    out[prefix + "mp_longest_gap_in_plan"] = excess[k_long] <= 100
+    out[prefix + "mp_plan_max_gap"] = round(max(b - a for a, b in zip(plan_moves, plan_moves[1:])), 1)
+    comp = []
+    for k in range(1, len(pg)):
+        if pg[k - 1] > 100 and pg[k] < 0.5 * med:
+            merged = js[k + 1] - js[k]
+            cls = "frame coalescing (plan points merged)" if merged >= 3 else ("born close together (the plan has them close)" if plg[k] < 2 * max(pg[k], 1) else "burst (the plan spaces them)")
+            comp.append({"prev_gap": round(pg[k - 1], 1), "gap": round(pg[k], 1), "plan_points_between": merged, "planned_gap": round(plg[k], 1), "class": cls})
+    out[prefix + "mp_compressions"] = comp
+    if first_down is not None and plan_downs:
+        out[prefix + "mp_settle_page"] = round(first_down - page_moves[-1], 1)
+        out[prefix + "mp_last_page_move_plan_moves_after"] = len(plan_moves) - 1 - js[-1]
+        out[prefix + "mp_press_offset"] = round((first_down - sh) - min(plan_downs)[0], 1)
+        out[prefix + "mp_settle_client"] = round(min(plan_downs)[1] - last_move_after, 1) if last_move_after else None
+    return out
+
+
+def mouse_report(ev, dwell_plan, settle_plan=None, conn_id=None):
     """The mouse the page saw, on event.timeStamp (unprefixed) and on the handler's clock (prefix h_). The PATH before the press: the
     gaps between consecutive mousemoves up to the first mousedown, their longest, how many are over 100 ms, the compressions (a gap
     under half the median gap right after a gap over 100 ms: the catch-up after a stall). The path's own plan (the Pacer's instants)
@@ -119,6 +211,12 @@ def mouse_report(ev, dwell_plan, settle_plan=None):
         if mv and first_down is not None:
             out[prefix + "press_settle"] = round(first_down - mv[-1], 1)
     out["mouse_events"] = {k: sum(1 for e in ev if e[0] == k) for k in ("mousemove", "mousedown", "mouseup", "click")}
+    mine = [m for m in MOUSESENDS if conn_id is not None and m[0] == conn_id]
+    out["mp_pairing"] = "exact (the core connection of the browser)" if mine else "unpaired"
+    out["mp_client_events"] = len(mine)
+    if mine:
+        for prefix, i in (("", 1), ("h_", 2)):
+            out.update(mouse_vs_plan(ev, mine, i, prefix))
     return out
 
 
@@ -236,6 +334,9 @@ PROXY_PORT = 0
 #: Every keydown and keyup our client sent through the core's Keyboard: (id of the keyboard, "down" or "up", key, wall ms before
 #: the command went out, wall ms after its answer came back).
 KEYSENDS = []
+#: Every Page.dispatchMouseEvent the stroke client sent: (id of the core connection = the browser, stroke id, type, x, y, planned offset
+#: `at` from the stroke's start in ms, wall ms before send_async, wall ms after it).
+MOUSESENDS = []
 
 
 class ProxyHandler(socketserver.StreamRequestHandler):
@@ -308,7 +409,7 @@ def install_key_probe():
         real_send = _stroke.Stroke.send
         if not getattr(real_send, "_hunt", False):
             def send(self, method, params, at_ms, *a, **k):
-                if method != "Page.dispatchKeyEvent":
+                if method not in ("Page.dispatchKeyEvent", "Page.dispatchMouseEvent"):
                     return real_send(self, method, params, at_ms, *a, **k)
                 if not k.get("paced"):
                     self.hold_until(at_ms)        # the wait for the instant, so `before` is the instant the command leaves
@@ -316,8 +417,12 @@ def install_key_probe():
                 try:
                     return real_send(self, method, params, at_ms, *a, **k)
                 finally:
-                    KEYSENDS.append((self.id, "down" if params.get("type") == "keydown" else "up", params.get("key"), before,
-                                     time.time() * 1000))
+                    if method == "Page.dispatchKeyEvent":
+                        KEYSENDS.append((self.id, "down" if params.get("type") == "keydown" else "up", params.get("key"), before,
+                                         time.time() * 1000))
+                    else:
+                        MOUSESENDS.append((id(self._c), self.id, params.get("type"), params.get("x"), params.get("y"), float(at_ms or 0.0),
+                                           before, time.time() * 1000))
             send._hunt = True
             _stroke.Stroke.send = send
         return
@@ -679,7 +784,7 @@ async def work(page, port, tag, trace=False):
     return goto, ev
 
 
-async def typing(page, port, arm, text=TEXT):
+async def typing(page, port, arm, text=TEXT, conn_id=None):
     """A click into a field (with the cursor's path when humanised) and the fixed text: ours through press_sequentially, which
     follows the core's plan; stock through the same plan driven by hand (it has none of its own: only the runner's delay)."""
     plan = typing_plan(text)
@@ -717,7 +822,7 @@ async def typing(page, port, arm, text=TEXT):
     keys, ups, moves, clicks, ev = await page.evaluate("[window.__k, window.__u, window.__m, window.__c, window.__ev]")
     # The report is made in main(), once the client's sends of our arms are matched to their browser.
     return {"text": text, "raw": [keys, ups, moves, clicks, plan, sends or None, ev],
-            "click_plan": click_plan_ms() if arm != "stock" else None, "settle_plan": press_settle_plan_ms() if arm != "stock" else None,
+            "conn_id": conn_id, "click_plan": click_plan_ms() if arm != "stock" else None, "settle_plan": press_settle_plan_ms() if arm != "stock" else None,
             "typing_wall_ms": round(took * 1000),
             "machine_cpu_busy_pct": round(100 * (1 - (cpu1.idle - cpu0.idle) / tot), 1) if tot > 0 else None}
 
@@ -1522,7 +1627,8 @@ async def _browser_work(arm, port, tag, row, browser, close, t0, c_start):
     row["goto_req_ms"], row["eval_ms"] = await work(page, port, tag, trace=(arm == "inproc" and TRACE_EVAL
                                                                           and int(tag.rsplit("-", 1)[1]) == 0))
     try:
-        row["typing"] = await typing(page, port, arm, TEXTS[int(tag.rsplit("-", 1)[1]) % len(TEXTS)])
+        conn = find_conn(browser)[0] if arm == "inproc" else None      # the browser's core connection: the key of its strokes
+        row["typing"] = await typing(page, port, arm, TEXTS[int(tag.rsplit("-", 1)[1]) % len(TEXTS)], id(conn) if conn is not None else None)
     except Exception as exc:   # noqa: BLE001
         row["typing"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
     if SESSION_S:
@@ -1808,10 +1914,10 @@ async def main(arm, n, rnd, binary):
         if isinstance(r, dict) and "raw" in (r.get("typing") or {}):
             t = r["typing"]
             keys, ups, moves, clicks, plan, sends, ev = t.pop("raw")
-            cplan, splan = t.pop("click_plan", None), t.pop("settle_plan", None)
+            cplan, splan, cid = t.pop("click_plan", None), t.pop("settle_plan", None), t.pop("conn_id", None)
             try:
                 t.update(typing_report(arm, keys, ups, moves, clicks, plan, sends))
-                t.update(mouse_report(ev, cplan, splan))
+                t.update(mouse_report(ev, cplan, splan, cid))
             except Exception as exc:   # noqa: BLE001
                 t["error"] = "report %s: %s" % (type(exc).__name__, str(exc)[:200])
     for r in rows:
