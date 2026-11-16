@@ -79,7 +79,7 @@ So the rule, which applies to every surface and not just that one:
 > **Assert the presence of the right signal, not the absence of a wrong one.** A page that
 > comes back empty, blocked or still loading is a failure, not a pass.
 
-Concretely: the WebRTC section must complete and show a host candidate and a server
+Concretely: the WebRTC section must complete and show a host candidate and, when there is no proxy or the proxy relays UDP, a server
 reflexive one. The canvas must produce a hash, twice, matching. The font list must be
 non-empty and belong to the platform you claim. A suppressed signal is itself a signal,
 and [CreepJS records blocking by name](creepjs-explained.md).
