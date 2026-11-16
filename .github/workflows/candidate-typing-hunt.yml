@@ -1,0 +1,393 @@
+# HUNT ONLY, never merged. Criterion 1b on the GREEN candidate 43776755353 (latitude/firefox-65 ef460207: the stroke-anchored births):
+# what the page sees (event.timeStamp) against the core's plan, under load, in the three forms of criterion 1: 4 browsers in one
+# process (inproc4), 1 browser per process with 4 processes at once (one), launch_server (remote); Linux and Windows. Core = the
+# stroke client (#281, 74018f83), wrapper = git main.
+name: candidate typing hunt
+on:
+  push:
+    branches: [hunt/published-latency]
+    paths: [.github/workflows/candidate-typing-hunt.yml]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: candidate-typing-hunt
+  cancel-in-progress: true
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+      ONLY_ARMS: "inproc4 one remote"
+      ROUNDS: "6"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: "3.12" }
+      - name: A venv with the stroke core (#281) and the wrapper of git main, and stock Playwright for the remote client
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=Scripts; else BIN=bin; fi
+          P="$RUNNER_TEMP/after/$BIN/python"
+          python -m venv "$RUNNER_TEMP/after"
+          "$P" -m pip install -q --upgrade pip
+          "$P" -m pip install -q "invisible-playwright==0.52.1" psutil websockets "playwright==$(cat scripts/playwright_pin.txt)"
+          "$P" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@74018f83c0b59fdaeff9e494426529331f8f7e60"
+          "$P" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@main"
+          "$P" -c "
+          import importlib.metadata as m, json
+          for n in ('invisible-core', 'invisible-playwright'):
+              d = m.distribution(n); u = json.loads(d.read_text('direct_url.json') or '{}')
+              print(n, d.version, u.get('vcs_info', {}).get('commit_id'))
+          import invisible_core.juggler._stroke as s; print('stroke client:', s.__name__)
+          "
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb; "$P" -m playwright install --with-deps firefox; else "$P" -m playwright install firefox; fi
+          echo "PY_AFTER=$P" >> "$GITHUB_ENV"
+      - name: The engine of the candidate 43776755353, sealed for this run
+        run: |
+          mkdir -p "$RUNNER_TEMP/eng" && cd "$RUNNER_TEMP/eng"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            gh run download 43776755353 -R oss-invisible/firefox_antidetect_patch -n asset-win-x86_64 -D .
+            unzip -q ./*.zip -d ff
+            FF="$(cd ff && pwd -W)/firefox.exe"
+          else
+            gh run download 43776755353 -R oss-invisible/firefox_antidetect_patch -n asset-linux-x86_64 -D .
+            mkdir ff && tar -xzf ./*.tar.gz -C ff
+            FF="$(find "$PWD/ff" -maxdepth 2 -type f -name firefox | head -1)"
+          fi
+          ls -l "$FF"; sha256sum "$FF"
+          echo "FF_AFTER=$FF" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          "$PY_AFTER" -m invisible_core seal --binary "$FF" --tag firefox-65-candidate -o "$RUNNER_TEMP/seal.json"
+          echo "INVISIBLE_SEAL_FILE=$RUNNER_TEMP/seal.json" >> "$GITHUB_ENV"
+      - name: Six rounds, the arms in rotating order
+        continue-on-error: true
+        timeout-minutes: 70
+        run: |
+          set +e
+          S=scripts/hunt_published_latency.py
+          # What an arm prints: its HUNT lines, each tagged with the arm.
+          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          # The retail arms: N browsers, round, seconds after the first load before the normal close (Linux headed under xvfb).
+          retail() {
+            if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              # A window manager in the virtual display, so the retail browser can be closed as a person closes it (wmctrl ->
+              # _NET_CLOSE_WINDOW -> WM_DELETE_WINDOW); without one only a signal is left, which is not a normal quit.
+              xvfb-run -a -s "-screen 0 1280x1024x24" sh -c 'openbox > /dev/null 2>&1 & sleep 1; exec "$0" "$@"' "$PY_AFTER" $S retail "$1" "$2" "$FF_RETAIL" "$3" 2>&1
+            else
+              "$PY_AFTER" $S retail "$1" "$2" "$FF_RETAIL" "$3" 2>&1
+            fi
+          }
+          # A limit per arm, shorter than the step's: 4 times what the arm should take, at most 12 minutes. The arm's python writes its pid
+          # (HUNT_PIDFILE, one line per process) and a watchdog kills that tree when the limit comes, printing the crash row; the next
+          # arm then runs. The watchdog's output is kept off the arm's pipe (a sleep left behind must not hold the tee).
+          limit_of() {
+            local e
+            case "$1" in
+              solo|nclose20) e=30 ;; shut20) e=30 ;; inproc4|inproc4quiet|inproc4tz|inproc4px|stock|nclose20x4) e=35 ;;
+              one|remote|retail1|retail4) e=45 ;; shut70|nclose75) e=85 ;; nclose75x4) e=95 ;; late|retail4late) e=100 ;;
+              shut180|retail1long) e=200 ;; *) e=100 ;;
+            esac
+            echo $(( e * 4 > 720 ? 720 : e * 4 ))
+          }
+          kill_arm() {
+            local pid
+            for pid in $(cat "$HUNT_PIDFILE" 2>/dev/null); do
+              if [ "$RUNNER_OS" = "Windows" ]; then taskkill //T //F //PID "$pid" > /dev/null 2>&1; else pkill -9 -P "$pid" > /dev/null 2>&1; kill -9 "$pid" > /dev/null 2>&1; fi
+            done
+          }
+          run_arm() {
+            local lim wd
+            lim=$(limit_of "$1")
+            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid"
+            : > "$HUNT_PIDFILE"
+            (
+              exec > /dev/null
+              sleep "$lim" > /dev/null 2>&1
+              echo "HUNTROW [$1] {\"arm\": \"$1\", \"round\": \"$2\", \"crash\": \"arm timed out after $lim s\"}" | tee -a "$RUNNER_TEMP/rows.log" >&2
+              kill_arm
+            ) &
+            wd=$!
+            case "$1" in
+              inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep inproc4 ;;
+              inproc4quiet) HUNT_NO_SAMPLER=1 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep inproc4quiet ;;
+              inproc4tz) HUNT_TIMEZONE=Europe/Rome "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep inproc4tz ;;
+              inproc4px) HUNT_PROXY=1 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep inproc4px ;;
+              late)    HUNT_TYPE_LATE_S=60 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep late ;;
+              solo)    "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep solo ;;
+              remote)  "$PY_AFTER" $S remote 4 "$2" "$FF_AFTER" 2>&1 | keep remote ;;
+              stock)   "$PY_AFTER" $S stock 4 "$2" 2>&1 | keep stock ;;
+              one)     for k in 0 1 2 3; do "$PY_AFTER" $S inproc 1 "$2-$k" "$FF_AFTER" > "$RUNNER_TEMP/one-$k.log" 2>&1 & done; wait
+                       cat "$RUNNER_TEMP"/one-*.log | keep one ;;
+              shut20)  HUNT_SHUT=1 HUNT_SESSION_S=20 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut20 ;;
+              shut70)  HUNT_SHUT=1 HUNT_SESSION_S=70 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut70 ;;
+              shut180) HUNT_SHUT=1 HUNT_SESSION_S=180 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut180 ;;
+              nclose20)    HUNT_NCLOSE=1 HUNT_SESSION_S=20 "$PY_NEXT" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep nclose20 ;;
+              nclose75)    HUNT_NCLOSE=1 HUNT_SESSION_S=75 "$PY_NEXT" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep nclose75 ;;
+              nclose20x4)  HUNT_NCLOSE=1 HUNT_SESSION_S=20 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep nclose20x4 ;;
+              nclose75x4)  HUNT_NCLOSE=1 HUNT_SESSION_S=75 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep nclose75x4 ;;
+              retail1) retail 1 "$2" 20 | keep retail1 ;;
+              retail1long) retail 1 "$2" 180 | keep retail1long ;;
+              retail4) retail 4 "$2" 20 | keep retail4 ;;
+              retail4late) retail 4 "$2" 70 | keep retail4late ;;
+            esac
+            pkill -P "$wd" > /dev/null 2>&1
+            kill "$wd" > /dev/null 2>&1
+            if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
+          }
+          # The full list (the default when the focused one below is removed):
+          #   inproc4 inproc4quiet inproc4tz inproc4px late solo one remote stock retail1 retail4 retail4late
+          # The shutdown hunt: why our engine on Windows does not exit within the core's 5 s after a long session. shut20/70/180 are
+          # ours (one browser per process, idle until the session is 20/70/180 s old, then closed, the engine's shutdown log timed),
+          # the retail ones are the real Firefox closed by its window after 20 s / 70 s (4 together) / 180 s.
+          #   shut20 shut70 shut180 retail1 retail4late retail1long   (the shutdown hunt of the run before)
+          # The close of the core with a reaper (venv "next", git main of the core and the wrapper's fix branch), 1 browser and 4 in one
+          # process, closed after 20 s / 75 s of session, against the real Firefox closed by its window, and ours as published (shut70).
+          ARMS=(nclose20 nclose75 nclose20x4 nclose75x4 retail1 retail4late shut70)
+          if [ -n "$ONLY_ARMS" ]; then read -ra ARMS <<< "$ONLY_ARMS"; fi
+          N=${#ARMS[@]}
+          for r in $(seq 0 $((${ROUNDS:-6}-1))); do
+            for k in $(seq 0 $((N-1))); do
+              if [ "$SECONDS" -gt 3780 ]; then echo "time guard: no new arm after $SECONDS s"; break 2; fi
+              a=${ARMS[$(( (k + r) % N ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"
+            done
+          done
+          true
+      - name: The table
+        if: always()
+        run: |
+          python - "$RUNNER_TEMP/rows.log" <<'PY'
+          import json, re, sys, statistics
+          rows = {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTROW \[(\w+)\] (.*)", line.strip())
+              if m:
+                  rows.setdefault(m.group(1), []).append(json.loads(m.group(2)))
+          def q(v, p):
+              v = sorted(x for x in v if x is not None)
+              return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          def trio(v):
+              return "p50 %s p95 %s max %s" % (q(v, .5), q(v, .95), max((x for x in v if x is not None), default=None))
+          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180", "nclose20", "nclose75", "nclose20x4", "nclose75x4"):
+              if not rows.get(arm):
+                  continue
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              crashes = len(rows.get(arm, [])) - len(r)
+              ev =[e for x in r for e in x["eval_ms"]]
+              gr = [g for x in r for g in x["goto_req_ms"]]
+              print("HUNTLAUNCHSPLIT %-12s ms: launch() %s | new_context %s | new_page %s | first_load %s | to_first_load p50 %s p95 %s | Firefox parent CPU s p50: launch() %s new_context %s new_page %s first_load %s"
+                    % (arm, trio([x.get("enter_ms") for x in r]), trio([x.get("ctx_ms") for x in r]), trio([x.get("new_page_ms") for x in r]), trio([x.get("first_load_ms") for x in r]),
+                       q([x.get("to_first_load_ms") for x in r], .5), q([x.get("to_first_load_ms") for x in r], .95),
+                       q([x.get("enter_cpu_s") for x in r], .5), q([x.get("ctx_cpu_s") for x in r], .5), q([x.get("new_page_cpu_s") for x in r], .5), q([x.get("first_load_cpu_s") for x in r], .5)))
+              print("HUNTTABLE %-12s browsers %3d crashes %d | launch ms p50 %s p95 %s | close ms p50 %s p95 %s | eval ms p50 %s p95 %s max %s >300ms %d of %d | goto->request ms p50 %s p90 %s max %s | cpu s/browser p50 %s"
+                    % (arm, len(r), crashes, q([x["launch_ms"] for x in r], .5), q([x["launch_ms"] for x in r], .95), q([x["close_ms"] for x in r], .5), q([x["close_ms"] for x in r], .95),
+                       q(ev, .5), q(ev, .95), max(ev) if ev else None, sum(1 for e in ev if e > 300), len(ev), q(gr, .5), q(gr, .9), max((g for g in gr if g is not None), default=None),
+                       q([x["cpu_s_per_browser"] for x in r], .5)))
+              ty = [x.get("typing") or {} for x in r]
+              ok = [t for t in ty if "slip_abs_max" in t]
+              errs = [t.get("error") for t in ty if t.get("error")]
+              print("HUNTTYPING %-12s typed %d of %d | key slip vs plan: p50 of browsers %s, max %s | keys over 100 ms %d of %d | compressions %d | mouse: longest gap %s ms, bursts <2 ms %d, clicks %d | errors %s"
+                    % (arm, len(ok), len(ty), q([t["slip_abs_p50"] for t in ok], .5), max((t["slip_abs_max"] for t in ok), default=None),
+                       sum(t["keys_over_100ms"] for t in ok), sum(t["keys_planned"] for t in ok), sum(t["compressions"] for t in ok),
+                       max((t["mouse_gap_max"] or 0 for t in ty if "mousemoves" in t), default=None), sum(t.get("mouse_bursts_under_2ms", 0) for t in ty),
+                       sum(t.get("clicks", 0) for t in ty), errs[:2]))
+              # Where the slip is born, per key (detail = planned, sent, answered, timeStamp, handler; ms from the first send).
+              det = [d for t in ok for d in t.get("detail") or []]
+              late_c = [d[1] - d[0] for d in det]
+              rt = [d[2] - d[1] for d in det]
+              birth = [d[3] - d[1] for d in det]
+              hts = [h for t in ok for h in t.get("handler_minus_ts") or []]
+              print("HUNTKEYCLOCKS %-12s on event.timeStamp: keys over 100 ms %d, max %s, compressions %d | on the handler: keys over 100 ms %d, max %s | handler - timeStamp p50 %s p95 %s max %s | matched %d of %d | machine CPU busy %% during typing p50 %s max %s"
+                    % (arm, sum(t["keys_over_100ms"] for t in ok), max((t["slip_abs_max"] for t in ok), default=None), sum(t["compressions"] for t in ok),
+                       sum(t.get("h_keys_over_100ms", 0) for t in ok), max((t.get("h_slip_abs_max", 0) for t in ok), default=None),
+                       q(hts, .5), q(hts, .95), max(hts, default=None), sum(1 for t in ok if t.get("detail")), len(ok),
+                       q([t.get("machine_cpu_busy_pct") for t in ty], .5), max((t.get("machine_cpu_busy_pct") or 0 for t in ty), default=None)))
+              if det:
+                  print("HUNTKEYSPLIT %-12s client send vs plan: keys over 100 ms %d, p50 %s max %s | client send -> engine answer p50 %s p95 %s max %s | client send -> event.timeStamp p50 %s p95 %s max %s"
+                        % (arm, sum(1 for x in late_c if abs(x) > 100), q(late_c, .5), max(late_c), q(rt, .5), q(rt, .95), max(rt), q(birth, .5), q(birth, .95), max(birth)))
+                  worst = sorted(((abs((t["detail"][i][3] - t["detail"][0][3]) - t["detail"][i][0]), t["detail"][max(0, i - 1):i + 1]) for t in ok if t.get("detail")
+                                  for i in range(len(t["detail"]))), key=lambda w: -w[0])[:4]
+                  for slip, pair in worst:
+                      print("HUNTKEYWORST %-12s timeStamp slip %.0f ms | previous and this key [planned, sent, answered, timeStamp, handler]: %s" % (arm, slip, pair))
+          # The retail Firefox 159: from the process start to the first page loaded (the onload beacon at the server), to the first
+          # visible top-level window, the normal close to every process of the tree gone, the session and the parent's CPU.
+          for arm in ("retail1", "retail4", "retail4late", "retail1long"):
+              all_r = rows.get(arm, [])
+              r = [x for x in all_r if "crash" not in x]
+              if not all_r:
+                  continue
+              print("HUNTRETAIL %-12s browsers %d crashes %d %s | start->load ms %s | start->window ms %s (no window: %d) | close->tree gone ms %s (timeouts %d) | close->main process gone ms p50 %s p95 %s | session s p50 %s | parent CPU s p50 %s p95 %s, at load p50 %s | tree CPU s at close p50 %s | exited before close %d | close cmd rc %s | last to exit %s"
+                    % (arm, len(r), len(all_r) - len(r), [x.get("crash") for x in all_r if "crash" in x][:1], trio([x.get("start_to_load_ms") for x in r]),
+                       trio([x.get("start_to_window_ms") for x in r]), sum(1 for x in r if x.get("start_to_window_ms") is None),
+                       trio([x.get("close_ms") for x in r]), sum(1 for x in r if x.get("close_timeout")),
+                       q([x.get("close_main_ms") for x in r], .5), q([x.get("close_main_ms") for x in r], .95), q([x.get("session_s") for x in r], .5),
+                       q([x.get("parent_cpu_s") for x in r], .5), q([x.get("parent_cpu_s") for x in r], .95), q([x.get("cpu_at_load_s") for x in r], .5),
+                       q([x.get("tree_cpu_at_close_s") for x in r], .5), sum(1 for x in r if x.get("exited_before_close")),
+                       sorted({str((x.get("close_cmd") or [None])[0]) for x in r}), sorted({(x.get("last_exits") or [["?"]])[0][0] for x in r})))
+          # The path of one evaluate, segment by segment (p50/p95 ms, over the traced browser of every round).
+          segs, missing, trace_n = {}, {}, {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTEVAL \[(\w+)\] (.*)", line.strip())
+              if m:
+                  d = json.loads(m.group(2))
+                  trace_n[m.group(1)] = trace_n.get(m.group(1), 0) + 1
+                  for name, vals in d["segs"].items():
+                      if isinstance(vals, list):
+                          segs.setdefault(m.group(1), {}).setdefault(name, []).extend(vals)
+                      elif name == "missing":
+                          missing[m.group(1)] = missing.get(m.group(1), 0) + vals
+          names = ("call_to_send", "send_to_pickup", "pickup_to_pipe", "pipe_to_reply_read", "read_to_ready", "ready_to_reply", "reply_to_loop", "dispatch", "resolve_to_return", "total")
+          for arm, s in sorted(segs.items()):
+              print("HUNTEVALSPLIT %-12s traced browsers %d, evaluates %d, incomplete %d, engine commands per evaluate p50 %s | p50/p95 ms: %s"
+                    % (arm, trace_n[arm], len(s.get("total", [])), missing.get(arm, 0), q(s.get("cmds", []), .5),
+                       " | ".join("%s %s/%s" % (n, q(s.get(n, []), .5), q(s.get(n, []), .95)) for n in names)))
+          # ---- The close of the core with a reaper (nclose arms): each step, ms from the user's close() call (p50/p95/max over every
+          # close), the steps between them, and the close of the other arms next to it (same job, same rounds).
+          NC = ("nclose20", "nclose75", "nclose20x4", "nclose75x4")
+          for arm in NC:
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if not rows.get(arm):
+                  continue
+              def d(a, b):
+                  return [x[b] - x[a] for x in r if x.get(a) is not None and x.get(b) is not None]
+              print("HUNTNCLOSE %-11s closes %d crashes %d, connection found by %s | from the close() call: (0) Connection.close entered %s | (i) pipe closed by the core %s | (ii) engine EOF seen by the reader %s | (iii) real parent exited %s | Connection.close returned %s | (iv) close() returned %s | (v) reaper finished %s (not finished %d)"
+                    % (arm, len(r), len(rows[arm]) - len(r), sorted({str(x.get("nc_mapped")) for x in r}), trio([x.get("nc_entry") for x in r]), trio([x.get("nc_pipe") for x in r]),
+                       trio([x.get("nc_eof") for x in r]), trio([x.get("nc_parent") for x in r]), trio([x.get("nc_conn_return") for x in r]), trio([x.get("nc_return") for x in r]),
+                       trio([x.get("nc_reaper") for x in r]), sum(1 for x in r if x.get("nc_reaper_finished") is False)))
+              print("HUNTNCLOSESTEPS %-11s steps ms: call->entry %s | entry->pipe closed %s | pipe closed->engine EOF %s | engine EOF->parent exit %s | parent exit->Connection.close returned %s | Connection.close returned->close() returned %s | close() returned->reaper finished %s"
+                    % (arm, trio([x.get("nc_entry") for x in r]), trio(d("nc_entry", "nc_pipe")), trio(d("nc_pipe", "nc_eof")), trio(d("nc_eof", "nc_parent")),
+                       trio(d("nc_parent", "nc_conn_return")), trio(d("nc_conn_return", "nc_return")), trio(d("nc_return", "nc_reaper"))))
+          for arm in NC + ("shut70", "retail1", "retail4late"):
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if r:
+                  print("HUNTCLOSECMP %-11s close() ms %s | n %d" % (arm, trio([x.get("nc_return", x.get("close_ms")) if arm in NC else x.get("close_ms") for x in r]), len(r)))
+          # ---- The shutdown hunt. Two numbers per close: (a) the close -> the quit (the first "Starting phase" line of the engine's
+          # AsyncShutdown log after the close started: Services.startup.quit has run), (b) the quit -> the main process gone (and the
+          # whole tree gone). Then the phases and the blockers by name, with their time against the quit (the time held in (b)).
+          SH = ("shut20", "shut70", "shut180", "retail1", "retail4late", "retail1long")
+          probes, shut, bgt = {}, {}, {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTPROBE \[(\w+)\] (.*)", line.strip())
+              if m:
+                  d = json.loads(m.group(2))
+                  probes.setdefault((m.group(1), d["name"]), []).append(d["ms"])
+                  continue
+              m = re.match(r"HUNTBGTASK \[(\w+)\] (.*)", line.strip())
+              if m:
+                  bgt.setdefault(m.group(1), []).append(json.loads(m.group(2)))
+                  continue
+              m = re.match(r"HUNTSHUT \[(\w+)\] (.*)", line.strip())
+              if m:
+                  d = json.loads(m.group(2))
+                  shut.setdefault(m.group(1), {}).setdefault((d["round"], d["tag"]), []).append((d["t_ms"], d.get("q_ms"), d["line"]))
+          def pmx(arm, name):
+              v = probes.get((arm, name), [])
+              return "%s/%s" % (q(v, .5), max(v) if v else None)
+          for arm in SH:
+              if not rows.get(arm):
+                  continue
+              r = [x for x in rows[arm] if "crash" not in x]
+              print("HUNTSHUTCLOSE %-11s closes %d crashes %d | session s at close p50 %s | close ms %s | (a) close->quit ms %s | (b) quit->main gone ms %s | (b) quit->tree gone ms %s | (c) real parent gone->tree gone ms %s | close->real parent gone p50 %s | quit not seen %d | Connection.close p50/max %s | EngineTree.end %s | EngineTree.wait_job_empty %s | SessionFiles.remove %s"
+                    % (arm, len(r), len(rows[arm]) - len(r), q([x.get("session_s_at_close", x.get("session_s")) for x in r], .5), trio([x.get("close_ms") for x in r]),
+                       trio([x.get("a_close_to_quit_ms") for x in r]), trio([x.get("b_quit_to_main_gone_ms") for x in r]), trio([x.get("b_quit_to_tree_gone_ms") for x in r]),
+                       trio([x.get("c_main_to_tree_gone_ms") for x in r]), q([x.get("close_to_main_gone_ms") for x in r], .5), sum(1 for x in r if x.get("a_close_to_quit_ms") is None),
+                       pmx(arm, "Connection.close"), pmx(arm, "EngineTree.end"), pmx(arm, "EngineTree.wait_job_empty"), pmx(arm, "SessionFiles.remove")))
+          # The background tasks (firefox --backgroundtask ..., the shutdown-ping sender): per close how many, when born against the close
+          # start, how long they lived and how they ended.
+          for arm in SH:
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if not r:
+                  continue
+              ts = bgt.get(arm, [])
+              per = {}
+              for t in ts:
+                  per[(t["round"], t["tag"])] = per.get((t["round"], t["tag"]), 0) + 1
+              counts = [per.get((x.get("round"), x.get("tag")), 0) for x in r]
+              ended = {}
+              for t in ts:
+                  k = re.sub(r"rc=-?\d+", "rc=N", t["ended_by"])
+                  ended[k] = ended.get(k, 0) + 1
+              print("HUNTBGSUM %-11s closes %d | tasks %d, per close p50 %s max %s, closes with none %d | born ms against the close p50 %s p95 %s | life ms p50 %s p95 %s max %s | ended by: %s | ended inside the core's cleanup %d | attributed by ancestry %d, assumed %d | parent pids %s | cmd %s"
+                    % (arm, len(r), len(ts), q(counts, .5), max(counts, default=None), sum(1 for c in counts if c == 0), q([t["born_ms"] for t in ts], .5), q([t["born_ms"] for t in ts], .95),
+                       q([t["life_ms"] for t in ts], .5), q([t["life_ms"] for t in ts], .95), max((t["life_ms"] for t in ts if t["life_ms"] is not None), default=None),
+                       ended, sum(1 for t in ts if t.get("ended_in")), sum(1 for t in ts if t["attrib"] != "assumed"), sum(1 for t in ts if t["attrib"] == "assumed"),
+                       sorted({str(x.get("parent_pids") or x.get("parent_pid")) for x in r})[:3], [" ".join(t["cmd"][1:4])[:70] for t in ts[:1]]))
+          phase_re = re.compile(r"(Starting|Finished) phase (\S+)")
+          add_re = re.compile(r"Adding blocker (.+) for phase (\S+)")
+          done_re = re.compile(r"Completed blocker (.+) for phase (\S+)")
+          for arm in SH:
+              closes = shut.get(arm, {})
+              if not closes:
+                  continue
+              ph, bl = {}, {}
+              for key, ls in closes.items():
+                  for t_ms, qv, text in ls:
+                      m = phase_re.search(text)
+                      if m and qv is not None and t_ms >= 0:
+                          ph.setdefault(m.group(2), {"Starting": [], "Finished": []})[m.group(1)].append(qv)
+                          continue
+                      m = add_re.search(text)
+                      if m:
+                          bl.setdefault((m.group(2), m.group(1)), {"add": set(), "done": {}})["add"].add(key)
+                          continue
+                      m = done_re.search(text)
+                      if m and qv is not None:
+                          bl.setdefault((m.group(2), m.group(1)), {"add": set(), "done": {}})["done"][key] = qv
+              for phase, v in sorted(ph.items(), key=lambda kv: q(kv[1]["Starting"], .5) if kv[1]["Starting"] else 1e12):
+                  print("HUNTPHASE %-11s %-34s closes %d | starts at quit+ms p50 %s max %s | finished at quit+ms p50 %s p95 %s max %s (finished in %d)"
+                        % (arm, phase, len(v["Starting"]), q(v["Starting"], .5), max(v["Starting"], default=None), q(v["Finished"], .5), q(v["Finished"], .95),
+                           max(v["Finished"], default=None), len(v["Finished"])))
+              ranked = sorted(bl.items(), key=lambda kv: -(max(kv[1]["done"].values()) if kv[1]["done"] else 1e12))[:40]
+              for (phase, name), v in ranked:
+                  done = list(v["done"].values())
+                  print("HUNTBLOCKER %-11s %-30s %-40s added in %d of %d closes, completed in %d, never completed in %d | completed at quit+ms (held in b) p50 %s p95 %s max %s"
+                        % (arm, phase, name[:40], len(v["add"]), len(closes), len(done), len(v["add"] - set(v["done"])), q(done, .5), q(done, .95), max(done, default=None)))
+              # The lines of the close with the longest (b), in order: the raw story.
+              slow = sorted((x for x in rows[arm] if "crash" not in x), key=lambda x: -(x.get("b_quit_to_main_gone_ms") or x.get("close_ms") or 0))[:1]
+              for x in slow:
+                  for t_ms, qv, text in closes.get((x["round"], x["tag"]), [])[:150]:
+                      print("HUNTSHUTRAW %-11s %s %s | close%+.0f ms quit%+.0f ms | %s" % (arm, x["round"], x["tag"], t_ms, qv if qv is not None else float("nan"), text[:140]))
+          PY
+          python - "$RUNNER_TEMP/rows.log" <<'PY2'
+          import json, re, sys
+          probes = {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTPROBE \[(\w+)\] (.*)", line.strip())
+              if m:
+                  d = json.loads(m.group(2)); probes.setdefault((m.group(1), d["name"]), []).append(d)
+          def q(v, p):
+              v = sorted(v); return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          for (arm, name), ds in sorted(probes.items()):
+              ms = [d["ms"] for d in ds]
+              line = "HUNTPROBESUM %-12s %-34s n %3d | ms p50 %s p95 %s max %s" % (arm, name, len(ds), q(ms, .5), q(ms, .95), max(ms))
+              if name == "geo._family_lock":
+                  w = [d["extra"]["waited_ms"] for d in ds]
+                  line += " | held by: %s | waited p50 %s p95 %s max %s" % (sorted({d["thread"] for d in ds})[:4], q(w, .5), q(w, .95), max(w))
+              print(line)
+          PY2
+          grep -h "HUNTSURVIVOR" "$RUNNER_TEMP/rows.log" | sed -E 's/"pid": [0-9]+, //' | sort -u | head -20 || true
+          grep -h "HUNTSLOW" "$RUNNER_TEMP/rows.log" | cut -c1-900 || true
+          # The geo helpers of the first launch of the first round (the first arm, inproc4, all four browsers): what prepare_session_geo
+          # spent its time on (t = seconds from the start of that process, ms = how long, thread).
+          grep -hE "HUNTPROBE \[inproc4\] .*\"round\": \"r0\".*\"name\": \"(geo\.|download\.|geoip_db\.|_geoip_db\.|udp_exit\.|requests\.)" "$RUNNER_TEMP/rows.log" | cut -c1-260 | head -150 || true
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true; else pkill -9 -f firefox > /dev/null 2>&1 || true; fi
+          echo done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: "candidate-typing-${{ matrix.os }}-${{ github.run_id }}", path: "${{ runner.temp }}/rows.log" }
