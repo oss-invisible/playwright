@@ -1285,6 +1285,10 @@ _RS_SYNC_START = re.compile(r"^(\S+) (?:local timestamp:|Local DB is empty, pull
 _RS_SYNC_END = re.compile(r"^(\S+) sync status is (\S+)")
 _RS_DUMP_START = re.compile(r"^(\S+) try to restore dump")
 _RS_DUMP_END = re.compile(r"^(\S+) (?:imported \d+ records from dump|no dump available)")
+_RS_WRITE_START = re.compile(r"^(\S+) \d+ to delete, \d+ to insert")
+_RS_WRITE_END = re.compile(r"^(\S+) \d+ created\. \d+ updated\. \d+ deleted\.")
+_RS_ATTACH_FETCH = re.compile(r"^([^:\s]+): Fetch attachments bundle from")
+_RS_ATTACH_DELETE = re.compile(r"^(\S+) Bulk delete \d+ obsolete attachments")
 _IDB_DONE = re.compile(r"Completed blocker RemoteSettingsClient - finish IDB access\.")
 
 
@@ -1306,9 +1310,17 @@ def rs_report(rs_lines, shut_lines, t_launch, t_close, quit_t=None, exit_t=None)
         if m:
             ev.append((t, m.group(1)))
     syncs, dumps, polls, bundles, attach = {}, {}, [], [], []
+    trigger_first, init, push = {}, [], []
     for t, x in ev:
         if x.startswith("Start polling for changes"):
-            polls.append([t, None])
+            mt = re.search(r"trigger=(\w+)", x)
+            trg = mt.group(1) if mt else "?"
+            polls.append([t, None, trg])
+            trigger_first.setdefault(trg, t)
+        elif x.startswith("Initialize Remote Settings"):
+            init.append(t)
+        elif x.startswith("Push notification received"):
+            push.append(t)
         elif x.startswith("Polling for changes done") and polls and polls[-1][1] is None:
             polls[-1][1] = t
         elif x.startswith("Download Remote Settings startup changesets bundle"):
@@ -1357,6 +1369,48 @@ def rs_report(rs_lines, shut_lines, t_launch, t_close, quit_t=None, exit_t=None)
     ends = [w[1] for w in pending if w[1] is not None]
     out["rs_busy_lasts_ms"] = round(max(ends) - t_close, 1) if ends else None
     out["rs_busy_never_ended"] = sum(1 for w in pending if w[1] is None)
+    # The WRITES (what the finish-IDB blocker waits for while it is a read-write operation in flight): a collection's records saved after
+    # a sync (the Database layer's "<id> N to delete, M to insert" until "<id> N created. N updated. N deleted." or the sync's end), a
+    # dump import into IDB ("try to restore dump" .. "imported N records from dump"), the startup bundle import, an attachment
+    # download or the bulk delete of obsolete attachments (instants).
+    wins, open_w = [], {}
+    for t, x in ev:
+        m = _RS_WRITE_START.match(x)
+        if m:
+            w = ["records saved after a sync", m.group(1), t, None]
+            open_w[m.group(1)] = w
+            wins.append(w)
+            continue
+        m = _RS_WRITE_END.match(x) or _RS_SYNC_END.match(x)
+        if m and m.group(1) in open_w and open_w[m.group(1)][3] is None:
+            open_w[m.group(1)][3] = t
+            continue
+        m = _RS_ATTACH_FETCH.match(x)
+        if m:
+            wins.append(["attachment download", m.group(1), t, t])
+            continue
+        m = _RS_ATTACH_DELETE.match(x)
+        if m:
+            wins.append(["attachment cache delete", m.group(1), t, t])
+    for k, ws in dumps.items():
+        wins += [["dump import into IDB", k, w[0], w[1]] for w in ws]
+    wins += [["startup bundle import", "-", w[0], w[1]] for w in bundles]
+    at_close = [w for w in wins if w[2] <= t_close and (w[3] is None or w[3] > t_close)]
+    at_close += [w for w in wins if w[2] <= t_close and w[3] == w[2] and t_close - w[2] <= 3000 and w not in at_close]
+    out["rs_writes_at_close"] = [{"kind": w[0], "id": w[1], "started_ms_before_close": round(t_close - w[2], 1),
+                                  "ends_ms_after_close": round(w[3] - t_close, 1) if w[3] is not None else None} for w in at_close][:8]
+    out["rs_write_kinds_at_close"] = sorted({w[0] for w in at_close})
+    out["rs_writes_total"] = len(wins)
+    ended = [w[3] for w in wins if w[3] is not None] + [w[1] for w in polls if w[1] is not None]
+    out["rs_last_write_end_ms"] = round(max(ended) - t_launch, 1) if ended and t_launch else None
+    out["rs_last_write_end_vs_close_ms"] = round(max(ended) - t_close, 1) if ended else None
+    # When each path starts (ms of session age): A = the update timer (trigger=timer), B = the user-idle tasks -> init -> push HELLO ->
+    # trigger=startup; other triggers are listed as they come.
+    out["rs_trigger_first_ms"] = {k: round(v - t_launch, 1) for k, v in trigger_first.items()} if t_launch else {}
+    out["rs_path_A_ms"] = out["rs_trigger_first_ms"].get("timer")
+    out["rs_path_B_ms"] = out["rs_trigger_first_ms"].get("startup")
+    out["rs_init_ms"] = round(init[0] - t_launch, 1) if init and t_launch else None
+    out["rs_push_ms"] = round(push[0] - t_launch, 1) if push and t_launch else None
     idb = next((t for t, x in shut_lines if _IDB_DONE.search(x)), None)
     out["rs_idb_done_q_ms"] = round(idb - quit_t, 1) if idb is not None and quit_t else None
     out["rs_idb_done_after_exit"] = bool(idb is not None and exit_t and idb > exit_t)
@@ -1382,6 +1436,7 @@ async def one_browser(arm, binary, port, tag):
     c_start = await asyncio.to_thread(parent_cpu)
     t0 = time.monotonic()
     row["launch_wall_ms"] = time.time() * 1000
+    row["os_idle_ms_at_launch"] = os_idle_ms()
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
         extra = json.loads(os.environ.get("HUNT_EXTRA_PREFS") or "{}") or None
@@ -1478,6 +1533,7 @@ async def _browser_work(arm, port, tag, row, browser, close, t0, c_start):
 async def _close_browser(arm, port, tag, row, browser, close, t0):
     """The close of one browser, always reached: what failed before it is in the row, what fails in the probes around it is too."""
     row["session_s_at_close"] = round(time.monotonic() - t0, 2)
+    row["os_idle_ms_at_close"] = os_idle_ms()
     OPEN_BROWSERS[tag] = "closing"
     rec = pwatch = tw = None
     try:
@@ -1836,6 +1892,27 @@ def visible_windows():
     return out
 
 
+def os_idle_ms():
+    """How long the interactive session has had no keyboard or mouse input (Windows: GetLastInputInfo), None elsewhere. The idle service
+    of Firefox reads the same OS clock, so ours and retail see the same idle on the same machine; the service's own "idle" notification
+    is not observable from here."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        return (ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+    except Exception:   # noqa: BLE001
+        return None
+
+
 def now_ms():
     return time.time() * 1000
 
@@ -1998,6 +2075,7 @@ class RetailBrowser:
         try:
             self.log = open(self.logpath, "wb")
             self.t_start = now_ms()
+            row["os_idle_ms_at_launch"] = os_idle_ms()
             url = "http://127.0.0.1:%d/retail?b=%s" % (port, self.tag)
             # Windows: the launcher process hands over to the browser and exits at once (the first run of this arm saw every
             # browser "exit before close", no window, the close timing out); -wait-for-browser keeps it until the browser ends,
@@ -2093,6 +2171,7 @@ class RetailBrowser:
         if RETAIL_SV is not None:
             RETAIL_SV.fast.set()
         row["parent_pid"], row["parent_is_window_owner"] = target, self.window_pid is not None
+        row["os_idle_ms_at_close"] = os_idle_ms()
         row["close_cmd_ms"] = round(self.t_close - c0, 1)
         row["session_s"] = round((self.t_close - self.t_start) / 1000, 2)
         deadline = self.t_close + 120000

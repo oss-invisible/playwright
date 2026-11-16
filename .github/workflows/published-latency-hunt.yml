@@ -354,6 +354,25 @@ jobs:
                           ids[(kind, k)] = ids.get((kind, k), 0) + 1
               print("HUNTRSBUSY %-12s in progress at the close (closes): %s | collections synced (first browser): %s"
                     % (arm, sorted(ids.items(), key=lambda kv: -kv[1])[:12], (r[0].get("rs_collections") or [])[:25]))
+              # WHICH write is in progress at the close, by kind and collection, and how long before the close it had started.
+              wr = {}
+              for x in r:
+                  for w in x.get("rs_writes_at_close") or []:
+                      wr.setdefault((w["kind"], w["id"]), []).append(w["started_ms_before_close"])
+              print("HUNTRSWRITE %-12s writes in progress at the close: %d of %d closes had one | %s"
+                    % (arm, sum(1 for x in r if x.get("rs_writes_at_close")), len(r),
+                       "; ".join("%s %s in %d closes, started before the close p50 %s max %s ms" % (k, i, len(v), q(v, .5), max(v)) for (k, i), v in sorted(wr.items(), key=lambda kv: -len(kv[1]))[:14])))
+              # The two paths of the first sync (ms of session age), the push HELLO, the last write's end against the close, and the OS idle
+              # of the session (GetLastInputInfo: the idle service reads the same clock; its own "idle" notification is not observable here).
+              print("HUNTRSPATHS %-12s path A (update timer, trigger=timer) first start %s | path B (idle tasks -> init -> push -> trigger=startup) first start %s | Initialize Remote Settings at %s | push notification at %s | other triggers %s | last write/poll end against the close ms %s | OS idle at launch p50 %s, at close p50 %s ms"
+                    % (arm, trio([x.get("rs_path_A_ms") for x in r]), trio([x.get("rs_path_B_ms") for x in r]), trio([x.get("rs_init_ms") for x in r]), trio([x.get("rs_push_ms") for x in r]),
+                       sorted({k for x in r for k in (x.get("rs_trigger_first_ms") or {}) if k not in ("timer", "startup")}), trio([x.get("rs_last_write_end_vs_close_ms") for x in r]),
+                       q([x.get("os_idle_ms_at_launch") for x in r], .5), q([x.get("os_idle_ms_at_close") for x in r], .5)))
+              for x in r:
+                  print("HUNTRSBROWSER %-12s %s %s | A %s B %s init %s push %s first sync %s ms | collections %s | writes at close %s | last end vs close %s ms | finish-IDB at quit+%s ms | parent exit %s ms"
+                        % (arm, x.get("round"), x.get("tag"), x.get("rs_path_A_ms"), x.get("rs_path_B_ms"), x.get("rs_init_ms"), x.get("rs_push_ms"), x.get("rs_first_sync_ms"),
+                           x.get("rs_collections_n"), [(w["kind"], w["id"], w["started_ms_before_close"], w["ends_ms_after_close"]) for w in x.get("rs_writes_at_close") or []][:4],
+                           x.get("rs_last_write_end_vs_close_ms"), x.get("rs_idb_done_q_ms"), x.get("nc_parent", x.get("close_main_ms"))))
           # The gaps between the phases of the shutdown (finish of one -> start of the next), ms, over every close.
           for arm in ("ncshut75x4", "ncshut150x4", "retail4late", "retail4x150"):
               r = [x for x in rows.get(arm, []) if "crash" not in x and x.get("phases")]
