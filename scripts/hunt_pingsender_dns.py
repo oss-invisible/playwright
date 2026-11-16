@@ -136,6 +136,11 @@ def capture(p, out, prefs_dir, seen_pids):
     except (OSError, TypeError) as exc:
         rec["prefs"] = None
         rec["prefs_error"] = "%s %s" % (type(exc).__name__, src)
+    # When the profile was born (the oldest file in it): which test's session it belongs to.
+    try:
+        rec["profile_oldest_mtime_ms"] = round(min(e.stat().st_mtime for e in os.scandir(profile) if e.is_file()) * 1000, 1) if profile else None
+    except (OSError, ValueError, TypeError):
+        rec["profile_oldest_mtime_ms"] = None
     seen_pids[p.pid] = rec
     emit(out, rec)
     threading.Thread(target=follow, args=(p, rec, out), daemon=True).start()
