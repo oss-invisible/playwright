@@ -774,6 +774,150 @@ def shut_report(lines, t_close, main_gone=None, tree_gone=None):
     return out, shown
 
 
+# ---- the close of the core with a reaper (nclose arms): the steps of one close, stamped ------------------------------------------------
+#: id(core Connection) -> CloseRec of the browser it belongs to; the fds of every connection, to see who closes which end.
+CONN_REC = {}
+FD_READ, FD_WRITE = {}, {}
+CONNS = []
+
+
+class CloseRec:
+    """The instants (time.perf_counter) of one close: the user's close() call, the core's Connection.close entry, the pipe closed by
+    the core (the write end: the engine's EOF is the exit command, no Browser.close is sent on the pipe), the engine's end of the pipe
+    seen by the core's reader (the empty os.read, then the release of the read end), the real parent's exit (the process the core
+    spawned), Connection.close returning, the user's close() returning, the reaper finished (after, joined outside the timing)."""
+    __slots__ = ("conn", "pid", "mapped", "t_call", "t_entry", "t_pipe", "t_eof", "t_reader_end", "t_parent", "t_conn_return",
+                 "t_return", "t_reaper", "reaper_finished")
+
+    def __init__(self, conn, mapped):
+        self.conn, self.mapped = conn, mapped
+        self.pid = getattr(getattr(conn, "_process", None), "pid", None)
+        self.t_call = self.t_entry = self.t_pipe = self.t_eof = self.t_reader_end = self.t_parent = None
+        self.t_conn_return = self.t_return = self.t_reaper = self.reaper_finished = None
+
+    def fields(self):
+        def ms(t):
+            return round((t - self.t_call) * 1000, 1) if t is not None and self.t_call is not None else None
+        return {"nc_entry": ms(self.t_entry), "nc_pipe": ms(self.t_pipe), "nc_eof": ms(self.t_eof), "nc_reader_end": ms(self.t_reader_end),
+                "nc_parent": ms(self.t_parent), "nc_conn_return": ms(self.t_conn_return), "nc_return": ms(self.t_return),
+                "nc_reaper": ms(self.t_reaper), "nc_reaper_finished": self.reaper_finished, "nc_mapped": self.mapped, "nc_pid": self.pid}
+
+
+def install_close_stamps():
+    """HUNT: stamp the steps of a close of the core (git main, with the reaper), without changing what it does. Wrapped:
+      invisible_core/juggler/connection.py: Connection.__init__   the fds of the pipe and the connection (to see who closes them)
+      invisible_core/juggler/connection.py: Connection.close      the entry, and the return of the call that did the work
+      invisible_core/juggler/connection.py: os (a copy of the module in its namespace) .close / .read: the close of the write end (the
+          pipe closed by the core: Connection.close does `os.close(fd)` of `_to_browser`), the empty read of the reader (the engine's
+          EOF) and the release of the read end
+      invisible_core/process.py: Reaper.run                       the reaper finished
+    """
+    import importlib
+    import types
+    cmod = importlib.import_module("invisible_core.juggler.connection")
+    pmod = importlib.import_module("invisible_core.process")
+    pc = time.perf_counter
+    if not getattr(cmod, "_hunt_os", False):
+        proxy = types.ModuleType("os")
+        proxy.__dict__.update(os.__dict__)
+        real_close, real_read = os.close, os.read
+
+        def close(fd):
+            c = FD_WRITE.pop(fd, None)
+            if c is not None:
+                r = CONN_REC.get(id(c))
+                if r is not None and r.t_pipe is None:
+                    r.t_pipe = pc()
+            else:
+                c = FD_READ.pop(fd, None)
+                if c is not None:
+                    r = CONN_REC.get(id(c))
+                    if r is not None and r.t_reader_end is None:
+                        r.t_reader_end = pc()
+            return real_close(fd)
+
+        def read(fd, n):
+            data = real_read(fd, n)
+            if not data:
+                c = FD_READ.get(fd)
+                if c is not None:
+                    r = CONN_REC.get(id(c))
+                    if r is not None and r.t_eof is None:
+                        r.t_eof = pc()
+            return data
+        proxy.close, proxy.read = close, read
+        cmod.os = proxy
+        cmod._hunt_os = True
+    real_init = cmod.Connection.__init__
+    if not getattr(real_init, "_hunt", False):
+        def __init__(self, *a, **k):
+            to_b = k.get("to_browser", a[0] if a else None)
+            from_b = k.get("from_browser", a[1] if len(a) > 1 else None)
+            FD_WRITE[to_b], FD_READ[from_b] = self, self       # before the reader thread starts
+            CONNS.append(self)
+            real_init(self, *a, **k)
+        __init__._hunt = True
+        cmod.Connection.__init__ = __init__
+    real_close_m = cmod.Connection.close
+    if not getattr(real_close_m, "_hunt", False):
+        def close_m(self, *a, **k):
+            rec = CONN_REC.get(id(self))
+            mine = rec is not None and rec.t_entry is None
+            if mine:
+                rec.t_entry = pc()
+            try:
+                return real_close_m(self, *a, **k)
+            finally:
+                if mine:
+                    rec.t_conn_return = pc()
+        close_m._hunt = True
+        cmod.Connection.close = close_m
+    real_run = pmod.Reaper.run
+    if not getattr(real_run, "_hunt", False):
+        def run(self):
+            try:
+                return real_run(self)
+            finally:
+                self.t_done = pc()
+        run._hunt = True
+        pmod.Reaper.run = run
+
+
+def find_conn(browser):
+    """The core Connection of a browser: through the client's connection -> transport -> server -> its browser object, else the first
+    connection nobody has claimed (exact for one browser per process)."""
+    try:
+        for obj in list(browser._connection._transport._server._objects.values()):
+            c = getattr(obj, "conn", None)
+            if c is not None and type(c).__name__ == "Connection":
+                return c, "server"
+    except Exception:   # noqa: BLE001
+        pass
+    for c in CONNS:
+        if id(c) not in CONN_REC:
+            return c, "guess"
+    return None, None
+
+
+class ParentWatch(threading.Thread):
+    """The instant the process the core spawned is gone (polled every 5 ms on its Process object)."""
+
+    def __init__(self, rec):
+        super().__init__(daemon=True, name="hunt-parentwatch")
+        self.rec = rec
+        self.proc = psutil.Process(rec.pid) if rec.pid else None
+
+    def run(self):
+        if self.proc is None:
+            return
+        stop = time.monotonic() + 120
+        while time.monotonic() < stop:
+            if not ExitWatch.alive(self.proc):
+                self.rec.t_parent = time.perf_counter()
+                return
+            time.sleep(0.005)
+
+
 def is_bg(arg):
     return arg.lstrip("-/").lower() == "backgroundtask"
 
@@ -983,6 +1127,14 @@ async def one_browser(arm, binary, port, tag):
         # The shutdown arms: idle until the session is SESSION_S old (from the start of the launch), then close.
         await asyncio.sleep(max(0.0, t0 + SESSION_S - time.monotonic()))
     row["session_s_at_close"] = round(time.monotonic() - t0, 2)
+    rec = pwatch = None
+    if os.environ.get("HUNT_NCLOSE") == "1":
+        conn, how = find_conn(browser)
+        if conn is not None:
+            rec = CloseRec(conn, how)
+            CONN_REC[id(conn)] = rec
+            pwatch = ParentWatch(rec)
+            pwatch.start()
     watch = None
     if os.environ.get("HUNT_SHUT") == "1":
         watch = ExitWatch()
@@ -991,8 +1143,21 @@ async def one_browser(arm, binary, port, tag):
         row["parent_pids"] = [p.pid for p in watch.main]
         row["close_wall_ms"] = time.time() * 1000
     t1 = time.monotonic()
+    if rec is not None:
+        rec.t_call = time.perf_counter()
     await close()
+    if rec is not None:
+        rec.t_return = time.perf_counter()
     row["close_ms"] = round((time.monotonic() - t1) * 1000)
+    if rec is not None:
+        # After the close's own timing: the parent's exit, and the reaper (joined here, never inside the close).
+        await asyncio.to_thread(pwatch.join, 60)
+        reaper = getattr(rec.conn, "reaper", None)
+        if reaper is not None:
+            await asyncio.to_thread(reaper.join, 60)
+            rec.t_reaper = getattr(reaper, "t_done", None) or time.perf_counter()
+            rec.reaper_finished = bool(reaper.finished)
+        row.update(rec.fields())
     if watch is not None:
         await asyncio.to_thread(watch.join, 95)
         row["_main_gone"], row["_tree_gone"] = watch.main_gone, watch.tree_gone
@@ -1178,6 +1343,8 @@ async def main(arm, n, rnd, binary):
         TRACE_EVAL = True
         if os.environ.get("HUNT_SHUT") == "1":
             install_output_capture()
+        if os.environ.get("HUNT_NCLOSE") == "1":
+            install_close_stamps()
     global PROXY_PORT
     if os.environ.get("HUNT_PROXY") == "1":
         proxy = ThreadingProxy(("127.0.0.1", 0), ProxyHandler)
@@ -1603,6 +1770,10 @@ def retail_main(n, rnd, binary, close_after):
 
 
 if __name__ == "__main__":
+    # The workflow's per-arm limit kills this process's tree by the pid written here (several processes of an arm append their own).
+    if os.environ.get("HUNT_PIDFILE"):
+        with open(os.environ["HUNT_PIDFILE"], "a", encoding="utf-8", newline="\n") as _pf:
+            _pf.write("%d\n" % os.getpid())
     if sys.argv[1] == "retail":
         retail_main(int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5]) if len(sys.argv) > 5 else 20.0)
         sys.exit(0)

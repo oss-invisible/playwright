@@ -50,6 +50,27 @@ jobs:
           "$RUNNER_TEMP/after/$BIN/python" -c "import importlib.metadata as m; print('after', m.version('invisible-playwright'), m.version('invisible-core'))"
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb xdotool wmctrl openbox; "$RUNNER_TEMP/after/$BIN/python" -m playwright install --with-deps firefox; else "$RUNNER_TEMP/after/$BIN/python" -m playwright install firefox; fi
           echo "PY_AFTER=$RUNNER_TEMP/after/$BIN/python" >> "$GITHUB_ENV"
+      - name: A third venv, "next" (core and wrapper from git, the close that hands the rest to a reaper)
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=Scripts; else BIN=bin; fi
+          N="$RUNNER_TEMP/next/$BIN/python"
+          python -m venv "$RUNNER_TEMP/next"
+          "$N" -m pip install -q --upgrade pip
+          # The wrapper's own dependencies first (its pin pulls invisible-core 64.73.0), then the core from git main, then the wrapper
+          # from its branch with --no-deps so the pin cannot pull the published core back.
+          "$N" -m pip install -q "invisible-playwright==0.52.1" psutil websockets
+          "$N" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@main"
+          "$N" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@fix/close-hands-the-files-to-the-reaper"
+          "$N" -c "
+          import importlib.metadata as m, json
+          for n in ('invisible-core', 'invisible-playwright'):
+              d = m.distribution(n)
+              u = json.loads(d.read_text('direct_url.json') or '{}')
+              print('next', n, d.version, u.get('url'), u.get('vcs_info', {}).get('requested_revision'), u.get('vcs_info', {}).get('commit_id'))
+          import invisible_core.process as p
+          print('next has the reaper:', hasattr(p, 'Reaper'))
+          "
+          echo "PY_NEXT=$N" >> "$GITHUB_ENV"
       - name: The engine the venv fetches
         run: |
           echo "FF_AFTER=$(cd "$RUNNER_TEMP" && "$PY_AFTER" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
@@ -91,7 +112,7 @@ jobs:
           set +e
           S=scripts/hunt_published_latency.py
           # What an arm prints: its HUNT lines, each tagged with the arm.
-          keep() { grep -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK)' | sed -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
           # The retail arms: N browsers, round, seconds after the first load before the normal close (Linux headed under xvfb).
           retail() {
             if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
@@ -103,7 +124,36 @@ jobs:
               "$PY_AFTER" $S retail "$1" "$2" "$FF_RETAIL" "$3" 2>&1
             fi
           }
+          # A limit per arm, shorter than the step's: 4 times what the arm should take, at most 12 minutes. The arm's python writes its pid
+          # (HUNT_PIDFILE, one line per process) and a watchdog kills that tree when the limit comes, printing the crash row; the next
+          # arm then runs. The watchdog's output is kept off the arm's pipe (a sleep left behind must not hold the tee).
+          limit_of() {
+            local e
+            case "$1" in
+              solo|nclose20) e=30 ;; shut20) e=30 ;; inproc4|inproc4quiet|inproc4tz|inproc4px|stock|nclose20x4) e=35 ;;
+              one|remote|retail1|retail4) e=45 ;; shut70|nclose75) e=85 ;; nclose75x4) e=95 ;; late|retail4late) e=100 ;;
+              shut180|retail1long) e=200 ;; *) e=100 ;;
+            esac
+            echo $(( e * 4 > 720 ? 720 : e * 4 ))
+          }
+          kill_arm() {
+            local pid
+            for pid in $(cat "$HUNT_PIDFILE" 2>/dev/null); do
+              if [ "$RUNNER_OS" = "Windows" ]; then taskkill //T //F //PID "$pid" > /dev/null 2>&1; else pkill -9 -P "$pid" > /dev/null 2>&1; kill -9 "$pid" > /dev/null 2>&1; fi
+            done
+          }
           run_arm() {
+            local lim wd
+            lim=$(limit_of "$1")
+            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid"
+            : > "$HUNT_PIDFILE"
+            (
+              exec > /dev/null
+              sleep "$lim" > /dev/null 2>&1
+              echo "HUNTROW [$1] {\"arm\": \"$1\", \"round\": \"$2\", \"crash\": \"arm timed out after $lim s\"}" | tee -a "$RUNNER_TEMP/rows.log" >&2
+              kill_arm
+            ) &
+            wd=$!
             case "$1" in
               inproc4) "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep inproc4 ;;
               inproc4quiet) HUNT_NO_SAMPLER=1 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep inproc4quiet ;;
@@ -118,11 +168,17 @@ jobs:
               shut20)  HUNT_SHUT=1 HUNT_SESSION_S=20 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut20 ;;
               shut70)  HUNT_SHUT=1 HUNT_SESSION_S=70 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut70 ;;
               shut180) HUNT_SHUT=1 HUNT_SESSION_S=180 "$PY_AFTER" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep shut180 ;;
+              nclose20)    HUNT_NCLOSE=1 HUNT_SESSION_S=20 "$PY_NEXT" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep nclose20 ;;
+              nclose75)    HUNT_NCLOSE=1 HUNT_SESSION_S=75 "$PY_NEXT" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep nclose75 ;;
+              nclose20x4)  HUNT_NCLOSE=1 HUNT_SESSION_S=20 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep nclose20x4 ;;
+              nclose75x4)  HUNT_NCLOSE=1 HUNT_SESSION_S=75 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep nclose75x4 ;;
               retail1) retail 1 "$2" 20 | keep retail1 ;;
               retail1long) retail 1 "$2" 180 | keep retail1long ;;
               retail4) retail 4 "$2" 20 | keep retail4 ;;
               retail4late) retail 4 "$2" 70 | keep retail4late ;;
             esac
+            pkill -P "$wd" > /dev/null 2>&1
+            kill "$wd" > /dev/null 2>&1
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
           # The full list (the default when the focused one below is removed):
@@ -130,7 +186,10 @@ jobs:
           # The shutdown hunt: why our engine on Windows does not exit within the core's 5 s after a long session. shut20/70/180 are
           # ours (one browser per process, idle until the session is 20/70/180 s old, then closed, the engine's shutdown log timed),
           # the retail ones are the real Firefox closed by its window after 20 s / 70 s (4 together) / 180 s.
-          ARMS=(shut20 shut70 shut180 retail1 retail4late retail1long)
+          #   shut20 shut70 shut180 retail1 retail4late retail1long   (the shutdown hunt of the run before)
+          # The close of the core with a reaper (venv "next", git main of the core and the wrapper's fix branch), 1 browser and 4 in one
+          # process, closed after 20 s / 75 s of session, against the real Firefox closed by its window, and ours as published (shut70).
+          ARMS=(nclose20 nclose75 nclose20x4 nclose75x4 retail1 retail4late shut70)
           if [ -n "$ONLY_ARMS" ]; then read -ra ARMS <<< "$ONLY_ARMS"; fi
           N=${#ARMS[@]}
           for r in $(seq 0 $((${ROUNDS:-6}-1))); do
@@ -155,7 +214,7 @@ jobs:
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
           def trio(v):
               return "p50 %s p95 %s max %s" % (q(v, .5), q(v, .95), max((x for x in v if x is not None), default=None))
-          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180"):
+          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180", "nclose20", "nclose75", "nclose20x4", "nclose75x4"):
               if not rows.get(arm):
                   continue
               r = [x for x in rows.get(arm, []) if "crash" not in x]
@@ -228,6 +287,26 @@ jobs:
               print("HUNTEVALSPLIT %-12s traced browsers %d, evaluates %d, incomplete %d, engine commands per evaluate p50 %s | p50/p95 ms: %s"
                     % (arm, trace_n[arm], len(s.get("total", [])), missing.get(arm, 0), q(s.get("cmds", []), .5),
                        " | ".join("%s %s/%s" % (n, q(s.get(n, []), .5), q(s.get(n, []), .95)) for n in names)))
+          # ---- The close of the core with a reaper (nclose arms): each step, ms from the user's close() call (p50/p95/max over every
+          # close), the steps between them, and the close of the other arms next to it (same job, same rounds).
+          NC = ("nclose20", "nclose75", "nclose20x4", "nclose75x4")
+          for arm in NC:
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if not rows.get(arm):
+                  continue
+              def d(a, b):
+                  return [x[b] - x[a] for x in r if x.get(a) is not None and x.get(b) is not None]
+              print("HUNTNCLOSE %-11s closes %d crashes %d, connection found by %s | from the close() call: (0) Connection.close entered %s | (i) pipe closed by the core %s | (ii) engine EOF seen by the reader %s | (iii) real parent exited %s | Connection.close returned %s | (iv) close() returned %s | (v) reaper finished %s (not finished %d)"
+                    % (arm, len(r), len(rows[arm]) - len(r), sorted({str(x.get("nc_mapped")) for x in r}), trio([x.get("nc_entry") for x in r]), trio([x.get("nc_pipe") for x in r]),
+                       trio([x.get("nc_eof") for x in r]), trio([x.get("nc_parent") for x in r]), trio([x.get("nc_conn_return") for x in r]), trio([x.get("nc_return") for x in r]),
+                       trio([x.get("nc_reaper") for x in r]), sum(1 for x in r if x.get("nc_reaper_finished") is False)))
+              print("HUNTNCLOSESTEPS %-11s steps ms: call->entry %s | entry->pipe closed %s | pipe closed->engine EOF %s | engine EOF->parent exit %s | parent exit->Connection.close returned %s | Connection.close returned->close() returned %s | close() returned->reaper finished %s"
+                    % (arm, trio([x.get("nc_entry") for x in r]), trio(d("nc_entry", "nc_pipe")), trio(d("nc_pipe", "nc_eof")), trio(d("nc_eof", "nc_parent")),
+                       trio(d("nc_parent", "nc_conn_return")), trio(d("nc_conn_return", "nc_return")), trio(d("nc_return", "nc_reaper"))))
+          for arm in NC + ("shut70", "retail1", "retail4late"):
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if r:
+                  print("HUNTCLOSECMP %-11s close() ms %s | n %d" % (arm, trio([x.get("nc_return", x.get("close_ms")) if arm in NC else x.get("close_ms") for x in r]), len(r)))
           # ---- The shutdown hunt. Two numbers per close: (a) the close -> the quit (the first "Starting phase" line of the engine's
           # AsyncShutdown log after the close started: Services.startup.quit has run), (b) the quit -> the main process gone (and the
           # whole tree gone). Then the phases and the blockers by name, with their time against the quit (the time held in (b)).
@@ -269,7 +348,7 @@ jobs:
               per = {}
               for t in ts:
                   per[(t["round"], t["tag"])] = per.get((t["round"], t["tag"]), 0) + 1
-              counts = [per.get((x["round"], x["tag"]), 0) for x in r]
+              counts = [per.get((x.get("round"), x.get("tag")), 0) for x in r]
               ended = {}
               for t in ts:
                   k = re.sub(r"rc=-?\d+", "rc=N", t["ended_by"])
