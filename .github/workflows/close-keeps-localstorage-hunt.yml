@@ -1,0 +1,100 @@
+# HUNT ONLY, never merged. Why a closed persistent session sometimes did not keep its localStorage (the red: run 43777526437, Windows,
+# tests/test_persistent_profile_keeps_state.py::test_cookies_and_local_storage_survive_to_the_next_session: the cookie reached
+# cookies.sqlite, the localStorage did not). The hypothesis: the loss goes with a browser the core TERMINATED when its shutdown deadline
+# ran out (Connection.close(timeout=5.0)), against one that left by itself after the pipe was closed.
+#
+# scripts/hunt_close_keeps_localstorage.py runs the test as a cycle (write both stores, wait ARM seconds, close, read the profile's
+# files, open the same profile again and read) 120 times per OS, four workers at once (each with its own profile and its own port, as xdist
+# does: 120 serial cycles with a 30 s arm do not fit in the 60 minutes of the job), in three arms (0 s = the test as written, 5 s and 30 s
+# between the write and the close, for the interval at which LSNG flushes). For each cycle it records how the browser left (by itself, or
+# ended by the core, with the core's calls that ended it and who was alive), the engine's shutdown log and phases, the files of the
+# profile after the close, and what the next session read. The table at the end: localStorage lost against how the browser left, per arm.
+#
+# The core is the main commit 65307f59f1245e214c8357593950d5ec929536ac (pin allowed, the pin repair off), the engine the one the wrapper
+# fetches. The probes are those of scripts/hunt_published_latency.py (the other session's hunt), imported, not copied.
+name: close keeps localstorage hunt
+on:
+  push:
+    branches: [hunt/close-keeps-localstorage]
+permissions:
+  contents: read
+concurrency:
+  group: close-keeps-localstorage-hunt
+  cancel-in-progress: true
+# Engine and GeoIP downloads go through the release API with this token (anonymous requests are the ones GitHub drops first).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+  PYTHONUNBUFFERED: "1"
+  INVISIBLE_CORE_PIN: allow
+  INVISIBLE_CORE_AUTOFIX: "off"
+  CORE_SHA: 65307f59f1245e214c8357593950d5ec929536ac
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install the wrapper, then the core of main over the one it pins
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]" psutil
+          # The system tool for `playwright install-deps firefox` below, as the e2e job does.
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+          python -m pip install --force-reinstall "invisible_core @ git+https://github.com/oss-invisible/core.git@${CORE_SHA}"
+          python - <<'PY'
+          import importlib.metadata as m, os
+          print("wrapper", m.version("invisible-playwright"), "core", m.version("invisible-core"))
+          direct = m.distribution("invisible-core").read_text("direct_url.json") or ""
+          print(direct)
+          assert os.environ["CORE_SHA"] in direct, "the core installed is not the commit asked for"
+          PY
+      - name: System deps (xvfb + Firefox runtime libs)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: Fetch the engine
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      # The GeoIP database is made by the repository (scripts/ci_lab_geoip.py: the same bytes on every run), never downloaded: without it
+      # the core asks GitHub which database is the latest on every launch.
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: 120 cycles, four at once (Linux under xvfb, Windows on the runner's desktop)
+        timeout-minutes: 45
+        run: |
+          mkdir -p evidence
+          OUT="evidence/close-keeps-localstorage-${{ runner.os }}.json"
+          if [ "$RUNNER_OS" = "Linux" ]; then PRE="xvfb-run -a"; else PRE=""; fi
+          # No new cycle starts after 35 minutes; a cycle in flight ends within its own 5 minutes.
+          $PRE python -u scripts/hunt_close_keeps_localstorage.py --cycles 120 --arms 0,5,30 --jobs 4 --budget-min 35 --binary "$FF" --out "$OUT"
+      - name: The table
+        if: always()
+        run: |
+          shopt -s nullglob
+          for f in evidence/*.json; do
+            python scripts/hunt_close_keeps_localstorage.py --summarize "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true; else pkill -9 -f firefox > /dev/null 2>&1 || true; fi
+          echo done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: close-keeps-localstorage-${{ matrix.os }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 14
