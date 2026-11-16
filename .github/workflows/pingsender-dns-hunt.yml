@@ -14,6 +14,11 @@
 # watcher (scripts/hunt_pingsender_dns.py) that polls every 20 ms for a pingsender process and at first sight copies its profile's prefs.js,
 # reads its route and environment and follows its end; the tests' own start and end instants from a pytest plugin (scripts/hunt_testtimes.py,
 # `-p`, no test touched).
+# Attribution of EVERY native DNS query from the network side (root): bpftrace on udp_sendmsg/udpv6_sendmsg (instant, pid, tid, thread name,
+# local port of each datagram to port 53; fallback `ss -u -a -p` polling when it cannot attach), tcpdump (name asked, local port), joined on the
+# local port and the time; the watcher snapshots every process of the engine (type, parents, profile, birth, end), every profile (prefs, birth,
+# removal) and a wall-clock/monotonic anchor. "The table" prints one HUNTQ line per query (who, which session and test, with or without a launch
+# proxy, when against the close of the session and the birth and end of its sender) and a HUNTQSUM per arm.
 name: pingsender dns hunt
 on:
   push:
@@ -73,6 +78,9 @@ jobs:
           sudo apt-get install -y xvfb
           python -m pip install --quiet psutil "playwright==$(cat wcand/scripts/playwright_pin.txt)"
           sudo "$(which python)" -m playwright install-deps firefox
+      - name: bpftrace and tcpdump (the network side of the attribution)
+        continue-on-error: true
+        run: sudo apt-get install -y bpftrace tcpdump
       - name: The venv of the arm (cand - core 74018f83 from git and the wrapper of release/0.53.0 with its dev extra; pub - the published packages)
         run: |
           export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
@@ -123,6 +131,86 @@ jobs:
           set +e
           OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT/junit" "$OUT/moz" "$OUT/pytest" "$OUT/times"; chmod -R 777 "$OUT"
           : > "$OUT/watch.jsonl"; : > "$OUT/runs.jsonl"
+          # The network side (root): which process owns the socket that sends each DNS query. bpftrace on udp_sendmsg / udpv6_sendmsg gives, for every
+          # datagram to port 53, the instant (CLOCK_MONOTONIC ns; the watcher writes anchors that turn it into wall clock), pid (thread group), tid, thread
+          # name and the local port; tcpdump gives the name asked and the local port. The join is in "The table".
+          DNS="$OUT/dns"; mkdir -p "$DNS"; chmod 777 "$DNS"
+          cat > "$DNS/q.bt" <<'BT'
+          BEGIN { printf("B %llu start\n", nsecs); }
+          kprobe:udp_sendmsg, kprobe:udpv6_sendmsg
+          {
+            @sk[tid] = arg0;
+            @mh[tid] = arg1;
+            @t0[tid] = nsecs;
+          }
+          kretprobe:udp_sendmsg, kretprobe:udpv6_sendmsg
+          /@sk[tid] != 0/
+          {
+            $sk = (struct sock *)@sk[tid];
+            $m = (struct msghdr *)@mh[tid];
+            $dp = $sk->__sk_common.skc_dport;
+            $nm = (struct sockaddr_in *)$m->msg_name;
+            if ($nm != 0) { $dp = $nm->sin_port; }
+            if ($dp == 0x3500) {
+              printf("Q %llu %d %d %s %d 53\n", @t0[tid], pid, tid, comm, $sk->__sk_common.skc_num);
+            }
+            delete(@sk[tid]); delete(@mh[tid]); delete(@t0[tid]);
+          }
+          END { clear(@sk); clear(@mh); clear(@t0); }
+          BT
+          cat > "$DNS/q-simple.bt" <<'BT'
+          BEGIN { printf("B %llu start\n", nsecs); }
+          kprobe:udp_sendmsg, kprobe:udpv6_sendmsg
+          {
+            $sk = (struct sock *)arg0;
+            $m = (struct msghdr *)arg1;
+            $dp = $sk->__sk_common.skc_dport;
+            $nm = (struct sockaddr_in *)$m->msg_name;
+            if ($nm != 0) { $dp = $nm->sin_port; }
+            if ($dp == 0x3500) {
+              printf("Q %llu %d %d %s %d 53\n", nsecs, pid, tid, comm, $sk->__sk_common.skc_num);
+            }
+          }
+          BT
+          cat > "$DNS/x.bt" <<'BT'
+          BEGIN { printf("B %llu start\n", nsecs); }
+          tracepoint:syscalls:sys_enter_execve
+          {
+            printf("X %llu %d %d ", nsecs, pid, ((struct task_struct *)curtask)->real_parent->tgid);
+            join(args->argv);
+          }
+          BT
+          { uname -r; ls -l /sys/kernel/btf/vmlinux; sudo bpftrace --version; tcpdump --version 2>&1 | head -1; } > "$DNS/info.txt" 2>&1; cat "$DNS/info.txt"
+          BPF_OK=0; : > "$DNS/status.txt"
+          for variant in "q.bt:-B line" "q.bt:" "q-simple.bt:-B line" "q-simple.bt:"; do
+            f="${variant%%:*}"; opt="${variant#*:}"
+            if [ -n "$opt" ]; then
+              sudo bpftrace $opt "$DNS/$f" > "$DNS/bpf-q.log" 2> "$DNS/bpf-q.err" &
+            else
+              sudo stdbuf -oL bpftrace "$DNS/$f" > "$DNS/bpf-q.log" 2> "$DNS/bpf-q.err" &
+            fi
+            BPFPID=$!
+            for _ in $(seq 1 75); do
+              grep -q '^B ' "$DNS/bpf-q.log" 2>/dev/null && break
+              sudo kill -0 "$BPFPID" 2>/dev/null || break
+              sleep 0.2
+            done
+            if grep -q '^B ' "$DNS/bpf-q.log" 2>/dev/null; then BPF_OK=1; echo "bpf=attached script=$f opt='$opt'" >> "$DNS/status.txt"; break; fi
+            echo "bpf=not attached script=$f opt='$opt': $(head -c 300 "$DNS/bpf-q.err" | tr '\n' ' ')" >> "$DNS/status.txt"
+            sudo pkill -INT -x bpftrace; sleep 1
+          done
+          sudo bpftrace -B line "$DNS/x.bt" > "$DNS/bpf-x.log" 2> "$DNS/bpf-x.err" &
+          sleep 1
+          if grep -q '^B ' "$DNS/bpf-x.log" 2>/dev/null; then echo "exec trace=attached" >> "$DNS/status.txt"; else echo "exec trace=not attached: $(head -c 200 "$DNS/bpf-x.err" | tr '\n' ' ')" >> "$DNS/status.txt"; fi
+          sudo tcpdump -Z root -i any -n -tt -l -s 200 'udp port 53' > "$DNS/tcpdump.txt" 2> "$DNS/tcpdump.err" &
+          sudo tcpdump -Z root -i any -n -s 200 -U -w "$DNS/dns.pcap" 'port 53' 2> "$DNS/tcpdump-pcap.err" &
+          for _ in $(seq 1 25); do grep -q listening "$DNS/tcpdump.err" 2>/dev/null && break; sleep 0.2; done
+          if grep -q listening "$DNS/tcpdump.err" 2>/dev/null; then echo "tcpdump=listening" >> "$DNS/status.txt"; else echo "tcpdump=not listening: $(head -c 200 "$DNS/tcpdump.err" | tr '\n' ' ')" >> "$DNS/status.txt"; fi
+          if [ "$BPF_OK" != 1 ]; then
+            echo "FALLBACK: bpftrace did not attach; the owner of each socket comes from ss -u -a -p polling" >> "$DNS/status.txt"
+            sudo "$(which python)" scripts/hunt_pingsender_dns.py sockpoll "$DNS/ss.jsonl" > "$DNS/ss.out" 2>&1 &
+          fi
+          cat "$DNS/status.txt"
           sudo "$(which python)" scripts/hunt_pingsender_dns.py watch "$OUT/watch.jsonl" "$OUT/prefs" > "$OUT/watch.out" 2>&1 &
           sleep 2; cat "$OUT/watch.out"
           (ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null) || echo "no ss or netstat on this runner"
@@ -154,6 +242,10 @@ jobs:
             if [ "$SECONDS" -gt 5400 ]; then echo "time guard: no new run after $SECONDS s"; break; fi
             one_run "$i"
           done
+          sudo pkill -INT -x bpftrace > /dev/null 2>&1
+          sudo pkill -INT -x tcpdump > /dev/null 2>&1
+          sudo pkill -f "hunt_pingsender_dns.py sockpoll" > /dev/null 2>&1
+          sleep 2
           sudo pkill -TERM -f "hunt_pingsender_dns.py watch" > /dev/null 2>&1
           sleep 1
           true
@@ -298,6 +390,235 @@ jobs:
                       first = log_time(hits[0])
                       print("HUNTALLTEL %-4s run %d %s | %d lines | sender %s | first at %s ms (run t0 %s) | %s" % (run["arm"], run["i"], os.path.basename(fn), len(hits), pid_of(os.path.basename(fn)) in sender_pids,
                             first, run["t0"], hits[:2]))
+          # ===== Every native DNS query, attributed from the network side: who sent it, which session, when ============================================
+          # The kernel's view: bpftrace on udp_sendmsg/udpv6_sendmsg gives (instant, pid, tid, thread name, local port) of every datagram to port 53,
+          # tcpdump gives (instant, local port, name asked); they are joined on the local port and the time. The watcher's records give the process
+          # (type, parents, profile), the profile's session (prefs, birth, end), the sender of the session (birth, end). The tests' instants give the test.
+          import bisect
+          import time as _time
+          dns = out + "/dns"
+          def text_of(p):
+              try:
+                  return open(p, encoding="utf-8", errors="replace").read()
+              except OSError:
+                  return ""
+          status = text_of(dns + "/status.txt").strip().replace("\n", "; ") or "no status file"
+          anch = sorted((w["mono"], w["wall"]) for w in watch if w["event"] == "anchor")
+          anch_m = [a[0] for a in anch]
+          def wall_of(mono):
+              if not anch:
+                  return None
+              k = bisect.bisect_left(anch_m, mono)
+              k = min(range(max(0, k - 1), min(len(anch), k + 1)), key=lambda j: abs(anch[j][0] - mono))
+              return anch[k][1] + (mono - anch[k][0]) / 1e6
+          BQ = re.compile(r"^Q (\d+) (\d+) (\d+) (.*) (\d+) (\d+)\s*$")
+          BX = re.compile(r"^X (\d+) (\d+) (\d+) (.*)$")
+          owners, execs = [], collections.defaultdict(list)
+          for ln in text_of(dns + "/bpf-q.log").splitlines():
+              m = BQ.match(ln)
+              if m and wall_of(int(m.group(1))) is not None:
+                  owners.append({"t": wall_of(int(m.group(1))), "pid": int(m.group(2)), "tid": int(m.group(3)), "comm": m.group(4), "sport": int(m.group(5)), "src": "bpf"})
+          for ln in text_of(dns + "/bpf-x.log").splitlines():
+              m = BX.match(ln)
+              if m and wall_of(int(m.group(1))) is not None:
+                  execs[int(m.group(2))].append({"t": wall_of(int(m.group(1))), "ppid": int(m.group(3)), "argv": m.group(4)[:200]})
+          n_bpf = len(owners)
+          for w in jl(dns + "/ss.jsonl"):
+              if w.get("event") == "ssq":
+                  owners.append({"t": w["t"], "pid": w["pid"], "tid": None, "comm": w["comm"], "sport": w["sport"], "src": "ss"})
+          owners.sort(key=lambda o: o["t"])
+          by_sport = collections.defaultdict(list)
+          for o in owners:
+              by_sport[o["sport"]].append(o)
+          TD = re.compile(r"^(\d+\.\d+) (\S+)\s+(In|Out)\s+IP6? (\S+)\.(\d+) > (\S+)\.(\d+): (\d+)\S* (?:\[[^\]]*\] )?(\w+)\? (\S+) \((\d+)\)")
+          tq, unparsed, tcp_lines = [], [], 0
+          for ln in text_of(dns + "/tcpdump.txt").splitlines():
+              tcp_lines += 1
+              m = TD.match(ln)
+              if not m:
+                  if "?" in ln:
+                      unparsed.append(ln[:160])
+                  continue
+              if m.group(7) != "53":
+                  continue
+              tq.append({"t": float(m.group(1)) * 1000, "dir": m.group(3), "sport": int(m.group(5)), "dst": m.group(6), "txid": m.group(8), "qtype": m.group(9), "qname": m.group(10).rstrip(".")})
+          # The same datagram appears twice on lo with -i any (Out and In): one query.
+          tq.sort(key=lambda x: x["t"])
+          uniq = []
+          for x in tq:
+              if any(y["sport"] == x["sport"] and y["txid"] == x["txid"] and y["qname"] == x["qname"] and y["qtype"] == x["qtype"] and y["dst"] == x["dst"] and abs(y["t"] - x["t"]) < 20 for y in uniq[-12:]):
+                  continue
+              uniq.append(x)
+          used = set()
+          rows_q = []
+          for x in uniq:
+              best = None
+              for o in by_sport.get(x["sport"], []):
+                  if id(o) in used:
+                      continue
+                  d = abs(o["t"] - x["t"])
+                  if d <= 1500 and (best is None or d < best[0]):
+                      best = (d, o)
+              if best:
+                  used.add(id(best[1]))
+              rows_q.append((x, best[1] if best else None, best[0] if best else None))
+          for o in owners:
+              if id(o) not in used and o["src"] == "bpf":
+                  rows_q.append(({"t": o["t"], "sport": o["sport"], "dst": "?", "qtype": "?", "qname": "?(no tcpdump line)", "txid": "?"}, o, None))
+          rows_q.sort(key=lambda r: r[0]["t"])
+          # The watcher's records: processes (with their updates and ends), profiles (prefs, end), by pid and by profile.
+          PR = collections.defaultdict(list)
+          cur = {}
+          for w in watch:
+              ev = w["event"]
+              if ev == "proc":
+                  r = dict(w, end=None)
+                  PR[w["pid"]].append(r)
+                  cur[(w["pid"], w["born"])] = r
+              elif ev == "pupd" and (w["pid"], w["born"]) in cur:
+                  cur[(w["pid"], w["born"])].update(comm=w["comm"], ptype=w["ptype"], head=w["head"], tail=w["tail"])
+              elif ev == "pend" and (w["pid"], w["born"]) in cur:
+                  cur[(w["pid"], w["born"])]["end"] = w["ended"]
+          PF = {}
+          for w in watch:
+              if w["event"] == "prof":
+                  PF.setdefault(w["profile"], {"born": w["born"], "first": w["first"], "prefs": None, "gone": None})["prefs"] = w["prefs"]
+              elif w["event"] == "pgone" and w["profile"] in PF:
+                  PF[w["profile"]]["gone"] = w["t"]
+                  PF[w["profile"]]["gone_seen"] = True
+          by_prof = collections.defaultdict(list)
+          for pl in PR.values():
+              for r in pl:
+                  if r.get("profile"):
+                      by_prof[r["profile"]].append(r)
+          def find_proc(pid, t):
+              for r in PR.get(pid, []):
+                  if r["seen"] - 150 <= t and (r["end"] is None or t <= r["end"] + 150):
+                      return r
+              return None
+          def run_of(t):
+              return next((r for r in runs if r["t0"] <= t <= r["t1"] + 3000), None)
+          TT = {}
+          def tests_of(run):
+              if run["i"] in TT:
+                  return TT[run["i"]]
+              T = collections.OrderedDict()
+              for e in jl(run["times"]):
+                  t = T.setdefault(e["nodeid"], {"start": None, "finish": None})
+                  if e["event"] == "start":
+                      t["start"] = e["t"]
+                  elif e["event"] == "finish":
+                      t["finish"] = e["t"]
+              order = list(T)
+              for k, n in enumerate(order):
+                  if T[n]["finish"] is None:
+                      T[n]["finish"] = T[order[k + 1]]["start"] if k + 1 < len(order) else run["t1"]
+              TT[run["i"]] = (T, order)
+              return TT[run["i"]]
+          def test_of(t):
+              run = run_of(t)
+              if not run:
+                  return None
+              T, order = tests_of(run)
+              for n in order:
+                  if T[n]["start"] is not None and T[n]["start"] <= t <= (T[n]["finish"] or 0) + 2:
+                      return n
+              return None
+          def proxy_of(prof, procs):
+              pf = (PF.get(prof) or {}).get("prefs")
+              routes = [r.get("route_proxy") for r in procs if r.get("route_present")]
+              if pf is None and not routes:
+                  return "?", "no prefs, no route"
+              ctx = (pf or {}).get("network.trr.stealth.contexts")
+              ptp = (pf or {}).get("network.proxy.type")
+              yes = ctx not in (None, '""', "") or any(routes) or ptp == "1"
+              return ("yes" if yes else "no"), "ctx=%s proxytype=%s route=%s" % (ctx, ptp, routes[:1] or "-")
+          def sess_of(prof):
+              """The session of a profile: its test (the one running when it was born), its close (the main browser's end, else the directory's), its senders."""
+              pl = by_prof.get(prof, [])
+              mains = sorted((r for r in pl if r["ptype"] == "main"), key=lambda r: r["seen"])
+              close = mains[0]["end"] if mains else None
+              close_src = "main browser exit" if close is not None else None
+              if close is None and (PF.get(prof) or {}).get("gone"):
+                  close, close_src = PF[prof]["gone"], "profile dir removed"
+              born = (PF.get(prof) or {}).get("born") or (mains[0]["seen"] if mains else None)
+              proxy, why = proxy_of(prof, pl)
+              return {"test": test_of(born) if born else None, "born": born, "close": close, "close_src": close_src, "proxy": proxy, "why": why,
+                      "senders": sorted((r for r in pl if r["ptype"] == "pingsender"), key=lambda r: r["seen"]), "main": mains[0] if mains else None}
+          SESS = {}
+          def sess(prof):
+              if prof not in SESS:
+                  SESS[prof] = sess_of(prof)
+              return SESS[prof]
+          def rel(v):
+              return "none" if v is None else "%+d" % round(v)
+          hq_rows = []
+          for x, o, dj in rows_q:
+              t = x["t"]
+              run = run_of(t)
+              row = {"arm": arm, "run": run["i"] if run else None, "t": round(t, 1), "hhmmss": _time.strftime("%H:%M:%S", _time.gmtime(t / 1000)) + ".%03d" % (t % 1000),
+                     "qname": x["qname"], "qtype": x["qtype"], "dst": x["dst"], "sport": x["sport"], "pid": o["pid"] if o else None, "tid": o["tid"] if o else None,
+                     "comm": o["comm"] if o else None, "owner_src": o["src"] if o else None, "join_dt_ms": round(dj) if dj is not None else None}
+              pr = find_proc(o["pid"], t) if o else None
+              row["proc_found"] = bool(pr)
+              if pr:
+                  row["ptype"], row["pcomm"], row["ppid"] = pr["ptype"], pr["comm"], pr["ppid"]
+                  row["chain"] = [(c["pid"], c["ptype"]) for c in pr.get("chain", [])[:4]]
+                  row["head"] = pr.get("head")
+                  row["tail"] = pr.get("tail")
+                  row["alive_ms"] = round(t - pr["seen"])
+                  row["profile"] = pr.get("profile")
+              elif o and execs.get(o["pid"]):
+                  ex = execs[o["pid"]][-1]
+                  row["ptype"] = "unseen-by-watcher:" + os.path.basename(ex["argv"].split(" ")[0])
+                  row["argv"] = ex["argv"][:120]
+                  row["profile"] = None
+              elif o:
+                  row["ptype"] = "other:" + (o["comm"] or "?")
+                  row["profile"] = None
+              else:
+                  row["ptype"] = "unattributed"
+                  row["profile"] = None
+              S = sess(row["profile"]) if row["profile"] else None
+              row["session_test"] = S["test"] if S else None
+              row["launch_proxy"] = S["proxy"] if S else "n/a"
+              row["proxy_signals"] = S["why"] if S else None
+              row["test_at"] = test_of(t)
+              row["since_close_ms"] = round(t - S["close"]) if S and S["close"] is not None else None
+              row["close_src"] = S["close_src"] if S else None
+              snd = []
+              if S:
+                  for s in S["senders"][:3]:
+                      snd.append({"pid": s["pid"], "born": round(t - s["seen"]), "end": round(t - s["end"]) if s["end"] is not None else None, "self": bool(pr and s is pr)})
+              row["senders"] = snd
+              row["phase"] = "nosession" if not S else ("session-open-at-end" if S["close"] is None else ("before_close" if t < S["close"] else "after_close"))
+              hq_rows.append(row)
+          with open(out + "/huntq.jsonl", "w", encoding="utf-8") as f:
+              for r in hq_rows:
+                  f.write(json.dumps(r, default=str) + "\n")
+          print("HUNTQDIAG %-4s status [%s] | bpf datagrams to :53 %d, ss records %d, exec records %d | tcpdump lines %d, queries %d (unparsed %d) | rows %d, with a pid %d, process known to the watcher %d, no pid %d, bpf datagram without a tcpdump line %d | anchors %d | sample unparsed %s"
+                % (arm, status, n_bpf, len(owners) - n_bpf, sum(len(v) for v in execs.values()), tcp_lines, len(uniq), len(unparsed), len(hq_rows), sum(1 for r in hq_rows if r["pid"]),
+                   sum(1 for r in hq_rows if r["proc_found"]), sum(1 for r in hq_rows if not r["pid"]), sum(1 for r in hq_rows if r["qname"].startswith("?")), len(anch), unparsed[:2]))
+          def fmt(r):
+              sn = ",".join("%d%s:b%s/e%s" % (s["pid"], "[self]" if s["self"] else "", "%+d" % s["born"], rel(s["end"])) for s in r["senders"]) or "none"
+              return ("HUNTQ arm=%s run=%s t=%.0f at=%s qname=%s qtype=%s sport=%s pid=%s tid=%s thread=\"%s\" type=%s comm=\"%s\" chain=%s profile=%s session_test=%s launch_proxy=%s [%s] test_running=%s since_close_ms=%s (%s) phase=%s senders(pid:ms_from_birth/ms_from_end)=%s src=%s"
+                      % (r["arm"], r["run"], r["t"], r["hhmmss"], r["qname"], r["qtype"], r["sport"], r["pid"], r["tid"], r["comm"], r["ptype"], r.get("pcomm"), r.get("chain"),
+                         os.path.basename(r["profile"]) if r["profile"] else None, short(r["session_test"] or "?") if r["session_test"] or r["profile"] else None, r["launch_proxy"], r["proxy_signals"],
+                         short(r["test_at"] or "?"), rel(r["since_close_ms"]), r["close_src"], r["phase"], sn, r["owner_src"]))
+          tel_rows = [r for r in hq_rows if r["qname"].rstrip(".") == TEL]
+          other_rows = [r for r in hq_rows if r["qname"].rstrip(".") != TEL]
+          for r in tel_rows:
+              print(fmt(r))
+          for r in other_rows[:150]:
+              print(fmt(r))
+          if len(other_rows) > 150:
+              print("HUNTQMORE %-4s %d more queries of other names in huntq.jsonl (uploaded)" % (arm, len(other_rows) - 150))
+          cnt_sum = collections.Counter((r["qname"], r["ptype"], r["launch_proxy"], r["phase"]) for r in hq_rows)
+          print("HUNTQSUM %-4s total %d (telemetry host %d) | by (qname, process type, session launch proxy, before/after close): %s"
+                % (arm, len(hq_rows), len(tel_rows), "; ".join("(%s, %s, proxy=%s, %s)=%d" % (k[0], k[1], k[2], k[3], v) for k, v in cnt_sum.most_common(80))))
+          cnt_run = collections.Counter((r["run"], r["ptype"]) for r in tel_rows)
+          print("HUNTQTEL %-4s telemetry-host queries by (run, type): %s | sessions of those with a launch proxy %d, without %d, unknown %d"
+                % (arm, dict(cnt_run), sum(1 for r in tel_rows if r["launch_proxy"] == "yes"), sum(1 for r in tel_rows if r["launch_proxy"] == "no"), sum(1 for r in tel_rows if r["launch_proxy"] not in ("yes", "no"))))
           PY
       - name: Readable outputs (written as root under sudo)
         if: always()
@@ -316,3 +637,5 @@ jobs:
             ${{ runner.temp }}/out/pytest
             ${{ runner.temp }}/out/prefs
             ${{ runner.temp }}/out/sender-logs
+            ${{ runner.temp }}/out/dns
+            ${{ runner.temp }}/out/huntq.jsonl
