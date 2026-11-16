@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import psutil
 
@@ -295,65 +296,79 @@ def anchor(out):
 
 
 def watch(out, prefs_dir):
+    state = {"live": {}, "procs": {}, "ignore": set(), "last_anchor": 0.0}
+    profiles = Profiles(out)
     os.makedirs(prefs_dir, exist_ok=True)
-    live, procs, ignore, profiles = {}, {}, set(), Profiles(out)
-    last_anchor = 0.0
     anchor(out)
     print("watching the engine's processes under %s (pingsender senders in full)" % ENGINE, flush=True)
     while True:
-        now = now_ms()
-        if now - last_anchor > 2000:
-            anchor(out)
-            last_anchor = now
         try:
-            pids = set(psutil.pids())
-        except psutil.Error:
-            pids = set()
-        # Ends, and the one second look at the comm and the command line a child sets after it starts.
-        for pid in list(live):
-            r, p = live[pid], procs[pid]
-            try:
-                gone = pid not in pids or not p.is_running() or p.status() == psutil.STATUS_ZOMBIE
-            except psutil.Error:
-                gone = True
-            if gone:
-                emit(out, {"event": "pend", "pid": pid, "born": r["born"], "ended": round(now_ms(), 1)})
-                del live[pid], procs[pid]
-            elif not r.get("refreshed") and now - r["seen"] > 500:
-                r["refreshed"] = True
-                try:
-                    cmd, comm = p.cmdline(), p.name()
-                    ptype = classify(cmd, comm)
-                except psutil.Error:
-                    continue
-                if comm != r["comm"] or ptype != r["ptype"]:
-                    r["comm"], r["ptype"] = comm, ptype
-                    emit(out, {"event": "pupd", "pid": pid, "born": r["born"], "comm": comm, "ptype": ptype, "head": brief(cmd[:6]), "tail": brief(cmd[-3:])})
-        ignore &= pids
-        # New engine processes, parents first (a child's profile is its parent's).
-        for pid in sorted(pids - set(live) - ignore):
-            try:
-                p = psutil.Process(pid)
-                exe = p.exe()
-                age = now / 1000 - p.create_time()
-            except psutil.Error:
-                continue
-            if not exe.startswith(ENGINE):
-                # A process between fork and exec still shows its parent's exe: look again for a second before dismissing it.
-                if age > 1.0:
-                    ignore.add(pid)
-                continue
-            try:
-                rec, cmd = snapshot(p, live)
-            except psutil.Error:
-                continue
-            live[pid], procs[pid] = rec, p
-            profiles.see(rec["profile"], rec["born"])
-            emit(out, rec)
-            if rec["ptype"] == "pingsender":
-                capture_sender(p, cmd, out, prefs_dir)
-        profiles.poll(now_ms())
+            sweep(out, prefs_dir, state, profiles)
+        except Exception:
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
         time.sleep(0.02)
+
+
+def sweep(out, prefs_dir, state, profiles):
+    """One pass of the watcher (the state outlives it): ends, the second look, the new engine processes, the profiles."""
+    live, procs, ignore = state["live"], state["procs"], state["ignore"]
+    now = now_ms()
+    if now - state["last_anchor"] > 2000:
+        anchor(out)
+        state["last_anchor"] = now
+    try:
+        pids = set(psutil.pids())
+    except psutil.Error:
+        pids = set()
+    # Ends, and the one look at the comm and the command line a child sets after it starts.
+    for pid in list(live):
+        r, p = live[pid], procs[pid]
+        try:
+            gone = pid not in pids or not p.is_running() or p.status() == psutil.STATUS_ZOMBIE
+        except psutil.Error:
+            gone = True
+        if gone:
+            emit(out, {"event": "pend", "pid": pid, "born": r["born"], "ended": round(now_ms(), 1)})
+            del live[pid], procs[pid]
+        elif not r.get("refreshed") and now - r["seen"] > 500:
+            r["refreshed"] = True
+            try:
+                cmd, comm = p.cmdline(), p.name()
+                ptype = classify(cmd, comm)
+            except psutil.Error:
+                continue
+            if comm != r["comm"] or ptype != r["ptype"]:
+                r["comm"], r["ptype"] = comm, ptype
+                emit(out, {"event": "pupd", "pid": pid, "born": r["born"], "comm": comm, "ptype": ptype, "head": brief(cmd[:6]), "tail": brief(cmd[-3:])})
+    ignore &= pids
+    # New engine processes, parents first (a child's profile is its parent's).
+    for pid in sorted(pids - set(live) - ignore):
+        try:
+            p = psutil.Process(pid)
+            exe = p.exe()
+            age = now / 1000 - p.create_time()
+        except psutil.Error:
+            continue
+        if not exe.startswith(ENGINE):
+            # A process between fork and exec still shows its parent's exe: look again for a second before dismissing it.
+            if age > 1.0:
+                ignore.add(pid)
+            continue
+        try:
+            rec, cmd = snapshot(p, live)
+        except psutil.Error:
+            continue
+        live[pid], procs[pid] = rec, p
+        profiles.see(rec["profile"], rec["born"])
+        emit(out, rec)
+        if rec["ptype"] == "pingsender":
+            try:
+                capture_sender(p, cmd, out, prefs_dir)
+            except psutil.Error:
+                pass
+    profiles.poll(now_ms())
 
 
 SS_RE = re.compile(r"^\S+\s+\d+\s+\d+\s+(\S+):(\d+)\s+(\S+):(\d+)\s+users:\(\((.*)\)\)\s*$")

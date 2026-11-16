@@ -664,7 +664,7 @@ jobs:
                           kind = "native"
                       elif hit and "lookup completed" in msg:
                           kind = "native-done"
-                      elif hit and mod == "TRR":
+                      elif hit and (mod == "TRR" or "TRR Resolve" in msg or "TRR::SendHTTPRequest" in msg or "TRRQuery" in msg or "TrrLookup" in msg):
                           kind = "trr"
                       elif hit:
                           kind = "resolver"
