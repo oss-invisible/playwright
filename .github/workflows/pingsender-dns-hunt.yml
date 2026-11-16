@@ -281,7 +281,27 @@ jobs:
                    sum(1 for r in ss if r["route"]), q([s.get("prefs_copy_mtime_vs_birth_ms") for s in seen], .5)))
           for r in [r for r in ss if r["lookup_lines"]][:8]:
               print("HUNTCROSSSENDER %-4s pid %s %s | owner %s | born in %s | asked in %s | log %s" % (arm, r["pid"], r["kind"], short(r["owner"] or "?"), short(r["born_test"] or "?"), short(r["lookup_test"] or "?"), r["sample"]))
+          # Every log file of every process, not only the senders': which pids wrote one, and which name the telemetry host, when, in which test.
+          sender_pids = {s["pid"] for s in seen}
+          for run in runs:
+              files = sorted(glob.glob(run["logd"] + "/*"))
+              names = [os.path.basename(f) for f in files]
+              pid_of = lambda b: int(re.search(r"ff-(\d+)", b).group(1)) if re.search(r"ff-(\d+)", b) else None
+              print("HUNTALLLOGS %-4s run %d | files %d | names %s | of a seen sender pid %d | sizes p50 %s" % (run["arm"], run["i"], len(files), names[:6], sum(1 for b in names if pid_of(b) in sender_pids),
+                    q([os.path.getsize(f) for f in files], .5)))
+              for fn in files:
+                  hits = []
+                  for ln in open(fn, encoding="utf-8", errors="replace"):
+                      if TEL in ln:
+                          hits.append(ln.rstrip()[:200])
+                  if hits:
+                      first = log_time(hits[0])
+                      print("HUNTALLTEL %-4s run %d %s | %d lines | sender %s | first at %s ms (run t0 %s) | %s" % (run["arm"], run["i"], os.path.basename(fn), len(hits), pid_of(os.path.basename(fn)) in sender_pids,
+                            first, run["t0"], hits[:2]))
           PY
+      - name: Readable outputs (written as root under sudo)
+        if: always()
+        run: sudo chmod -R a+rX "$RUNNER_TEMP/out" || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
