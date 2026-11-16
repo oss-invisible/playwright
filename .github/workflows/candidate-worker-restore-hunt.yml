@@ -1,0 +1,141 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# candidate-worker-restore-hunt.yml - a MEASUREMENT, not a gate: after a page is restored from
+# the back-forward cache, is the restored worker told ended (Page.workerDestroyed) and is it
+# alive when it is? (scripts/hunt_worker_after_restore.py), on the binary of an ENGINE
+# CANDIDATE and not on the published one, on Linux and on Windows. The expected result is 0
+# workerDestroyed after the restore.
+#
+# The candidate is named by two files of this branch, written when the hunt is launched:
+#   ci/candidate-run.txt        the id of the candidate's run of `release` in oss-invisible/firefox_antidetect_patch
+#   ci/candidate-core-ref.txt   the core_ref that run was gated with
+# Both say TODO until then, and the first step of every job refuses TODO. The binary is the
+# artifact asset-<leg> of that run, extracted as the gate of the candidate does and sealed
+# as firefox-N-candidate (scripts/hunt_candidate_binary.py says how).
+#
+# Per system, two shards (a runner each) of four processes at once (the load of xdist), each
+# process 19 repetitions of five scenarios: 152 repetitions of each scenario per system. Four of
+# the scenarios go away to ANOTHER SITE and come back (with site isolation on, the page's process
+# changes there: a.test -> c.test), so a system gives 608 restores with a process switch; the
+# fifth, a same-site away, is the control. Nothing is asserted; the records are the artifact and
+# the line HUNTTOTAL of each shard counts the restores with a process switch and the workers
+# told ended after them.
+#
+# It runs on a push to its own branch only.
+# ─────────────────────────────────────────────────────────────────────────────
+name: candidate-worker-restore-hunt
+
+on:
+  push:
+    branches: [hunt/candidate-worker-restore]
+
+permissions:
+  contents: read
+  actions: read
+
+# A hunt has a group of its own, unique to the run: a newer push never cancels
+# a measurement that is half done (tests/test_ci_runs_once_per_commit.py).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  # reads the artifacts and the log of the candidate's run (the engine repository is public)
+  GH_TOKEN: ${{ github.token }}
+  GITHUB_TOKEN: ${{ github.token }}
+  # the core of the candidate, not the one the wrapper pins: the pair is mismatched on purpose, as the gate of the candidate runs it
+  INVISIBLE_CORE_PIN: allow
+  INVISIBLE_CORE_AUTOFIX: "off"
+
+jobs:
+  worker-restore:
+    name: candidate-worker-restore (${{ matrix.system }}, shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - { system: linux,   runner: ubuntu-24.04, leg: linux-x86_64, shard: 1 }
+          - { system: linux,   runner: ubuntu-24.04, leg: linux-x86_64, shard: 2 }
+          - { system: windows, runner: windows-2022, leg: win-x86_64,   shard: 1 }
+          - { system: windows, runner: windows-2022, leg: win-x86_64,   shard: 2 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      # TODO in either file ends the job here, in seconds, with the reason.
+      - name: The candidate is named (ci/candidate-run.txt, ci/candidate-core-ref.txt)
+        run: python scripts/hunt_candidate_binary.py check
+      - name: Install the core of the candidate, the wrapper and the test deps
+        run: |
+          set -e
+          CORE_GIT="git+https://github.com/oss-invisible/core@$(python scripts/hunt_candidate_binary.py core-ref)"
+          python -m pip install --upgrade pip
+          python -m pip install --quiet "$CORE_GIT"
+          python -m pip install --quiet ".[dev]"
+          python -m pip install --quiet --force-reinstall "$CORE_GIT"
+          python -m pip install --quiet "playwright==$(cat scripts/playwright_pin.txt)"
+          python scripts/hunt_candidate_binary.py verify-core
+      - name: System deps (xvfb + Firefox runtime libs)
+        if: matrix.system == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The binary of the candidate (asset-${{ matrix.leg }}), sealed
+        run: python scripts/hunt_candidate_binary.py fetch --leg ${{ matrix.leg }} --dest "$RUNNER_TEMP/candidate"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build --pin ci/geoip.json
+      - name: The same scenarios, 19 repetitions in each of 4 processes (76 per scenario and shard)
+        timeout-minutes: 50
+        env:
+          PYTHONUNBUFFERED: "1"
+          MOZ_CRASHREPORTER_DISABLE: "1"
+        run: |
+          set +e +o pipefail
+          mkdir -p hunt-out
+          cp "$RUNNER_TEMP/candidate/candidate.json" hunt-out/
+          export SCEN="top-other-site-location:plain,top-other-site-location:pinger,top-other-site-goto:plain,oop-frame-other-site-location:plain,top-same-site-location:plain"
+          cat > hunt-out/run4.sh <<'EOF'
+          for p in 1 2 3 4; do
+            python -u scripts/hunt_worker_after_restore.py "$FF" --out "hunt-out/part-$p.json" --reps 19 --proc $p \
+              --deadline-minutes 40 --scenarios "$SCEN" > "hunt-out/part-$p.log" 2>&1 &
+          done
+          wait
+          EOF
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a bash hunt-out/run4.sh; else bash hunt-out/run4.sh; fi
+          cat hunt-out/part-*.log | grep -E "^HUNTROW" | cut -c1-260
+          python scripts/hunt_worker_after_restore.py --summarize hunt-out/part-*.json --summary-out "hunt-out/summary-$RUNNER_OS-${{ matrix.shard }}.json" | tee hunt-out/summary.txt
+          python -c "import glob,json;print('SEAL', [m.get('seal_tag') for m in json.load(open(glob.glob('hunt-out/summary-*.json')[0]))['metas']])"
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo pkill -9 -f firefox || true; else taskkill //F //IM firefox.exe //T 2>/dev/null || true; fi
+          echo done
+      - name: Upload the records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-worker-restore-${{ matrix.system }}-shard-${{ matrix.shard }}-${{ github.run_id }}
+          path: hunt-out/
+          if-no-files-found: warn
+          retention-days: 14
+      # The verdict is only that the sample is there: a workerDestroyed is what the hunt is for.
+      - name: Verdict (at least 300 restores with a process switch in this shard, 600 in the two)
+        if: always()
+        run: |
+          python - <<'PY'
+          import glob, json, sys
+          files = glob.glob("hunt-out/summary-*.json")
+          if not files:
+              sys.exit("no summary was written")
+          totals = json.load(open(files[0], encoding="utf-8"))["totals"]
+          print(totals)
+          if totals["restores_with_process_switch"] < 300:
+              sys.exit("only %d restores with a process switch in this shard (300 are wanted)" % totals["restores_with_process_switch"])
+          PY
