@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -666,6 +667,7 @@ def serve_one(binary):
 # ---- the shutdown arms (shut20 / shut70 / shut180): one browser per process, its output kept with the time of each line --------------
 #: (wall ms, text) of every line the engine printed, recorded by the replacement of ProcessOutput._pump (HUNT_SHUT=1).
 ENGINE_LINES = []
+ENGINE_LINES_BY = {}
 #: Pids of the processes the core spawned (Connection.__init__'s `process`), and the engine's tree at the close.
 ENGINE_PIDS = []
 TREE_PIDS = []
@@ -686,10 +688,13 @@ def install_output_capture():
         return
 
     def _pump(self) -> None:
+        mine = ENGINE_LINES_BY.setdefault(id(self), [])       # this engine's lines (id of its ProcessOutput = id(conn.output))
         try:
             for raw in iter(self._stream.readline, b""):
                 text = raw.decode("utf-8", "replace").rstrip("\r\n")
-                ENGINE_LINES.append((time.time() * 1000, text))
+                stamped = (time.time() * 1000, text)
+                ENGINE_LINES.append(stamped)
+                mine.append(stamped)
                 with self._cv:
                     if text.strip():
                         self._lines.append(text)
@@ -755,6 +760,10 @@ class ExitWatch(threading.Thread):
             time.sleep(0.01)
 
 
+_ADD_RE = re.compile(r"Adding blocker (.+) for phase (\S+)")
+_DONE_RE = re.compile(r"Completed blocker (.+) for phase (\S+)")
+
+
 def shut_report(lines, t_close, main_gone=None, tree_gone=None):
     """From the lines of an engine's output (wall ms, text), the close's start (wall ms) and when its main process and its whole tree
     were gone: (a) the close -> the quit (the first "Starting phase" line after the close: AsyncShutdown, with its log on, prints
@@ -768,6 +777,21 @@ def shut_report(lines, t_close, main_gone=None, tree_gone=None):
            "b_quit_to_tree_gone_ms": round(tree_gone - quit_t, 1) if quit_t and tree_gone else None,
            "c_main_to_tree_gone_ms": round(tree_gone - main_gone, 1) if main_gone and tree_gone else None,
            "shut_lines": len(lines)}
+    # What the engine was in when it exited: the last phase/blocker line before the parent's exit, and the blockers added and not
+    # completed by then.
+    upto = [(t, x) for t, x in lines if t <= (main_gone or float("inf"))]
+    last = next(((t, x) for t, x in reversed(upto) if t >= t_close and ("phase" in x or "blocker" in x)), None)
+    out["last_phase_line"] = last[1][:160] if last else None
+    out["last_phase_line_ms"] = round(last[0] - t_close, 1) if last else None
+    added, done = {}, set()
+    for _t, x in upto:
+        m = _ADD_RE.search(x)
+        if m:
+            added[(m.group(2), m.group(1))] = True
+        m = _DONE_RE.search(x)
+        if m:
+            done.add((m.group(2), m.group(1)))
+    out["pending_blockers"] = ["%s / %s" % (ph, nm[:50]) for (ph, nm) in added if (ph, nm) not in done][:12]
     after = [(t, x) for t, x in lines if t >= t_close and SHUT_RE.search(x)][:160]
     before = [(t, x) for t, x in lines if t < t_close and "Adding blocker" in x][:80]
     shown = [(round(t - t_close, 1), round(t - quit_t, 1) if quit_t else None, x) for t, x in before + after]
@@ -787,20 +811,23 @@ class CloseRec:
     seen by the core's reader (the empty os.read, then the release of the read end), the real parent's exit (the process the core
     spawned), Connection.close returning, the user's close() returning, the reaper finished (after, joined outside the timing)."""
     __slots__ = ("conn", "pid", "mapped", "t_call", "t_entry", "t_pipe", "t_eof", "t_reader_end", "t_parent", "t_conn_return",
-                 "t_return", "t_reaper", "reaper_finished")
+                 "t_return", "t_reaper", "reaper_finished", "wall_call", "wall_parent", "parent_gone_before")
 
     def __init__(self, conn, mapped):
         self.conn, self.mapped = conn, mapped
         self.pid = getattr(getattr(conn, "_process", None), "pid", None)
         self.t_call = self.t_entry = self.t_pipe = self.t_eof = self.t_reader_end = self.t_parent = None
         self.t_conn_return = self.t_return = self.t_reaper = self.reaper_finished = None
+        self.wall_call = self.wall_parent = None
+        self.parent_gone_before = False
 
     def fields(self):
         def ms(t):
             return round((t - self.t_call) * 1000, 1) if t is not None and self.t_call is not None else None
         return {"nc_entry": ms(self.t_entry), "nc_pipe": ms(self.t_pipe), "nc_eof": ms(self.t_eof), "nc_reader_end": ms(self.t_reader_end),
                 "nc_parent": ms(self.t_parent), "nc_conn_return": ms(self.t_conn_return), "nc_return": ms(self.t_return),
-                "nc_reaper": ms(self.t_reaper), "nc_reaper_finished": self.reaper_finished, "nc_mapped": self.mapped, "nc_pid": self.pid}
+                "nc_reaper": ms(self.t_reaper), "nc_reaper_finished": self.reaper_finished, "nc_mapped": self.mapped, "nc_pid": self.pid,
+                "nc_parent_gone_before_close": self.parent_gone_before}
 
 
 def install_close_stamps():
@@ -865,6 +892,13 @@ def install_close_stamps():
             mine = rec is not None and rec.t_entry is None
             if mine:
                 rec.t_entry = pc()
+            if os.environ.get("HUNT_CLOSE_TIMEOUT"):
+                # The core's own deadline is 5.0 s (the default of `timeout`, also what aclose passes): raised in this hunt only.
+                wide = float(os.environ["HUNT_CLOSE_TIMEOUT"])
+                if a and a[0] == 5.0:
+                    a = (wide,) + tuple(a[1:])
+                elif not a and k.get("timeout", 5.0) == 5.0:
+                    k["timeout"] = wide
             try:
                 return real_close_m(self, *a, **k)
             finally:
@@ -887,7 +921,8 @@ def find_conn(browser):
     """The core Connection of a browser: through the client's connection -> transport -> server -> its browser object, else the first
     connection nobody has claimed (exact for one browser per process)."""
     try:
-        for obj in list(browser._connection._transport._server._objects.values()):
+        impl = getattr(browser, "_impl_obj", browser)        # the public Browser wraps the impl, which owns the connection
+        for obj in list(impl._connection._transport._server._objects.values()):
             c = getattr(obj, "conn", None)
             if c is not None and type(c).__name__ == "Connection":
                 return c, "server"
@@ -905,7 +940,13 @@ class ParentWatch(threading.Thread):
     def __init__(self, rec):
         super().__init__(daemon=True, name="hunt-parentwatch")
         self.rec = rec
-        self.proc = psutil.Process(rec.pid) if rec.pid else None
+        # A psutil race (the process gone before it is looked at) is a fact about that browser, never a crash of its row.
+        try:
+            self.proc = psutil.Process(rec.pid) if rec.pid else None
+        except psutil.Error:
+            self.proc = None
+            rec.t_parent = time.perf_counter()
+            rec.parent_gone_before = True
 
     def run(self):
         if self.proc is None:
@@ -914,8 +955,123 @@ class ParentWatch(threading.Thread):
         while time.monotonic() < stop:
             if not ExitWatch.alive(self.proc):
                 self.rec.t_parent = time.perf_counter()
+                self.rec.wall_parent = time.time() * 1000
                 return
             time.sleep(0.005)
+
+
+class TreeWatch(threading.Thread):
+    """At the close instant (the snapshot is taken in the constructor, before the close is asked for): the process tree of one browser
+    by type (parent, tab, gpu, rdd, socket, utility, ...), then every 20 ms the CPU seconds of each process until it exits. The CPU of
+    the tree between the close and the parent's exit, and between the close and the last process gone, is the sum over its processes
+    of the last CPU read minus the first (an exited process keeps its last read: at most 20 ms lost)."""
+
+    def __init__(self, main_pid):
+        super().__init__(daemon=True, name="hunt-treewatch")
+        self.main_pid = main_pid
+        self.procs = {}          # pid -> [Process, type, first cpu, last cpu, alive]
+        self.wall_parent = self.wall_gone = None
+        self.cpu_to_parent = self.cpu_to_gone = None
+        try:
+            main = psutil.Process(main_pid)
+            for p in [main] + main.children(recursive=True):
+                self._add(p)
+        except psutil.Error:
+            pass
+
+    def _add(self, p):
+        try:
+            kind = proc_kind(p)
+            t = p.cpu_times()
+            c = t.user + t.system
+            self.procs[p.pid] = [p, kind[3:] if kind.startswith("ff:") else kind, c, c, True]
+        except psutil.Error:
+            pass
+
+    def _cpu(self):
+        return sum(v[3] - v[2] for v in list(self.procs.values()))
+
+    def run(self):
+        stop = time.monotonic() + 120
+        tick = 0
+        while time.monotonic() < stop:
+            tick += 1
+            for pid, v in list(self.procs.items()):
+                if not v[4]:
+                    continue
+                try:
+                    if not ExitWatch.alive(v[0]):
+                        v[4] = False
+                        continue
+                    t = v[0].cpu_times()
+                    v[3] = t.user + t.system
+                except psutil.Error:
+                    v[4] = False
+            now = time.time() * 1000
+            main = self.procs.get(self.main_pid)
+            if self.wall_parent is None and (main is None or not main[4]):
+                self.wall_parent, self.cpu_to_parent = now, self._cpu()
+            if tick % 5 == 0 and main is not None and main[4]:
+                try:
+                    for c in main[0].children(recursive=True):
+                        if c.pid not in self.procs:
+                            self._add(c)
+                except psutil.Error:
+                    pass
+            if not any(v[4] for v in list(self.procs.values())):
+                self.wall_gone, self.cpu_to_gone = now, self._cpu()
+                if self.wall_parent is None:
+                    self.wall_parent, self.cpu_to_parent = now, self.cpu_to_gone
+                return
+            time.sleep(0.02)
+
+    def fields(self):
+        types = {}
+        for v in list(self.procs.values()):
+            types[v[1]] = types.get(v[1], 0) + 1
+        return {"tree_types": types, "tree_procs": len(self.procs),
+                "tree_cpu_to_parent_exit_s": round(self.cpu_to_parent, 3) if self.cpu_to_parent is not None else None,
+                "tree_cpu_to_tree_gone_s": round(self.cpu_to_gone, 3) if self.cpu_to_gone is not None else None}
+
+
+#: tag -> "open" / "closing" / "closed" / "close-failed" of every browser this process launched.
+OPEN_BROWSERS = {}
+ARM_CTX = {"arm": None, "round": None}
+
+
+def print_alive(why, daemons=True):
+    """Every live thread (name, daemon flag, its Python stack) and the browsers whose close() was not completed."""
+    frames = sys._current_frames()
+    for t in threading.enumerate():
+        if t.daemon and not daemons:
+            continue
+        fr = frames.get(t.ident)
+        stack = []
+        if fr is not None:
+            stack = ["%s:%d %s" % (f.filename.replace("\\", "/").rsplit("/", 2)[-1], f.lineno, f.name) for f in traceback.extract_stack(fr)[-8:]]
+        print("HUNTALIVE " + json.dumps({**ARM_CTX, "why": why, "os": sys.platform, "thread": t.name, "daemon": t.daemon,
+                                         "main": t is threading.main_thread(), "stack": stack}), flush=True)
+    print("HUNTALIVE " + json.dumps({**ARM_CTX, "why": why, "os": sys.platform, "browsers": dict(OPEN_BROWSERS),
+                                     "not_closed": [k for k, v in OPEN_BROWSERS.items() if v != "closed"]}), flush=True)
+
+
+def start_alive_watchdog():
+    """30 s before the arm's limit (HUNT_LIMIT_S, set by the workflow) every live thread is printed; faulthandler writes the stacks of
+    all threads to a file beside the pid file 5 s before it, as a fallback should this thread not get to run."""
+    limit = float(os.environ.get("HUNT_LIMIT_S") or 0)
+    if limit <= 40:
+        return
+    t = threading.Timer(limit - 30, print_alive, args=("30s-before-the-limit",))
+    t.daemon = True
+    t.start()
+    if os.environ.get("HUNT_PIDFILE"):
+        import faulthandler
+        global _FAULT_FILE
+        _FAULT_FILE = open(os.environ["HUNT_PIDFILE"] + ".fault", "w")
+        faulthandler.dump_traceback_later(limit - 5, file=_FAULT_FILE)
+
+
+_FAULT_FILE = None
 
 
 def is_bg(arg):
@@ -1037,18 +1193,22 @@ def print_shut(arm, rnd, tag, shown):
                                         "line": text[:160]}), flush=True)
 
 
+SV_OF = {}
+
+
 async def one_browser(arm, binary, port, tag):
     row = {"arm": arm, "tag": tag}
     sv = None
     if os.environ.get("HUNT_SHUT") == "1":
         sv = SurvivorWatch(time.time() * 1000, lambda: {pid: tag for pid in set(ENGINE_PIDS) | set(TREE_PIDS)})
         sv.start()
+        SV_OF[tag] = sv
     c_start = await asyncio.to_thread(parent_cpu)
     t0 = time.monotonic()
     if arm == "inproc":
         from invisible_playwright.async_api import InvisiblePlaywright
         extra = json.loads(os.environ.get("HUNT_EXTRA_PREFS") or "{}") or None
-        if os.environ.get("HUNT_SHUT") == "1":
+        if os.environ.get("HUNT_SHUT") == "1" or os.environ.get("HUNT_NCSHUT") == "1":
             extra = {**(extra or {}), **SHUT_PREFS}
         more = {}
         if os.environ.get("HUNT_TIMEZONE"):
@@ -1079,6 +1239,16 @@ async def one_browser(arm, binary, port, tag):
         async def close(browser=browser, pw=pw):
             await browser.close()
             await pw.stop()
+    OPEN_BROWSERS[tag] = "open"
+    try:
+        await _browser_work(arm, port, tag, row, browser, close, t0, c_start)
+    except Exception as exc:   # noqa: BLE001
+        # A failure of the work (or of the hunt's own probes) is a fact of this row; the browser is closed all the same, below.
+        row["error_before_close"] = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+    return await _close_browser(arm, port, tag, row, browser, close, t0)
+
+
+async def _browser_work(arm, port, tag, row, browser, close, t0, c_start):
     # The launch in four segments, each with its time and the CPU of the Firefox parent processes (every browser of this process
     # added: exact for one browser per process) during it. A CPU read takes tens of ms on Windows (the process list): it is taken in
     # a thread, and its time is taken out of the segment times and of launch_ms.
@@ -1126,42 +1296,84 @@ async def one_browser(arm, binary, port, tag):
     if SESSION_S:
         # The shutdown arms: idle until the session is SESSION_S old (from the start of the launch), then close.
         await asyncio.sleep(max(0.0, t0 + SESSION_S - time.monotonic()))
+
+
+async def _close_browser(arm, port, tag, row, browser, close, t0):
+    """The close of one browser, always reached: what failed before it is in the row, what fails in the probes around it is too."""
     row["session_s_at_close"] = round(time.monotonic() - t0, 2)
-    rec = pwatch = None
-    if os.environ.get("HUNT_NCLOSE") == "1":
-        conn, how = find_conn(browser)
-        if conn is not None:
-            rec = CloseRec(conn, how)
-            CONN_REC[id(conn)] = rec
-            pwatch = ParentWatch(rec)
-            pwatch.start()
+    OPEN_BROWSERS[tag] = "closing"
+    rec = pwatch = tw = None
+    try:
+        if os.environ.get("HUNT_NCLOSE") == "1":
+            conn, how = find_conn(browser)
+            if conn is not None:
+                rec = CloseRec(conn, how)
+                CONN_REC[id(conn)] = rec
+                pwatch = ParentWatch(rec)
+                pwatch.start()
+                if os.environ.get("HUNT_NCSHUT") == "1":
+                    tw = TreeWatch(rec.pid)          # the tree by type at this instant, before the close is asked for
+                    tw.start()
+                    try:
+                        impl_contexts = list(browser.contexts)
+                        row["ncontexts"] = len(impl_contexts)
+                        row["npages"] = sum(len(c.pages) for c in impl_contexts)
+                    except Exception as exc:   # noqa: BLE001
+                        row["ncontexts_error"] = repr(exc)[:120]
+    except Exception as exc:   # noqa: BLE001
+        row["probe_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
     watch = None
-    if os.environ.get("HUNT_SHUT") == "1":
-        watch = ExitWatch()
-        watch.start()
+    try:
+        if os.environ.get("HUNT_SHUT") == "1":
+            watch = ExitWatch()
+            watch.start()
+            row["parent_pids"] = [p.pid for p in watch.main]
+            row["close_wall_ms"] = time.time() * 1000
+    except Exception as exc:   # noqa: BLE001
+        row["probe_error_exitwatch"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+    sv = SV_OF.get(tag)
+    if sv is not None:
         sv.fast.set()
-        row["parent_pids"] = [p.pid for p in watch.main]
-        row["close_wall_ms"] = time.time() * 1000
     t1 = time.monotonic()
     if rec is not None:
         rec.t_call = time.perf_counter()
-    await close()
+        rec.wall_call = time.time() * 1000
+    try:
+        await close()
+        OPEN_BROWSERS[tag] = "closed"
+    except Exception as exc:   # noqa: BLE001
+        OPEN_BROWSERS[tag] = "close-failed"
+        row["close_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:300])
     if rec is not None:
         rec.t_return = time.perf_counter()
     row["close_ms"] = round((time.monotonic() - t1) * 1000)
-    if rec is not None:
-        # After the close's own timing: the parent's exit, and the reaper (joined here, never inside the close).
-        await asyncio.to_thread(pwatch.join, 60)
-        reaper = getattr(rec.conn, "reaper", None)
-        if reaper is not None:
-            await asyncio.to_thread(reaper.join, 60)
-            rec.t_reaper = getattr(reaper, "t_done", None) or time.perf_counter()
-            rec.reaper_finished = bool(reaper.finished)
-        row.update(rec.fields())
-    if watch is not None:
-        await asyncio.to_thread(watch.join, 95)
-        row["_main_gone"], row["_tree_gone"] = watch.main_gone, watch.tree_gone
-        row["_bg"] = await asyncio.to_thread(sv.finish)
+    try:
+        if rec is not None:
+            # After the close's own timing: the parent's exit, and the reaper (joined here, never inside the close).
+            await asyncio.to_thread(pwatch.join, 125)
+            reaper = getattr(rec.conn, "reaper", None)
+            if reaper is not None:
+                await asyncio.to_thread(reaper.join, 60)
+                rec.t_reaper = getattr(reaper, "t_done", None) or time.perf_counter()
+                rec.reaper_finished = bool(reaper.finished)
+            row.update(rec.fields())
+            if tw is not None:
+                await asyncio.to_thread(tw.join, 125)
+                row.update(tw.fields())
+                lines = ENGINE_LINES_BY.get(id(getattr(rec.conn, "output", None)), [])
+                fields, shown = shut_report(lines, rec.wall_call, rec.wall_parent, tw.wall_gone)
+                row.update(fields)
+                row["_shown"] = shown
+                if row.get("nc_parent") is not None and row["nc_parent"] > 4900:
+                    row["_slow"] = {"tag": tag, "parent_exit_ms": row["nc_parent"], "last_phase_line": fields.get("last_phase_line"),
+                                    "last_phase_line_ms": fields.get("last_phase_line_ms"), "pending_blockers": fields.get("pending_blockers"),
+                                    "tail": [[t, x[:140]] for t, _q, x in shown if 0 <= t <= row["nc_parent"] + 1][-8:]}
+        if watch is not None:
+            await asyncio.to_thread(watch.join, 95)
+            row["_main_gone"], row["_tree_gone"] = watch.main_gone, watch.tree_gone
+            row["_bg"] = await asyncio.to_thread(sv.finish)
+    except Exception as exc:   # noqa: BLE001
+        row["probe_error_after"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
     if row["close_ms"] > SLOW_MS:
         SLOW.append(("close", tag, t1, time.monotonic()))
     return row
@@ -1341,7 +1553,7 @@ async def main(arm, n, rnd, binary):
         install_key_probe()
         install_evalsplit()
         TRACE_EVAL = True
-        if os.environ.get("HUNT_SHUT") == "1":
+        if os.environ.get("HUNT_SHUT") == "1" or os.environ.get("HUNT_NCSHUT") == "1":
             install_output_capture()
         if os.environ.get("HUNT_NCLOSE") == "1":
             install_close_stamps()
@@ -1377,9 +1589,14 @@ async def main(arm, n, rnd, binary):
             r["engine_lines_total"] = len(ENGINE_LINES)
         bgs = bg_report(r.pop("_bg", []), r["close_wall_ms"], arm, rnd, r["tag"]) if r.get("close_wall_ms") else []
         r["bg_n"] = len(bgs)
+        shown = r.pop("_shown", shown)
+        slow = r.pop("_slow", None)
         print("HUNTROW " + json.dumps(r), flush=True)
         print_shut(arm, rnd, r["tag"], shown)
         print_bg(bgs)
+        if slow:
+            print("HUNTSLOWCLOSE " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, **slow}), flush=True)
+    print_alive("end-of-main", daemons=False)
     for tag, segs in EVAL_OUT:
         print("HUNTEVAL " + json.dumps({"arm": arm, "round": rnd, "os": sys.platform, "tag": tag, "segs": segs}), flush=True)
     SAMPLER.stop.set()
@@ -1658,6 +1875,11 @@ class RetailBrowser:
         started. close_ms is from the command's return to the instant no process of the tree is alive."""
         row = self.row
         target = self.main_pid()
+        try:
+            tw = TreeWatch(target)       # the tree by type at the instant before the close is asked for
+        except Exception as exc:   # noqa: BLE001
+            tw = None
+            row["tree_error"] = repr(exc)[:120]
         c0 = now_ms()
         if IS_WIN:
             r = subprocess.run(["taskkill", "/PID", str(target)], capture_output=True, text=True, timeout=30)
@@ -1677,6 +1899,8 @@ class RetailBrowser:
             except OSError as exc:
                 row["close_cmd"] = [1, repr(exc)[:140]]
         self.t_close = now_ms()
+        if tw is not None:
+            tw.start()
         if RETAIL_SV is not None:
             RETAIL_SV.fast.set()
         row["parent_pid"], row["parent_is_window_owner"] = target, self.window_pid is not None
@@ -1711,6 +1935,9 @@ class RetailBrowser:
         last = sorted(((ms, self.names.get(pid, "?")) for pid, ms in self.exit_ms.items()), reverse=True)[:4]
         row["last_exits"] = [[nm, ms] for ms, nm in last]
         row["procs_seen"] = len(self.procs)
+        if tw is not None:
+            tw.join(30)
+            row.update(tw.fields())
         row["parent_cpu_s"] = round(self.cpu_last, 3) if self.cpu_last is not None else row.get("cpu_at_close_s")
 
 
@@ -1753,6 +1980,12 @@ def retail_main(n, rnd, binary, close_after):
         if b.t_close:
             fields, shown = shut_report(b.log_matches, b.t_close, getattr(b, "main_gone_wall", None), getattr(b, "gone_wall", None))
             r.update(fields)
+            if (r.get("close_main_ms") or 0) > 4900:
+                tail = [[t, x[:140]] for t, _q, x in shown if 0 <= t <= r["close_main_ms"] + 1][-8:]
+                print("HUNTSLOWCLOSE " + json.dumps({"arm": "retail", "round": rnd, "os": sys.platform, "tag": b.tag,
+                                                     "parent_exit_ms": r["close_main_ms"], "last_phase_line": fields.get("last_phase_line"),
+                                                     "last_phase_line_ms": fields.get("last_phase_line_ms"),
+                                                     "pending_blockers": fields.get("pending_blockers"), "tail": tail}), flush=True)
         mine = [x for x in bg_all if x["attrib"] == b.tag or (x["attrib"] is None and n == 1)]
         bgs = bg_report(mine, b.t_close, "retail", rnd, b.tag) if b.t_close else []
         r["bg_n"] = len(bgs)
@@ -1769,11 +2002,79 @@ def retail_main(n, rnd, binary, close_after):
     shutil.rmtree(work, ignore_errors=True)
 
 
+def exitprobe_inner(binary, rnd):
+    """HUNT: launch one browser, raise the hunt's own simulated error BEFORE close(), and let the interpreter exit. A daemon thread
+    prints what is alive 6 s after the raise (if the interpreter is still there)."""
+    from invisible_playwright.async_api import InvisiblePlaywright
+
+    async def go():
+        cm = InvisiblePlaywright(seed=42, binary_path=binary, humanize=True, headless=True)
+        browser = await cm.__aenter__()
+        await browser.new_page()
+        OPEN_BROWSERS["probe"] = "open"
+        t = threading.Timer(6.0, print_alive, args=("6s-after-the-raise",))
+        t.daemon = True
+        t.start()
+        print("HUNTEXITPROBE raised", flush=True)
+        raise RuntimeError("simulated hunt error before close()")
+    ARM_CTX.update({"arm": "exitprobe", "round": rnd})
+    asyncio.run(go())
+
+
+def exitprobe_outer(rnd, binary, label):
+    """Runs exitprobe_inner as a child and times the interpreter's exit from the raise; 55 s at most, then its tree is killed."""
+    t_start = time.time() * 1000
+    p = subprocess.Popen([sys.executable, __file__, "exitprobe-inner", binary, rnd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1, env={**os.environ, "HUNT_LABEL": label})
+    raised = []
+
+    def pump():
+        for line in p.stdout:
+            line = line.rstrip()
+            if line.startswith("HUNTEXITPROBE raised"):
+                raised.append(time.time() * 1000)
+            if line.startswith("HUNT"):
+                print(line.replace("\"arm\": \"exitprobe\"", "\"arm\": \"exitprobe\", \"label\": \"%s\"" % label, 1), flush=True)
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    timed_out = False
+    try:
+        rc = p.wait(timeout=55)
+    except subprocess.TimeoutExpired:
+        timed_out, rc = True, None
+    t_exit = time.time() * 1000
+    left = []
+    for q in psutil.process_iter(["name"]):
+        try:
+            if "firefox" in (q.info["name"] or "").lower() and q.create_time() * 1000 >= t_start:
+                left.append(q.pid)
+        except psutil.Error:
+            pass
+    if timed_out:
+        for q in psutil.Process(p.pid).children(recursive=True) + [psutil.Process(p.pid)]:
+            try:
+                q.kill()
+            except psutil.Error:
+                pass
+    th.join(3)
+    print("HUNTROW " + json.dumps({"arm": "exitprobe", "label": label, "round": rnd, "os": sys.platform, "returncode": rc, "timed_out": timed_out,
+                                   "raised": bool(raised), "exit_after_raise_ms": round(t_exit - raised[0], 1) if raised else None,
+                                   "firefox_left_after_exit": len(left)}), flush=True)
+
+
 if __name__ == "__main__":
     # The workflow's per-arm limit kills this process's tree by the pid written here (several processes of an arm append their own).
     if os.environ.get("HUNT_PIDFILE"):
         with open(os.environ["HUNT_PIDFILE"], "a", encoding="utf-8", newline="\n") as _pf:
             _pf.write("%d\n" % os.getpid())
+    ARM_CTX.update({"arm": os.environ.get("HUNT_ARM"), "round": sys.argv[3] if len(sys.argv) > 3 else None})
+    if sys.argv[1] == "exitprobe-outer":
+        exitprobe_outer(sys.argv[2], sys.argv[3], sys.argv[4])
+        sys.exit(0)
+    if sys.argv[1] == "exitprobe-inner":
+        exitprobe_inner(sys.argv[2], sys.argv[3])
+        sys.exit(0)
+    start_alive_watchdog()
     if sys.argv[1] == "retail":
         retail_main(int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5]) if len(sys.argv) > 5 else 20.0)
         sys.exit(0)
@@ -1781,3 +2082,7 @@ if __name__ == "__main__":
         serve_one(sys.argv[2])
         sys.exit(0)
     asyncio.run(main(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None))
+    # The interpreter now waits for the non-daemon threads (the core's reaper is one): if it is still here in 5 s, say what holds it.
+    _late = threading.Timer(5.0, print_alive, args=("5s-after-main-returned", False))
+    _late.daemon = True
+    _late.start()

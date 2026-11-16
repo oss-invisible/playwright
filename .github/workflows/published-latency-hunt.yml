@@ -34,9 +34,9 @@ jobs:
         part: [ours, retail]
         include:
           - part: ours
-            arms: "nclose20 nclose75 nclose20x4 nclose75x4 shut70"
+            arms: "exitprobe_after exitprobe_next ncshut75x4"
           - part: retail
-            arms: "retail1 retail4late"
+            arms: "retail4late"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -121,7 +121,7 @@ jobs:
           set +e
           S=scripts/hunt_published_latency.py
           # What an arm prints: its HUNT lines, each tagged with the arm.
-          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK|ALIVE|EXITPROBE)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
           # The retail arms: N browsers, round, seconds after the first load before the normal close (Linux headed under xvfb).
           retail() {
             if [ -z "$FF_RETAIL" ]; then echo "HUNTROW {\"arm\": \"retail\", \"crash\": \"no retail Firefox\"}"; return; fi
@@ -141,7 +141,7 @@ jobs:
             case "$1" in
               solo|nclose20) e=30 ;; shut20) e=30 ;; inproc4|inproc4quiet|inproc4tz|inproc4px|stock|nclose20x4) e=35 ;;
               one|remote|retail1|retail4) e=45 ;; shut70|nclose75) e=85 ;; nclose75x4) e=95 ;; late|retail4late) e=100 ;;
-              shut180|retail1long) e=200 ;; *) e=100 ;;
+              shut180|retail1long|ncshut75x4) e=200 ;; exitprobe_after|exitprobe_next) e=15 ;; *) e=100 ;;
             esac
             echo $(( e * 4 > 720 ? 720 : e * 4 ))
           }
@@ -154,11 +154,15 @@ jobs:
           run_arm() {
             local lim wd
             lim=$(limit_of "$1")
-            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid"
+            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid" HUNT_ARM="$1" HUNT_LIMIT_S="$lim"
             : > "$HUNT_PIDFILE"
+            rm -f "$RUNNER_TEMP/arm.done" "$HUNT_PIDFILE.fault"
             (
               exec > /dev/null
               sleep "$lim" > /dev/null 2>&1
+              # The arm ended on its own: nothing to report, nothing to kill (killing the sleep of this watchdog used to let it get
+              # here, and the "timed out" rows of the run 43783310128 were that, not a hang).
+              [ -e "$RUNNER_TEMP/arm.done" ] && exit 0
               echo "HUNTROW [$1] {\"arm\": \"$1\", \"round\": \"$2\", \"crash\": \"arm timed out after $lim s\"}" | tee -a "$RUNNER_TEMP/rows.log" >&2
               kill_arm
             ) &
@@ -181,13 +185,17 @@ jobs:
               nclose75)    HUNT_NCLOSE=1 HUNT_SESSION_S=75 "$PY_NEXT" $S inproc 1 "$2" "$FF_AFTER" 2>&1 | keep nclose75 ;;
               nclose20x4)  HUNT_NCLOSE=1 HUNT_SESSION_S=20 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep nclose20x4 ;;
               nclose75x4)  HUNT_NCLOSE=1 HUNT_SESSION_S=75 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep nclose75x4 ;;
+              exitprobe_after) "$PY_AFTER" $S exitprobe-outer "$2" "$FF_AFTER" after 2>&1 | keep exitprobe_after ;;
+              exitprobe_next)  "$PY_NEXT" $S exitprobe-outer "$2" "$FF_AFTER" next 2>&1 | keep exitprobe_next ;;
+              ncshut75x4)  HUNT_NCLOSE=1 HUNT_NCSHUT=1 HUNT_SESSION_S=75 HUNT_CLOSE_TIMEOUT=60 "$PY_NEXT" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep ncshut75x4 ;;
               retail1) retail 1 "$2" 20 | keep retail1 ;;
               retail1long) retail 1 "$2" 180 | keep retail1long ;;
               retail4) retail 4 "$2" 20 | keep retail4 ;;
               retail4late) retail 4 "$2" 70 | keep retail4late ;;
             esac
-            pkill -P "$wd" > /dev/null 2>&1
+            : > "$RUNNER_TEMP/arm.done"
             kill "$wd" > /dev/null 2>&1
+            if [ -s "$HUNT_PIDFILE.fault" ]; then sed "s/^/HUNTALIVE [$1] fault: /" "$HUNT_PIDFILE.fault" | head -120; fi
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
           # The full list (the default when the focused one below is removed):
@@ -223,7 +231,7 @@ jobs:
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
           def trio(v):
               return "p50 %s p95 %s max %s" % (q(v, .5), q(v, .95), max((x for x in v if x is not None), default=None))
-          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180", "nclose20", "nclose75", "nclose20x4", "nclose75x4"):
+          for arm in ("inproc4", "inproc4quiet", "inproc4tz", "inproc4px", "late", "solo", "one", "remote", "stock", "shut20", "shut70", "shut180", "nclose20", "nclose75", "nclose20x4", "nclose75x4", "ncshut75x4"):
               if not rows.get(arm):
                   continue
               r = [x for x in rows.get(arm, []) if "crash" not in x]
@@ -298,7 +306,7 @@ jobs:
                        " | ".join("%s %s/%s" % (n, q(s.get(n, []), .5), q(s.get(n, []), .95)) for n in names)))
           # ---- The close of the core with a reaper (nclose arms): each step, ms from the user's close() call (p50/p95/max over every
           # close), the steps between them, and the close of the other arms next to it (same job, same rounds).
-          NC = ("nclose20", "nclose75", "nclose20x4", "nclose75x4")
+          NC = ("nclose20", "nclose75", "nclose20x4", "nclose75x4", "ncshut75x4")
           for arm in NC:
               r = [x for x in rows.get(arm, []) if "crash" not in x]
               if not rows.get(arm):
@@ -316,10 +324,40 @@ jobs:
               r = [x for x in rows.get(arm, []) if "crash" not in x]
               if r:
                   print("HUNTCLOSECMP %-11s close() ms %s | n %d" % (arm, trio([x.get("nc_return", x.get("close_ms")) if arm in NC else x.get("close_ms") for x in r]), len(r)))
+          # ---- ncshut75x4 against retail4late: where ours loses time. (a) close -> quit, (b) quit -> real parent gone, (c) parent gone ->
+          # tree gone; the tree at the close by type; the CPU of the tree between the close and the parent's exit (more work or more waiting:
+          # slow closes, parent exit over 4.9 s, against the fast ones).
+          for arm in ("ncshut75x4", "retail4late"):
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if not r:
+                  continue
+              def pe(x):
+                  return x.get("nc_parent") if x.get("nc_parent") is not None else x.get("close_main_ms")
+              slow = [x for x in r if (pe(x) or 0) > 4900]
+              fast = [x for x in r if pe(x) is not None and pe(x) <= 4900]
+              types = {}
+              for x in r:
+                  for k, v in (x.get("tree_types") or {}).items():
+                      types.setdefault(k, []).append(v)
+              print("HUNTNCSHUT %-11s closes %d | parent exit after the close ms %s | over 4.9 s: %d of %d | (a) close->quit ms %s | (b) quit->parent exit ms %s | (c) parent exit->tree gone ms %s | contexts p50 %s pages p50 %s | tree at the close, p50 per type %s | processes p50 %s"
+                    % (arm, len(r), trio([pe(x) for x in r]), len(slow), len(r), trio([x.get("a_close_to_quit_ms") for x in r]), trio([x.get("b_quit_to_main_gone_ms") for x in r]),
+                       trio([x.get("c_main_to_tree_gone_ms") for x in r]), q([x.get("ncontexts") for x in r], .5), q([x.get("npages") for x in r], .5),
+                       {k: q(v, .5) for k, v in sorted(types.items())}, q([x.get("tree_procs") for x in r], .5)))
+              print("HUNTTREECPU %-11s CPU s of the tree: close->parent exit, all %s | slow closes %s | fast closes %s || close->tree gone, all %s | slow %s | fast %s"
+                    % (arm, trio([x.get("tree_cpu_to_parent_exit_s") for x in r]), trio([x.get("tree_cpu_to_parent_exit_s") for x in slow]),
+                       trio([x.get("tree_cpu_to_parent_exit_s") for x in fast]), trio([x.get("tree_cpu_to_tree_gone_s") for x in r]),
+                       trio([x.get("tree_cpu_to_tree_gone_s") for x in slow]), trio([x.get("tree_cpu_to_tree_gone_s") for x in fast])))
+          # The interpreter's exit after a raise before close() (venvs "after" = published 64.73.0 and "next" = core main + reaper).
+          for arm in ("exitprobe_after", "exitprobe_next"):
+              r = [x for x in rows.get(arm, []) if "crash" not in x]
+              if rows.get(arm):
+                  print("HUNTEXITPROBE %-15s runs %d | raised %d | timed out %d | exit after the raise ms %s | return codes %s | firefox processes left after the exit p50 %s max %s"
+                        % (arm, len(r), sum(1 for x in r if x.get("raised")), sum(1 for x in r if x.get("timed_out")), trio([x.get("exit_after_raise_ms") for x in r]),
+                           sorted({str(x.get("returncode")) for x in r}), q([x.get("firefox_left_after_exit") for x in r], .5), max((x.get("firefox_left_after_exit") or 0 for x in r), default=None)))
           # ---- The shutdown hunt. Two numbers per close: (a) the close -> the quit (the first "Starting phase" line of the engine's
           # AsyncShutdown log after the close started: Services.startup.quit has run), (b) the quit -> the main process gone (and the
           # whole tree gone). Then the phases and the blockers by name, with their time against the quit (the time held in (b)).
-          SH = ("shut20", "shut70", "shut180", "retail1", "retail4late", "retail1long")
+          SH = ("shut20", "shut70", "shut180", "retail1", "retail4late", "retail1long", "ncshut75x4")
           probes, shut, bgt = {}, {}, {}
           for line in open(sys.argv[1], encoding="utf-8"):
               m = re.match(r"HUNTPROBE \[(\w+)\] (.*)", line.strip())
@@ -421,7 +459,9 @@ jobs:
               print(line)
           PY2
           grep -h "HUNTSURVIVOR" "$RUNNER_TEMP/rows.log" | sed -E 's/"pid": [0-9]+, //' | sort -u | head -20 || true
-          grep -h "HUNTSLOW" "$RUNNER_TEMP/rows.log" | cut -c1-900 || true
+          grep -h "HUNTSLOW\b" "$RUNNER_TEMP/rows.log" | cut -c1-900 || true
+          grep -h "HUNTSLOWCLOSE" "$RUNNER_TEMP/rows.log" | cut -c1-1100 | head -40 || true
+          grep -h "HUNTALIVE" "$RUNNER_TEMP/rows.log" | cut -c1-500 | head -80 || true
           # The geo helpers of the first launch of the first round (the first arm, inproc4, all four browsers): what prepare_session_geo
           # spent its time on (t = seconds from the start of that process, ms = how long, thread).
           grep -hE "HUNTPROBE \[inproc4\] .*\"round\": \"r0\".*\"name\": \"(geo\.|download\.|geoip_db\.|_geoip_db\.|udp_exit\.|requests\.)" "$RUNNER_TEMP/rows.log" | cut -c1-260 | head -150 || true
