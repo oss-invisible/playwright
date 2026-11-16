@@ -26,9 +26,17 @@ jobs:
   hunt:
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         os: [windows-2022, ubuntu-24.04]
+        # The real Firefox in a job of its own: twice a Windows runner running it with ours was lost ("lost communication",
+        # runs 43769962892 and 43777096307, no log left), and ours went with it.
+        part: [ours, retail]
+        include:
+          - part: ours
+            arms: "nclose20 nclose75 nclose20x4 nclose75x4 shut70"
+          - part: retail
+            arms: "retail1 retail4late"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -36,6 +44,7 @@ jobs:
         shell: bash
     env:
       PYTHONUNBUFFERED: "1"
+      ONLY_ARMS: ${{ matrix.arms }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
@@ -423,4 +432,4 @@ jobs:
           echo done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
-        with: { name: "published-latency-${{ matrix.os }}-${{ github.run_id }}", path: "${{ runner.temp }}/rows.log" }
+        with: { name: "published-latency-${{ matrix.os }}-${{ matrix.part }}-${{ github.run_id }}", path: "${{ runner.temp }}/rows.log" }
