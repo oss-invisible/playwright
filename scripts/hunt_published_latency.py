@@ -57,15 +57,69 @@ TEXTS = ["someone@example.com", "tomeone@example.com", "pomeone@example.com", "l
 #: The page stamps every keydown and keyup with two clocks, the event's birth (performance.timeOrigin + event.timeStamp) and the
 #: handler (performance.timeOrigin + performance.now()); every mousemove and click with the handler's.
 TYPE_PAGE = (b"<!doctype html><html><body style='margin:0'><div style='height:300px'></div><input id=f style='margin-left:300px'>"
-             b"<script>window.__k=[];window.__u=[];window.__m=[];window.__c=[];const T=()=>performance.timeOrigin+performance.now();"
+             b"<script>window.__k=[];window.__u=[];window.__m=[];window.__c=[];window.__ev=[];const T=()=>performance.timeOrigin+performance.now();"
              b"document.addEventListener('keydown',e=>__k.push([e.key,performance.timeOrigin+e.timeStamp,T()]),true);document.addEventListener('keyup',e=>__u.push([e.key,performance.timeOrigin+e.timeStamp,T()]),true);"
-             b"document.addEventListener('mousemove',e=>__m.push(T()),true);document.addEventListener('click',e=>__c.push(T()),true);</script></body></html>")
+             b"document.addEventListener('mousemove',e=>__m.push(T()),true);document.addEventListener('click',e=>__c.push(T()),true);"
+             b"for(const t of ['mousemove','mousedown','mouseup','click'])document.addEventListener(t,e=>__ev.push([t,performance.timeOrigin+e.timeStamp,T()]),true);</script></body></html>")
 
 
 def typing_plan(text=TEXT):
     """The core's plan for the session's first field: (dwell, gap) per character, for the persona of SEED and typing nonce 1."""
     from invisible_core.juggler._behaviour import TypingPersona, plan_typing
     return plan_typing(text, TypingPersona.from_seed(SEED), nonce=1)
+
+
+def click_plan_ms():
+    """The core's planned dwell (ms the button stays down) of the session's first click of the first page: `plan_click(persona, 1,
+    nonce)` with the persona of SEED and the nonce `PageActs.next("click")` gives for page 0, act 1, which is `act_nonce(0, 1) = 1`
+    (the first page the script asks for is number 0, and the count of a kind starts at 1). EXACT as far as the page number and the
+    count are what that says: the first click of the page, no click before it. None where the core has no `plan_click`."""
+    try:
+        from invisible_core.juggler._behaviour import PointerPersona, plan_click
+        return plan_click(PointerPersona.from_seed(SEED), 1, nonce=1)[0][0]
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def press_settle_plan_ms():
+    try:
+        from invisible_core.juggler._behaviour import PointerPersona, plan_press_settle
+        return plan_press_settle(PointerPersona.from_seed(SEED), nonce=1)
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def mouse_report(ev, dwell_plan, settle_plan=None):
+    """The mouse the page saw, on event.timeStamp (unprefixed) and on the handler's clock (prefix h_). The PATH before the press: the
+    gaps between consecutive mousemoves up to the first mousedown, their longest, how many are over 100 ms, the compressions (a gap
+    under half the median gap right after a gap over 100 ms: the catch-up after a stall). The path's own plan (the Pacer's instants)
+    comes from the wrapper's cursor and the geometry of the page, and is not reproduced here: the shape is judged by its gaps. The CLICK:
+    mousedown -> mouseup against the planned dwell. The engine births a mouse event `latency` ms before its handler (2-30 ms, drawn per
+    event on the page's count of acts, not reproduced here), so on timeStamp the dwell differs from the plan by the difference of the
+    two draws (at most 28 ms, typically a few): read the slip against that."""
+    out = {"click_dwell_plan": round(dwell_plan, 1) if dwell_plan is not None else None,
+           "press_settle_plan": round(settle_plan, 1) if settle_plan is not None else None}
+    for prefix, i in (("", 1), ("h_", 2)):
+        downs = sorted(e[i] for e in ev if e[0] == "mousedown")
+        ups = sorted(e[i] for e in ev if e[0] == "mouseup")
+        first_down = downs[0] if downs else None
+        mv = sorted(e[i] for e in ev if e[0] == "mousemove" and (first_down is None or e[i] <= first_down))
+        gaps = [b - a for a, b in zip(mv, mv[1:])]
+        med = sorted(gaps)[len(gaps) // 2] if gaps else None
+        out[prefix + "mv_n"] = len(mv)
+        out[prefix + "mv_gap_med"] = round(med, 1) if med is not None else None
+        out[prefix + "mv_gap_max"] = round(max(gaps), 1) if gaps else None
+        out[prefix + "mv_gaps_over_100ms"] = sum(1 for g in gaps if g > 100)
+        out[prefix + "mv_compressions"] = sum(1 for k in range(1, len(gaps)) if gaps[k - 1] > 100 and med is not None and gaps[k] < 0.5 * med)
+        if downs and ups and ups[0] >= downs[0]:
+            dwell = ups[0] - downs[0]
+            out[prefix + "click_dwell"] = round(dwell, 1)
+            if dwell_plan is not None:
+                out[prefix + "click_dwell_slip"] = round(dwell - dwell_plan, 1)
+        if mv and first_down is not None:
+            out[prefix + "press_settle"] = round(first_down - mv[-1], 1)
+    out["mouse_events"] = {k: sum(1 for e in ev if e[0] == k) for k in ("mousemove", "mousedown", "mouseup", "click")}
+    return out
 
 
 def _against_plan(times, planned, prefix):
@@ -243,6 +297,30 @@ class ThreadingProxy(socketserver.ThreadingMixIn, socketserver.TCPServer):
 def install_key_probe():
     """Wrap the core's Keyboard.down / up (the only senders of Page.dispatchKeyEvent in our client): the wall time before the command
     goes out and after its answer, per keyboard instance (one per page)."""
+    try:
+        # The stroke core (#281): a key event leaves through `_stroke.Stroke.send` at its planned instant; Keyboard.down / up only
+        # plan it. Recorded there: the stroke id (one text = one stroke), the event's type and key, the wall time before the command
+        # goes out (after the wait for its instant) and after `send_async` returned (the reply is collected at the end of the stroke).
+        from invisible_core.juggler import _stroke
+    except ImportError:
+        _stroke = None
+    if _stroke is not None:
+        real_send = _stroke.Stroke.send
+        if not getattr(real_send, "_hunt", False):
+            def send(self, method, params, at_ms, *a, **k):
+                if method != "Page.dispatchKeyEvent":
+                    return real_send(self, method, params, at_ms, *a, **k)
+                if not k.get("paced"):
+                    self.hold_until(at_ms)        # the wait for the instant, so `before` is the instant the command leaves
+                before = time.time() * 1000
+                try:
+                    return real_send(self, method, params, at_ms, *a, **k)
+                finally:
+                    KEYSENDS.append((self.id, "down" if params.get("type") == "keydown" else "up", params.get("key"), before,
+                                     time.time() * 1000))
+            send._hunt = True
+            _stroke.Stroke.send = send
+        return
     try:
         from invisible_core.juggler import keyboard as kb
     except Exception as exc:   # noqa: BLE001
@@ -636,9 +714,11 @@ async def typing(page, port, arm, text=TEXT):
     took = time.monotonic() - m0
     cpu1 = psutil.cpu_times()
     tot = sum(cpu1) - sum(cpu0)
-    keys, ups, moves, clicks = await page.evaluate("[window.__k, window.__u, window.__m, window.__c]")
+    keys, ups, moves, clicks, ev = await page.evaluate("[window.__k, window.__u, window.__m, window.__c, window.__ev]")
     # The report is made in main(), once the client's sends of our arms are matched to their browser.
-    return {"text": text, "raw": [keys, ups, moves, clicks, plan, sends or None], "typing_wall_ms": round(took * 1000),
+    return {"text": text, "raw": [keys, ups, moves, clicks, plan, sends or None, ev],
+            "click_plan": click_plan_ms() if arm != "stock" else None, "settle_plan": press_settle_plan_ms() if arm != "stock" else None,
+            "typing_wall_ms": round(took * 1000),
             "machine_cpu_busy_pct": round(100 * (1 - (cpu1.idle - cpu0.idle) / tot), 1) if tot > 0 else None}
 
 
@@ -1570,9 +1650,11 @@ async def main(arm, n, rnd, binary):
     for r in rows:
         if isinstance(r, dict) and "raw" in (r.get("typing") or {}):
             t = r["typing"]
-            keys, ups, moves, clicks, plan, sends = t.pop("raw")
+            keys, ups, moves, clicks, plan, sends, ev = t.pop("raw")
+            cplan, splan = t.pop("click_plan", None), t.pop("settle_plan", None)
             try:
                 t.update(typing_report(arm, keys, ups, moves, clicks, plan, sends))
+                t.update(mouse_report(ev, cplan, splan))
             except Exception as exc:   # noqa: BLE001
                 t["error"] = "report %s: %s" % (type(exc).__name__, str(exc)[:200])
     for r in rows:

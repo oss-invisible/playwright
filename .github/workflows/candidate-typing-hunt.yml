@@ -1,7 +1,7 @@
-# HUNT ONLY, never merged. Criterion 1b on the GREEN candidate 43776755353 (latitude/firefox-65 ef460207: the stroke-anchored births):
-# what the page sees (event.timeStamp) against the core's plan, under load, in the three forms of criterion 1: 4 browsers in one
-# process (inproc4), 1 browser per process with 4 processes at once (one), launch_server (remote); Linux and Windows. Core = the
-# stroke client (#281, 74018f83), wrapper = git main.
+# HUNT ONLY, never merged. Criterion 1b on the GREEN candidate 43785139398 (latitude/firefox-65 a4d3fbd8): what the page sees
+# (event.timeStamp, and the handler's clock) against the core's plan, under load, for the keys and for the mouse (the path before the
+# first click and the click's dwell), in two forms of criterion 1: 4 browsers in one process (inproc4) and 1 browser per process with 4
+# processes at once (one); Linux and Windows. Core = the stroke client (#281, 74018f83), wrapper = release/0.53.0.
 name: candidate typing hunt
 on:
   push:
@@ -30,14 +30,14 @@ jobs:
         shell: bash
     env:
       PYTHONUNBUFFERED: "1"
-      ONLY_ARMS: "inproc4 one remote"
+      ONLY_ARMS: "one inproc4"
       ROUNDS: "6"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: "3.12" }
-      - name: A venv with the stroke core (#281) and the wrapper of git main, and stock Playwright for the remote client
+      - name: A venv with the stroke core (#281) and the wrapper of release/0.53.0, and stock Playwright for the remote client
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then BIN=Scripts; else BIN=bin; fi
           P="$RUNNER_TEMP/after/$BIN/python"
@@ -45,7 +45,7 @@ jobs:
           "$P" -m pip install -q --upgrade pip
           "$P" -m pip install -q "invisible-playwright==0.52.1" psutil websockets "playwright==$(cat scripts/playwright_pin.txt)"
           "$P" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@74018f83c0b59fdaeff9e494426529331f8f7e60"
-          "$P" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@main"
+          "$P" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@release/0.53.0"
           "$P" -c "
           import importlib.metadata as m, json
           for n in ('invisible-core', 'invisible-playwright'):
@@ -55,15 +55,15 @@ jobs:
           "
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q xvfb; "$P" -m playwright install --with-deps firefox; else "$P" -m playwright install firefox; fi
           echo "PY_AFTER=$P" >> "$GITHUB_ENV"
-      - name: The engine of the candidate 43776755353, sealed for this run
+      - name: The engine of the candidate 43785139398, sealed for this run
         run: |
           mkdir -p "$RUNNER_TEMP/eng" && cd "$RUNNER_TEMP/eng"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            gh run download 43776755353 -R oss-invisible/firefox_antidetect_patch -n asset-win-x86_64 -D .
+            gh run download 43785139398 -R oss-invisible/firefox_antidetect_patch -n asset-win-x86_64 -D .
             unzip -q ./*.zip -d ff
             FF="$(cd ff && pwd -W)/firefox.exe"
           else
-            gh run download 43776755353 -R oss-invisible/firefox_antidetect_patch -n asset-linux-x86_64 -D .
+            gh run download 43785139398 -R oss-invisible/firefox_antidetect_patch -n asset-linux-x86_64 -D .
             mkdir ff && tar -xzf ./*.tar.gz -C ff
             FF="$(find "$PWD/ff" -maxdepth 2 -type f -name firefox | head -1)"
           fi
@@ -112,11 +112,13 @@ jobs:
           run_arm() {
             local lim wd
             lim=$(limit_of "$1")
-            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid"
+            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid" HUNT_ARM="$1" HUNT_LIMIT_S="$lim"
             : > "$HUNT_PIDFILE"
+            rm -f "$RUNNER_TEMP/arm.done" "$HUNT_PIDFILE.fault"
             (
               exec > /dev/null
               sleep "$lim" > /dev/null 2>&1
+              [ -e "$RUNNER_TEMP/arm.done" ] && exit 0
               echo "HUNTROW [$1] {\"arm\": \"$1\", \"round\": \"$2\", \"crash\": \"arm timed out after $lim s\"}" | tee -a "$RUNNER_TEMP/rows.log" >&2
               kill_arm
             ) &
@@ -144,7 +146,7 @@ jobs:
               retail4) retail 4 "$2" 20 | keep retail4 ;;
               retail4late) retail 4 "$2" 70 | keep retail4late ;;
             esac
-            pkill -P "$wd" > /dev/null 2>&1
+            : > "$RUNNER_TEMP/arm.done"
             kill "$wd" > /dev/null 2>&1
             if [ "$RUNNER_OS" = "Windows" ]; then taskkill //F //IM firefox.exe //T > /dev/null 2>&1; else pkill -9 -f firefox > /dev/null 2>&1; fi
           }
@@ -216,12 +218,32 @@ jobs:
                        q(hts, .5), q(hts, .95), max(hts, default=None), sum(1 for t in ok if t.get("detail")), len(ok),
                        q([t.get("machine_cpu_busy_pct") for t in ty], .5), max((t.get("machine_cpu_busy_pct") or 0 for t in ty), default=None)))
               if det:
-                  print("HUNTKEYSPLIT %-12s client send vs plan: keys over 100 ms %d, p50 %s max %s | client send -> engine answer p50 %s p95 %s max %s | client send -> event.timeStamp p50 %s p95 %s max %s"
+                  print("HUNTKEYSPLIT %-12s client send vs plan: keys over 100 ms %d, p50 %s max %s | client send -> send_async returned p50 %s p95 %s max %s | client send -> event.timeStamp p50 %s p95 %s max %s"
                         % (arm, sum(1 for x in late_c if abs(x) > 100), q(late_c, .5), max(late_c), q(rt, .5), q(rt, .95), max(rt), q(birth, .5), q(birth, .95), max(birth)))
                   worst = sorted(((abs((t["detail"][i][3] - t["detail"][0][3]) - t["detail"][i][0]), t["detail"][max(0, i - 1):i + 1]) for t in ok if t.get("detail")
                                   for i in range(len(t["detail"]))), key=lambda w: -w[0])[:4]
                   for slip, pair in worst:
                       print("HUNTKEYWORST %-12s timeStamp slip %.0f ms | previous and this key [planned, sent, answered, timeStamp, handler]: %s" % (arm, slip, pair))
+          # The mouse the page saw before and at the first click: the path (the gaps between consecutive mousemoves up to the press, on
+          # event.timeStamp and, h_, on the handler), the click's dwell (mousedown -> mouseup) against the core's planned dwell (plan_click
+          # of the persona of the seed, nonce 1 = the first click of page 0: exact). The path's own plan is the wrapper cursor's and is
+          # judged by its gaps; the dwell on timeStamp differs from the plan by the difference of the two events' `latency` draws (<= 28 ms).
+          for arm in ("inproc4", "one", "remote"):
+              ty = [x.get("typing") or {} for x in rows.get(arm, []) if "crash" not in x]
+              mt = [t for t in ty if "mv_n" in t]
+              if not mt:
+                  continue
+              for pre, name in (("", "event.timeStamp"), ("h_", "handler")):
+                  def g(k):
+                      return [t.get(pre + k) for t in mt]
+                  def mx(k):
+                      return max((v for v in g(k) if v is not None), default=None)
+                  slips = [abs(v) for v in g("click_dwell_slip") if v is not None]
+                  print("HUNTMOUSE %-8s on %-15s browsers %d | path: moves p50 %s, median gap p50 %s ms, longest gap p50 %s max %s | gaps over 100 ms %d | compressions %d | click dwell p50 %s vs plan p50 %s: slip p50 %s, |slip| p50 %s max %s | press settle (last move -> press) p50 %s vs plan p50 %s"
+                        % (arm, name, len(mt), q(g("mv_n"), .5), q(g("mv_gap_med"), .5), q(g("mv_gap_max"), .5), mx("mv_gap_max"),
+                           sum(v or 0 for v in g("mv_gaps_over_100ms")), sum(v or 0 for v in g("mv_compressions")), q(g("click_dwell"), .5),
+                           q([t.get("click_dwell_plan") for t in mt], .5), q(g("click_dwell_slip"), .5), q(slips, .5), max(slips, default=None),
+                           q(g("press_settle"), .5), q([t.get("press_settle_plan") for t in mt], .5)))
           # The retail Firefox 159: from the process start to the first page loaded (the onload beacon at the server), to the first
           # visible top-level window, the normal close to every process of the tree gone, the session and the parent's CPU.
           for arm in ("retail1", "retail4", "retail4late", "retail1long"):
