@@ -325,7 +325,7 @@ jobs:
               for s in snd:
                   born_test = test_at(s["born"])
                   owner = test_at(s["profile_oldest_mtime_ms"]) if s.get("profile_oldest_mtime_ms") else None
-                  files = glob.glob("%s/ff-%d.log*" % (run["logd"], s["pid"]))
+                  files = glob.glob("%s/ff--*.%d.log*" % (run["logd"], s["pid"]))
                   times, lines = [], []
                   for fn in files:
                       for ln in open(fn, encoding="utf-8", errors="replace"):
@@ -378,7 +378,7 @@ jobs:
           for run in runs:
               files = sorted(glob.glob(run["logd"] + "/*"))
               names = [os.path.basename(f) for f in files]
-              pid_of = lambda b: int(re.search(r"ff-(\d+)", b).group(1)) if re.search(r"ff-(\d+)", b) else None
+              pid_of = lambda b: int((re.search(r"ff--(?:main|child)\.(\d+)", b) or re.search(r"ff-(\d+)", b)).group(1)) if re.search(r"ff-", b) else None
               print("HUNTALLLOGS %-4s run %d | files %d | names %s | of a seen sender pid %d | sizes p50 %s" % (run["arm"], run["i"], len(files), names[:6], sum(1 for b in names if pid_of(b) in sender_pids),
                     q([os.path.getsize(f) for f in files], .5)))
               for fn in files:
@@ -531,7 +531,7 @@ jobs:
                   return "?", "no prefs, no route"
               ctx = (pf or {}).get("network.trr.stealth.contexts")
               ptp = (pf or {}).get("network.proxy.type")
-              yes = ctx not in (None, '""', "") or any(routes) or ptp == "1"
+              yes = "*" in str(ctx) or any(routes) or ptp == "1"   # "*,6" = launch proxy; "6" = context-only (no launch proxy); empty = none
               return ("yes" if yes else "no"), "ctx=%s proxytype=%s route=%s" % (ctx, ptp, routes[:1] or "-")
           def sess_of(prof):
               """The session of a profile: its test (the one running when it was born), its close (the main browser's end, else the directory's), its senders."""
@@ -619,10 +619,133 @@ jobs:
           cnt_run = collections.Counter((r["run"], r["ptype"]) for r in tel_rows)
           print("HUNTQTEL %-4s telemetry-host queries by (run, type): %s | sessions of those with a launch proxy %d, without %d, unknown %d"
                 % (arm, dict(cnt_run), sum(1 for r in tel_rows if r["launch_proxy"] == "yes"), sum(1 for r in tel_rows if r["launch_proxy"] == "no"), sum(1 for r in tel_rows if r["launch_proxy"] not in ("yes", "no"))))
+          # ===== The MOZ_LOG side: every lookup of the telemetry host in every process's own log, native or TRR, attributed by pid ======================
+          # Files: ff--main.<pid>.log.moz_log (a parent or background-task process), ff--child.<pid>.log.child-N.moz_log (a child process). The line
+          # names its own process kind and thread: `[Parent 10037: Socket Thread]: D/nsHostResolver Resolving host [...]`.
+          LOGPROC = re.compile(r"\[(\w+) (\d+): ([^\]]*)\]: (.*)$")
+          MOZ_PID = (re.compile(r"ff--(?:main|child)\.(\d+)"), re.compile(r"ff-(\d+)"))
+          DEC = re.compile(r"skip|bypass|exclu|not us|disabl|fallback|mode|confirm|blocklist|proxy|allow", re.I)
+          def moz_pid_of(base):
+              for rx in MOZ_PID:
+                  m = rx.search(base)
+                  if m:
+                      return int(m.group(1))
+              return None
+          def templ_of(msg):
+              s = re.sub(r"0x[0-9a-fA-F]+", "P", msg)
+              s = re.sub(r"\[[^\]]*\]", "[..]", s)
+              s = re.sub(r"\d+", "N", s)
+              return s[:95]
+          def ctx_of(prof):
+              pf = (PF.get(prof) or {}).get("prefs")
+              return str((pf or {}).get("network.trr.stealth.contexts", "?")) if pf is not None else "?"
+          mozl = []          # one per native lookup (a "Calling getaddrinfo" line for the telemetry host)
+          per_pid = {}       # (arm, run, pid) -> counters
+          templ = collections.Counter()
+          for run in runs:
+              for fn in sorted(glob.glob(run["logd"] + "/*")):
+                  base = os.path.basename(fn)
+                  fpid = moz_pid_of(base)
+                  recs = []
+                  for ln in open(fn, encoding="utf-8", errors="replace"):
+                      hit = TEL in ln
+                      if not hit and not ("TRR" in ln and DEC.search(ln)):
+                          continue
+                      if not hit and len(recs) > 3000:
+                          continue
+                      tm = log_time(ln)
+                      mm = LOGPROC.search(ln)
+                      if tm is None or not mm:
+                          continue
+                      msg = mm.group(4)
+                      mod = re.match(r"[A-Z]/(\w+)", msg)
+                      mod = mod.group(1) if mod else "?"
+                      if hit and "Calling getaddrinfo" in msg:
+                          kind = "native"
+                      elif hit and "lookup completed" in msg:
+                          kind = "native-done"
+                      elif hit and mod == "TRR":
+                          kind = "trr"
+                      elif hit:
+                          kind = "resolver"
+                      else:
+                          kind = "context"
+                      recs.append({"t": tm, "kind": kind, "proc": mm.group(1), "pid": int(mm.group(2)), "thread": mm.group(3), "msg": msg[:230], "mod": mod})
+                  hits = [r for r in recs if r["kind"] != "context"]
+                  if not hits:
+                      continue
+                  pid = fpid or hits[0]["pid"]
+                  pr = find_proc(pid, hits[0]["t"])
+                  c = per_pid.setdefault((run["arm"], run["i"], pid), {"native": 0, "trr": 0, "resolver": 0, "done": 0, "pr": pr, "proc": hits[0]["proc"], "file": base})
+                  for r in hits:
+                      templ[(pr["ptype"] if pr else "log:" + r["proc"], r["mod"], templ_of(r["msg"]))] += 1
+                      k = {"native": "native", "trr": "trr", "resolver": "resolver"}.get(r["kind"], "done")
+                      c[k] += 1
+                  for r in hits:
+                      if r["kind"] != "native":
+                          continue
+                      near = [x for x in recs if x is not r and abs(x["t"] - r["t"]) <= 250 and x["kind"] in ("context", "trr", "resolver")][:6]
+                      prof = pr.get("profile") if pr else None
+                      S = sess(prof) if prof else None
+                      mozl.append({"arm": run["arm"], "run": run["i"], "t": r["t"], "pid": pid, "ptype": pr["ptype"] if pr else "unseen", "logproc": r["proc"], "thread": r["thread"],
+                                   "profile": prof, "session_test": S["test"] if S else None, "proxy": S["proxy"] if S else "n/a", "ctx": ctx_of(prof) if prof else "?",
+                                   "test_at": test_of(r["t"]), "since_close": round(r["t"] - S["close"]) if S and S["close"] is not None else None, "line": r["msg"],
+                                   "near": [(round(x["t"] - r["t"]), x["kind"], x["msg"][:150]) for x in near], "file": base})
+          mozl.sort(key=lambda r: r["t"])
+          with open(out + "/huntl.jsonl", "w", encoding="utf-8") as f:
+              for r in mozl:
+                  f.write(json.dumps(r, default=str) + "\n")
+          for r in mozl:
+              print("HUNTL arm=%s run=%s t=%.0f at=%s pid=%s type=%s log_process=%s thread=\"%s\" session_test=%s launch_proxy=%s ctx=%s test_running=%s since_close_ms=%s | %s | near(ms,kind,line)=%s"
+                    % (r["arm"], r["run"], r["t"], _time.strftime("%H:%M:%S", _time.gmtime(r["t"] / 1000)) + ".%03d" % (r["t"] % 1000), r["pid"], r["ptype"], r["logproc"], r["thread"],
+                       short(r["session_test"] or "?"), r["proxy"], r["ctx"], short(r["test_at"] or "?"), rel(r["since_close"]), r["line"][:200], r["near"][:4]))
+          agg = collections.defaultdict(collections.Counter)
+          for (a, ri, pid), c in per_pid.items():
+              pr = c["pr"]
+              prof = pr.get("profile") if pr else None
+              key = (pr["ptype"] if pr else "log:" + c["proc"], "proxy=" + (sess(prof)["proxy"] if prof else "n/a"), "ctx=" + (ctx_of(prof) if prof else "?"))
+              agg[key]["processes"] += 1
+              agg[key]["with a native lookup"] += 1 if c["native"] else 0
+              agg[key]["native lookups"] += c["native"]
+              agg[key]["TRR lines"] += c["trr"]
+              agg[key]["other resolver lines"] += c["resolver"]
+          for k, v in sorted(agg.items(), key=lambda kv: -kv[1]["processes"]):
+              print("HUNTLSUM %-4s %s | %s" % (arm, k, dict(v)))
+          for (pt, mod, tp), n in templ.most_common(30):
+              print("HUNTLTEMPL %-4s %-12s %-14s x%-4d %s" % (arm, pt, mod, n, tp))
+          # Failing tests by EXACT node id (the junit's classname and name are rebuilt from the node id: no truncated name mixes the variants).
+          def junit_of(run):
+              d = {}
+              try:
+                  for tc in ET.parse(run["junit"]).getroot().iter("testcase"):
+                      for f in list(tc.findall("failure")) + list(tc.findall("error")):
+                          d[(tc.get("classname"), tc.get("name"))] = (f.get("message") or "") + "\n" + (f.text or "")
+              except (OSError, ET.ParseError):
+                  pass
+              return d
+          for run in runs:
+              T, order = tests_of(run)
+              jd = junit_of(run)
+              for n in order:
+                  parts = n.split("::")
+                  want = (parts[0][:-3].replace("/", ".") + "".join("." + c for c in parts[1:-1]), parts[-1])
+                  msg = jd.get(want)
+                  if msg is None:
+                      continue
+                  a, b = T[n]["start"], (T[n]["finish"] or 0) + 2
+                  asked = QRE.findall(msg.split("asked the resolver of the machine", 1)[-1]) if "asked the resolver of the machine" in msg else []
+                  nat = [r for r in mozl if r["run"] == run["i"] and a <= r["t"] <= b]
+                  ker = [r for r in hq_rows if r["run"] == run["i"] and r["qname"].rstrip(".") == TEL and a <= r["t"] <= b]
+                  print("HUNTFAIL %-4s run %d %s | trap counted (name, port, proto) %s | MOZ_LOG native lookups of the telemetry host in its window %d: %s | kernel-side queries of the telemetry host in its window %d: %s"
+                        % (run["arm"], run["i"], n, [(x[0], x[1], x[2]) for x in asked][:8], len(nat),
+                           [(r["pid"], r["ptype"], r["logproc"], "session " + short(r["session_test"] or "?"), "proxy " + r["proxy"], "ctx " + str(r["ctx"]), "+%d ms into the test" % round(r["t"] - a)) for r in nat][:6],
+                           len(ker), [(r["pid"], r["ptype"], "session " + short(r["session_test"] or "?"), "proxy " + r["launch_proxy"], "sport %s" % r["sport"], "+%d ms into the test" % round(r["t"] - a)) for r in ker][:6]))
           PY
       - name: Readable outputs (written as root under sudo)
         if: always()
-        run: sudo chmod -R a+rX "$RUNNER_TEMP/out" || true
+        run: |
+          sudo tar -czf "$RUNNER_TEMP/out/moz-logs.tgz" -C "$RUNNER_TEMP/out" moz || true
+          sudo chmod -R a+rX "$RUNNER_TEMP/out" || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -639,3 +762,5 @@ jobs:
             ${{ runner.temp }}/out/sender-logs
             ${{ runner.temp }}/out/dns
             ${{ runner.temp }}/out/huntq.jsonl
+            ${{ runner.temp }}/out/huntl.jsonl
+            ${{ runner.temp }}/out/moz-logs.tgz
