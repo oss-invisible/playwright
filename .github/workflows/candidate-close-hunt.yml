@@ -1,0 +1,230 @@
+# HUNT ONLY, never merged. The close of 4 browsers together on Windows, WITHOUT any deadline of the hunt, on the candidate 43843317541
+# (latitude/firefox-65, series 05522a48bdd8), core 0e35e35 (oss-invisible/core, fix/stroke-on-own-clock: close() waits for the browser's real
+# exit, `process.BROWSER_EXIT_LIMIT` = 80 s), wrapper 274fdc28 (release/0.53.0).
+# The earlier close hunts raised the deadlines of Connection.close and of the Reaper in the hunt itself (HUNT_CLOSE_TIMEOUT). Here nothing is
+# raised: scripts/hunt_candidate.py replaces those wrappers with stamps that only measure (and refuses to start when HUNT_CLOSE_TIMEOUT is
+# set); HUNTCLOSEARGS prints what Connection.close and the Reaper received.
+# Arms (a job each, the real Firefox in a job of its own): ours = cand4close (4 browsers in one process, idle until the session is 75 s old,
+# closed together), retail = retail4close (the official Firefox 159, 4 together, closed by its window 70 s after the first load).
+# Reported: how many browsers were terminated or killed instead of exiting by themselves (expected zero) and the exit code of every process
+# of each tree, and the close() duration (p50, p95, max) for ours and for retail.
+name: candidate close hunt
+on:
+  push:
+    branches: [hunt/published-latency]
+    paths: [.github/workflows/candidate-close-hunt.yml]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: candidate-close-hunt
+  cancel-in-progress: true
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - { os: windows-2022, part: ours, arms: "cand4close" }
+          - { os: windows-2022, part: retail, arms: "retail4close" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+      PART: ${{ matrix.part }}
+      ONLY_ARMS: ${{ matrix.arms }}
+      ROUNDS: "6"
+      HUNT_CAND_CLOSE: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: "3.12" }
+      - name: A venv (psutil; for ours also the core 0e35e35, the wrapper 274fdc28 and stock Playwright's driver)
+        run: |
+          P="$RUNNER_TEMP/after/Scripts/python"
+          python -m venv "$RUNNER_TEMP/after"
+          "$P" -m pip install -q --upgrade pip
+          "$P" -m pip install -q psutil
+          if [ "$PART" = ours ]; then
+            "$P" -m pip install -q "invisible-playwright==0.52.1" websockets "playwright==$(cat scripts/playwright_pin.txt)"
+            "$P" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@0e35e35f4a1017234c8cc51858c829de6f23ffc8"
+            "$P" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@274fdc2812e471f14039b2bef7e034efeae68a47"
+            "$P" -c "
+          import importlib.metadata as m, json
+          for n in ('invisible-core', 'invisible-playwright'):
+              d = m.distribution(n); u = json.loads(d.read_text('direct_url.json') or '{}')
+              print(n, d.version, u.get('vcs_info', {}).get('commit_id'))
+          import invisible_core.process as p
+          print('BROWSER_EXIT_LIMIT', p.BROWSER_EXIT_LIMIT, 'SENDER_GRACE', __import__('invisible_core.juggler._profile', fromlist=['x']).SENDER_GRACE)
+          "
+            "$P" -m playwright install firefox
+          fi
+          echo "PY_AFTER=$P" >> "$GITHUB_ENV"
+      - name: The engine of the candidate 43843317541, sealed for this run
+        if: matrix.part == 'ours'
+        run: |
+          RUN=43843317541
+          # The run's own state is printed, and the series is checked: a push before the build is green fails here, with the artifacts it lacks.
+          gh run view "$RUN" -R oss-invisible/firefox_antidetect_patch --json status,conclusion,headSha,headBranch || true
+          SHA=$(gh run view "$RUN" -R oss-invisible/firefox_antidetect_patch --json headSha --jq .headSha)
+          case "$SHA" in 05522a48bdd8*) ;; *) echo "the run $RUN is not the series 05522a48bdd8 ($SHA)"; exit 1 ;; esac
+          gh api "repos/oss-invisible/firefox_antidetect_patch/actions/runs/$RUN/artifacts" --jq '.artifacts[] | "artifact \(.name) \(.size_in_bytes) expired=\(.expired)"' | head -20
+          mkdir -p "$RUNNER_TEMP/eng" && cd "$RUNNER_TEMP/eng"
+          gh run download "$RUN" -R oss-invisible/firefox_antidetect_patch -n asset-win-x86_64 -D .
+          unzip -q ./*.zip -d ff
+          FF="$(cd ff && pwd -W)/firefox.exe"
+          ls -l "$FF"; sha256sum "$FF"
+          echo "FF_AFTER=$FF" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          "$PY_AFTER" -m invisible_core seal --binary "$FF" --tag firefox-65-candidate -o "$RUNNER_TEMP/seal.json"
+          echo "INVISIBLE_SEAL_FILE=$RUNNER_TEMP/seal.json" >> "$GITHUB_ENV"
+      - name: The retail Firefox 159.0 en-US (official)
+        if: matrix.part == 'retail'
+        run: |
+          B=https://archive.mozilla.org/pub/firefox/releases/159.0/win64/en-US/
+          R="$RUNNER_TEMP/retail"
+          mkdir -p "$R"
+          curl -fsSL --retry 3 -o "$R/package.exe" "${B}Firefox%20Setup%20159.0.exe"
+          sha256sum "$R/package.exe"
+          if command -v 7z > /dev/null 2>&1; then SZ=7z; else SZ="/c/Program Files/7-Zip/7z.exe"; fi
+          "$SZ" x "$R/package.exe" -o"$R/win" -y > /dev/null
+          FF="$R/win/core/firefox.exe"
+          ls -l "$FF"; sha256sum "$FF"
+          echo "FF_RETAIL=$FF" >> "$GITHUB_ENV"
+      - name: Six rounds
+        continue-on-error: true
+        timeout-minutes: 70
+        run: |
+          set +e
+          S=scripts/hunt_candidate.py
+          if [ -n "$HUNT_CLOSE_TIMEOUT" ]; then echo "HUNT_CLOSE_TIMEOUT is set: this hunt raises no deadline"; exit 1; fi
+          # What an arm prints: its HUNT lines, each tagged with the arm.
+          keep() { grep --line-buffered -E '^HUNT(ROW|SLOW|PROBE|EVAL|SHUT|SURVIVOR|BGTASK|ALIVE|PARENTS|CLOSEARGS)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
+          # A limit per arm: the arm's python writes its pid (HUNT_PIDFILE) and a watchdog kills that tree when the limit comes, printing the crash row.
+          limit_of() {
+            case "$1" in
+              cand4close) echo 720 ;; retail4close) echo 400 ;; *) echo 400 ;;
+            esac
+          }
+          kill_arm() {
+            local pid
+            for pid in $(cat "$HUNT_PIDFILE" 2>/dev/null); do taskkill //T //F //PID "$pid" > /dev/null 2>&1; done
+          }
+          run_arm() {
+            local lim wd
+            lim=$(limit_of "$1")
+            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid" HUNT_ARM="$1" HUNT_LIMIT_S="$lim"
+            : > "$HUNT_PIDFILE"
+            rm -f "$RUNNER_TEMP/arm.done" "$HUNT_PIDFILE.fault"
+            (
+              exec > /dev/null
+              sleep "$lim" > /dev/null 2>&1
+              [ -e "$RUNNER_TEMP/arm.done" ] && exit 0
+              echo "HUNTROW [$1] {\"arm\": \"$1\", \"round\": \"$2\", \"crash\": \"arm timed out after $lim s\"}" | tee -a "$RUNNER_TEMP/rows.log" >&2
+              kill_arm
+            ) &
+            wd=$!
+            case "$1" in
+              # 4 browsers in one process, idle until the session is 75 s old, then closed together. The shutdown log of the engine on (the
+              # same preferences retail gets in its profile), nothing else, no timeout of the hunt.
+              cand4close) HUNT_NCLOSE=1 HUNT_NCSHUT=1 HUNT_SESSION_S=75 "$PY_AFTER" $S inproc 4 "$2" "$FF_AFTER" 2>&1 | keep cand4close ;;
+              retail4close) "$PY_AFTER" $S retail 4 "$2" "$FF_RETAIL" 70 2>&1 | keep retail4close ;;
+            esac
+            : > "$RUNNER_TEMP/arm.done"
+            kill "$wd" > /dev/null 2>&1
+            if [ -s "$HUNT_PIDFILE.fault" ]; then sed "s/^/HUNTALIVE [$1] fault: /" "$HUNT_PIDFILE.fault" | head -120; fi
+            taskkill //F //IM firefox.exe //T > /dev/null 2>&1
+          }
+          read -ra ARMS <<< "$ONLY_ARMS"
+          N=${#ARMS[@]}
+          for r in $(seq 0 $((${ROUNDS:-6}-1))); do
+            for k in $(seq 0 $((N-1))); do
+              if [ "$SECONDS" -gt 3780 ]; then echo "time guard: no new arm after $SECONDS s"; break 2; fi
+              a=${ARMS[$(( (k + r) % N ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"
+            done
+          done
+          true
+      - name: The table
+        if: always()
+        run: |
+          python - "$RUNNER_TEMP/rows.log" <<'PY'
+          import collections, json, re, sys
+          rows, cargs = {}, []
+          for line in open(sys.argv[1], encoding="utf-8"):
+              m = re.match(r"HUNTROW \[(\w+)\] (.*)", line.strip())
+              if m:
+                  rows.setdefault(m.group(1), []).append(json.loads(m.group(2)))
+                  continue
+              m = re.match(r"HUNTCLOSEARGS \[(\w+)\] (.*)", line.strip())
+              if m:
+                  cargs.append((m.group(1), json.loads(m.group(2))))
+          def q(v, p):
+              v = sorted(x for x in v if x is not None)
+              return v[min(len(v) - 1, int(p * len(v)))] if v else None
+          def trio(v):
+              v = [x for x in v if x is not None]
+              return "p50 %s p95 %s max %s (n %d)" % (q(v, .5), q(v, .95), max(v, default=None), len(v))
+          def exits_of(r):
+              c = collections.Counter()
+              for x in r:
+                  for _pid, kind, rc, _ms in x.get("x_exits") or []:
+                      c[(kind, rc)] += 1
+              return dict(sorted(c.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))))
+          # What the core was given: no deadline of the hunt anywhere. `effective_timeout` None = Connection.close's own limit (BROWSER_EXIT_LIMIT).
+          seen = collections.Counter()
+          for arm, a in cargs:
+              if a.get("what") == "Connection.close" and a.get("mine"):
+                  seen[(arm, "Connection.close", "asked %s" % (a.get("asked"),), "effective %s" % (a.get("effective_timeout"),), "limit when None %s" % (a.get("limit_when_none"),))] += 1
+              elif a.get("what") == "Reaper.__init__":
+                  seen[(arm, "Reaper", "grace %s" % (a.get("grace"),), "timeout %s" % (a.get("timeout"),))] += 1
+          for k, n in sorted(seen.items()):
+              print("HUNTCLOSE2ARGS %dx %s" % (n, " | ".join(k)))
+          for arm in ("cand4close",):
+              allr = rows.get(arm, [])
+              r = [x for x in allr if "crash" not in x]
+              if not allr:
+                  continue
+              ended = [x for x in r if x.get("x_browser_ended")]
+              print("HUNTCLOSE2 ours %s | browsers closed %d (crash rows %d, close errors %d, errors before the close %d) | TERMINATED OR KILLED instead of exiting by themselves: %d of %d | by cause: a browser process that is not the shutdown-ping sender was still alive when the core ended the tree %d, the launcher terminated by Connection.close %d, the wait for the browser's exit answered False %d | the sender (or its task) still alive after the reaper's grace and ended %d | the engine's own parent exit code (core_process_returncode) %s"
+                    % (arm, len(r), len(allr) - len(r), sum(1 for x in r if x.get("close_error")), sum(1 for x in r if x.get("error_before_close")), len(ended), len(r),
+                       sum(1 for x in r if x.get("x_left_nonsender")), sum(1 for x in r if x.get("x_conn_terminate")),
+                       sum(1 for x in r if any(w["ret"] is False for w in x.get("x_wait_browser_gone") or [])), sum(1 for x in r if x.get("x_left_sender")),
+                       dict(collections.Counter(str(x.get("core_process_returncode")) for x in r))))
+              print("HUNTCLOSE2EXITS ours %s | exit code of every process of every tree (kind, code): count -> %s | the parents' codes by the hunt's own wait (one entry per parent process seen): %s" % (arm, exits_of(r), dict(collections.Counter(str(v.get("rc")) for x in r for v in (x.get("parent_exits") or {}).values()))))
+              print("HUNTCLOSE2TIME ours %s | close() ms (the user's call to its return) %s | Connection.close returned, ms from the call %s | the real parent gone %s | the reaper finished %s | session s at close p50 %s"
+                    % (arm, trio([x.get("close_ms") for x in r]), trio([x.get("nc_conn_return") for x in r]), trio([x.get("nc_parent") for x in r]), trio([x.get("nc_reaper") for x in r]),
+                       q([x.get("session_s_at_close") for x in r], .5)))
+              for x in r:
+                  print("HUNTCLOSE2ROW ours %s %s | close() %s ms | ended %s | left non-sender %s sender %s | exit codes %s | ends %s"
+                        % (arm, x.get("tag"), x.get("close_ms"), x.get("x_browser_ended"), x.get("x_left_nonsender"), x.get("x_left_sender"),
+                           dict(collections.Counter("%s:%s" % (k, rc) for _p, k, rc, _m in x.get("x_exits") or [])),
+                           [(e["after_ms"], e["dur_ms"], e["sent"]) for e in x.get("x_end_calls") or []]))
+          for arm in ("retail4close",):
+              allr = rows.get(arm, [])
+              r = [x for x in allr if "crash" not in x]
+              if not allr:
+                  continue
+              print("HUNTCLOSE2 retail %s | browsers closed %d (crash rows %d) | killed by the hunt after 120 s %d | exited before the close %d | the close command's own code %s | exit codes of every process of every tree (kind, code): count -> %s"
+                    % (arm, len(r), len(allr) - len(r), sum(1 for x in r if x.get("close_timeout")), sum(1 for x in r if x.get("exited_before_close")),
+                       dict(collections.Counter(str((x.get("close_cmd") or [None])[0]) for x in r)), exits_of(r)))
+              print("HUNTCLOSE2TIME retail %s | close() = the close command to the main process gone, ms %s | to the whole tree gone (the sender included) %s | session s p50 %s"
+                    % (arm, trio([x.get("close_main_ms") for x in r]), trio([x.get("close_ms") for x in r]), q([x.get("session_s") for x in r], .5)))
+          PY
+          grep -h "HUNTSLOWCLOSE" "$RUNNER_TEMP/rows.log" | cut -c1-1200 || true
+          grep -h "HUNTSURVIVOR" "$RUNNER_TEMP/rows.log" | sed -E 's/"pid": [0-9]+, //' | sort -u | head -20 || true
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          taskkill //F //IM firefox.exe //T > /dev/null 2>&1 || true
+          echo done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: "candidate-close-${{ matrix.part }}-${{ github.run_id }}", path: "${{ runner.temp }}/rows.log" }
