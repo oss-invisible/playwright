@@ -1,21 +1,32 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# second-goto-trace-hunt.yml - a MEASUREMENT, not a gate: the protocol trace of
-# the second goto that replaces the first, on OUR browser only. The scenario is
-# the one of scripts/hunt_second_goto_vs_stock.py (a first goto to a page whose
-# response is half there, a second goto to a third site as soon as the client
-# has heard that response); with `--trace` every repetition also saves, with its
-# time, every Juggler event the client receives for the page (navigationStarted,
-# navigationCommitted, navigationAborted, frameAttached, frameDetached, the
-# requests of the documents, executionContextsCleared and executionContextCreated)
-# and the navigation id of each goto. It answers what the browser said, and in
-# what order, in the repetitions where goto 2 stays pending and in the ones
-# where it commits. It runs on a push to its own branch only.
+# control-a-trace-hunt.yml - a MEASUREMENT, not a gate: the Control+A file of the
+# e2e (tests/test_control_a_selects_all_in_a_field_e2e.py, 20 tests: 5 ways to press
+# the shortcut x 2 fields x the in-process browser and the stock client), run again
+# and again with the protocol trace of scripts/hunt_trace_plugin.py, to find the cause
+# of a rare red: `Page.set_content: the caller's world never appeared for frame
+# mainframe-N - did you call install()? Worlds seen: ['']`.
+#
+# What it records, per test run, in one JSON: the events the engine sends about
+# navigations, frames and contexts (executionContextsCleared / Created / Destroyed with
+# the world), the commands the server sends (Page.setInitScripts, which is what
+# declares the caller's world; Runtime.evaluate with its context), and the marks of
+# install(), caller_context() and set_content, all with their time. scripts/
+# hunt_ctrla_summary.py then puts the red runs and the green ones side by side.
+#
+# ROUNDS OF FOUR COPIES, not `-n 4`: four pytest processes at once, each on the whole
+# file (what a `--dist loadfile` worker of the gate does), so that every browser lives
+# the same 10 tests per mode, in the same order, as in the gate and four browsers are
+# up together (scripts/hunt_ctrla_rounds.py says why). Rounds follow until 300 test
+# runs per system are recorded (4 rounds = 320). A red copy never stops the others,
+# and the verdict of the job is only that the files are there.
+#
+# It runs on a push to its own branch only.
 # ─────────────────────────────────────────────────────────────────────────────
-name: second-goto-trace-hunt
+name: control-a-trace-hunt
 
 on:
   push:
-    branches: [hunt/second-goto-trace]
+    branches: [hunt/control-a-trace]
 
 permissions:
   contents: read
@@ -33,10 +44,10 @@ env:
   INVISIBLE_CORE_AUTOFIX: "off"
 
 jobs:
-  second-goto-trace-linux:
-    name: second-goto-trace (linux)
+  control-a-trace-linux:
+    name: control-a-trace (linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
@@ -58,28 +69,41 @@ jobs:
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
-      - name: Trace the second goto, ours, 20 repetitions
+      - name: The Control+A file in rounds of four copies, with the protocol trace
+        timeout-minutes: 30
         env:
           PYTHONUNBUFFERED: "1"
-        run: xvfb-run -a python -u scripts/hunt_second_goto_vs_stock.py --trace --browser invisible --binary "$FF" --repetitions 20 --out-dir "$RUNNER_TEMP/second-goto-trace"
+        run: xvfb-run -a python -u scripts/hunt_ctrla_rounds.py --binary "$FF" --out-dir "$RUNNER_TEMP/ctrla-hunt" --min-runs 300 --copies 4 --budget-min 18
       - name: Close every Firefox left
         if: always()
         run: |
           pkill -f firefox || true
           echo "left: $(pgrep -fc firefox || true)"
-      - name: Upload the trace
+      - name: The summary of the red and the green runs
+        if: always()
+        run: python scripts/hunt_ctrla_summary.py "$RUNNER_TEMP/ctrla-hunt/trace" --max-reds 30 | tee "$RUNNER_TEMP/ctrla-hunt/summary.txt" || true
+      - name: Upload the traces, the junit and the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: second-goto-trace-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/second-goto-trace/*.json
+          name: control-a-trace-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ctrla-hunt
           if-no-files-found: warn
           retention-days: 14
+      # The verdict is only that the files are there: a red test is what the hunt is for.
+      - name: Verdict (the files are there)
+        if: always()
+        run: |
+          traces=$(ls "$RUNNER_TEMP/ctrla-hunt/trace"/*.json 2>/dev/null | wc -l)
+          junits=$(ls "$RUNNER_TEMP/ctrla-hunt/junit"/*.xml 2>/dev/null | wc -l)
+          echo "trace files: $traces, junit files: $junits"
+          if [ "$traces" -lt 300 ]; then echo "::warning::only $traces test runs were recorded (300 were wanted)"; fi
+          [ "$traces" -gt 0 ] && [ "$junits" -gt 0 ]
 
-  second-goto-trace-windows:
-    name: second-goto-trace (windows)
+  control-a-trace-windows:
+    name: control-a-trace (windows)
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -99,21 +123,34 @@ jobs:
         run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
-      - name: Trace the second goto, ours, 20 repetitions
+      - name: The Control+A file in rounds of four copies, with the protocol trace
+        timeout-minutes: 30
         env:
           PYTHONUNBUFFERED: "1"
-        run: python -u scripts/hunt_second_goto_vs_stock.py --trace --browser invisible --binary "$FF" --repetitions 20 --out-dir "$RUNNER_TEMP/second-goto-trace"
+        run: python -u scripts/hunt_ctrla_rounds.py --binary "$FF" --out-dir "$RUNNER_TEMP/ctrla-hunt" --min-runs 300 --copies 4 --budget-min 18
       - name: Close every Firefox left
         if: always()
         shell: pwsh
         run: |
           Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
-      - name: Upload the trace
+      - name: The summary of the red and the green runs
+        if: always()
+        run: python scripts/hunt_ctrla_summary.py "$RUNNER_TEMP/ctrla-hunt/trace" --max-reds 30 | tee "$RUNNER_TEMP/ctrla-hunt/summary.txt" || true
+      - name: Upload the traces, the junit and the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: second-goto-trace-windows-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/second-goto-trace/*.json
+          name: control-a-trace-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ctrla-hunt
           if-no-files-found: warn
           retention-days: 14
+      # The verdict is only that the files are there: a red test is what the hunt is for.
+      - name: Verdict (the files are there)
+        if: always()
+        run: |
+          traces=$(ls "$RUNNER_TEMP/ctrla-hunt/trace"/*.json 2>/dev/null | wc -l)
+          junits=$(ls "$RUNNER_TEMP/ctrla-hunt/junit"/*.xml 2>/dev/null | wc -l)
+          echo "trace files: $traces, junit files: $junits"
+          if [ "$traces" -lt 300 ]; then echo "::warning::only $traces test runs were recorded (300 were wanted)"; fi
+          [ "$traces" -gt 0 ] && [ "$junits" -gt 0 ]
