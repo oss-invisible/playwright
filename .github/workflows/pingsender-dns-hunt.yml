@@ -1,12 +1,16 @@
-# HUNT ONLY, never merged. The shutdown-ping sender (`firefox --backgroundtask pingsender ...`) and the machine's resolver: in a session with
-# a LAUNCH proxy, does the sender ask the machine (UDP) for incoming.telemetry.mozilla.org? Hypothesis: in the sender's process
-# network.trr.stealth.contexts is absent or empty when its lookup starts (the route comes from STEALTHFOX_PINGSENDER_ROUTE, the resolver
-# state from a snapshot of the profile's prefs.js). Per close: the route the sender received (its environment), a copy of prefs.js taken
-# when it appears, the nsHostResolver/TRR log of each pid (MOZ_LOG_FILE per pid), and a resolver trap at 127.0.0.1:53 (resolv.conf points at it)
-# that logs every query with the pid that sent it. Linux only.
-# Arms: cand (the candidate 43785139398 engine, core 74018f83, wrapper release/0.53.0) and pub (invisible-playwright 0.52.1 + invisible-core
-# 64.73.0 on the engine it fetches), each with a SOCKS5 launch proxy (the hunt's own: no auth, CONNECT by name and by address, every target
-# logged), and cand_http / pub_http with an HTTP CONNECT proxy. 2 rounds of 12 closes: 24 per arm.
+# HUNT ONLY, never merged. The shutdown-ping sender (`firefox --backgroundtask pingsender ...`) and the machine's resolver, in the wrapper's OWN
+# e2e lab: tests/test_nothing_leaves_but_the_proxy_e2e.py, scheme launch_and_context, two kinds of page work (hints, subresources), run as the
+# candidate's gate runs it on Linux (job gate / wrapper.e2e.context.egress: root, `sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR
+# INVPW_REQUIRE_TRAP=1`, the resolver trap and the gateway fixtures of tests/_leaks.py and tests/_doh_servers.py, the GeoIP database of
+# scripts/ci_lab_geoip.py, the engine copied to /opt where root can run it, the seal of the binary), untouched. Each pytest process runs both
+# tests; 10 processes per arm = 20 executions per arm.
+# Arms: cand = wrapper release/0.53.0 (its tests), core 74018f83, the engine of the candidate 43785139398, sealed as the gate seals it;
+# pub = the wrapper tag v0.52.1 (its tests, same file and scheme), the published invisible-playwright 0.52.1 + invisible-core 64.73.0 on
+# the engine they fetch.
+# Probes around the tests, none of them in the tests: MOZ_LOG=sync,timestamp,nsHostResolver:5,TRR:5 and MOZ_LOG_FILE=<dir>/ff-%PID.log in
+# pytest's environment (the engine and the sender inherit them; %PID gives a file per process); a root watcher (scripts/hunt_pingsender_dns.py)
+# that polls every 20 ms for a pingsender process and, at first sight, copies its profile's prefs.js, reads its route and its environment, and
+# follows its end; and what the trap counted, read from the failure message of the test itself.
 name: pingsender dns hunt
 on:
   push:
@@ -29,167 +33,224 @@ jobs:
       matrix:
         os: [ubuntu-24.04]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
     env:
       PYTHONUNBUFFERED: "1"
-      ROUNDS: "2"
-      SESSIONS: "12"
+      RUNS: "10"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      - name: Checkout the wrapper of the candidate arm (release/0.53.0, its tests)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: oss-invisible/playwright
+          ref: release/0.53.0
+          path: wcand
+          fetch-depth: 1
+      - name: Checkout the wrapper of the published arm (tag v0.52.1, its tests)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: oss-invisible/playwright
+          ref: v0.52.1
+          path: wpub
+          fetch-depth: 1
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with: { python-version: "3.12" }
-      - name: Two venvs, the stroke core with the wrapper of release/0.53.0 (cand) and the published packages (pub)
+        with: { python-version: "3.11" }
+      # The GeoIP database is made by the repository (the same bytes every run), as the gate does: without it the core asks GitHub on every call.
+      - name: The GeoIP database (made by the repository)
+        working-directory: wcand
+        run: python scripts/ci_lab_geoip.py build --pin ci/geoip.json
+      - name: Linux system deps (Firefox runtime libs, a virtual display), psutil for the watcher
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q xvfb
-          python -m venv "$RUNNER_TEMP/cand"
-          python -m venv "$RUNNER_TEMP/pub"
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          python -m pip install --quiet psutil "playwright==$(cat wcand/scripts/playwright_pin.txt)"
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The candidate venv (core 74018f83 from git, the wrapper of release/0.53.0 with its dev extra) and the published venv
+        run: |
+          export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
+          python -m venv "$RUNNER_TEMP/cand"; python -m venv "$RUNNER_TEMP/pub"
           C="$RUNNER_TEMP/cand/bin/python"; P="$RUNNER_TEMP/pub/bin/python"
-          for V in "$C" "$P"; do "$V" -m pip install -q --upgrade pip; "$V" -m pip install -q "invisible-playwright==0.52.1" psutil websockets; done
-          "$C" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@74018f83c0b59fdaeff9e494426529331f8f7e60"
-          "$C" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@release/0.53.0"
+          "$C" -m pip install --quiet --upgrade pip; "$P" -m pip install --quiet --upgrade pip
+          CORE_GIT="git+https://github.com/oss-invisible/core@74018f83c0b59fdaeff9e494426529331f8f7e60"
+          "$C" -m pip install --quiet "$CORE_GIT"
+          (cd wcand && "$C" -m pip install --quiet ".[dev]")
+          "$C" -m pip install --quiet --force-reinstall "$CORE_GIT"
+          "$P" -m pip install --quiet "invisible-playwright[dev]==0.52.1"
           for V in "$C" "$P"; do
             "$V" -c "
           import importlib.metadata as m, json
           for n in ('invisible-core', 'invisible-playwright'):
               d = m.distribution(n); u = json.loads(d.read_text('direct_url.json') or '{}')
-              print(n, d.version, u.get('vcs_info', {}).get('commit_id'))
+              print(n, d.version, u.get('vcs_info', {}).get('commit_id') or 'the index')
           "
           done
           echo "PY_CAND=$C" >> "$GITHUB_ENV"
           echo "PY_PUB=$P" >> "$GITHUB_ENV"
-      - name: The engine the published packages fetch, and the candidate's (43785139398, sealed)
+      # The engines go where root can run them (a path of root's that everyone can read), as the gate does for its root legs.
+      - name: The candidate engine (43785139398, sealed as the gate seals it) and the engine the published packages fetch
         run: |
-          echo "FF_PUB=$(cd "$RUNNER_TEMP" && "$PY_PUB" -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+          export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
           mkdir -p "$RUNNER_TEMP/eng" && cd "$RUNNER_TEMP/eng"
           gh run download 43785139398 -R oss-invisible/firefox_antidetect_patch -n asset-linux-x86_64 -D .
           mkdir ff && tar -xzf ./*.tar.gz -C ff
           FF="$(find "$PWD/ff" -maxdepth 2 -type f -name firefox | head -1)"
-          ls -l "$FF"; sha256sum "$FF"
-          echo "FF_CAND=$FF" >> "$GITHUB_ENV"
-          cd "$GITHUB_WORKSPACE"
-          "$PY_CAND" -m invisible_core seal --binary "$FF" --tag firefox-65-candidate -o "$RUNNER_TEMP/seal.json"
-          echo "SEAL_CAND=$RUNNER_TEMP/seal.json" >> "$GITHUB_ENV"
-      - name: The resolver trap (root), then the arms in rotating order
+          sudo rm -rf /opt/ff /opt/ff-pub
+          sudo cp -a "$(dirname "$FF")" /opt/ff
+          PUB_SRC="$(cd "$RUNNER_TEMP" && "$PY_PUB" -m invisible_playwright fetch | tail -1)"
+          sudo cp -a "$(dirname "$PUB_SRC")" /opt/ff-pub
+          sudo chown -R root:root /opt/ff /opt/ff-pub
+          sudo chmod -R go+rX /opt/ff /opt/ff-pub
+          ls -l /opt/ff/firefox /opt/ff-pub/"$(basename "$PUB_SRC")"; sha256sum /opt/ff/firefox
+          echo "FF_CAND=/opt/ff/firefox" >> "$GITHUB_ENV"
+          echo "FF_PUB=/opt/ff-pub/$(basename "$PUB_SRC")" >> "$GITHUB_ENV"
+          "$PY_CAND" -m invisible_core seal --binary /opt/ff/firefox --tag firefox-65-candidate -o "$RUNNER_TEMP/gate.seal.json"
+      - name: The watcher (root, the whole job) and the runs, the arms alternating
         continue-on-error: true
-        timeout-minutes: 60
-        env:
-          HUNT_LOGDIR: ${{ runner.temp }}/moz
-          HUNT_TRAP_LOG: ${{ runner.temp }}/trap.jsonl
+        timeout-minutes: 75
         run: |
           set +e
-          S=scripts/hunt_pingsender_dns.py
-          mkdir -p "$HUNT_LOGDIR"; : > "$HUNT_TRAP_LOG"; chmod 666 "$HUNT_TRAP_LOG"
-          sudo cp -a /etc/resolv.conf "$RUNNER_TEMP/resolv.conf.orig"
-          sudo "$PY_PUB" $S trap "$HUNT_TRAP_LOG" > "$RUNNER_TEMP/trap.out" 2>&1 &
-          for i in $(seq 1 50); do grep -q "127.0.0.1" /etc/resolv.conf && break; sleep 0.2; done
-          cat "$RUNNER_TEMP/trap.out"; cat /etc/resolv.conf
-          getent hosts example.com; tail -2 "$HUNT_TRAP_LOG"
-          keep() { grep --line-buffered -E '^HUNT(PING|SENDER)' | sed -u -E "s/^(HUNT[A-Z]+) /\1 [$1] /"; }
-          # A limit per arm (12 closes of about 15 s, at most 12 minutes): the arm's python writes its pid, a watchdog kills its tree and
-          # prints the crash line when the limit comes; it fires only if the arm has not ended (a flag file).
-          kill_arm() { local pid; for pid in $(cat "$HUNT_PIDFILE" 2>/dev/null); do pkill -9 -P "$pid" > /dev/null 2>&1; kill -9 "$pid" > /dev/null 2>&1; done; }
-          run_arm() {
-            local lim wd
-            lim=720
-            export HUNT_PIDFILE="$RUNNER_TEMP/arm.pid"
-            : > "$HUNT_PIDFILE"; rm -f "$RUNNER_TEMP/arm.done"
-            (
-              exec > /dev/null
-              sleep "$lim" > /dev/null 2>&1
-              [ -e "$RUNNER_TEMP/arm.done" ] && exit 0
-              echo "HUNTPING [$1] {\"arm\": \"$1\", \"round\": \"$2\", \"error\": \"arm timed out after $lim s\"}" | tee -a "$RUNNER_TEMP/rows.log" >&2
-              kill_arm
-            ) &
-            wd=$!
-            case "$1" in
-              cand)      INVISIBLE_SEAL_FILE="$SEAL_CAND" "$PY_CAND" $S run cand "$SESSIONS" "$2" "$FF_CAND" 2>&1 | keep cand ;;
-              pub)       "$PY_PUB" $S run pub "$SESSIONS" "$2" "$FF_PUB" 2>&1 | keep pub ;;
-              cand_http) INVISIBLE_SEAL_FILE="$SEAL_CAND" "$PY_CAND" $S run cand_http "$SESSIONS" "$2" "$FF_CAND" 2>&1 | keep cand_http ;;
-              pub_http)  "$PY_PUB" $S run pub_http "$SESSIONS" "$2" "$FF_PUB" 2>&1 | keep pub_http ;;
-            esac
-            : > "$RUNNER_TEMP/arm.done"
-            kill "$wd" > /dev/null 2>&1
-            pkill -9 -f "/firefox" > /dev/null 2>&1
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT/junit" "$OUT/moz" "$OUT/pytest"; chmod -R 777 "$OUT"
+          : > "$OUT/watch.jsonl"; : > "$OUT/runs.jsonl"
+          sudo "$(which python)" scripts/hunt_pingsender_dns.py watch "$OUT/watch.jsonl" "$OUT/prefs" > "$OUT/watch.out" 2>&1 &
+          sleep 2; cat "$OUT/watch.out"
+          (ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null) || echo "no ss or netstat on this runner"
+          # One pytest process: exactly the gate's command for this suite (judge args: -m e2e and the test file), the gate's environment, root
+          # through sudo -H -E, then -k to the scheme launch_and_context and two kinds of page work. A fresh process for each run.
+          one_run() {
+            local arm="$1" i="$2" py wdir bin logd junit rc t0 t1
+            logd="$OUT/moz/$arm-$i"; mkdir -p "$logd"; chmod 777 "$logd"
+            junit="$OUT/junit/$arm-$i.xml"
+            if [ "$arm" = cand ]; then py="$PY_CAND"; wdir=wcand; bin="$FF_CAND"; else py="$PY_PUB"; wdir=wpub; bin="$FF_PUB"; fi
+            ENVV=(INVPW_REQUIRE_TRAP=1 "PATH=$PATH" PYTHONUNBUFFERED=1 "INVPW_BINARY_PATH=$bin" "STEALTHFOX_E2E_BINARY=$bin"
+                  "MOZ_LOG=sync,timestamp,nsHostResolver:5,TRR:5" "MOZ_LOG_FILE=$logd/ff-%PID.log")
+            if [ "$arm" = cand ]; then ENVV+=(INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow "INVISIBLE_SEAL_FILE=$RUNNER_TEMP/gate.seal.json"); fi
+            t0=$(date +%s%3N)
+            ( cd "$wdir" && sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR "${ENVV[@]}" timeout 480 "$py" -m pytest -m e2e \
+                tests/test_nothing_leaves_but_the_proxy_e2e.py -k "launch_and_context and (hints or subresources)" \
+                -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$junit" ) > "$OUT/pytest/$arm-$i.txt" 2>&1
+            rc=$?
+            t1=$(date +%s%3N)
+            printf '{"arm":"%s","i":%d,"t0":%s,"t1":%s,"rc":%d,"junit":"%s","logd":"%s"}\n' "$arm" "$i" "$t0" "$t1" "$rc" "$junit" "$logd" >> "$OUT/runs.jsonl"
+            echo "== $arm run $i rc=$rc ($(( (t1 - t0) / 1000 )) s)"; tail -n 6 "$OUT/pytest/$arm-$i.txt" | cut -c1-300
+            sudo pkill -9 -f "/opt/ff" > /dev/null 2>&1
           }
-          ARMS=(cand pub cand_http pub_http)
-          N=${#ARMS[@]}
-          for r in $(seq 0 $((${ROUNDS:-2}-1))); do
-            for k in $(seq 0 $((N-1))); do
-              if [ "$SECONDS" -gt 3300 ]; then echo "time guard: no new arm after $SECONDS s"; break 2; fi
-              a=${ARMS[$(( (k + r) % N ))]}; run_arm "$a" "r$r" | tee -a "$RUNNER_TEMP/rows.log"
-            done
+          for i in $(seq 0 $((RUNS-1))); do
+            if [ "$SECONDS" -gt 4200 ]; then echo "time guard: no new run after $SECONDS s"; break; fi
+            if [ $((i % 2)) -eq 0 ]; then one_run cand "$i"; one_run pub "$i"; else one_run pub "$i"; one_run cand "$i"; fi
           done
-          cp "$HUNT_TRAP_LOG" "$RUNNER_TEMP/trap-all.jsonl"
+          sudo pkill -TERM -f "hunt_pingsender_dns.py watch" > /dev/null 2>&1
+          sleep 1
           true
-      - name: Restore resolv.conf, stop the trap, kill every firefox left
+      - name: Safety (resolv.conf, firefox left)
         if: always()
         run: |
-          sudo pkill -TERM -f "hunt_pingsender_dns.py trap" || true
-          sleep 2
-          if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then sudo rm -f /etc/resolv.conf; sudo cp -a "$RUNNER_TEMP/resolv.conf.orig" /etc/resolv.conf; fi
-          ls -l /etc/resolv.conf; cat "$RUNNER_TEMP/trap.out" || true
-          pkill -9 -f "/firefox" > /dev/null 2>&1 || true
+          ls -l /etc/resolv.conf; cat /etc/resolv.conf | head -5
+          sudo pkill -9 -f "/opt/ff" > /dev/null 2>&1 || true
           echo done
       - name: The table
         if: always()
         run: |
-          python - "$RUNNER_TEMP/rows.log" <<'PY'
-          import collections, json, re, sys
-          pings, senders = {}, {}
-          for line in open(sys.argv[1], encoding="utf-8"):
-              m = re.match(r"HUNT(PING|SENDER) \[(\w+)\] (.*)", line.strip())
-              if m:
-                  (pings if m.group(1) == "PING" else senders).setdefault(m.group(2), []).append(json.loads(m.group(3)))
+          python - "$RUNNER_TEMP/out" <<'PY'
+          import collections, glob, json, os, re, sys, xml.etree.ElementTree as ET
+          out = sys.argv[1]
+          TEL = "incoming.telemetry.mozilla.org"
+          def jl(p):
+              return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()] if os.path.exists(p) else []
+          runs, watch = jl(out + "/runs.jsonl"), jl(out + "/watch.jsonl")
+          seen = [w for w in watch if w["event"] == "seen"]
+          ends = {w["pid"]: w for w in watch if w["event"] == "end"}
           def q(v, p):
               v = sorted(x for x in v if x is not None)
               return v[min(len(v) - 1, int(p * len(v)))] if v else None
           def cnt(v):
               return dict(collections.Counter(str(x) for x in v).most_common(8))
-          for arm in ("cand", "pub", "cand_http", "pub_http"):
-              rows = pings.get(arm, [])
-              if not rows:
+          # What the trap counted: the failure message of the test names the queries ("name/qtype (protocol)" of ResolverTrap.describe()).
+          QRE = re.compile(r"([A-Za-z0-9_.\-]+)/(\d+) \((\w+)\)")
+          os.makedirs(out + "/sender-logs", exist_ok=True)
+          per_arm = {}
+          for run in runs:
+              tests = failures = 0
+              msgs = []
+              try:
+                  root = ET.parse(run["junit"]).getroot()
+                  for tc in root.iter("testcase"):
+                      tests += 1
+                      for f in list(tc.findall("failure")) + list(tc.findall("error")):
+                          failures += 1
+                          msgs.append(((f.get("message") or "") + "\n" + (f.text or "")))
+              except (OSError, ET.ParseError):
+                  pass
+              asked = []
+              for m in msgs:
+                  tail = m.split("asked the resolver of the machine", 1)[-1]
+                  asked += [(n, int(t), pr) for n, t, pr in QRE.findall(tail)]
+              tel = [a for a in asked if a[0].rstrip(".") == TEL]
+              snd = [s for s in seen if run["t0"] <= s["seen"] <= run["t1"] + 3000]
+              rec = per_arm.setdefault(run["arm"], {"runs": 0, "red_runs": 0, "tests": 0, "red_tests": 0, "tel": [], "asked": collections.Counter(), "senders": [], "msg": []})
+              rec["runs"] += 1
+              rec["red_runs"] += 1 if failures or run["rc"] != 0 else 0
+              rec["tests"] += tests
+              rec["red_tests"] += failures
+              rec["tel"].append(len(tel))
+              rec["asked"].update(a[0] for a in asked)
+              if msgs and len(rec["msg"]) < 2:
+                  rec["msg"].append(msgs[0][:700].replace("\n", " | "))
+              for s in snd:
+                  s = dict(s, run=run["i"], lifetime_ms=(ends.get(s["pid"]) or {}).get("lifetime_ms"))
+                  # The sender's own MOZ_LOG: the lines of the telemetry host, with the flags of the lookup.
+                  lines, files = [], glob.glob("%s/ff-%d.log*" % (run["logd"], s["pid"]))
+                  for fn in files:
+                      for ln in open(fn, encoding="utf-8", errors="replace"):
+                          if TEL in ln:
+                              lines.append(ln.rstrip()[:260])
+                  s["moz_files"], s["moz_lines"] = len(files), lines
+                  s["moz_tokens"] = sorted({t.lower() for ln in lines for t in re.findall(r"(TRR_ONLY|DISABLE_TRR|RESOLVE_[A-Z_]*TRR[A-Z_]*|NativeLookup|native|[Ff]lags\W*\w+|[Mm]ode\W*\d)", ln)})[:16]
+                  s["trap_native_in_run"] = len(tel)
+                  rec["senders"].append(s)
+                  for fn in files:
+                      os.system("gzip -c '%s' > '%s/%s-%d-%s.gz'" % (fn, out + "/sender-logs", run["arm"], run["i"], os.path.basename(fn)))
+          for arm in ("cand", "pub"):
+              r = per_arm.get(arm)
+              if not r:
                   continue
-              ok = [r for r in rows if "error" not in r]
-              ss = senders.get(arm, [])
-              nat_f = [r for r in ok if r.get("native_telemetry_by_firefox")]
-              nat_s = [r for r in ok if r.get("native_telemetry_by_sender")]
-              print("HUNTPINGSUM %-10s closes %d (errors %d) | closes with a sender %d, senders %d | closes with a NATIVE query for the telemetry host by a firefox process %d (by the sender %d) | trap queries per close p50 %s | proxy saw the telemetry host in %d closes, as %s"
-                    % (arm, len(ok), len(rows) - len(ok), sum(1 for r in ok if r.get("senders")), len(ss), len(nat_f), len(nat_s), q([r.get("trap_queries_total") for r in ok], .5),
-                       sum(1 for r in ok if r.get("proxy_saw_telemetry")), cnt(t["atyp"] for r in ok for t in r.get("proxy_saw_telemetry") or [])))
+              ss = r["senders"]
               route = [s.get("route") or {} for s in ss]
-              print("HUNTPINGROUTE %-10s route in the sender's environment: present %d of %d | proxy record present %d | proxy fields type/scheme/host %s | route prefs present %d, stealth.contexts in the route %s"
-                    % (arm, sum(1 for r in route if r.get("present")), len(ss), sum(1 for r in route if r.get("proxy_present")),
-                       cnt((r.get("proxy") or {}).get("type") or (r.get("proxy") or {}).get("scheme") or (r.get("proxy") or {}).get("server") for r in route if r.get("proxy_present")),
-                       sum(1 for r in route if r.get("prefs_n")), cnt(r.get("stealth_contexts_in_route") for r in route if r.get("present"))))
-              ps = [s.get("prefs_at_sender") or {} for s in ss]
-              pc = [s.get("prefs_at_close") or {} for s in ss]
-              print("HUNTPINGPREFS %-10s prefs.js copy at the sender: stealth.contexts %s | trr.mode %s | trr.uri set %s | excluded-domains %s | proxy.type %s || at the close: stealth.contexts %s | copy mtime vs the sender's birth ms p50 %s min %s max %s | copy taken after the birth ms p50 %s | no copy %d"
-                    % (arm, cnt(p.get("network.trr.stealth.contexts") for p in ps), cnt(p.get("network.trr.mode") for p in ps), cnt(bool(p.get("network.trr.uri")) for p in ps),
-                       cnt(p.get("network.trr.excluded-domains") for p in ps), cnt(p.get("network.proxy.type") for p in ps), cnt(p.get("network.trr.stealth.contexts") for p in pc),
-                       q([s.get("prefs_copy_mtime_vs_birth_ms") for s in ss], .5), min((s.get("prefs_copy_mtime_vs_birth_ms") for s in ss if s.get("prefs_copy_mtime_vs_birth_ms") is not None), default=None),
-                       max((s.get("prefs_copy_mtime_vs_birth_ms") for s in ss if s.get("prefs_copy_mtime_vs_birth_ms") is not None), default=None),
-                       q([s.get("prefs_copy_taken_after_birth_ms") for s in ss], .5), sum(1 for s in ss if not s.get("prefs_at_sender"))))
-              ml = [s.get("moz_log") or {} for s in ss]
-              print("HUNTPINGLOG %-10s MOZ_LOG of the sender: env has MOZ_LOG %d of %d | log files p50 %s | senders whose log names the telemetry host %d | tokens %s | trap queries of the sender p50 %s, senders with one %d"
-                    % (arm, sum(1 for s in ss if s.get("env_moz_log")), len(ss), q([m.get("files") for m in ml], .5), sum(1 for m in ml if m.get("n")),
-                       cnt(t for m in ml for t in m.get("tokens") or []), q([len(s.get("trap_queries") or []) for s in ss], .5), sum(1 for s in ss if s.get("trap_queries"))))
-              who = collections.Counter(t["who"] for r in ok for t in r.get("telemetry_queries") or [])
-              print("HUNTPINGWHO %-10s queries for the telemetry host that reached the machine's resolver, by who: %s | other names asked by firefox processes %s | sender lifetime ms p50 %s max %s | sender born against the close ms p50 %s"
-                    % (arm, dict(who), sorted({n for r in ok for n in r.get("other_names_by_firefox") or []})[:12], q([s.get("lifetime_ms") for s in ss], .5),
-                       max((s.get("lifetime_ms") or 0 for s in ss), default=None), q([s.get("rel_close_ms") for s in ss], .5)))
-              for s in [s for s in ss if s.get("trap_queries")][:4] + ss[:2]:
-                  print("HUNTPINGSENDER %-10s %s s%s pid %s | route %s | prefs at sender %s | log lines %s | trap %s"
-                        % (arm, s.get("round"), s.get("session"), s.get("pid"), json.dumps(s.get("route"))[:300], json.dumps(s.get("prefs_at_sender"))[:300],
-                           (s.get("moz_log") or {}).get("lines", [])[:3], s.get("trap_queries")))
+              pf = [s.get("prefs") or {} for s in ss]
+              print("HUNTLAB %-5s runs %d (red %d), tests %d (red %d) | native queries for the telemetry host per run: %s (runs with one %d) | other names the trap named: %s | senders seen %d, per run p50 %s"
+                    % (arm, r["runs"], r["red_runs"], r["tests"], r["red_tests"], r["tel"], sum(1 for t in r["tel"] if t), dict(r["asked"].most_common(8)),
+                       len(ss), q(collections.Counter(s["run"] for s in ss).values(), .5)))
+              print("HUNTLABROUTE %-5s route in the sender's environment: present %d of %d | proxy record present %d | proxy fields %s | route prefs present %d | MOZ_LOG reached the sender %d, MOZ_LOG_FILE %d"
+                    % (arm, sum(1 for x in route if x.get("present")), len(ss), sum(1 for x in route if x.get("proxy_present")),
+                       cnt(json.dumps(x.get("proxy"), sort_keys=True) for x in route if x.get("proxy_present")), sum(1 for x in route if x.get("prefs_n")),
+                       sum(1 for s in ss if s.get("env_moz_log")), sum(1 for s in ss if s.get("env_moz_log_file"))))
+              mt = [s.get("prefs_copy_mtime_vs_birth_ms") for s in ss if s.get("prefs_copy_mtime_vs_birth_ms") is not None]
+              print("HUNTLABPREFS %-5s prefs.js copied at the sender: stealth.contexts %s | trr.mode %s | trr.uri set %s | excluded-domains %s | proxy.type %s | copy mtime vs the sender's birth ms p50 %s min %s max %s | copy taken after the birth ms p50 %s | no copy %d (profile found in %d)"
+                    % (arm, cnt(p.get("network.trr.stealth.contexts") for p in pf), cnt(p.get("network.trr.mode") for p in pf), cnt(bool(p.get("network.trr.uri")) for p in pf),
+                       cnt(p.get("network.trr.excluded-domains") for p in pf), cnt(p.get("network.proxy.type") for p in pf), q(mt, .5), min(mt, default=None), max(mt, default=None),
+                       q([s.get("prefs_copy_taken_after_birth_ms") for s in ss], .5), sum(1 for s in ss if not s.get("prefs")), sum(1 for s in ss if s.get("profile"))))
+              print("HUNTLABLOG %-5s MOZ_LOG of the sender: log files p50 %s | senders whose log names the telemetry host %d | tokens %s | sender lifetime ms p50 %s max %s"
+                    % (arm, q([s.get("moz_files") for s in ss], .5), sum(1 for s in ss if s.get("moz_lines")), cnt(t for s in ss for t in s.get("moz_tokens") or []),
+                       q([s.get("lifetime_ms") for s in ss], .5), max((s.get("lifetime_ms") or 0 for s in ss), default=None)))
+              for m in r["msg"]:
+                  print("HUNTLABFAIL %-5s %s" % (arm, m))
+              for s in ss[:6]:
+                  print("HUNTLABSENDER %-5s run %s pid %s | route %s | prefs %s | mtime vs birth %s | log lines %s | tokens %s | natives asked in that run %s"
+                        % (arm, s["run"], s["pid"], json.dumps(s.get("route"))[:260], json.dumps(s.get("prefs"))[:260], s.get("prefs_copy_mtime_vs_birth_ms"),
+                           s.get("moz_lines", [])[:3], s.get("moz_tokens"), s.get("trap_native_in_run")))
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: "pingsender-dns-${{ github.run_id }}"
           path: |
-            ${{ runner.temp }}/rows.log
-            ${{ runner.temp }}/trap-all.jsonl
+            ${{ runner.temp }}/out/runs.jsonl
+            ${{ runner.temp }}/out/watch.jsonl
+            ${{ runner.temp }}/out/watch.out
+            ${{ runner.temp }}/out/junit
+            ${{ runner.temp }}/out/pytest
+            ${{ runner.temp }}/out/prefs
+            ${{ runner.temp }}/out/sender-logs
