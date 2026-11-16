@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# candidate-control-a-hunt.yml - a MEASUREMENT, not a gate: the Control+A file of the
+# e2e (tests/test_control_a_selects_all_in_a_field_e2e.py, 20 tests: 5 ways to press
+# the shortcut x 2 fields x the in-process browser and the stock client), run again and
+# again with the protocol trace of scripts/hunt_trace_plugin.py, on the Windows binary of
+# an ENGINE CANDIDATE and not on the published one. The rare red it looks for is
+# `Page.set_content: the caller's world never appeared for frame mainframe-N - did you
+# call install()? Worlds seen: ['']`.
+#
+# The candidate is named by two files of this branch, written when the hunt is launched:
+#   ci/candidate-run.txt        the id of the candidate's run of `release` in oss-invisible/firefox_antidetect_patch
+#   ci/candidate-core-ref.txt   the core_ref that run was gated with
+# Both say TODO until then, and the first step of the job refuses TODO. The binary is the
+# artifact asset-win-x86_64 of that run, extracted as the gate of the candidate does and
+# sealed as firefox-N-candidate (scripts/hunt_candidate_binary.py says how).
+#
+# ROUNDS OF FOUR COPIES, not `-n 4`: four pytest processes at once, each on the whole
+# file (what a `--dist loadfile` worker of the gate does), so that every browser lives
+# the same 10 tests per mode, in the same order, as in the gate (scripts/hunt_ctrla_rounds.py
+# says why). Rounds follow until 320 test runs are recorded (4 rounds). A red copy never
+# stops the others; the verdict is only that 320 traces and the junit files are there.
+#
+# It runs on a push to its own branch only.
+# ─────────────────────────────────────────────────────────────────────────────
+name: candidate-control-a-hunt
+
+on:
+  push:
+    branches: [hunt/candidate-control-a]
+
+permissions:
+  contents: read
+  actions: read
+
+# A hunt has a group of its own, unique to the run: a newer push never cancels
+# a measurement that is half done (tests/test_ci_runs_once_per_commit.py).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  # reads the artifacts and the log of the candidate's run (the engine repository is public)
+  GH_TOKEN: ${{ github.token }}
+  GITHUB_TOKEN: ${{ github.token }}
+  # the core of the candidate, not the one the wrapper pins: the pair is mismatched on purpose, as the gate of the candidate runs it
+  INVISIBLE_CORE_PIN: allow
+  INVISIBLE_CORE_AUTOFIX: "off"
+
+jobs:
+  candidate-control-a-windows:
+    name: candidate-control-a (windows)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      # TODO in either file ends the job here, in seconds, with the reason.
+      - name: The candidate is named (ci/candidate-run.txt, ci/candidate-core-ref.txt)
+        run: python scripts/hunt_candidate_binary.py check
+      - name: Install the core of the candidate, the wrapper and the test deps
+        run: |
+          set -e
+          CORE_GIT="git+https://github.com/oss-invisible/core@$(python scripts/hunt_candidate_binary.py core-ref)"
+          python -m pip install --upgrade pip
+          python -m pip install --quiet "$CORE_GIT"
+          python -m pip install --quiet ".[dev]"
+          python -m pip install --quiet --force-reinstall "$CORE_GIT"
+          python -m pip install --quiet "playwright==$(cat scripts/playwright_pin.txt)"
+          python scripts/hunt_candidate_binary.py verify-core
+      - name: The binary of the candidate (asset-win-x86_64), sealed
+        run: python scripts/hunt_candidate_binary.py fetch --leg win-x86_64 --dest "$RUNNER_TEMP/candidate"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build --pin ci/geoip.json
+      - name: The Control+A file in rounds of four copies, with the protocol trace
+        timeout-minutes: 45
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python -u scripts/hunt_ctrla_rounds.py --binary "$FF" --out-dir "$RUNNER_TEMP/ctrla-hunt" --min-runs 320 --copies 4 --budget-min 28
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: The summary of the red and the green runs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/ctrla-hunt"
+          cp "$RUNNER_TEMP/candidate/candidate.json" "$RUNNER_TEMP/ctrla-hunt/" || true
+          python scripts/hunt_ctrla_summary.py "$RUNNER_TEMP/ctrla-hunt/trace" --max-reds 30 | tee "$RUNNER_TEMP/ctrla-hunt/summary.txt" || true
+      - name: Upload the traces, the junit and the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-control-a-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ctrla-hunt
+          if-no-files-found: warn
+          retention-days: 14
+      # The verdict is only that the files are there: a red test is what the hunt is for.
+      - name: Verdict (320 traces and the junit files are there)
+        if: always()
+        run: |
+          traces=$(ls "$RUNNER_TEMP/ctrla-hunt/trace"/*.json 2>/dev/null | wc -l)
+          junits=$(ls "$RUNNER_TEMP/ctrla-hunt/junit"/*.xml 2>/dev/null | wc -l)
+          echo "trace files: $traces, junit files: $junits"
+          [ "$traces" -ge 320 ] && [ "$junits" -gt 0 ]
