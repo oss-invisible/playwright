@@ -10,7 +10,7 @@ records, and returns what it returned), and nothing is raised (the hunt refuses 
     python hunt_candidate_closewhy.py selftest                      synthetic data through the report and the compare
 
 It imports `hunt_published_latency.py` and `hunt_candidate.py` (never edited, so the workflows that watch them do not start) and puts its
-own probes around the close path of the wrapper (ef3ba1c8) and of the core (0e35e35):
+own probes around the close path of the wrapper (30ee9e59, release/0.53.0) and of the core (8c5e9dbd, fix/stroke-on-own-clock, with #287):
 
   1. STAMPS. Every step of the close, with `time.perf_counter_ns` (one clock for the process), a wall anchor (wall = anchor + delta) and the
      name of the thread that took it: the client's Browser.close (public and impl), the message it sends, the transport's queue, the server
@@ -57,8 +57,8 @@ WALL0_MS = time.time() * 1000.0
 
 #: What a probe sees of the two packages it was written against (the pins of the workflow): the wrapper's and the core's functions are
 #: checked against these lines when they are wrapped, and the log says which differ.
-WRAPPER_PIN = "ef3ba1c8623fda7177476e6c9247dcaa4e27bd86"
-CORE_PIN = "0e35e35f4a1017234c8cc51858c829de6f23ffc8"
+WRAPPER_PIN = "30ee9e597c5434e4f1a17020fc2cea82ab303262"
+CORE_PIN = "8c5e9dbda105dc2a153085db25f9aaf839245e20"
 
 GAP_S = 0.5            # a gap over this is looked into
 LONG_NS = 5_000_000    # a psutil call of this length is stamped with its instant
@@ -259,11 +259,14 @@ def wrap(owner, name: str, label: str, *, expect=None, critical=False, tag_of=No
         rebind_everywhere(real, call)
 
 
-def note_custom(owner, name: str, label: str, real, expect) -> None:
+def note_custom(owner, name: str, label: str, real, expect, critical: bool = False) -> None:
     """The line of a function the hunt wraps by hand (the wrapper around it is not `wrap`'s)."""
     qual = getattr(owner, "__qualname__", None) or getattr(owner, "__name__", "?")
     where, line = WHERE.get((qual, name)) or (where_of(real), line_of(real))
-    WRAPPED.append((label, where, "ok" if expect is None or line == expect else "LINE %s, expected %s" % (line, expect)))
+    status = "ok" if expect is None or line == expect else "LINE %s, expected %s" % (line, expect)
+    WRAPPED.append((label, where, status))
+    if critical and status != "ok":
+        raise SystemExit("closewhy: %s is at %s, not %s: not the package this probe was written for" % (label, where, expect))
 
 
 def wrap_agg(owner, name: str, label: str, *, expect=None) -> None:
@@ -538,11 +541,14 @@ def install_closewhy(H, HC) -> None:
     cmod = importlib.import_module("invisible_core.juggler.connection")
     prof = importlib.import_module("invisible_core.juggler._profile")
     om = importlib.import_module("invisible_core._offloop")
+    rmod = importlib.import_module("invisible_playwright._juggler._reaped")
+    dmod = importlib.import_module("invisible_playwright._juggler.dispatcher")
     # The lines of the core's functions are read BEFORE the hunt's own wrappers (hunt_candidate) go round them.
     for owner, names in ((pmod.EngineTree, ("end", "release", "_wait", "wait_browser_gone", "members", "remember", "_survives")),
-                         (pmod.Reaper, ("run", "then", "start")), (pmod.EngineJob, ("wait_empty", "terminate", "active", "pids")),
+                         (pmod.Reaper, ("run", "then", "start", "join", "_continue")), (pmod.EngineJob, ("wait_empty", "terminate", "active", "pids")),
                          (pmod.LifetimeGuard, ("reap",)), (cmod.Connection, ("close",)), (prof.SessionFiles, ("remove",)),
-                         (pmod, ("reap_session", "find_processes", "terminate")), (prof, ("remove_profile",)), (om, ("off_the_loop",))):
+                         (pmod, ("reap_session", "find_processes", "terminate")), (prof, ("remove_profile",)), (om, ("off_the_loop",)),
+                         (rmod, ("after_the_reapers",)), (dmod.Server, ("after_reapers",))):
         for n in names:
             snapshot_where(owner, n)
     HC.install_clean_close_stamps()          # the stamps of the earlier hunt (CloseRec, the exits, the ends), as in cand4close
@@ -587,11 +593,38 @@ def install_closewhy(H, HC) -> None:
     wrap(pmod.EngineJob, "terminate", "job.terminate", expect=725)
     wrap_agg(pmod.EngineJob, "active", "job.active", expect=657)
     wrap_agg(pmod.EngineJob, "pids", "job.pids", expect=694)
-    wrap(pmod.Reaper, "run", "reaper.run", expect=1237, critical=True,
+    wrap(pmod.Reaper, "run", "reaper.run", expect=1274, critical=True,
          tag_of=lambda self: TAG_BY["tree"].get(id(self.tree)), adopt=lambda self: TAG_BY["tree"].get(id(self.tree)),
          extra_of=lambda self: {"grace": self.grace, "timeout": self.timeout})
-    wrap(pmod.Reaper, "then", "reaper.then", expect=1225, tag_of=lambda self, step: TAG_BY["tree"].get(id(self.tree)))
-    wrap(pmod.Reaper, "start", "reaper.start", expect=1260, tag_of=lambda self: TAG_BY["tree"].get(id(self.tree)))
+    wrap(pmod.Reaper, "_continue", "reaper._continue", expect=1260, critical=True,
+         tag_of=lambda self: TAG_BY["tree"].get(id(self.tree)), adopt=lambda self: TAG_BY["tree"].get(id(self.tree)))
+    real_then = pmod.Reaper.then
+
+    def reaper_then(self, step):
+        """Each step handed to a reaper is stamped when it runs, on whichever thread runs it (the reaper's, or its continuation)."""
+        if not EPOCH_ON[0]:
+            return real_then(self, step)
+        tag = TAG_BY["tree"].get(id(self.tree))
+        name = getattr(step, "__qualname__", None) or repr(step)[:60]
+
+        def timed():
+            me()["tag"] = tag
+            stamp("reaper.step.enter", tag, step=name)
+            try:
+                return step()
+            finally:
+                stamp("reaper.step.exit", tag)
+        stamp("reaper.then.enter", tag, step=name, finished=getattr(self, "_finished", None))
+        try:
+            return real_then(self, timed)
+        finally:
+            stamp("reaper.then.exit", tag)
+    reaper_then._cw = True
+    functools.update_wrapper(reaper_then, real_then)
+    pmod.Reaper.then = reaper_then
+    note_custom(pmod.Reaper, "then", "reaper.then", real_then, 1231, critical=True)
+    wrap(pmod.Reaper, "start", "reaper.start", expect=1297, tag_of=lambda self: TAG_BY["tree"].get(id(self.tree)))
+    wrap(pmod.Reaper, "join", "reaper.join", expect=1305, tag_of=lambda self, *a, **k: TAG_BY["tree"].get(id(self.tree)))
     wrap(pmod.LifetimeGuard, "reap", "guard.reap", expect=299, extra_of=lambda self, *a, **k: {"guard": type(self).__name__, "by": callers(4)})
     wrap(pmod, "reap_session", "reap_session", expect=270, rebind=True, extra_of=lambda *a, **k: {"by": callers(4)})
     wrap(pmod, "find_processes", "find_processes", expect=163, rebind=True)
@@ -708,8 +741,8 @@ def install_closewhy(H, HC) -> None:
     handle._cw = True
     functools.update_wrapper(handle, real_handle)
     dmod.Server.handle = handle
-    note_custom(dmod.Server, "handle", "server.handle", real_handle, 469)
-    wrap(dmod.Server, "shutdown", "server.shutdown", expect=446, tag_of=server_tag, adopt=server_tag)
+    note_custom(dmod.Server, "handle", "server.handle", real_handle, 487)
+    wrap(dmod.Server, "shutdown", "server.shutdown", expect=464, tag_of=server_tag, adopt=server_tag)
 
     real_on = dmod.Server.on_shutdown
     snapshot_where(dmod.Server, "on_shutdown")
@@ -727,7 +760,7 @@ def install_closewhy(H, HC) -> None:
         return real_on(self, timed_hook)
     on_shutdown._cw = True
     dmod.Server.on_shutdown = on_shutdown
-    note_custom(dmod.Server, "on_shutdown", "server.on_shutdown", real_on, 428)
+    note_custom(dmod.Server, "on_shutdown", "server.on_shutdown", real_on, 431)
 
     real_after = dmod.Server.after_shutdown
     snapshot_where(dmod.Server, "after_shutdown")
@@ -745,12 +778,12 @@ def install_closewhy(H, HC) -> None:
         return real_after(self, timed_step)
     after_shutdown._cw = True
     dmod.Server.after_shutdown = after_shutdown
-    note_custom(dmod.Server, "after_shutdown", "server.after_shutdown", real_after, 431)
+    note_custom(dmod.Server, "after_shutdown", "server.after_shutdown", real_after, 434)
 
     is_browser = lambda self, *a, **k: getattr(self, "TYPE", None) == "Browser"     # noqa: E731
     browser_tag = lambda self, *a, **k: TAG_BY["conn"].get(id(getattr(self, "conn", None)))      # noqa: E731
-    wrap(dmod.Dispatcher, "emit", "dispatcher.emit", expect=182, only=is_browser, tag_of=browser_tag, extra_of=lambda self, method, *a, **k: {"method": method})
-    wrap(dmod.Dispatcher, "dispose", "dispatcher.dispose", expect=191, only=is_browser, tag_of=browser_tag)
+    wrap(dmod.Dispatcher, "emit", "dispatcher.emit", expect=183, only=is_browser, tag_of=browser_tag, extra_of=lambda self, method, *a, **k: {"method": method})
+    wrap(dmod.Dispatcher, "dispose", "dispatcher.dispose", expect=192, only=is_browser, tag_of=browser_tag)
     wrap(smod.BrowserDispatcher, "op_close", "server.op_close", expect=6111, critical=True, tag_of=browser_tag, adopt=browser_tag)
 
     wrap(tmod.InProcessTransport, "send", "transport.send", expect=208, tag_of=transport_tag,
@@ -787,10 +820,14 @@ def install_closewhy(H, HC) -> None:
     wrap(tmod.InProcessTransport, "wait_until_stopped", "transport.wait_until_stopped", expect=204, tag_of=transport_tag)
 
     conn_tag = lambda self, conn, *a, **k: TAG_BY["conn"].get(id(conn))     # noqa: E731
-    wrap(rmod.SessionRemoval, "close", "removal.close", expect=52, critical=True, tag_of=conn_tag, adopt=conn_tag)
+    wrap(rmod.SessionRemoval, "close", "removal.close", expect=56, critical=True, tag_of=conn_tag, adopt=conn_tag)
     wrap(rmod.SessionRemoval, "run", "removal.run", expect=38)
     wrap(rmod.SessionRemoval, "after_shutdown", "removal.after_shutdown", expect=45)
-    wrap(rmod, "final_reap", "final_reap", expect=93, critical=True, rebind=True)
+    wrap(rmod, "after_the_reapers", "after_the_reapers", expect=97, critical=True, rebind=True,
+         extra_of=lambda step, *tokens, **k: {"tokens": len(tokens), "forget": k.get("forget", False), "step": getattr(step, "__qualname__", "?")})
+    wrap(rmod, "final_reap", "final_reap", expect=137, critical=True, rebind=True)
+    wrap(dmod.Server, "after_reapers", "server.after_reapers", expect=455, tag_of=server_tag)
+    wrap(dmod.Server, "note_session_token", "server.note_session_token", expect=449)
 
     for label, where, status in WRAPPED:
         # Every probe is listed in the first round; the others print only what is not as expected, and the summary.
@@ -1181,7 +1218,7 @@ def sample_report(run: Run, t0: int, t1: int, uids: list, L, F, reply_uid=None) 
                 any_other = True
                 n_run_total += 1
                 cls = thread_class(name)
-                if name == "invisible-reaper":
+                if name in ("invisible-reaper", "invisible-reaper-then"):
                     cls += "[%s]" % short(itag.get(ident))
                 others[cls] += 1
                 top = run.frame(run.stacks[sid][0]) if run.stacks[sid] else "?"
@@ -1268,7 +1305,7 @@ def report_run(run: Run, L, F, rounds_seen: list) -> list:
 def reapers_report(run: Run, L, F) -> None:
     sp = spans_of(run)
     r, t_epoch = run.rnd(), (first(run.stamps, "epoch.start") or {}).get("pc")
-    names = ("reaper.run", "reaper.start", "tree.end", "tree.release", "tree._wait", "tree.wait_browser_gone", "job.wait_empty", "job.terminate", "guard.reap",
+    names = ("reaper.run", "reaper._continue", "reaper.step", "reaper.then", "reaper.join", "after_the_reapers", "server.after_reapers", "reaper.start", "tree.end", "tree.release", "tree._wait", "tree.wait_browser_gone", "job.wait_empty", "job.terminate", "guard.reap",
              "reap_session", "find_processes", "process.terminate", "session_files.remove", "remove_profile", "removal.close", "removal.run",
              "offloop[final_reap]", "final_reap", "offloop[_join_workers]", "server.shutdown", "server.hook", "server.after_step", "transport.request_stop",
              "transport.wait_until_stopped", "transport._settle")
@@ -1286,7 +1323,7 @@ def reapers_report(run: Run, L, F) -> None:
     for a in run.accs:
         t = run.threads.get(a["u"]) or {}
         name = t.get("name", "?")
-        key = "%s[%s]" % (name, short(t.get("tag"))) if name in ("invisible-reaper", "invisible-teardown") or (t.get("tag") and name.startswith("juggler")) else thread_class(name)
+        key = "%s[%s]" % (name, short(t.get("tag"))) if name in ("invisible-reaper", "invisible-reaper-then", "invisible-teardown") or (t.get("tag") and name.startswith("juggler")) else thread_class(name)
         site = "%s %s:%s %s" % (a["fn"], a["file"].rsplit("/", 1)[-1], a["line"], a["func"])
         g = groups[key][site]
         g[0] += a["n"]
@@ -1316,6 +1353,23 @@ def stats_line(mode: str, closes: list) -> str:
                                               pct(cm, .5), max(cm, default=None))
 
 
+def verdict_line(mode: str, closes: list, files: int) -> str:
+    """HUNTCWVERDICT: the closes where (the user's close() return - Connection.close return) is over 0.5 s. The criterion is 0 in `together`;
+    `sequential` is the control (printed, never judged). A close that could not be measured (no Connection.close return or no close() return)
+    or fewer closes than 4 per round make the verdict INCOMPLETE: a missing close is not a pass."""
+    gu = [c["gap_user"] for c in closes]
+    measured = [g for g in gu if g is not None]
+    over = sum(1 for g in measured if g > GAP_S * 1000)
+    expected = 4 * files
+    head = "HUNTCWVERDICT mode=%s closes=%d (expected %d) unmeasured=%d closes_with_gap_over_%.1fs=%d max_gap_ms=%s" % (
+        mode, len(closes), expected, len(gu) - len(measured), GAP_S, over, max(measured, default=None))
+    if mode != "together":
+        return head + " CONTROL (not judged)"
+    if len(closes) < expected or len(measured) < len(closes):
+        return head + " INCOMPLETE"
+    return head + (" PASS" if over == 0 else " FAIL")
+
+
 def write_readable(runs: list, outdir: str, lines: list) -> None:
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "report.txt"), "w", encoding="utf-8", newline="\n") as f:
@@ -1337,7 +1391,7 @@ def write_readable(runs: list, outdir: str, lines: list) -> None:
                 for tid, state, sid in p["s"]:
                     ident, name = run.tids[tid]
                     if name == "MainThread" or state in ("R", "L"):
-                        f.write("  %s%s [%s] %s\n" % (name, "[%s]" % short(itag.get(ident)) if name == "invisible-reaper" else "", state, run.stack(sid, 12)))
+                        f.write("  %s%s [%s] %s\n" % (name, "[%s]" % short(itag.get(ident)) if name.startswith("invisible-reaper") else "", state, run.stack(sid, 12)))
 
 
 def load_runs(d: str) -> list:
@@ -1377,6 +1431,7 @@ def report_main(d: str, rows_log: str = None) -> int:
         reapers_report(run, L, F)
     L("HUNTCW4 the arm, all rounds:")
     L(stats_line(runs[0].mode(), allc))
+    L(verdict_line(runs[0].mode(), allc, len(runs)))
     if rows_log and os.path.exists(rows_log):
         text = open(rows_log, encoding="utf-8", errors="replace").read()
         rows = []
@@ -1408,6 +1463,10 @@ def compare_main(d: str) -> int:
             print(stats_line(mode, by[mode]))
         else:
             print("HUNTCWCMP %-10s | no data (the job did not leave a file)" % mode)
+    files = collections.Counter(run.mode() for run in runs)
+    for mode in ("together", "sequential"):
+        if mode in by:
+            print(verdict_line(mode, by[mode], files[mode]))
     for mode in ("together", "sequential"):
         gaps = sorted(((c["gap_user"], c["tag"]) for c in by.get(mode, []) if c["gap_user"] is not None), reverse=True)[:8]
         print("HUNTCWCMP %-10s | the largest gaps (ms, browser): %s" % (mode, gaps))

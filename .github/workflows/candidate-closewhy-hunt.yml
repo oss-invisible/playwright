@@ -5,7 +5,9 @@
 # returning almost together; in three cases the delay equals another browser's EngineTree.end, waiting for its pingsender). The hypothesis to prove or
 # refute: the OTHER browsers' reapers (process scans, polling waits, psutil calls) hold the GIL or a shared lock and starve the thread that must deliver
 # the close's reply. Whatever the stacks show is reported.
-# Pins: engine = candidate run 43843317541 (series 05522a48bdd8), wrapper = oss-invisible/playwright at ef3ba1c8, core = oss-invisible/core at 0e35e35.
+# Pins: engine = candidate run 43843317541 (series 05522a48bdd8), wrapper = oss-invisible/playwright at 30ee9e59 (release/0.53.0: after_the_reapers, Server.after_reapers), core = oss-invisible/core at 8c5e9dbd
+# (fix/stroke-on-own-clock, with #287: Reaper.then on a finished reaper runs the step on the non-daemon continuation thread invisible-reaper-then).
+# This round is the one WITH the fix: the verdict line HUNTCWVERDICT is PASS when no close of `together` returns more than 0.5 s after Connection.close.
 # Scenario of cand4close: 4 browsers in one process, idle until the session is 75 s old, closed together; the shutdown log of the engine on.
 # Arms (a job each, max-parallel 2): together = the 4 closes at once (as cand4close), sequential = the same 4 browsers, each close awaited before the next.
 # scripts/hunt_candidate_closewhy.py (imports scripts/hunt_candidate.py and scripts/hunt_published_latency.py, edits neither) puts around the close path of the
@@ -54,15 +56,15 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: "3.12" }
-      - name: A venv (psutil, the core 0e35e35, the wrapper ef3ba1c8 and stock Playwright's driver)
+      - name: A venv (psutil, the core 8c5e9dbd, the wrapper 30ee9e59 and stock Playwright's driver)
         run: |
           P="$RUNNER_TEMP/after/Scripts/python"
           python -m venv "$RUNNER_TEMP/after"
           "$P" -m pip install -q --upgrade pip
           "$P" -m pip install -q psutil
           "$P" -m pip install -q "invisible-playwright==0.52.1" websockets "playwright==$(cat scripts/playwright_pin.txt)"
-          "$P" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@0e35e35f4a1017234c8cc51858c829de6f23ffc8"
-          "$P" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@ef3ba1c8623fda7177476e6c9247dcaa4e27bd86"
+          "$P" -m pip install -q --force-reinstall "git+https://github.com/oss-invisible/core@8c5e9dbda105dc2a153085db25f9aaf839245e20"
+          "$P" -m pip install -q --no-deps --force-reinstall "git+https://github.com/oss-invisible/playwright@30ee9e597c5434e4f1a17020fc2cea82ab303262"
           "$P" -c "
           import importlib.metadata as m, json
           for n in ('invisible-core', 'invisible-playwright'):
