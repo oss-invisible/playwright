@@ -72,7 +72,7 @@ jobs:
           gh run view "$RUN" -R oss-invisible/firefox_antidetect_patch --json status,conclusion,headSha,headBranch || true
           SHA=$(gh run view "$RUN" -R oss-invisible/firefox_antidetect_patch --json headSha --jq .headSha)
           case "$SHA" in 05522a48bdd8*) ;; *) echo "the run $RUN is not the series 05522a48bdd8 ($SHA)"; exit 1 ;; esac
-          gh api "repos/oss-invisible/firefox_antidetect_patch/actions/runs/$RUN/artifacts" --jq '.artifacts[] | "artifact \(.name) \(.size_in_bytes) expired=\(.expired)"' | head -20
+          gh api "repos/oss-invisible/firefox_antidetect_patch/actions/runs/$RUN/artifacts" --jq '.artifacts[] | "artifact \(.name) \(.size_in_bytes) expired=\(.expired)"' | head -20 || true
           mkdir -p "$RUNNER_TEMP/eng" && cd "$RUNNER_TEMP/eng"
           if [ "$RUNNER_OS" = "Windows" ]; then
             gh run download "$RUN" -R oss-invisible/firefox_antidetect_patch -n asset-win-x86_64 -D .
