@@ -165,12 +165,11 @@ def _offline_session_geo(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _a_unit_test_asks_mozilla_for_no_intermediates_list(request, monkeypatch):
-    """Outside the e2e, a launch declares no intermediates list and starts no check of it.
+    """Outside the e2e, a launch declares no intermediates list.
 
-    The core's `write_user_js` (every launch the server makes) declares Mozilla's list: on a cold cache it downloads it in line, on a warm one the launch starts a
-    background check, and the line it writes would differ with the cache of whoever runs the test. The two functions are stubbed, as the core's own suite does
-    (tests/conftest.py of invisible-core): no list, no thread, no request. The tests of `fetch` set their own; a test marked `e2e` gets the real ones (the CI legs
-    point them at the empty file of `ci/intermediates.json`)."""
+    The core's `write_user_js` (every launch the server makes) declares Mozilla's list: on a cold cache it downloads it in line, and the line it writes would
+    differ with the cache of whoever runs the test. The function is stubbed, as the core's own suite does (tests/conftest.py of invisible-core): no list, no
+    request. The tests of `fetch` set their own; a test marked `e2e` gets the real one (the CI legs point it at the empty file of `ci/intermediates.json`)."""
     if request.node.get_closest_marker("e2e") is not None:
         return
     try:
@@ -178,7 +177,6 @@ def _a_unit_test_asks_mozilla_for_no_intermediates_list(request, monkeypatch):
     except Exception:  # the package is absent: the tests that need it say so
         return
     monkeypatch.setattr(_im, "ensure_intermediates", lambda *a, **kw: None)
-    monkeypatch.setattr(_im, "refresh_intermediates_in_background", lambda *a, **kw: None)
 
 
 @pytest.fixture(autouse=True)
