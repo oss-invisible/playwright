@@ -164,6 +164,14 @@ def _offline_session_geo(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _what_the_core_declares_for_a_proxy_is_recorded(monkeypatch):
+    """The core keeps no UDP verdict in memory, so a test that wants to know what the launch declared reads it where it is
+    written: `_udp_line.record_declared` spies the one function that renders the engine's proxy command (unit and e2e)."""
+    from _udp_line import record_declared
+    record_declared(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
 def _a_unit_test_asks_mozilla_for_no_intermediates_list(request, monkeypatch):
     """Outside the e2e, a launch declares no intermediates list.
 
@@ -186,21 +194,13 @@ def _a_unit_test_does_not_depend_on_the_seal_of_whoever_runs_it(request, monkeyp
     The CI jobs export it (a LOCAL seal of the candidate, with no published assets) for the e2e tests that launch the engine under test. A unit test
     that composes a launch (``build_env``, ``launch_persistent_context``, a second browser served by a virtual display) reaches ``ensure_binary`` and
     died with ``SealError: the active seal ... is a LOCAL seal with no published assets`` only because of where it ran. Here the variable is taken out
-    of the test's environment (``monkeypatch`` puts it back), and the seal the process had already resolved is dropped, so the test resolves the
+    of the test's environment (``monkeypatch`` puts it back); the core reads the seal on every call, so the test resolves the
     packaged one; a test that wants a seal sets the variable itself, after this. The e2e tests, which are the ones that need it, keep it."""
     if request.node.get_closest_marker("e2e") is not None:
         yield
         return
-    try:
-        from invisible_core.seal import _reset_active_seal_for_tests
-    except Exception:  # the package is absent: the tests that need it say so
-        _reset_active_seal_for_tests = None
     monkeypatch.delenv("INVISIBLE_SEAL_FILE", raising=False)
-    if _reset_active_seal_for_tests is not None:
-        _reset_active_seal_for_tests()
     yield
-    if _reset_active_seal_for_tests is not None:
-        _reset_active_seal_for_tests()
 
 
 @pytest.fixture(scope="session", autouse=True)
