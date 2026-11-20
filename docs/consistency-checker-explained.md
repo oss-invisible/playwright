@@ -1,20 +1,20 @@
 ---
-title: "How CreepJS decides you are lying"
-description: "CreepJS asks whether a browser is telling the truth, not just what it reports. Read from its own source: how it detects a lie and why spoofing scores worse."
+title: "How a consistency checker decides you are lying"
+description: "A consistency checker asks whether a browser is telling the truth, not just what it reports. Read from its own source: how it detects a lie and why spoofing scores worse."
 parent: "Detectors, Explained"
 grand_parent: "Guides"
 nav_order: 2
 ---
 
 
-# How CreepJS decides you are lying
+# How a consistency checker decides you are lying
 
-Most fingerprinting tests ask what your browser reports. CreepJS mostly asks whether
+Most fingerprinting tests ask what your browser reports. A consistency checker mostly asks whether
 your browser is *telling the truth*, which is a different question and a much harder
 one to pass by spoofing.
 
-Read from the source on 2026-07-27 ([`abrahamjuliot/creepjs`](https://github.com/abrahamjuliot/creepjs),
-`src/lies/index.ts` and the module layout) and not from the rendered page, because
+Read from the source on 2026-07-27 (the open-source code of a public
+consistency-checking test page: its tampering module and the module layout) and not from the rendered page, because
 the interesting part is the method instead of the numbers it prints.
 
 ## The shape of it
@@ -39,7 +39,7 @@ anything else here, and nothing looks tampered with".
 
 ## How it finds tampering
 
-Four techniques, all visible in `src/lies/index.ts` and [described in general
+Four techniques, all visible in its tampering module and [described in general
 terms elsewhere](tostring-native-code-detection.md).
 
 **A pristine reference.** It creates fresh iframes and reaches into
@@ -67,7 +67,7 @@ a native one, shows up here without any cleverness.
 
 **Blocking the probe is itself recorded.** Among the lie names in the source are
 `client blocked phantom iframe` and `client blocked behemoth iframe`. If your
-environment prevents CreepJS from creating its reference iframes, that prevention is
+environment prevents a consistency checker from creating its reference iframes, that prevention is
 written down as a lie.
 
 That last one is the principle worth taking away, and it generalises far beyond this
@@ -105,12 +105,12 @@ remains exactly as hard as it was.
 
 Run directly against a live Playwright-driven Chromium session with no stealth
 layer of any kind applied - no injected patches, no engine-level work, nothing
-this project or any comparable tool does. CreepJS's own headless module returned
+this project or any comparable tool does. A consistency checker's own headless module returned
 0% headless and 0% stealth, with a 25% "like headless" partial-similarity score
 alongside them.
 
 Worth stating plainly what that does and does not mean: it says
-this one specific, directly-checked session did not trip CreepJS's headless
+this one specific, directly-checked session did not trip a consistency checker's headless
 heuristics that day, not that headless or automation detection in general is
 solved, and not that every Playwright launch configuration scores the same way.
 The rest of the report - the parts covered throughout this page, the lie
@@ -130,14 +130,14 @@ Two things worth doing when you open it:
 
 ## Short answers to the questions that lead here
 
-**What does the CreepJS score actually mean?** Not "your fingerprint is rare". It means
+**What does the consistency checker score actually mean?** Not "your fingerprint is rare". It means
 nothing here contradicts anything else here, and nothing looks tampered with.
 
 **Why does it detect my stealth plugin?** Four ways, and each is cheap: a pristine copy
 of the built-ins from a fresh iframe, stack-trace inspection, descriptor and prototype
 walking, and recording a blocked probe as a lie.
 
-**Should I block CreepJS from creating its iframes?** No. Blocking is written down as a
+**Should I block a consistency checker from creating its iframes?** No. Blocking is written down as a
 lie, by name, in its source. Suppressing a signal is a signal.
 
 **Why does more patching score worse?** Because every override is another candidate for
@@ -149,19 +149,19 @@ JavaScript layer there is no override to find and no seam to detect.
 
 ## Sources
 
-- CreepJS's own GitHub repository, [`abrahamjuliot/creepjs`](https://github.com/abrahamjuliot/creepjs),
-  `src/lies/index.ts` and the module layout, read 2026-07-27, for the four
+- The public source repository of a consistency-checking test page,
+  its tampering module and the module layout, read 2026-07-27, for the four
   tampering-detection techniques and the lie names quoted throughout.
 - MDN Web Docs, [`HTMLIFrameElement.contentWindow`](https://developer.mozilla.org/en-US/docs/Web/API/HTMLIFrameElement/contentWindow),
   [`Function.prototype.toString()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/toString),
   [`Object.getOwnPropertyDescriptor()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/getOwnPropertyDescriptor),
   and [`Object.getPrototypeOf()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/getPrototypeOf),
-  retrieved 2026-08-28, for the four native APIs CreepJS's tampering checks are built on.
+  retrieved 2026-08-28, for the four native APIs a consistency checker's tampering checks are built on.
 - Mozilla's own [Fingerprinting wiki page](https://wiki.mozilla.org/Security/Fingerprinting),
-  retrieved 2026-08-28, for Firefox's `resistFingerprinting` mode, which CreepJS's own
+  retrieved 2026-08-28, for Firefox's `resistFingerprinting` mode, which consistency checker's own
   `resistance` module identifies.
 - This project's own testing: a live, unmodified Playwright-driven Chromium session run
-  directly against CreepJS's headless module, for the 0% headless / 0% stealth scores
+  directly against a consistency checker's headless module, for the 0% headless / 0% stealth scores
   quoted above.
 
 **See also:** [what sannysoft checks](sannysoft-explained.md), whose canvas-in-iframe test is the same idea in miniature, [the three levels](playwright-stealth-levels.md), and [AudioContext fingerprinting](audiocontext-fingerprinting.md), where its silent-buffer check is worked through in detail.
@@ -169,5 +169,5 @@ JavaScript layer there is no override to find and no seam to detect.
 ---
 
 *From the notes of [invisible_playwright](https://github.com/oss-invisible/playwright).
-CreepJS is a release gate here. The lie names above are quoted from its source and
+A consistency checker is a release gate here. The lie names above are quoted from its source and
 not paraphrased, because the exact strings are what you will see in a report.*
