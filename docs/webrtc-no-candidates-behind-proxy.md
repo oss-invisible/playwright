@@ -123,7 +123,7 @@ reference through a proxy:
 
 The measured result, through a SOCKS5 residential exit: the host candidate reads as
 `.local`, the server reflexive candidate carries the proxy egress IP, the public IP the
-page reports equals that egress, and [CreepJS](creepjs-explained.md) shows the WebRTC
+page reports equals that egress, and [a consistency checker](consistency-checker-explained.md) shows the WebRTC
 panel complete and unblocked rather than recording a suppressed probe. Zero of the
 "empty list" and "blocked" states that the untouched paths produce. None of this changes
 the behaviour without a proxy, where the real gather runs normally.

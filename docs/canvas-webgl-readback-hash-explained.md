@@ -1,22 +1,22 @@
 ---
-title: "BrowserLeaks canvas and WebGL hash, explained"
-description: "The BrowserLeaks canvas and WebGL signature is a hash of a pixel readback, not your GPU. What it measures, and why one seed gives a byte-identical hash."
+title: "The canvas and WebGL readback hash, explained"
+description: "The canvas and WebGL signature a raw-value inspector shows is a hash of a pixel readback, not your GPU. What it measures, and why one seed gives a byte-identical hash."
 parent: "Detectors, Explained"
 grand_parent: "Guides"
 nav_order: 6
 ---
 
 
-# BrowserLeaks canvas and WebGL hash, explained
+# The canvas and WebGL readback hash, explained
 
-The BrowserLeaks canvas and WebGL signature is a hash of the pixels a readback call
+The canvas and WebGL signature a raw-value inspector shows is a hash of the pixels a readback call
 returns, not a fingerprint of your GPU. It sits at the very end of the render pipeline,
 which is why editing a reported renderer string never moves it, and why the only way to
 control it is to control the bytes handed back at the readback boundary. Get that boundary
 right and one seed produces a byte-identical hash on Windows and Linux alike.
 
-BrowserLeaks shows you a canvas "signature" and a WebGL "signature" and treats each as a
-stable identifier for your machine (see [what each BrowserLeaks panel tests](browserleaks-explained.md)
+A raw-value inspector shows you a canvas "signature" and a WebGL "signature" and treats each as a
+stable identifier for your machine (see [what each raw-value inspector panel tests](raw-value-inspector-explained.md)
 for the wider tour). People read those short hex strings as a fingerprint
 of the GPU, and then try to change the GPU to change them. That is the wrong layer. The
 signature is a hash of one specific thing, and once you know which thing, the whole
@@ -26,7 +26,7 @@ This page is what the signature measures, where in the pipeline it is actually t
 has to be true for two machines to produce the same one, and how to read both values
 yourself against a stock browser.
 
-## What BrowserLeaks calls a signature
+## What a raw-value inspector calls a signature
 
 The canvas test draws text and shapes into an off-screen canvas, then asks the page to
 read the resulting pixels back out and hashes them. The WebGL test does the same with a
@@ -90,7 +90,7 @@ between Windows and Linux. The honest test is not "did the hash change", it is "
 different hosts, same seed, produce the same hash to the byte".
 
 Measured on this build, same seed on Windows and on Linux, read in the page the way
-BrowserLeaks reads it: the canvas signature is `df2a9319` on both, and the WebGL signature
+a raw-value inspector reads it: the canvas signature is `df2a9319` on both, and the WebGL signature
 is `0df1d6f8` on both. Not close, identical.
 
 | Signature | Windows | Linux | Match |
@@ -189,7 +189,7 @@ seeded one gives the same answer on a second machine and the stock one does not.
 
 ## Conclusion
 
-The BrowserLeaks canvas and WebGL signatures are hashes of a readback, and the readback is
+The canvas and WebGL signatures a raw-value inspector shows are hashes of a readback, and the readback is
 the only place a page can observe a render at all. That single fact is what makes the
 surface tractable: substitute the bytes at the readback boundary with a function of the
 seed, and the signature becomes seed-determined instead of GPU-determined, byte-identical
@@ -200,7 +200,7 @@ byte on two different hosts, with zero cross-host failures across sixteen seeds.
 
 ## Short answers to the questions that lead here
 
-**What does the BrowserLeaks canvas signature actually measure?** The hash of the pixels a
+**What does the raw-value inspector canvas signature actually measure?** The hash of the pixels a
 readback call returns, not any property of your GPU. It is downstream of the entire render
 pipeline, which is why editing a renderer string does not move it.
 
@@ -225,10 +225,8 @@ signature is the pixels, the renderer string is a reported value, and both have 
 
 ## Sources
 
-- BrowserLeaks canvas and WebGL pages, read for how the signature is computed: a hash over
-  the bytes returned by a readback call
-  ([browserleaks.com/canvas](https://browserleaks.com/canvas),
-  [browserleaks.com/webgl](https://browserleaks.com/webgl)).
+- The canvas and WebGL pages of public raw-value inspectors, read for how the signature is
+  computed: a hash over the bytes returned by a readback call.
 - This project's host-independence audit, which maps every path a host-dependent render
   value can reach JavaScript and confirms the seeded hashes (`df2a9319`, `0df1d6f8`)
   byte-identical on Windows and Linux, zero of sixteen seeds failing the cross-host check.

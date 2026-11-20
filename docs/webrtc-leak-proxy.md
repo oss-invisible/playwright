@@ -205,8 +205,8 @@ their own page.
 ## How to check your own setup
 
 Run a WebRTC test page through the proxy you actually deploy with. Not localhost:
-localhost bypasses the proxy and tests nothing. [BrowserLeaks](https://browserleaks.com/webrtc)
-lists the full candidate set, and [CreepJS](https://abrahamjuliot.github.io/creepjs/)
+localhost bypasses the proxy and tests nothing. A public site that shows your IP and WebRTC candidates
+lists the full candidate set, and a public fingerprint test page
 shows what a real detector extracts from it.
 
 What you want to see:
@@ -275,9 +275,9 @@ disabled is reporting the absence of a feature, not the presence of protection.
 - [Chrome for Developers, `chrome.privacy` API reference](https://developer.chrome.com/docs/extensions/reference/api/privacy),
   retrieved 2026-08-28, documenting the `webRTCIPHandlingPolicy` values, including
   `disable_non_proxied_udp`, behind the Chromium flag.
-- [BrowserLeaks, WebRTC test page](https://browserleaks.com/webrtc), retrieved
+- A public WebRTC test page that shows your IP and candidates, retrieved
   2026-08-28, for checking the full ICE candidate set through a live proxy.
-- [CreepJS](https://abrahamjuliot.github.io/creepjs/), retrieved 2026-08-28, for what a
+- A public fingerprint test page, retrieved 2026-08-28, for what a
   real detector extracts from the candidate set.
 
 **See also:** [when the timezone does not match the proxy](timezone-proxy-mismatch.md),

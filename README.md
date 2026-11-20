@@ -262,7 +262,7 @@ organised into four sections instead of one flat list:
   audio, network and WebRTC, the automation layer, AI agents, the detectors themselves
   explained from source, and testing.
 - **[Comparisons](docs/comparisons.md)** -
-  against Camoufox, Patchright, nodriver and playwright-stealth, and the case for
+  against Patchright, nodriver and playwright-stealth, and the case for
   Firefox over Chromium generally.
 - **[Integrations](docs/integrations/)** -
   Scrapy, Crawlee, Robot Framework, CodeceptJS, test runners, Playwright MCP, and the
@@ -305,7 +305,7 @@ covers the frameworks that pick Chromium over CDP for you.
 
 **On the Firefox side**
 
-- **[Camoufox](https://github.com/daijro/camoufox)** - patches C++ too, wider surface, ships a fingerprint database instead of deriving one from a seed. [Comparison](docs/vs-camoufox.md).
+- **Other patched Firefox builds** - some patch C++ too, with a wider surface and a fingerprint database instead of one derived from a seed. [How the stealth levels differ](docs/playwright-stealth-levels.md).
 - **[LibreWolf](https://librewolf.net)** - a privacy-defaults Firefox to browse with, not to automate.
 - **[arkenfox/user.js](https://github.com/arkenfox/user.js)** - hardening through preferences. Where a preference is enough, use it.
 

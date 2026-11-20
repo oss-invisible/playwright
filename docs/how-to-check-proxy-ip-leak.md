@@ -248,8 +248,8 @@ compare-against-a-real-browser method these checks sit inside.
   passed a fully blocked WebRTC behind a proxy, and the positive-form check that replaced
   it: host candidate as a `.local` name, server-reflexive address equal to the proxy exit,
   gathering completing.
-- The public leak and fingerprint pages read from their own output, including BrowserLeaks
-  for per-surface values and CreepJS for how a suppressed signal is recorded rather than
+- The public leak and fingerprint pages read from their own output, including a site that shows your IP and WebRTC candidates
+  for per-surface values and a fingerprint test page for how a suppressed signal is recorded rather than
   ignored.
 - Playwright's documented [proxy configuration](https://playwright.dev/python/docs/network)
   and `page.evaluate`, used unchanged.
