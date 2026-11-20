@@ -46,13 +46,15 @@ what a leak check reads out of that candidate, see
 
 ## One lookup, shared with the timezone and the locale
 
-The exit address is not guessed and not read from the machine. By default (`timezone`
-unset and `locale="auto"`) the library discovers the proxy's exit address once, at
-launch, by making a round trip out through the same proxy the session uses and reading
+The exit address is not guessed and not read from the machine. At every launch, whatever
+you pass for `timezone` and `locale`, the library discovers the proxy's exit address once,
+by making a round trip out through the same proxy the session uses and reading
 back the address the far side saw. That is the address the rest of the world will see
 for this session, because it is the path the session's own traffic takes.
 
-The timezone and the locale of the session are derived from that same address. The
+By default (`timezone` unset and `locale="auto"`) the timezone and the locale of the
+session are derived from that same address; an explicit `timezone` replaces only the zone,
+and the discovery is made all the same. The
 measurement of the proxy's UDP relay runs in parallel with the discovery and compares
 the address the STUN server saw with that same exit, so when a `srflx` exists it is that
 same address. If you have read [why the timezone has to match the
@@ -107,7 +109,7 @@ send: with a proxy set, a datagram never leaves directly from the machine.
 | Session | Where the STUN datagram goes | `srflx` candidate | `host` candidates | ICE error |
 |---|---|---|---|---|
 | SOCKS5 proxy whose UDP relay works and exits from the same address as its TCP | Through the proxy's UDP relay | Present, and it is the proxy's exit address | mDNS names (`<uuid>.local`), UDP and TCP | None |
-| SOCKS5 proxy that cannot carry UDP, or SOCKS4 | Nowhere | Absent | mDNS names, UDP and TCP | One `icecandidateerror` 701 for the STUN request, after roughly ten seconds, when gathering ends |
+| SOCKS5 proxy that cannot carry UDP, or SOCKS4 | Nowhere | Absent | mDNS names, UDP and TCP | One `icecandidateerror` 701 for the STUN request, after about eleven seconds, when gathering ends |
 | HTTP or HTTPS proxy | Nowhere: CONNECT carries no UDP | Absent | mDNS names, UDP and TCP | Same as above |
 | No proxy | Directly from the machine, as in any browser | Present when the STUN server answers: the line's real public address | mDNS names | None |
 
@@ -149,7 +151,11 @@ proxy = {"server": "socks5://gate.example.com:1080", "username": "u", "password"
 
 GATHER = """
 () => new Promise((resolve) => {
-  const pc = new RTCPeerConnection();
+  // Firefox has no default STUN server: without one there is never a srflx.
+  // Use a STUN server you can reach (this is a generic example).
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
   const cands = [];
   pc.onicecandidate = (e) => {
     if (e.candidate) { cands.push(e.candidate.candidate); }
@@ -157,6 +163,8 @@ GATHER = """
   };
   pc.createDataChannel("probe");
   pc.createOffer().then((o) => pc.setLocalDescription(o));
+  // Safety net only: a proxy that cannot carry UDP ends gathering at about eleven seconds.
+  setTimeout(() => resolve(cands), 25000);
 })
 """
 
@@ -190,7 +198,7 @@ with InvisiblePlaywright(seed=42, proxy=proxy) as browser:
 Run it at least ten times and from the machine that runs production, not from your
 laptop. Behind a SOCKS5 proxy whose UDP relay answers from the exit address it reports
 a `srflx` whose address equals the exit. Behind any other proxy it reports no `srflx`,
-and gathering ends after roughly ten seconds with one `icecandidateerror` 701 for the
+and gathering ends after about eleven seconds with one `icecandidateerror` 701 for the
 STUN request. In both cases the host candidates are `.local`
 names rather than LAN addresses, which is what a current browser emits and what a
 [reader of the candidate list](playwright-detected-as-bot.md) expects to see.
@@ -228,14 +236,15 @@ its address is then the proxy's exit.
 from its exit address: the UDP ASSOCIATE was refused, the relay did not answer, UDP
 leaves from another address than the TCP exit, or the proxy is SOCKS4, HTTP or HTTPS.
 No datagram leaves, so there is no `srflx` and nothing to mismatch. The page sees mDNS
-host candidates and, when gathering ends after roughly ten seconds, one
+host candidates and, when gathering ends after about eleven seconds, one
 `icecandidateerror` 701 for the STUN request.
 
-**How is the exit address found?** By default (`timezone` unset and `locale="auto"`),
-once at launch, by a round trip out through the same proxy the session uses, reading
-back the address the far side saw. The timezone and the locale are derived from that
-same address, and the UDP measurement runs in parallel and compares the address the
-STUN server saw with that exit.
+**How is the exit address found?** Once at every launch, with or without an explicit
+`timezone` or `locale`, by a round trip out through the same proxy the session uses,
+reading back the address the far side saw. By default (`timezone` unset and
+`locale="auto"`) the timezone and the locale are derived from that same address; an
+explicit `timezone` replaces only the zone. The UDP measurement runs in parallel and
+compares the address the STUN server saw with that exit, whatever you pass for them.
 
 **Do I have to configure any of this?** With the defaults, no. Pass a proxy and the
 exit and its UDP relay are measured before the browser launches. No option forces UDP on or declares an

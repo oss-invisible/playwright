@@ -10,7 +10,7 @@ nav_order: 14
 # No public ICE candidate behind a proxy
 
 With this library behind a proxy that cannot carry UDP, the page reads a list of host
-candidates only (mDNS names), no public candidate, and one ICE error after roughly ten
+candidates only (mDNS names), no public candidate, and one ICE error after about eleven
 seconds: not an empty list.
 
 The short version: STUN needs UDP, and most residential proxies do not carry it. SOCKS5
@@ -20,7 +20,7 @@ If the SOCKS5 UDP relay works and exits from the same address as the proxy's TCP
 goes through the relay and the page gets a real `srflx` carrying the proxy's exit
 address. Otherwise (SOCKS5 without a working relay, SOCKS4, HTTP or HTTPS) no datagram
 leaves at all: there is no `srflx`, the host candidates are still there as mDNS names,
-and one `icecandidateerror` 701 arrives after roughly ten seconds. The list is not
+and one `icecandidateerror` 701 arrives after about eleven seconds. The list is not
 empty, but in that case it has no public candidate.
 
 You route the browser through a residential proxy, open a detection page, and the
@@ -125,7 +125,7 @@ The cases a page can observe, side by side:
 | Stock Firefox behind a home NAT (no proxy) | Non-empty | Typically present when the STUN server answers, carries the public IP | The usual shape |
 | invisible, no proxy | Host (mDNS) plus srflx | Present when the STUN server answers: the line's real public address | Same as a browser on that line |
 | invisible via a SOCKS5 proxy whose UDP relay works and exits from the same address as its TCP | Host (mDNS) plus srflx | Present, carries the proxy exit address | A real srflx, no error |
-| invisible via a proxy that cannot carry UDP (SOCKS5 without a working relay, SOCKS4, HTTP, HTTPS) | Host candidates only, mDNS, UDP and TCP | Absent | No public candidate, and one `icecandidateerror` 701 after roughly ten seconds |
+| invisible via a proxy that cannot carry UDP (SOCKS5 without a working relay, SOCKS4, HTTP, HTTPS) | Host candidates only, mDNS, UDP and TCP | Absent | No public candidate, and one `icecandidateerror` 701 after about eleven seconds |
 
 What happens in each case:
 
@@ -141,7 +141,7 @@ What happens in each case:
   the proxy as a router that drops UDP. No datagram leaves, neither through the proxy
   nor from the machine. The `srflx` is absent. The host candidates are present, as mDNS
   names, for UDP and TCP, and one `icecandidateerror` 701 for the STUN request arrives
-  when gathering ends, after roughly ten seconds. The list has no public candidate
+  when gathering ends, after about eleven seconds. The list has no public candidate
   because the proxy cannot give it one.
 - **No proxy.** The STUN datagram leaves directly from the machine, as in any browser,
   and when the STUN server answers the `srflx` is the line's real public address.
@@ -178,7 +178,11 @@ from invisible_playwright import InvisiblePlaywright
 
 GATHER_ICE = """
 () => new Promise((resolve) => {
-    const pc = new RTCPeerConnection();
+    // Firefox has no default STUN server: without one there is no srflx and no 701.
+    // Use a STUN server you can reach (this is a generic example).
+    const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
     const lines = [];
     const errors = [];
     const done = () => resolve({ lines, errors });
@@ -187,12 +191,14 @@ GATHER_ICE = """
         if (e.candidate) {
             lines.push(e.candidate.candidate);
         } else {
-            setTimeout(done, 500);   // null candidate marks gathering complete
+            setTimeout(done, 500);   // null candidate marks gathering complete; the 701 comes just before
         }
     };
     pc.createDataChannel("probe");
     pc.createOffer().then((offer) => pc.setLocalDescription(offer));
-    setTimeout(done, 20000);  // do not hang; a proxy without UDP ends at ~10 s
+    // Safety net only: a proxy that cannot carry UDP ends gathering, and delivers the 701,
+    // at about eleven seconds, so the normal exit is the null candidate above.
+    setTimeout(done, 25000);
 });
 """
 
@@ -267,7 +273,7 @@ before launch. Behind a SOCKS5 proxy whose UDP relay works and exits from the sa
 address as its TCP, STUN goes through the relay and the page gets a real `srflx` with the
 proxy's exit address. Behind a proxy that cannot carry UDP, no datagram leaves, there is no
 `srflx`, the host candidates stay as mDNS names, and one `icecandidateerror` 701 arrives
-after roughly ten seconds. Which case you are in is decided by the proxy, not by an
+after about eleven seconds. Which case you are in is decided by the proxy, not by an
 option. And whichever tool you use, read the candidate list on the deployed path instead
 of trusting that no leak means all is well.
 
@@ -279,7 +285,7 @@ defines UDP ASSOCIATE, but most exits do not implement it or relay from an addre
 than their TCP exit, and HTTP, HTTPS and SOCKS4 proxies carry no UDP at all. Behind such
 a proxy invisible sends no datagram, so there is no server reflexive candidate. The host
 candidates are still there as mDNS names, and one `icecandidateerror` 701 arrives after
-roughly ten seconds.
+about eleven seconds.
 
 **Is a candidate list without a srflx safe because nothing leaked?** Nothing leaked, but
 it is not the shape a typical unproxied consumer browser shows, which has a server
@@ -303,7 +309,7 @@ the proxy before launch and the engine follows the result.
 proxy whose UDP relay works and exits from the same address as its TCP, host candidates
 as mDNS names plus a real `srflx` whose address is the proxy's exit address, and no
 error. If the proxy cannot carry UDP, host candidates as mDNS names, no `srflx`, and
-one `icecandidateerror` 701 after roughly ten seconds.
+one `icecandidateerror` 701 after about eleven seconds.
 
 **How do I test it without fooling myself?** Assert the list is non-empty and that its
 host candidates are mDNS names, then check the case you expect: a `srflx` equal to the

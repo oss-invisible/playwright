@@ -126,7 +126,7 @@ place.
   fix when you would rather keep IPv6. With invisible_playwright, a proxy whose TCP
   exit is IPv6 is not measured as able to carry UDP, so the session behaves as if the
   proxy could not carry UDP: no `typ srflx` candidate and one `icecandidateerror` 701
-  after roughly ten seconds.
+  after about eleven seconds.
 
 Pick removal of the choice (force v4) or coverage of both (dual-stack exit). What you
 do not want is the middle state: an IPv6-capable host and a v4-only proxy with nothing

@@ -182,7 +182,7 @@ Anything else (ASSOCIATE refused, no reply, a different address, an IPv6 TCP exi
 proxy that is not SOCKS5) makes the browser treat the proxy as a router that drops UDP: no
 datagram leaves the machine, neither through the proxy nor directly, there is no
 server-reflexive candidate, and the host candidates stay `.local` names. Gathering ends
-with one `icecandidateerror` (701) for the STUN request after roughly ten seconds. There is
+with one `icecandidateerror` (701) for the STUN request after about eleven seconds. There is
 never a fallback to a direct datagram, and no option forces UDP on, declares a public IP
 or edits a candidate. Each context uses its own proxy for WebRTC, so a context with its
 own SOCKS5 proxy gets its own server-reflexive candidate.

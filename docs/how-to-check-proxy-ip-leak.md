@@ -53,7 +53,7 @@ present for the check to pass:
   equals the proxy egress IP. This is what a real machine behind NAT produces, and its
   address is what a remote peer would see. Behind an HTTP or HTTPS proxy, SOCKS4, or a
   SOCKS5 proxy that cannot carry UDP, expect no `srflx` at all, and one `icecandidateerror`
-  (701) for the STUN request when gathering ends, after roughly ten seconds. No datagram
+  (701) for the STUN request when gathering ends, after about eleven seconds. No datagram
   leaves the machine in that case, so an absent `srflx` is the correct state, not a leak.
 - **The gathering completes.** The page finishes, not "Computing" forever.
 
@@ -141,14 +141,24 @@ with InvisiblePlaywright(seed=42, proxy=PROXY) as browser:
                 iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
             });
             pc.createDataChannel('probe');
-            const lines = [];
+            const lines = [], errors = [];
             pc.onicecandidate = e => { if (e.candidate) lines.push(e.candidate.candidate); };
+            pc.onicecandidateerror = e => errors.push(e.errorCode);
             await pc.setLocalDescription(await pc.createOffer());
-            await new Promise(r => setTimeout(r, 4000));   // let gathering finish
+            // Wait for gathering to end; the 25 s is only a safety net (a proxy that cannot
+            // carry UDP ends gathering, and delivers the 701, at about eleven seconds).
+            await new Promise(r => {
+                const cap = setTimeout(r, 25000);
+                pc.onicegatheringstatechange = () => {
+                    if (pc.iceGatheringState === 'complete') { clearTimeout(cap); r(); }
+                };
+            });
             pc.close();
-            return lines;
+            return {lines, errors};
         }
     """)
+    errors = candidates["errors"]
+    candidates = candidates["lines"]
 
     host  = [c for c in candidates if "typ host"  in c]
     srflx = [c for c in candidates if "typ srflx" in c]
@@ -195,7 +205,8 @@ field:
 Behind a proxy that cannot carry UDP (an HTTP or HTTPS proxy, SOCKS4, or a SOCKS5 proxy
 whose relay refuses, stays silent or exits from another address), the same page gives the
 other correct shape: host candidates only, no `srflx`, and one `icecandidateerror` (701)
-for the STUN request after roughly ten seconds. Assert that `host` is non-empty, that no
+for the STUN request after about eleven seconds, which the script above sees because it
+listens to `icecandidateerror` and waits for gathering to end (`errors == [701]`). Assert that `host` is non-empty, that no
 candidate is a real address of your machine, and that `srflx` is empty. The library decides
 this itself by measuring the proxy before launch, and no option forces UDP on.
 

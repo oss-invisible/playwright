@@ -163,7 +163,7 @@ What a page can observe depends on the session:
 | Session | Where the STUN datagram goes | `srflx` candidate | `host` candidates | ICE error |
 |---|---|---|---|---|
 | SOCKS5 proxy whose UDP relay works and exits from the same address as its TCP | through the proxy's UDP relay (SOCKS5 UDP ASSOCIATE) | present, and it is the proxy's exit address | mDNS names (`<uuid>.local`), UDP and TCP | none |
-| SOCKS5 proxy that cannot carry UDP (ASSOCIATE refused, relay silent, UDP exits from another address), or SOCKS4 | nowhere: no datagram leaves, neither through the proxy nor from the machine | absent | mDNS names, UDP and TCP | one `icecandidateerror` 701 for the STUN request, after roughly ten seconds, when gathering ends |
+| SOCKS5 proxy that cannot carry UDP (ASSOCIATE refused, relay silent, UDP exits from another address), or SOCKS4 | nowhere: no datagram leaves, neither through the proxy nor from the machine | absent | mDNS names, UDP and TCP | one `icecandidateerror` 701 for the STUN request, after about eleven seconds, when gathering ends |
 | HTTP or HTTPS proxy (CONNECT) | nowhere, same as above: CONNECT carries no UDP | absent | mDNS names, UDP and TCP | same as above |
 | No proxy | directly from the machine, as in any browser | present when the STUN server answers: the line's real public address | mDNS names | none |
 
@@ -279,7 +279,7 @@ the proxy's SOCKS5 UDP relay when the relay works and exits from the same addres
 TCP, nowhere otherwise.
 
 **What do I see behind a proxy that cannot carry UDP?** Host candidates as mDNS names, no
-`srflx`, and one `icecandidateerror` 701 for the STUN request after roughly ten seconds,
+`srflx`, and one `icecandidateerror` 701 for the STUN request after about eleven seconds,
 when gathering ends. No datagram leaves directly from the machine. A SOCKS4 proxy and an
 HTTP or HTTPS proxy behave the same way.
 

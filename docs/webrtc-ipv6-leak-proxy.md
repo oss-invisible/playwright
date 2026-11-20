@@ -128,7 +128,7 @@ both IPv4 and IPv6, a retail browser also shows IPv6 candidates, while
 invisible_playwright shows IPv4 only.
 
 The snippet gives up after four seconds. When the proxy cannot carry UDP, gathering
-ends after roughly ten seconds, so a run of this snippet returns the host
+ends after about eleven seconds, so a run of this snippet returns the host
 candidates only.
 
 ## What actually stops it
@@ -158,7 +158,7 @@ in parallel with the exit discovery.
   HTTP or HTTPS proxy.** No datagram leaves, neither through the proxy nor from the
   machine. There is no `typ srflx` line, the host candidates are still there, and
   gathering ends with one `icecandidateerror` 701 for the STUN request after
-  roughly ten seconds.
+  about eleven seconds.
 - **No proxy.** The STUN datagram goes out directly from the machine, as in any
   browser, and when the STUN server answers the `typ srflx` line is the line's real
   public address.

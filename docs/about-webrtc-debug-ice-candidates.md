@@ -142,7 +142,7 @@ replies; none is invented and no address is rewritten.
 | Session | The STUN datagram goes | `srflx` | `host` | `icecandidateerror` |
 |---|---|---|---|---|
 | SOCKS5 proxy whose UDP relay works and exits from the same address as its TCP | through the proxy's UDP relay | present, equal to the proxy exit | mDNS names, UDP and TCP | none |
-| SOCKS5 proxy that cannot carry UDP, or SOCKS4 | nowhere | absent | mDNS names, UDP and TCP | one `701` for the STUN request, after roughly ten seconds, when gathering ends |
+| SOCKS5 proxy that cannot carry UDP, or SOCKS4 | nowhere | absent | mDNS names, UDP and TCP | one `701` for the STUN request, after about eleven seconds, when gathering ends |
 | HTTP or HTTPS proxy | nowhere (CONNECT carries no UDP) | absent | mDNS names, UDP and TCP | same as the row above |
 | No proxy | directly from the machine, as in any browser | present when the STUN server answers: the line's real public address | mDNS names | none |
 
@@ -153,11 +153,11 @@ How to recognise each one from `about:webrtc` or from the `icecandidate` and
   proxy exits from, and no error event. Behind a SOCKS5 proxy this is the only shape
   in which a `srflx` appears.
 - **The proxy does not carry coherent UDP.** Host candidates only, then a single `701`
-  `icecandidateerror` for the STUN request about ten seconds after the offer, at the
+  `icecandidateerror` for the STUN request about eleven seconds after the offer, at the
   moment gathering finishes, and no `srflx`. This covers a SOCKS5 proxy that refuses
   UDP ASSOCIATE, a relay that never answers, a relay whose UDP leaves from an address
   other than the TCP exit, and SOCKS4. An error that arrives at once instead of after
-  about ten seconds points at a STUN server name that did not resolve, not at the proxy.
+  about eleven seconds points at a STUN server name that did not resolve, not at the proxy.
 - **An HTTP or HTTPS proxy.** The same picture as the previous case: CONNECT carries
   no UDP, so the STUN request goes nowhere and ends in one `701`.
 - **No proxy.** A `typ srflx` line, present when the STUN server answers: the line's
@@ -225,7 +225,7 @@ with InvisiblePlaywright(seed=42, proxy=PROXY) as browser:
 
 Then the same read as data, so a wrong candidate fails a check instead of a session.
 This gathers the candidate strings and the `icecandidateerror` codes the page itself
-would list, waits for gathering to finish (about ten seconds when the proxy cannot
+would list, waits for gathering to finish (about eleven seconds when the proxy cannot
 carry the STUN request), and prints them. Replace the STUN server with one you control:
 
 ```python
@@ -304,7 +304,7 @@ catches](how-to-test-bot-detection.md).
 `about:webrtc` turns WebRTC from a badge into a list you can read. It shows the host
 candidate so you can confirm it is a `.local` name and not a raw private address, the
 server-reflexive candidate so you can confirm it is your proxy egress when the proxy
-carries UDP (and its absence, with a single `701` after about ten seconds, when it does
+carries UDP (and its absence, with a single `701` after about eleven seconds, when it does
 not), and the gathering timeline so you can confirm the answers arrived
 the way a browser produces them rather than instantly. Pair it with `about:config` to
 see the switches behind each line, drive the same read from Playwright to make it a
@@ -324,7 +324,7 @@ visible where stock hides it. Check `media.peerconnection.ice.obfuscate_host_add
 carries the STUN request, your proxy egress address, with the port and priority of a
 real `srflx`. Not your real public IP and not a private address. When the proxy cannot
 carry UDP there is no `srflx`: you see host candidates and a single `701`
-`icecandidateerror` after about ten seconds.
+`icecandidateerror` after about eleven seconds.
 
 **A leak site says "No Leak" but I still get flagged. Why?** "No Leak" can mean the
 candidates are correct, or it can mean WebRTC was suppressed and gathered nothing,

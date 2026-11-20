@@ -205,7 +205,7 @@ What you want to see:
 - Host candidate is a `<uuid>.local` name. Not a LAN IP, and not absent.
 - With a SOCKS5 proxy whose UDP relay works, an srflx candidate exists and its address
   equals the exit address of your proxy. With any other proxy there is no srflx, and
-  gathering ends with one `icecandidateerror` 701 after roughly ten seconds (see the
+  gathering ends with one `icecandidateerror` 701 after about eleven seconds (see the
   table below).
 - No IPv6 candidate.
 - The same page in a stock Firefox, side by side, differing only in the IP (or, with a
@@ -237,7 +237,7 @@ launch by the library, in the same lookup that resolves the timezone, so the two
 | Session | Where the STUN datagram goes | `srflx` candidate | `host` candidates | ICE error |
 |---|---|---|---|---|
 | SOCKS5 proxy whose UDP relay works and exits from the same address as its TCP | Through the proxy's UDP relay (SOCKS5 UDP ASSOCIATE) | Present, and it is the proxy's exit address | mDNS names (`<uuid>.local`), UDP and TCP | None |
-| SOCKS5 proxy that cannot carry UDP (ASSOCIATE refused, relay silent, UDP exits from another address), or SOCKS4 | Nowhere: no datagram leaves, neither through the proxy nor from the machine | Absent | mDNS names, UDP and TCP | One `icecandidateerror` 701 for the STUN request, after roughly ten seconds, when gathering ends |
+| SOCKS5 proxy that cannot carry UDP (ASSOCIATE refused, relay silent, UDP exits from another address), or SOCKS4 | Nowhere: no datagram leaves, neither through the proxy nor from the machine | Absent | mDNS names, UDP and TCP | One `icecandidateerror` 701 for the STUN request, after about eleven seconds, when gathering ends |
 | HTTP or HTTPS proxy (CONNECT) | Nowhere, same as above: CONNECT carries no UDP | Absent | mDNS names, UDP and TCP | Same as above |
 | No proxy | Directly from the machine, as in any browser | Present when the STUN server answers: the line's real public address | mDNS names | None |
 
