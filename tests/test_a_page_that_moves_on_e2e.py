@@ -78,13 +78,16 @@ def _replace_after_load(ms: int, cross_site: bool) -> bytes:
 
 
 def _replace_without_a_timer(held: bool, cross_site: bool) -> bytes:
-    """The page of a `networkidle` case: it replaces itself with no timer in it, so how fast the machine is cannot
-    decide whether the move comes before the half second of quiet that `networkidle` waits for.
+    """The page of a `networkidle` case that moves AFTER its `load`, with no timer in it:
 
-    - ``held`` False: from inside the `load` handler itself, before `load` is even reported;
-    - ``held`` True: when the first bytes of a response the server holds open arrive. That request is in flight until
-      the navigation aborts it, so the network is not quiet for as long as the page has not moved, whatever the load
-      on the machine."""
+    - ``held`` False: from inside the `load` handler itself;
+    - ``held`` True: when the first bytes of a response the server holds open arrive.
+
+    The engine reports `load` before the page's own `load` handler runs, and the request that handler opens reaches the
+    client later, from the parent process. Between the document's commit and that request nothing is in flight, and on
+    a loaded machine that silence can be half a second: `networkidle` is then reached on this page, before it moves,
+    as Playwright's is (its idle timer starts at the commit and does not even wait for `load`). Which page the answer
+    comes on is the speed of the machine; the test asserts what holds on both."""
     target = ("location.origin.replace('127.0.0.1','localhost')+'/landed'"
               if cross_site else "'/landed'")
     if held:
@@ -93,6 +96,16 @@ def _replace_without_a_timer(held: bool, cross_site: bool) -> bytes:
     else:
         script = "addEventListener('load', () => location.replace(%s))" % target
     return ("<!doctype html><html><body><p id=p>first</p><script>%s</script></body></html>" % script).encode()
+
+
+def _replace_while_the_document_is_held(cross_site: bool) -> bytes:
+    """The page of the strict `networkidle` case: the server sends this markup and keeps the document's own response
+    open (`HELD_DOCUMENTS`), and the inline script moves the page while it is still arriving. The document request is
+    in flight from before the commit until the move cuts it, and a document that never finished never has its `load`:
+    `networkidle` (which implies `load`) cannot be reached on this page, however fast or slow the machine."""
+    target = ("location.origin.replace('127.0.0.1','localhost')+'/landed'"
+              if cross_site else "'/landed'")
+    return ("<!doctype html><html><body><p id=p>first</p><script>location.replace(%s)</script>" % target).encode()
 
 
 PAGES = {
@@ -110,6 +123,8 @@ for _ms in (0, 50, 300):
 for _name, _held in (("0", False), ("50", True)):
     PAGES["/ir" + _name] = _replace_without_a_timer(_held, False)
     PAGES["/ix" + _name] = _replace_without_a_timer(_held, True)
+# the strict networkidle cases: the document itself is held open while its script moves the page, same site and another
+HELD_DOCUMENTS = {"/hdr": _replace_while_the_document_is_held(False), "/hdx": _replace_while_the_document_is_held(True)}
 
 
 @pytest.fixture(scope="module")
@@ -127,6 +142,20 @@ def site():
                 self.end_headers()
                 try:
                     self.wfile.write(b"x" * 16384)
+                    self.wfile.flush()
+                except OSError:
+                    return
+                release.wait(60)
+                return
+            if self.path.split("?")[0] in HELD_DOCUMENTS:
+                # a document that has begun and does not end: no Content-Length, the markup at once, then the response
+                # stays open until the page has left it (or the module's teardown)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    self.wfile.write(HELD_DOCUMENTS[self.path.split("?")[0]])
                     self.wfile.flush()
                 except OSError:
                     return
@@ -196,12 +225,27 @@ def test_a_read_right_after_goto_answers(page, site, path):
 
 @pytest.mark.parametrize("path", ["/r0", "/r50", "/x0", "/x50"])
 def test_networkidle_is_reached_on_the_page_that_replaced_ours(page, site, path):
-    """The page moves with no timer (`_replace_without_a_timer`): `networkidle` promises half a second without
-    network, and that cannot pass before the move however slow the machine is. A `networkidle` that comes back on the
-    first page, or never comes back because the new frame forgot the navigation, is still red."""
+    """The page moves after its `load` with no timer (`_replace_without_a_timer`). `goto(..., "networkidle")` answers:
+    on the first page when half a second of silence came before its move (the speed of the machine decides, as in
+    Playwright), or on the page that replaced it. Either way the page then lands, and `networkidle` is reached there.
+    A `goto` that never answers because the new frame forgot the navigation ([B228]) is still red; the answer that
+    must never come on the first page is the strict case below."""
     for i in range(ROUNDS):
         _goto(page, "%s/i%s?n=%d" % (site, path[1:], i), wait_until="networkidle",
               timeout=30_000)
+        assert page.url.split("?")[0].endswith(("/i" + path[1:], "/landed")), page.url
+        page.wait_for_url("**/landed", timeout=30_000)
+        page.wait_for_load_state("networkidle", timeout=30_000)
+        assert page.url.endswith("/landed"), page.url
+
+
+@pytest.mark.parametrize("path", ["/hdr", "/hdx"])
+def test_networkidle_is_reached_only_on_the_page_that_replaced_a_document_still_arriving(page, site, path):
+    """The document is held open while its script moves the page (`_replace_while_the_document_is_held`): its request
+    is in flight until the move and it never has its `load`, so `networkidle` cannot be reached on it, whatever the
+    machine. `goto` answers on /landed, or it is red."""
+    for i in range(ROUNDS):
+        _goto(page, "%s%s?n=%d" % (site, path, i), wait_until="networkidle", timeout=30_000)
         assert page.url.endswith("/landed"), page.url
 
 
