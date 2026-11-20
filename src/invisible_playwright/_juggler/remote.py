@@ -727,6 +727,7 @@ def _launch_params(session: Any, *, virtual_display: bool, headless: bool,
     session._locale = geo.locale
     session._webrtc_egress_ip = geo.egress_ip
     session._geolocation = geo.geolocation_override()
+    session._udp_exit = geo.udp_exit
     executable = resolve_executable(session._binary_path)
     pw_headless = bool(headless)
     if not headless and virtual_display:

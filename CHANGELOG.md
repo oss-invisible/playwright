@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.0] - 2026-11-20
+
+### Changed
+- Pins invisible-core 67.78.0 (same engine, firefox-67). The core keeps no value in memory between two calls: the seal, the identity of the engine,
+  the GPU tables, the time zones, the keyboard tables, the exit address and the UDP verdict of a proxy are read or measured each time they are needed,
+  so what a launch costs is visible where it is paid.
+- `invisible-playwright fetch` looks for a newer list of intermediate certificates every time it runs (a small request; the list is downloaded only
+  when Mozilla changed it). A launch only reads the list on disk and starts no background check.
+- `new_context(proxy=...)` measures the UDP exit of its proxy every time, instead of reusing a measurement of the same proxy from the last 30 minutes.
+- A launch without a proxy asks for its exit address every time, instead of reusing an answer from the last 2 minutes.
+- The UDP verdict the session measured at launch is handed to the browser's proxy command explicitly.
+
+### Fixed
+- `wait_for_load_state("networkidle")` and `goto(..., wait_until="networkidle")` on a new document count the quiet from that document's
+  commit, as Playwright does: the silence before the commit no longer counts toward its 500 ms.
+
 ## [0.56.0] - 2026-11-19
 
 ### Engine firefox-67
