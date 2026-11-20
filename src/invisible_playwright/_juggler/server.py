@@ -6289,7 +6289,7 @@ class BrowserTypeDispatcher(Dispatcher):
                 # The measure is the one the launch's geo step made for this proxy, handed here in the prefs (nothing is
                 # asked of the network here, and nothing is remembered): `unmeasured` when there is none, never a claimed
                 # `coherent`.
-                proxy = launch_proxy_command(params["proxy"], udp_exit)
+                proxy = launch_proxy_command(params["proxy"], udp_exit=udp_exit)
             except ValueError as exc:
                 raise ProtocolException("launch(proxy=...) cannot be applied: "
                                         "%s" % exc)

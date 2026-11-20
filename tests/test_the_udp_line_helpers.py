@@ -107,5 +107,5 @@ def test_what_the_launch_declared_is_what_the_core_rendered_and_an_absent_declar
         with pytest.raises(AssertionError):
             declared_udp(mute.proxy)
         # the launch's way: a verdict handed over is the one declared, and the last one wins
-        _udp_exit.launch_proxy_command(good.proxy, "no")
+        _udp_exit.launch_proxy_command(good.proxy, udp_exit="no")
         assert declared_udp(good.proxy) == "no"

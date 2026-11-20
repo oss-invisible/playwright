@@ -194,7 +194,7 @@ def test_op_launch_reads_the_list_before_the_prefs_are_cleaned_and_writes_a_prof
     assert source.index("session_udp_stun_servers(launch_prefs)") < source.index("take_session_motion(launch_prefs)")
     assert source.index("take_session_motion(launch_prefs)") < source.index("write_user_js(")
     assert source.index("session_udp_exit(launch_prefs)") < source.index("take_session_motion(launch_prefs)")
-    assert "launch_proxy_command(params[\"proxy\"], udp_exit)" in source
+    assert "launch_proxy_command(params[\"proxy\"], udp_exit=udp_exit)" in source
     assert "parse_proxy(params[\"proxy\"]).as_engine_command()" not in source
 
 
@@ -229,7 +229,7 @@ def test_no_stun_address_reaches_the_browsers_environment_argv_prefs_or_pipe():
                              executable=None, base_env={})
     # ...and what the engine is given: the prefs after the server took its own keys out, the environment, the pipe.
     browser_prefs, _seed, _budget = take_session_motion(prefs)
-    pipe = repr(_udp_exit.launch_proxy_command({"server": "socks5://10.0.0.1:1080"}, "coherent"))
+    pipe = repr(_udp_exit.launch_proxy_command({"server": "socks5://10.0.0.1:1080"}, udp_exit="coherent"))
     given = repr(browser_prefs) + repr(env) + pipe
     for needle in servers + ["198.51.100.5", "203.0.113.9"]:
         assert needle not in given, needle
@@ -243,7 +243,7 @@ def test_a_hand_made_launch_proxy_cannot_claim_a_coherent_udp():
         command = _udp_exit.launch_proxy_command(dict(gw.proxy, udp="coherent"))
     assert command["udp"] == "unmeasured"
     with mismatched() as gw:
-        command = _udp_exit.launch_proxy_command(dict(gw.proxy, udp="coherent"), "no")
+        command = _udp_exit.launch_proxy_command(dict(gw.proxy, udp="coherent"), udp_exit="no")
     assert command["udp"] == "no", "the verdict handed over is what is declared, not what the proxy dict claims"
 
 
@@ -260,7 +260,7 @@ def test_the_verdict_of_the_geo_step_reaches_the_server_in_the_prefs_and_is_decl
         prefs = session._build_prefs()
         assert prefs[UDP_EXIT_PREF] == verdict
         assert session_udp_exit(prefs) == verdict
-        assert _udp_exit.launch_proxy_command(proxy, session_udp_exit(prefs))["udp"] == verdict
+        assert _udp_exit.launch_proxy_command(proxy, udp_exit=session_udp_exit(prefs))["udp"] == verdict
         rest, _seed, _budget = take_session_motion(prefs)
         assert UDP_EXIT_PREF not in rest, "the verdict must not be written into the profile"
 
@@ -273,7 +273,7 @@ def test_a_session_that_measured_nothing_writes_no_verdict_and_the_proxy_is_unme
     session._timezone, session._locale = "Asia/Tokyo", decide_session_locale("en-US")
     prefs = session._build_prefs()
     assert UDP_EXIT_PREF not in prefs and session_udp_exit(prefs) is None
-    assert _udp_exit.launch_proxy_command({"server": "socks5://10.0.0.1:1080"}, session_udp_exit(prefs))["udp"] == "unmeasured"
+    assert _udp_exit.launch_proxy_command({"server": "socks5://10.0.0.1:1080"}, udp_exit=session_udp_exit(prefs))["udp"] == "unmeasured"
 
 
 def test_a_caller_cannot_claim_a_verdict_among_its_own_prefs():
