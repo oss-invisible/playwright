@@ -19,7 +19,8 @@ pytestmark = pytest.mark.unit
 TESTS = Path(__file__).resolve().parents[1]
 E2E = TESTS / "test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e.py"
 BINARY = "/engine/firefox"
-BUNDLE = "/home/runner/.cache/invisible-playwright/firefox-67_159.0_20261119174916/fonts"
+BUNDLE = "/opt/invisible-playwright/firefox-67_159.0_20261119174916/fonts"
+BUNDLE_MD5 = hashlib.md5(BUNDLE.encode()).hexdigest()
 XDG = "/tmp/pytest-of-runner/pytest-0/popen-gw3/test_the_warm_parent_reads_the0/xdg-cache"
 
 
@@ -67,16 +68,16 @@ def test_an_unfinished_open_with_no_resumed_line_is_not_counted_either_way():
 def test_the_cache_of_the_bundle_is_the_one_named_by_the_md5_of_its_path_and_no_other():
     module = _module()
     prefixes = module._bundle_cache_prefixes([BUNDLE])
-    assert prefixes == {hashlib.md5(BUNDLE.encode()).hexdigest()} and "aeb8dbdec1b325a659f0799c0b8c0872" in prefixes
+    assert prefixes == {hashlib.md5(BUNDLE.encode()).hexdigest()} and BUNDLE_MD5 in prefixes
     # green: the cache the cold launch wrote and the warm one read
-    assert module._is_a_cache_of(XDG + "/fontconfig//aeb8dbdec1b325a659f0799c0b8c0872-le64.cache-9", prefixes)
+    assert module._is_a_cache_of(XDG + "/fontconfig//" + BUNDLE_MD5 + "-le64.cache-9", prefixes)
     # red: the caches of system folders, which the old criterion counted as "the warm parent read the cache"
     for system in ("c855463f699352c367813e37f3f70ea7", "4c599c202bc5c08e2d34565a40eac3b2", "3830d5c3ddfd5cd38a049b759396e72e",
                    "e13b20fdb08344e0e664864cc2ede53d"):
         assert module._is_a_cache_of(XDG + "/fontconfig//%s-le64.cache-9" % system, prefixes) is False
     # what it is written through is not a read of the cache
-    assert not module._is_a_cache_of(XDG + "/fontconfig//aeb8dbdec1b325a659f0799c0b8c0872-le64.cache-9.NEW", prefixes)
-    assert not module._is_a_cache_of(XDG + "/fontconfig//aeb8dbdec1b325a659f0799c0b8c0872-le64.cache-9.TMP-YhscHU", prefixes)
+    assert not module._is_a_cache_of(XDG + "/fontconfig//" + BUNDLE_MD5 + "-le64.cache-9.NEW", prefixes)
+    assert not module._is_a_cache_of(XDG + "/fontconfig//" + BUNDLE_MD5 + "-le64.cache-9.TMP-YhscHU", prefixes)
 
 
 def test_the_name_fontconfig_prints_for_the_folder_is_a_name_of_the_bundle_s_cache_too():
