@@ -328,7 +328,7 @@ def _launch(firefox_binary, work: Path, xdg: Path, extra_prefs=None):
     # Evidence for a launch whose cache is missing: every line of the log, by ANY process, that names the bundle's folder, the cache
     # folder or a ``.uuid``, with the role of the process and the window it is in (the opens above count only the parent's, and only
     # in the window). The raw lines say who scanned (or did not), and where fontconfig wrote.
-    trace = list(cache_opens)
+    trace = []
     for i, line in enumerate(lines):
         if any(u in line for u in under) or cache_dir in line or "/.uuid" in line:
             m = _LINE.match(line) or re.match(r"^(\d+)\s", line)
@@ -355,6 +355,7 @@ def _launch(firefox_binary, work: Path, xdg: Path, extra_prefs=None):
                 cache_opens.append("%s\t%s\t%s\t%s\t%s" % (
                     times[i], "startup" if i < start else "later", role(int(m.group(1))),
                     "no-result" if result is None else ("ok" if result >= 0 else "refused"), quoted[0]))
+    trace = cache_opens + trace
     return {
         "parent_pid": pid,
         "parent_environ_xdg_cache_home": environ_xdg,
