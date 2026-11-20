@@ -257,20 +257,25 @@ jobs:
           mkdir -p evidence/goto-hunt
           pids=()
           for i in $(seq 1 "${{ inputs.procs }}"); do
-            python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence "evidence/goto-hunt/p$i" > "evidence/hunter-$i.log" 2>&1 &
+            python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence "evidence/goto-hunt/p$i" > "evidence/goto-hunt/hunter-$i.log" 2>&1 &
             pids+=($!)
           done
           status=0
           for i in "${!pids[@]}"; do wait "${pids[$i]}" || status=1; done
-          for f in evidence/hunter-*.log; do echo "== $f"; grep -E "CAUGHT|\"rounds\"|Traceback" "$f" || tail -3 "$f"; done
+          # A hunter that never wrote its `rounds` line died before the end: its log's last 40 lines say how.
+          for f in evidence/goto-hunt/hunter-*.log; do
+            echo "== $f"
+            if grep -qE "\"rounds\"" "$f"; then grep -E "CAUGHT|\"rounds\"|Traceback" "$f"; else tail -40 "$f"; fi
+          done
           exit $status
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: goto-hunt-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # The hunters' logs are inside evidence/goto-hunt: in run 44764553902 the pattern evidence/hunter-*.log next to the folder
+          # uploaded nothing (the artifact had the folder only), and the log of the hunter that died was lost.
           path: |
             evidence/goto-hunt
-            evidence/hunter-*.log
           if-no-files-found: warn
           retention-days: 14
