@@ -61,6 +61,7 @@ from urllib.parse import urlsplit
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+from _fission_frames import PROOF_SECONDS, TRIALS, other_process_proved, ticks_inside  # noqa: E402
 from _servers import LocalServer  # noqa: E402
 
 SEED = 4242
@@ -86,12 +87,9 @@ GROUPS = {
     "fonts": ("fonts_check", "font_width_arial", "font_width_segoe_ui", "font_width_fallback"),
 }
 
-#: How long the second iframe keeps its main thread busy, and the gaps the top then sees in a
-#: 10 ms timer: a process shared with the top delays the timer by about the whole spin, a process
-#: of its own does not delay it at all.
+#: How long the second iframe keeps its main thread busy; what the top's 10 ms timer does meanwhile
+#: says whether the process is shared (see `SPIN_PROBE_JS`).
 SPIN_MS = 400
-SHARED_PROCESS_GAP_MS = 300
-OWN_PROCESS_GAP_MS = 200
 
 #: The strategy-0 prefs, passed explicitly so that the case keeps its meaning on the day the core
 #: writes strategy 1 by default.
@@ -184,8 +182,11 @@ function measure(family) {
 // The process probe: a document asked to spin keeps its process's main thread busy.
 window.addEventListener('message', e => {
   if (e.data && e.data.fission_busy) {
+    const start = Date.now();
     const end = performance.now() + e.data.fission_busy;
     while (performance.now() < end) { /* spin */ }
+    // the wall-clock window of the spin, told to whoever asked: the observer's ticks are placed against it
+    if (e.source) e.source.postMessage({fission_spun: [start, Date.now()]}, '*');
   }
 });
 async function collect(name) {
@@ -533,23 +534,23 @@ def _serve():
     raise RuntimeError("no port free on all of %s, %s, %s: %s" % (HOST_TOP, HOST_OOP, HOST_OOP_2, last))
 
 
-#: Run in the top document: ask the iframe on the third site to spin, report the longest gap
-#: between two ticks of a 10 ms timer. What a site can measure about its own process, with no
-#: help from the driver.
+#: Run in the top document: ask the iframe on the third site to spin, tick a 10 ms timer meanwhile and report the
+#: time of every tick and the wall-clock window of the spin the iframe tells. What a site can measure about its own
+#: process, with no help from the driver. A tick INSIDE the window proves the iframe is in another process (one thread
+#: cannot tick while it spins); no tick proves nothing alone (a loaded machine starves a process for seconds).
 SPIN_PROBE_JS = """(spin) => new Promise(resolve => {
-  let last = performance.now(), longest = 0;
-  const id = setInterval(() => {
-    const now = performance.now();
-    longest = Math.max(longest, now - last);
-    last = now;
-  }, 10);
+  const ticks = [];
+  const id = setInterval(() => ticks.push(Date.now()), 10);
+  const done = (spun) => { clearInterval(id); removeEventListener('message', on); resolve([ticks, spun]); };
+  const on = e => { if (e.data && e.data.fission_spun) done(e.data.fission_spun); };
+  addEventListener('message', on);
   document.getElementById('oop2').contentWindow.postMessage({fission_busy: spin}, '*');
-  setTimeout(() => { clearInterval(id); resolve(longest); }, 1500);
+  setTimeout(() => done(null), 30000);
 })"""
 
 
 def _run(binary: str, seed: int, strategy: int) -> dict:
-    """Open the page once; return what the four documents read and the longest timer gap the top saw."""
+    """Open the page once; return what the four documents read and the spin trials the top saw."""
     from invisible_playwright import InvisiblePlaywright
 
     prefs = dict(STRATEGY_1_PREFS if strategy == 1 else STRATEGY_0_PREFS)
@@ -566,10 +567,20 @@ def _run(binary: str, seed: int, strategy: int) -> dict:
                     break
                 page.wait_for_timeout(200)
             results = page.evaluate("() => window.__parity")
-            longest_gap = page.evaluate(SPIN_PROBE_JS, SPIN_MS)
+            # strategy 1: until one spin shows ticks inside it (a healthy machine needs one). strategy 0: all of
+            # them, and none may show a tick inside (the proof of one process is the absence, every time)
+            trials = []
+            if strategy == 1:
+                # spins until one shows ticks inside it, for 30 s (a loaded machine starves the top for a whole spin now and then)
+                end = time.monotonic() + PROOF_SECONDS
+                while not other_process_proved(trials) and time.monotonic() < end:
+                    trials.append(tuple(page.evaluate(SPIN_PROBE_JS, SPIN_MS)))
+            else:
+                for _ in range(TRIALS):
+                    trials.append(tuple(page.evaluate(SPIN_PROBE_JS, SPIN_MS)))
     finally:
         server.shutdown()
-    return {"results": results, "longest_gap_ms": longest_gap, "port": port}
+    return {"results": results, "spin_trials": trials, "port": port}
 
 
 @pytest.fixture(scope="module", params=[
@@ -599,18 +610,23 @@ def test_every_context_reported(run):
 def test_the_iframes_run_where_the_strategy_puts_them(run, strategy):
     """The precondition of the strategy-1 case, read by the page itself.
 
-    The iframe on the third site spins for 400 ms. In a process shared with the top the top's
-    10 ms timer stalls for about that long; in a process of its own it does not.
+    The iframe on the third site spins for 400 ms while the top ticks a 10 ms timer, and the iframe tells the window
+    of its spin. In a process shared with the top no tick can run inside the window; in a process of its own ticks
+    run inside it (`_fission_frames.other_process_proved`, which says why that is the proof no load can fake).
     """
-    gap = run["longest_gap_ms"]
+    trials = run["spin_trials"]
+    seen = [(ticks_inside(ticks, spun), len(ticks), (spun[1] - spun[0]) if spun else None) for ticks, spun in trials]
+    # a spin that did not happen proves nothing in either direction: at least one must have been seen
+    assert any(spun and spun[1] - spun[0] >= SPIN_MS * 0.9 for _ticks, spun in trials), (
+        "the iframe did not spin for %d ms (ticks inside, ticks in all, spin ms): %r" % (SPIN_MS, seen))
     if strategy == 0:
-        assert gap >= SHARED_PROCESS_GAP_MS, (
-            "strategy 0 keeps the iframes in the top's process, so a %d ms spin should stall "
-            "the top's timer; the longest gap was %.0f ms" % (SPIN_MS, gap))
+        assert not other_process_proved(trials), (
+            "strategy 0 keeps the iframes in the top's process, so no tick of the top's timer can run inside a %d ms "
+            "spin; (ticks inside, ticks in all, spin ms) per spin: %r" % (SPIN_MS, seen))
     else:
-        assert gap < OWN_PROCESS_GAP_MS, (
-            "strategy 1 gives the third site a process of its own, so a %d ms spin should not "
-            "stall the top's timer; the longest gap was %.0f ms" % (SPIN_MS, gap))
+        assert other_process_proved(trials), (
+            "strategy 1 gives the third site a process of its own, so the top's timer should tick inside a %d ms "
+            "spin; in %d spins it never did; (ticks inside, ticks in all, spin ms) per spin: %r" % (SPIN_MS, len(trials), seen))
 
 
 @pytest.mark.e2e

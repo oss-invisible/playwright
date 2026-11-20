@@ -7,10 +7,16 @@ four such contexts left four more processes (8 web content processes at the end 
 BrowserContext now waits a few seconds for the processes of its container once its pages are gone, and kills the
 ones that stay.
 
-The test closes five such contexts in a row and counts the web content processes under the engine after each.
-The first context may add ONE process that is not the leak (the engine starts a spare content process when the
-first page takes one, and Linux keeps it), so the count after the fifth must not be above the count after the
-SECOND: a flat line from there on (on the old engine every context adds one: [4, 5, 6, 7, 8]).
+The test closes five such contexts in a row. While each page is open it counts the processes that host a site
+(at least one: the page's, or the count would prove nothing), and once `close` has answered it waits, with a deadline of 30 s
+that only a process that never goes reaches, for them to be gone: none may be left (on the old engine every context leaves its own, one more each
+time). Only the processes of the page's site are counted, asked for by name (tests/_processes.py): the browser is
+launched with `fission.processSiteNames`, which names a content process by the site it hosts (the page is served
+from `http://127.0.0.1:<port>`; a site never includes the port). The browser starts processes of its own, and
+counting every content process, or every one that hosts any site, read them as a leak ([2, 2, 2, 5, 5] on the e2e
+of the 0.50.0 commit, three "Web Content" and no site left; a process for a Mozilla site started by the New Tab
+page). If the name were not what the test expects, the count while the page is open would be 0 and the first assert
+says so. Off Linux the test skips: no other system names the process.
 
 The engine that does it is not published when this file is written: `engine_at_least` makes the test wait for
 it, and on an older engine it is skipped, never passed.
@@ -20,18 +26,20 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 
 import pytest
 
-pytest.importorskip("websockets")
+import websockets  # noqa: F401 - the dev extra installs it: a missing one is a failure, never a skip
 from websockets.asyncio.client import connect  # noqa: E402
 
+from _processes import NAMED_BY_SITE, site_processes_below  # noqa: E402
 from _servers import LocalServer  # noqa: E402
+from _waits import awatch  # noqa: E402
 
 pytestmark = pytest.mark.e2e
 
 ENGINE_WITH_THE_FIX = "firefox-61"
+SITE = "http://127.0.0.1"    # the site of the served page; a site never includes the port
 
 PAGE = (b"<!doctype html><title>sw</title><script>"
         b"navigator.serviceWorker.register('/sw.js').catch(e => { document.title = 'ERR ' + e; });</script>")
@@ -59,24 +67,6 @@ def _serve():
     return server, "http://127.0.0.1:%d" % server.server_address[1]
 
 
-def _web_processes(root_pid):
-    import psutil
-
-    found = set()
-    try:
-        children = psutil.Process(root_pid).children(recursive=True)
-    except psutil.Error:
-        return found
-    for process in children:
-        try:
-            command = " ".join(process.cmdline())
-        except psutil.Error:
-            continue
-        if "-contentproc" in command and command.rstrip().endswith(" tab"):
-            found.add(process.pid)
-    return found
-
-
 class _Client:
     """The few calls of Playwright's protocol this test needs, over the served WebSocket."""
 
@@ -99,11 +89,25 @@ class _Client:
         await self.call("", "initialize", {"sdkLanguage": "python"})
         self.browser = [g for g, o in self.objects.items() if o["type"] == "Browser"][0]
 
+    async def evaluate(self, frame, expression):
+        """The value of a JavaScript expression in the frame (a promise is awaited by the protocol)."""
+        result = await self.call(frame, "evaluateExpression", {
+            "expression": expression, "isFunction": False, "arg": {"value": {"v": "undefined"}, "handles": []}})
+        value = result["value"]
+        return value["b"] if "b" in value else value   # the protocol's own tag of a boolean
+
     async def new_page(self):
         context = (await self.call(self.browser, "newContext", {}))["context"]["guid"]
         page = (await self.call(context, "newPage", {}))["page"]["guid"]
         frame = self.objects[page]["initializer"]["mainFrame"]["guid"]
         return context, frame
+
+
+#: A deadline no healthy run comes near: every wait below ends on its condition, not on this.
+DEADLINE_S = 30
+
+#: The page asked for a service worker and the browser has taken it (the install handler is the endless loop).
+REGISTERED = ("navigator.serviceWorker.getRegistration().then(r => !!r && !!(r.installing || r.waiting || r.active))")
 
 
 def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(firefox_binary, engine_at_least):
@@ -112,32 +116,44 @@ def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(f
 
     server, base = _serve()
     launched = launch_server(host="127.0.0.1", port=0, headless=True, virtual_display=False, humanize=False,
-                             seed=4266, binary_path=firefox_binary, launch_timeout_ms=180_000)
+                             seed=4266, binary_path=firefox_binary, launch_timeout_ms=180_000,
+                             extra_prefs=NAMED_BY_SITE)
+
+    def sites():
+        return site_processes_below(launched.process.pid, SITE)
 
     async def drive():
-        counts = []
+        opened, left = [], []
         async with connect(launched.ws_endpoint, max_size=None) as ws:
             client = _Client(ws)
             await client.start()
             for i in range(5):
                 context, frame = await client.new_page()
                 await client.call(frame, "goto", {"url": "%s/?i=%d" % (base, i), "waitUntil": "load", "timeout": 30000})
-                await asyncio.sleep(1.0)               # the worker is registered, its install loop is running
-                await client.call(context, "close")
-                deadline = time.time() + 10
-                settled = None
-                while time.time() < deadline:          # the count after the close, once it stops moving
-                    now = _web_processes(launched.process.pid)
-                    if settled is not None and len(now) == settled:
-                        break
-                    settled = len(now)
-                    await asyncio.sleep(1.0)
-                counts.append(len(_web_processes(launched.process.pid)))
-        return counts
+                # the worker is registered (asked of the page, not slept for), so its install loop is running
+                state = {"registered": False}
+
+                async def ask():
+                    state["registered"] = await client.evaluate(frame, REGISTERED)
+                    await asyncio.sleep(0.1)
+
+                known = await awatch(lambda: state["registered"], bool, DEADLINE_S, ask)
+                assert known.ok, "the service worker of the page was never registered (round %d): %s" % (i, known.render())
+
+                async def look():
+                    await asyncio.sleep(0.1)
+
+                seen = await awatch(lambda: len(sites()), lambda n: n > 0, DEADLINE_S, look)
+                opened.append(seen.history[-1][1])
+                await client.call(context, "close")    # the engine waits for the context's processes, then kills
+                gone = await awatch(lambda: len(sites()), lambda n: n == 0, DEADLINE_S, lambda: asyncio.sleep(0.25))
+                left.append(gone.history[-1][1])
+        return opened, left
 
     try:
-        counts = asyncio.run(drive())
+        opened, left = asyncio.run(drive())
     finally:
         launched.close()
         server.shutdown()
-    assert counts[4] <= counts[1], "web content processes after each closed context: %r" % (counts,)
+    assert all(opened), "a page with no process for its site: the count proves nothing (%r)" % (opened,)
+    assert left == [0] * 5, "processes of a site left after each closed context: %r" % (left,)

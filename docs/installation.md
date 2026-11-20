@@ -18,7 +18,7 @@ uv add invisible-playwright
 uv run invisible-playwright fetch      # one-time ~238 MB download (~544 MB unpacked), sha256-verified
 ```
 
-If you do not have a uv project yet, [the README's install steps](https://github.com/feder-cr/invisible_playwright#install) create one.
+If you do not have a uv project yet, [the README's install steps](https://github.com/oss-invisible/playwright#install) create one.
 
 `uv add` gets you the wrapper and its API. `fetch` downloads the patched Firefox
 binary itself, verifies it against a sha256 shipped inside `invisible-core`, and caches
@@ -45,7 +45,7 @@ export INVISIBLE_PLAYWRIGHT_CACHE_DIR=/mnt/big/engines
 ```
 
 If you already have a compatible binary on disk and want to skip the download
-entirely, point `INVPW_BINARY_PATH` at it instead. The full list of environment
+entirely, pass it as `binary_path=` instead. The full list of environment
 variables, including the ones for corporate networks and CI, is in
 [Configuration](configuration.md).
 
@@ -76,7 +76,7 @@ against a sha256 shipped inside `invisible-core` every time it runs, not just on
 first install, so re-running `fetch` is itself the verification.
 
 **What if I already have a compatible binary, or `fetch` can't reach the network?**
-Point `INVPW_BINARY_PATH` at a binary you already have to skip the download
+Pass `binary_path=` for a binary you already have to skip the download
 entirely. [Configuration](configuration.md) lists the other environment variables,
 including the ones for corporate networks and CI.
 

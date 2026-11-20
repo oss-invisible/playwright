@@ -58,9 +58,7 @@ Please use the Async API instead."""
         dispatcher_fiber = MainGreenlet(greenlet_main)
 
         # MODIFIED by invisible_playwright: the transport is the in-process
-        # server, from `make_transport`. The Node driver was removed on
-        # 2026-08-28, and `INVPW_TRANSPORT=driver` is refused with a message
-        # that says so - see `_juggler/transport.py`.
+        # server, from `make_transport` (`_juggler/transport.py`).
         transport = make_transport(self._loop)
         self._connection = Connection(
             dispatcher_fiber,

@@ -39,6 +39,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from . import perimeter, variants
+from ._reaped import after_the_reapers
+from ._threads import ThreadStarter
 # One class for a target that is gone, raised here for a disposed object and
 # by the connection for a closed pipe. Defined there, the lower layer.
 from invisible_core.juggler.connection import TargetClosedError  # noqa: F401 - re-exported on purpose
@@ -274,8 +276,32 @@ class Server:
         self._on_shutdown: list = []
         #: What `shutdown` runs after every hook. See `after_shutdown`.
         self._after_shutdown: list = []
+        #: The session tokens of the launches this server made, in order: what `after_reapers` waits for.
+        self._session_tokens: list = []
+        self._starter: Optional[ThreadStarter] = None
+        self._starter_lock = threading.Lock()
+        self._is_shut_down = False
+        #: Why a thread the starter was handed could not be started (the last few).
+        self.start_errors: list = []
 
     # ── plumbing ────────────────────────────────────────────────────────────
+    @property
+    def thread_starter(self) -> ThreadStarter:
+        """The ONE thread that starts threads for this connection: the transport's workers and every browser's reader hand theirs to it.
+
+        Built on first use, ended by `shutdown`. Served by several clients (`remote._SharedServer`) it is the same one: the server
+        is the connection's owner there too, and its browser's contexts come and go under it."""
+        with self._starter_lock:
+            if self._starter is None:
+                self._starter = ThreadStarter(self._start_failed)
+                if self._is_shut_down:
+                    self._starter.stop()
+            return self._starter
+
+    def _start_failed(self, why: str) -> None:
+        if len(self.start_errors) < 32:
+            self.start_errors.append(why)
+
     def attach(self, transport: Any) -> None:
         self._transport = transport
 
@@ -420,6 +446,21 @@ class Server:
         """
         self._after_shutdown.append(step)
 
+    def note_session_token(self, token: Any) -> None:
+        """A launch was made under ``token`` (a `SessionToken` or its value): its reaper is one of those `after_reapers` waits for."""
+        value = getattr(token, "value", token)
+        if value and value not in self._session_tokens:
+            self._session_tokens.append(value)
+
+    def after_reapers(self, step: Callable[[], None]) -> None:
+        """Like `after_shutdown`, for a step that is slow or waits for something (a folder's removal): it is run once the
+        session's reapers are done with the launches (`_reaped.after_the_reapers`), never on the shutdown thread that the user's
+        stop waits for. With no reaper it runs there, as `after_shutdown` runs it.
+
+        ⛔ THE TOKENS ARE READ WHEN THE SHUTDOWN RUNS THE STEP, not now: the folders are made by a context, after the launch
+        that gives the reaper its token, and the reaper itself exists only once the hooks have closed the connection."""
+        self.after_shutdown(lambda: after_the_reapers(step, *self._session_tokens))
+
     def shutdown(self) -> None:
         for hook in reversed(self._on_shutdown):
             try:
@@ -436,6 +477,11 @@ class Server:
             except Exception:
                 pass
         self._after_shutdown.clear()
+        with self._starter_lock:
+            self._is_shut_down = True
+            starter = self._starter
+        if starter is not None:
+            starter.stop()
 
     # ── the entry point ─────────────────────────────────────────────────────
     def handle(self, message: Dict) -> Any:

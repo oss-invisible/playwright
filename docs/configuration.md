@@ -73,11 +73,14 @@ row is for a specific situation.
 |---|---|
 | `INVISIBLE_PLAYWRIGHT_CACHE_DIR` | Put the cache somewhere else - another drive, a shared location, a path your CI already caches. It holds the engine and this machine's state (the GeoIP database, the font manifest) |
 | `INVISIBLE_PLAYWRIGHT_ENGINE_DIR` | Keep the engine apart from the state, for example on a read-only disk built once per release: `invisible-playwright fetch` with it set fills it, and a launch only reads it. The cache directory must still be writable |
-| `INVPW_BINARY_PATH` | Point at a binary you already have, and skip the download |
 | `STEALTHFOX_GITHUB_TOKEN` | A rate-limited or corporate network that refuses anonymous GitHub downloads |
 | `INVISIBLE_PLAYWRIGHT_SKEW=allow` | Run a Playwright version outside the tested range anyway |
-| `INVPW_CURSOR_ENGINE` | `python` (default), `binary`, or `off` |
+| `INVPW_CURSOR_ENGINE` | `python` (default, same as unset) or `off`. Any other value stops the launch with an error that lists these two |
 | `INVISIBLE_DOWNLOAD_DEADLINE` | Seconds allowed for one engine download, default `1800`. Raise it on a very slow link; `0` removes the bound |
+
+A binary you already have is not an environment variable: pass it as
+`binary_path=` to `InvisiblePlaywright(...)`. That route skips the download, and the
+engine is still checked against the sealed build, so a different one is refused.
 
 ```bash
 export INVISIBLE_PLAYWRIGHT_CACHE_DIR=/mnt/big/engines

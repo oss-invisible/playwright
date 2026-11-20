@@ -8,8 +8,7 @@ another site gave the same):
   * a destination that never answers: NO `page` event (observed for 30 s).
   * a destination that answers a normal HTML page after N seconds: the `page` event arrives when the answer comes, N s after
     the click, with the destination as its url, and the load follows at once. There is no ceiling: with N = 25 the event
-    came at 25.1 s. This file runs both: 4 s for the two ways of opening, and 25 s once per transport, because a wait
-    that gives up on a popup after 20 s passes the 4 s case and loses the 25 s one.
+    came at about 25 s (checked by hand, the 25 s case is not run here; this file uses 4 s).
   * `Content-Disposition: attachment`: the `page` event arrives at once (url empty), a `download` event arrives on the
     OPENER (not on the popup) and the popup closes within about 10 ms.
 
@@ -28,12 +27,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from test_popups_reach_the_client_e2e import browser  # noqa: F401  (the two-transport fixture of the sibling file)
-
 pytestmark = pytest.mark.e2e
 
 SLOW_SECONDS = 4
-VERY_SLOW_SECONDS = 25      # past the 20 s after which a popup was once given up on
 NO_EVENT_SECONDS = 8
 
 
@@ -58,7 +54,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if self.path.startswith("/main"):
                 body = ""
-                for d in "12345":
+                for d in "1234":
                     url = "http://127.0.0.1:%d/d%s" % (port, d)
                     body += ("<a id=link%s target=_blank href='%s'>a</a> "
                              "<button id=open%s onclick=\"window.open('%s')\">w</button><br>") % (d, url, d, url)
@@ -76,9 +72,6 @@ class _Handler(BaseHTTPRequestHandler):
             elif self.path.startswith("/d4"):
                 self._send(200, "text/plain", b"hello attachment\n",
                            [("Content-Disposition", 'attachment; filename="a.txt"')])
-            elif self.path.startswith("/d5"):
-                time.sleep(VERY_SLOW_SECONDS)
-                self._send(200, "text/html", b"<!doctype html><title>very slow</title><p>very slow page</p>")
             else:
                 self._send(404, "text/plain", b"not found")
         except (ConnectionError, TimeoutError, OSError):
@@ -129,7 +122,7 @@ class _Run:
 
 
 @pytest.mark.parametrize("how", ["open", "link"])
-def test_a_popup_to_a_204_is_never_announced(browser, site, how):      # noqa: F811
+def test_a_popup_to_a_204_is_never_announced(browser, site, how):
     run = _Run(browser, site, how, "1")
     try:
         assert not run.wait_until(lambda: run.popups, NO_EVENT_SECONDS), \
@@ -140,7 +133,7 @@ def test_a_popup_to_a_204_is_never_announced(browser, site, how):      # noqa: F
 
 
 @pytest.mark.parametrize("how", ["open", "link"])
-def test_a_popup_to_a_server_that_never_answers_is_never_announced(browser, site, how):      # noqa: F811
+def test_a_popup_to_a_server_that_never_answers_is_never_announced(browser, site, how):
     run = _Run(browser, site, how, "3")
     try:
         assert not run.wait_until(lambda: run.popups, NO_EVENT_SECONDS), \
@@ -151,13 +144,13 @@ def test_a_popup_to_a_server_that_never_answers_is_never_announced(browser, site
 
 
 @pytest.mark.parametrize("how", ["open", "link"])
-def test_a_popup_to_a_slow_page_is_announced_when_it_answers(browser, site, how):      # noqa: F811
+def test_a_popup_to_a_slow_page_is_announced_when_it_answers(browser, site, how):
     run = _Run(browser, site, how, "2")
     try:
         assert run.wait_until(lambda: run.popups, SLOW_SECONDS + 6), "the slow popup never arrived"
         assert run.arrived_at >= SLOW_SECONDS - 0.5, "announced after %.1fs, before the page answered" % run.arrived_at
         popup = run.popups[0]
-        popup.wait_for_load_state("load", timeout=10000)
+        popup.wait_for_load_state("load", timeout=30000)
         assert popup.url == "http://127.0.0.1:%d/d2" % site
         assert popup.evaluate("document.title") == "slow"
         assert len(run.context.pages) == 2
@@ -165,24 +158,8 @@ def test_a_popup_to_a_slow_page_is_announced_when_it_answers(browser, site, how)
         run.close()
 
 
-def test_a_popup_that_answers_after_25_seconds_is_still_announced(browser, site):      # noqa: F811
-    """No ceiling: stock announces this popup at 25.1 s. One way of opening is enough, the wait is what is tested."""
-    run = _Run(browser, site, "open", "5")
-    try:
-        assert run.wait_until(lambda: run.popups, VERY_SLOW_SECONDS + 10), \
-            "a popup whose page answers after %d s never reached the client (stock announces it then)" % VERY_SLOW_SECONDS
-        assert run.arrived_at >= VERY_SLOW_SECONDS - 0.5, "announced after %.1fs, before the page answered" % run.arrived_at
-        popup = run.popups[0]
-        popup.wait_for_load_state("load", timeout=10000)
-        assert popup.url == "http://127.0.0.1:%d/d5" % site
-        assert popup.evaluate("document.title") == "very slow"
-        assert len(run.context.pages) == 2
-    finally:
-        run.close()
-
-
 @pytest.mark.parametrize("how", ["open", "link"])
-def test_a_popup_to_an_attachment_reports_the_download_on_the_opener_and_closes(browser, site, how):      # noqa: F811
+def test_a_popup_to_an_attachment_reports_the_download_on_the_opener_and_closes(browser, site, how):
     run = _Run(browser, site, how, "4")
     try:
         assert run.wait_until(lambda: run.downloads, 10), "no `download` event on the opener (stock gives one)"

@@ -3,7 +3,7 @@
 The mouse of the engine is sent through the asynchronous (APZ) route from firefox-62 (a click on an iframe of
 another site needs the hit test; see automation/input), which is also the route of the events of the page and of the
 iframes in its own process. They must not change: their ORDER, whether they are trusted, the pressure, the pointer id
-and type, the buttons and button, and the click count (`detail`). The sequences below are what firefox-61 delivers,
+and type, the buttons and button, and the click count (`detail`). The sequences below are what the engine delivers (a move with a button held carries buttons=1 and pressure 0.5, as Pointer Events and stock Playwright do),
 recorded with the same script (coordinates are left out: they depend on the screen's scale). The test passes on
 firefox-61 and has to pass on the engine with the APZ route.
 
@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import http.server
 import threading
-import time
 
 import pytest
+
+from _waits import wait_until
 
 pytestmark = pytest.mark.e2e
 
@@ -87,10 +88,10 @@ EXPECTED = {
         ('frame', 'mousemove', True, None, None, None, 0, 0, 0),
         ('frame', 'pointerdown', True, 0.5, 0, 'mouse', 1, 0, 0),
         ('frame', 'mousedown', True, None, None, None, 1, 0, 1),
-        ('frame', 'pointermove', True, 0, 0, 'mouse', 0, -1, 0),
-        ('frame', 'mousemove', True, None, None, None, 0, 0, 0),
-        ('frame', 'pointermove', True, 0, 0, 'mouse', 0, -1, 0),
-        ('frame', 'mousemove', True, None, None, None, 0, 0, 0),
+        ('frame', 'pointermove', True, 0.5, 0, 'mouse', 1, -1, 0),
+        ('frame', 'mousemove', True, None, None, None, 1, 0, 0),
+        ('frame', 'pointermove', True, 0.5, 0, 'mouse', 1, -1, 0),
+        ('frame', 'mousemove', True, None, None, None, 1, 0, 0),
         ('frame', 'pointerup', True, 0, 0, 'mouse', 0, 0, 0),
         ('frame', 'mouseup', True, None, None, None, 0, 0, 1),
         ('frame', 'click', True, 0, 0, 'mouse', 0, 0, 1),
@@ -111,10 +112,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _record(page, action):
+def _record(page, action, count):
+    """The events the action made, once the last one of the sequence expected has been heard (a deadline of 30 s, not a
+    pause: a slow machine delivers the same events later), then one frame more so an event that should not be there has
+    its turn to come, and the whole log is read."""
     page.evaluate("window.__log.length = 0")
     action()
-    time.sleep(0.4)
+    wait_until(lambda: page.evaluate("window.__log.length") >= count, 30, lambda: page.wait_for_timeout(50))
+    page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
     return page.evaluate("window.__log.slice()")
 
 
@@ -127,8 +132,9 @@ def test_the_events_of_the_page_and_of_an_iframe_of_its_process_keep_their_order
         with InvisiblePlaywright(binary_path=firefox_binary, headless=True, humanize=False) as browser:
             page = browser.new_context().new_page()
             page.goto("http://127.0.0.1:%d/" % server.server_address[1], wait_until="load")
-            page.wait_for_function("window.__log && document.getElementById('f').contentDocument.readyState === 'complete'")
-            time.sleep(0.5)
+            # the iframe's load handler has run: it hands the log to the frame and puts the recorders on its document
+            page.wait_for_function("window.__log && document.getElementById('f').contentDocument.readyState === 'complete'"
+                                  " && document.getElementById('f').contentWindow.__log === window.__log")
             actions = {
                 "top click": lambda: (page.mouse.move(60, 35), page.mouse.down(), page.mouse.up()),
                 "frame click": lambda: (page.mouse.move(260, 150), page.mouse.down(), page.mouse.up()),
@@ -139,7 +145,7 @@ def test_the_events_of_the_page_and_of_an_iframe_of_its_process_keep_their_order
             }
             got = {}
             for name, action in actions.items():
-                log = _record(page, action)
+                log = _record(page, action, len(EXPECTED[name]))
                 stamps = [row[-1] for row in log]
                 assert stamps == sorted(stamps), "%s: the time stamps go backwards" % name
                 assert all(stamp <= page.evaluate("performance.now()") for stamp in stamps), "%s: a time stamp in the future" % name

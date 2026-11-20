@@ -20,13 +20,13 @@ the two classes is `await`, and nothing else belongs in this file.
 """
 from __future__ import annotations
 
+import asyncio
 import os
-from ._cursor import (ENGINE_BINARY,
-                      ENGINE_PYTHON,
+from ._cursor import (ENGINE_PYTHON,
                       enable_for as _enable_cursor_engine,
                       max_seconds_for as _cursor_max_seconds)
 from ._engine import resolve_executable
-from ._juggler.server import COMPOSED_PREF, MOTION_BUDGET_PREF, POINTER_PREF, SESSION_SEED_PREF
+from ._juggler.server import COMPOSED_PREF, MOTION_BUDGET_PREF, POINTER_PREF, SESSION_SEED_PREF, UDP_EXIT_PREF, UDP_STUN_PREF
 from typing import Any, Dict, Optional
 
 from invisible_core import compose_session_prefs, context_geometry, make_virtual_display
@@ -65,11 +65,22 @@ __all__ = ["build_prefs", "true_headless_requested", "TRUE_HEADLESS_ENV",
 TRUE_HEADLESS_ENV = "INVPW_TRUE_HEADLESS"
 
 
-def session_geo(timezone: str, proxy: Optional[Dict[str, str]], locale: Any):
+def udp_stun_list(servers: Optional[Any]) -> Optional[list]:
+    """The `udp_stun_servers=` of a launch, validated by the core ("ip:port" IPv4 literals; a name or a bad port
+    raises ValueError naming the parameter) and normalised to "ip:port" strings; None for the two public defaults."""
+    if servers is None:
+        return None
+    from invisible_core._udp_exit import stun_servers
+    return ["%s:%d" % server for server in stun_servers(servers)]
+
+
+def session_geo(timezone: str, proxy: Optional[Dict[str, str]], locale: Any,
+                seed: Optional[int] = None):
     """`invisible_core.prepare_session_geo`, the one network step of composing a
-    session (the egress IP). One name, so a hermetic test replaces it alone."""
+    session (the egress IP). One name, so a hermetic test replaces it alone.
+    The seed places the session on the map (the declared position)."""
     from invisible_core import prepare_session_geo
-    return prepare_session_geo(timezone, proxy, locale)
+    return prepare_session_geo(timezone, proxy, locale, seed=seed)
 
 
 def default_session(executable: Optional[str] = None,
@@ -83,12 +94,22 @@ def default_session(executable: Optional[str] = None,
     What `server.session_for_launch` gives a launch that names no session."""
     from .launcher import InvisiblePlaywright
     session = InvisiblePlaywright(binary_path=executable, humanize=False, proxy=proxy or None)
-    geo = session_geo(session._timezone, session._proxy, session._locale_requested)
+    geo = session_geo(session._timezone, session._proxy, session._locale_requested,
+                      seed=session.seed)
     session._timezone, session._locale = geo.timezone, geo.locale
+    session._udp_exit = geo.udp_exit
+    session._geolocation = geo.geolocation_override()
     prefs = session._build_prefs()
-    env = build_env(srflx_declared=geo.srflx_to_declare(), profile=session._profile,
+    env = build_env(network_declared=declared_network(session), profile=session._profile,
                     executable=executable, base_env={})
     return prefs, env
+
+
+def declared_network(session: Any) -> str:
+    """The host network this session declares to the engine (the value of
+    STEALTHFOX_WEBRTC_NETWORK), drawn from its seed, with or without a proxy."""
+    from invisible_core import network_to_declare
+    return network_to_declare(session.seed)
 
 
 def true_headless_requested(env: Optional[Dict[str, str]] = None) -> bool:
@@ -99,13 +120,9 @@ def true_headless_requested(env: Optional[Dict[str, str]] = None) -> bool:
 #: lives. It was duplicated here byte-for-byte - ten entries, including the
 def build_env(
     *,
-    #: The address to DECLARE as srflx, or None to declare nothing and let the
-    #: real one through. ⛔ This is NOT the egress IP: it is a DECISION the
-    #: core makes in a single place, looking at the capabilities of the egress
-    #: (`SessionGeo.srflx_to_declare`). The old name, `egress_ip`, said
-    #: something else and made the rule look like "there's a proxy -> declare
-    #: it", which is the wrong question.
-    srflx_declared: Optional[str],
+    #: The host network the engine reads (STEALTHFOX_WEBRTC_NETWORK), drawn from
+    #: the session seed (`declared_network`); None declares nothing.
+    network_declared: Optional[str],
     profile: Any = None,
     executable: Optional[str] = None,
     base_env: Optional[Dict[str, str]] = None,
@@ -166,7 +183,7 @@ def build_env(
                     f"(e.g. {missing[:3]}). Engine: {executable}. The metrics "
                     f"would describe fonts that are not there.")
         manifest_path = cached_font_manifest_path(manifest)
-    return build_launch_env({}, srflx_declared=srflx_declared,
+    return build_launch_env({}, network_declared=network_declared,
                             manifest_path=manifest_path, base_env=base_env,
                             display_env=display_env)
 
@@ -182,6 +199,9 @@ def build_prefs(
     humanize: Any,
     show_cursor: Optional[bool] = None,
     session_seed: Optional[int] = None,
+    udp_stun_servers: Optional[Any] = None,
+    udp_exit: Optional[str] = None,
+    preload_newtab: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Fingerprint prefs plus the humanize toggle, which is always set explicitly.
 
@@ -198,13 +218,9 @@ def build_prefs(
     #
     # What stays here is this path's DELIVERY and its two decisions:
     #
-    #   humanize   The pref selects WHICH generator runs, not whether motion
-    #              happens. While the wrapper draws the path it must be false,
-    #              or every waypoint we send would itself be expanded into a
-    #              path by the browser. `max_seconds_for` is applied HERE rather
-    #              than passing `humanize` through, because a falsy-but-numeric
-    #              cap with the binary engine selected has to mean the default,
-    #              not "off".
+    #   humanize   Always false: the wrapper draws the path, and a true value
+    #              would make the browser expand every waypoint we send into a
+    #              path of its own.
     #   show_cursor  Passed through UNTRANSLATED, and that is the difference
     #              from the line above: `humanize` needs a decision here
     #              because two engines compete for it, while the visible dot
@@ -226,9 +242,10 @@ def build_prefs(
         # workarounds meant for that desktop apply only then. Nothing here
         # reads the platform: the fact travels, not a prediction of it.
         virtual_display=virtual_display,
-        humanize=(_cursor_max_seconds(humanize)
-                  if cursor_engine == ENGINE_BINARY else False),
+        humanize=False,
         show_cursor=show_cursor,
+        # None (the caller did not say) writes nothing in the core; False / True are declarations.
+        preload_newtab=preload_newtab,
     ).prefs
     # ⛔ THE TYPING SEED RIDES IN THE PREFS AND NEVER REACHES THE PROFILE.
     #
@@ -255,9 +272,8 @@ def build_prefs(
     # nobody is making.
     #
     # ⛔ AND WHO DRAWS THE WALK TRAVELS TOO (`POINTER_PREF`): with the seed
-    # alone the server could not tell the Python generator from the engine's own
-    # expansion or from `INVPW_CURSOR_ENGINE=off`, and a walk drawn on top of
-    # either would humanise twice.
+    # alone the server could not tell the Python generator from
+    # `INVPW_CURSOR_ENGINE=off`, and would draw a walk nobody asked for.
     #
     # Milliseconds, and an int: Gecko has no float pref type, and `1.0` written
     # as a number arrives with the right value and the wrong type - the defect
@@ -265,6 +281,16 @@ def build_prefs(
     # The persona's keyboards are in the prefs already: the core declares them
     # with the language and country (invisible_core.prefs._apply_locale).
     prefs[COMPOSED_PREF] = True
+    # ⛔ THE STUN SERVERS OF THE UDP-EXIT MEASUREMENT ride here for the server only (`UDP_STUN_PREF`): `op_launch`
+    # takes the key out before the profile is written, as it does the seed. Not written when the launch named none.
+    if udp_stun_servers:
+        prefs[UDP_STUN_PREF] = ",".join(udp_stun_servers)
+    # ⛔ AND THE VERDICT OF THAT MEASUREMENT (`SessionGeo.udp_exit`) rides with it (`UDP_EXIT_PREF`): the core keeps no verdict
+    # in memory, so the server is told it here, and `op_launch` takes the key out as it does the list. Not written when nothing
+    # was measured.
+    prefs.pop(UDP_EXIT_PREF, None)        # never what a caller wrote among its own prefs: only the measurement
+    if udp_exit:
+        prefs[UDP_EXIT_PREF] = udp_exit
     if session_seed is not None and humanize:
         prefs[SESSION_SEED_PREF] = int(session_seed)
         prefs[POINTER_PREF] = cursor_engine == ENGINE_PYTHON
@@ -279,16 +305,14 @@ class ProxyEgressDrifted(RuntimeError):
     This is not a condition the product can recover from, and it is deliberate
     that it is an error instead of a silent update.
 
-    The IP we declare to the engine for the WebRTC srflx candidate is
-    discovered ONCE, at launch. If the egress changes afterwards, the page
-    exits from one address and WebRTC announces another: it is exactly the
-    comparison detectors make ("WebRTC IP doesn't match your Remote IP"), and
-    no Firefox on a real connection produces it.
+    The timezone and the locale are decided ONCE, at launch, from the egress
+    country. If the egress moves afterwards, the page exits from one place
+    while the timezone and the language still describe another: a mismatch no
+    real connection produces.
 
-    Updating the value on the fly would be worse, not better: the site would
-    see the WebRTC IP change before its own eyes mid-session, which is just as
-    unnatural a signal. If the egress does not hold for the duration of the
-    session, that proxy is not sticky and is not usable for this purpose.
+    Updating them on the fly would be just as unnatural (the site would see
+    them change mid-session). If the egress does not hold for the duration of
+    the session, that proxy is not sticky and is not usable for this purpose.
 
     Measured on 2026-08-25: the two providers tried both declare sessions
     sticky by TIME (60 minutes at most for one, a sliding timeout for the
@@ -302,9 +326,9 @@ class ProxyEgressNonVerificabile(RuntimeError):
 
     This is not drift and it is not parity: it is absence of measurement. A
     proxy that does not answer the probe for several checks in a row is not a
-    proxy that holds, it is a proxy we are flying blind on while the engine
-    keeps declaring to every page an address that nobody is confirming any
-    more.
+    proxy that holds, it is a proxy we are flying blind on while the timezone
+    and the locale, decided from the egress at launch, go on being declared
+    to every page with nobody confirming the egress they came from any more.
     """
 
 
@@ -384,9 +408,26 @@ class CommonLaunch:
     `_cursor_engine`, `_extra_prefs`, `_headless`, `_humanize`,
     `_lifetime_guard`, `_locale` (the core's SessionLocale, None until
     `__enter__` decides it), `_profile`, `_session_token`, `_show_cursor`,
-    `_srflx_declared`, `_timezone` and `_virtual_display` in their own
-    `__init__`. They already did, identically, which is why this works at all.
+    `_network_declared`, `_timezone` and `_virtual_display` in their own
+    `__init__`; `_geolocation` (the position the session declares, the
+    ``geolocation`` object of a context, None until `__enter__` decides it
+    and when the exit has no point) is the class default below. They already did, identically, which is why this works at all.
     """
+
+    #: The position this session declares to the engine
+    #: (``SessionGeo.geolocation_override()``: latitude, longitude, accuracy),
+    #: or None. Set by `__enter__` from the egress, like `_timezone`.
+    _geolocation: Optional[Dict[str, float]] = None
+
+    #: Where this session measures a SOCKS5 proxy's UDP exit from: the ``udp_stun_servers=`` of the launch, as
+    #: "ip:port" strings (validated by the core), or None for the two public defaults. Kept on the session so the
+    #: launch geo step and the browser's later context proxies use the same list.
+    _udp_stun_servers: Optional[list] = None
+
+    #: What the launch's geo step measured of the SOCKS5 proxy's UDP exit (``SessionGeo.udp_exit``: ``coherent``, ``no``,
+    #: ``unmeasured``), or None when nothing was measured. Set by `__enter__` with the timezone; it travels to the server in
+    #: the prefs (`UDP_EXIT_PREF`) because the core remembers none.
+    _udp_exit: Optional[str] = None
 
     def _resolve_headless(self) -> bool:
         """Translate the user's ``headless`` flag.
@@ -401,19 +442,72 @@ class CommonLaunch:
         ``self._virtual_display`` is the fact ``_build_prefs`` reads to decide
         whether the desktop workarounds apply (B172).
         """
+        pw_headless, vd = self._plan_headless()
+        if vd is not None:
+            vd.start()
+            self._virtual_display = vd
+        return pw_headless
+
+    def _plan_headless(self) -> "tuple[bool, Any]":
+        """THE decision, made once for both APIs: ``(pw_headless, display)``.
+
+        ``pw_headless`` is what Playwright is told; ``display`` is the hidden
+        surface the caller must START (and then record in
+        ``self._virtual_display``, which `_build_prefs` reads), or None when
+        none is wanted: headless off, true headless asked for, or a platform
+        with no display to make. The two callers only decide WHERE the start
+        runs - inline in the sync client, in a worker in the async one - so
+        the decision cannot drift between them (B172 was one such drift).
+        """
         if not self._headless:
-            return False
+            return False, None
         # Opt-in TRUE headless, shared with the async class. It existed on the
         # async API ONLY until 2026-07-27: a documented env var that worked
         # depending on which entry point the caller happened to pick, which is
         # the same drift that shipped the process-leak fix to half the users.
         if true_headless_requested():
-            return True
-        vd = make_virtual_display()
-        if vd is not None:
-            vd.start()
-            self._virtual_display = vd
-        return False
+            return True, None
+        return False, make_virtual_display()
+
+    async def _resolve_headless_async(self) -> bool:
+        """`_resolve_headless` for the async API: the display starts in a worker.
+
+        Starting the surface is a blocking call - on Linux it spawns an Xvfb
+        and waits for it to report ready (~75 ms measured, seconds on a loaded
+        host) - and `__aenter__` made it on the user's loop, so every other
+        browser of the process stood still for that long, `headless=True`
+        or not. The surface is the same and is still created before the prefs
+        are composed; only the thread changes. The sync API keeps the direct
+        call: nothing else runs on its thread.
+        """
+        pw_headless, vd = self._plan_headless()
+        if vd is None:
+            return pw_headless
+        started = asyncio.ensure_future(asyncio.to_thread(vd.start))
+        try:
+            await asyncio.shield(started)
+        except asyncio.CancelledError:
+            # The worker cannot be interrupted and may yet create the surface
+            # for a launch nobody is waiting for: release it when it ends.
+            loop = asyncio.get_running_loop()
+
+            def release(done: "asyncio.Future") -> None:
+                if not done.cancelled() and done.exception() is None:
+                    loop.run_in_executor(None, vd.stop)
+
+            started.add_done_callback(release)
+            raise
+        self._virtual_display = vd
+        return pw_headless
+
+    def _take_display(self) -> Any:
+        """THE release, made once for both APIs: the hidden surface this session started, taken out of it (None when there is none).
+
+        The counterpart of `_plan_headless`: the two teardowns only decide WHERE the stop runs - inline in the sync client, off the
+        loop in the async one. Stopping waits for the Xvfb to exit (`Popen.wait`, a loop of sleeps on POSIX), and on the user's loop
+        that wait held every other browser of the process (e2e Linux, run 43701692047)."""
+        display, self._virtual_display = self._virtual_display, None
+        return display
 
     def _default_context_kwargs(self) -> Dict[str, Any]:
         # The screen and viewport in CSS pixels, derived once in the core:
@@ -443,13 +537,23 @@ class CommonLaunch:
         # None before __enter__ has decided.
         if self._locale is not None:
             kwargs["locale"] = self._locale.primary
+        # The position the core declares for this machine. It travels as the
+        # standard `geolocation` context option, so the engine gets
+        # `Browser.setGeolocationOverride` for EVERY context (the default one
+        # and each `new_context`/`new_page`), a caller's own `geolocation=`
+        # wins like any other default, and the PERMISSION is not granted here:
+        # the page's grant (the caller's `grant_permissions`) is what makes the
+        # engine answer. The override belongs to each context (Juggler keys it
+        # by `browserContextId`), so a context that closes takes its own with it.
+        if self._geolocation is not None:
+            kwargs["geolocation"] = dict(self._geolocation)
         return kwargs
 
     def _build_env(self, prefs: Dict[str, Any]) -> Dict[str, str]:
         """Env for the Firefox subprocess, then stamped with this session's token.
 
         The body is `build_env`, shared with the async class - it was
-        written twice, identically, and the WebRTC pair is a contract with the
+        written twice, identically, and the WebRTC declaration is a contract with the
         binary, so two landing sites meant two chances to miss a change.
 
         The token stamp stays here because it is the only genuinely per-session
@@ -458,7 +562,7 @@ class CommonLaunch:
         """
         vd = self._virtual_display
         return self._session_token.stamp(
-            build_env(srflx_declared=self._srflx_declared,
+            build_env(network_declared=self._network_declared,
                       profile=self._profile,
                       executable=resolve_executable(self._binary_path),
                       display_env=vd.launch_env() if vd is not None else None))
@@ -481,6 +585,9 @@ class CommonLaunch:
             humanize=self._humanize,
             show_cursor=self._show_cursor,
             session_seed=self.seed,
+            udp_stun_servers=self._udp_stun_servers,
+            udp_exit=self._udp_exit,
+            preload_newtab=self._preload_newtab,
         )
 
     def _arm_cursor_engine(self, owner: Any) -> None:
@@ -499,24 +606,3 @@ class CommonLaunch:
         _enable_cursor_engine(
             owner, seed=self.seed, max_seconds=_cursor_max_seconds(self._humanize)
         )
-
-    def _bind_process_tree(self) -> None:
-        """Tie the browser tree to this process's lifetime, at the OS level.
-
-        MEASURED before being written, because the first attempt at this fixed
-        a path that was not broken: an exception out of the `with` block does
-        NOT leak - __exit__ runs and Playwright cleans up, zero survivors over
-        an interleaved A/B. The leak is the killed-runner path, where __exit__
-        never executes at all: launch, kill the runner, and eight processes
-        were still alive; twelve on the second attempt. Nothing written inside
-        _teardown can reach that, so the guarantee comes from a Windows job
-        object that the kernel empties when this process's handle closes,
-        however this process ends.
-
-        Best-effort by construction: a failure here leaves the pre-existing
-        behaviour rather than breaking a launch that is otherwise fine.
-        """
-        try:
-            self._lifetime_guard.bind(self._session_token)
-        except Exception:
-            pass

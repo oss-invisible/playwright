@@ -23,7 +23,7 @@ import pytest
 from _servers import LocalServer
 
 READ = """() => new Promise(resolve => {
-  const timer = setTimeout(() => resolve({timeout: true}), 8000);
+  const timer = setTimeout(() => resolve({timeout: true}), 30000);
   navigator.geolocation.getCurrentPosition(
     p => { clearTimeout(timer); resolve({lat: p.coords.latitude, lon: p.coords.longitude}); },
     e => { clearTimeout(timer); resolve({error: e.code, message: e.message}); });

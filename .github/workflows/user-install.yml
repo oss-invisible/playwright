@@ -72,9 +72,11 @@ on:
 permissions:
   contents: read
 
+# Only a new push to a ledger pull request cancels the run it supersedes. The
+# weekly schedule and a manual run (both on main) never cancel each other.
 concurrency:
-  group: user-install-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   install:
@@ -92,12 +94,34 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      # Only what the TEST needs. The package under test is installed by the
+      # Only what the TEST needs (and `uv`, for the wait below to ask uv, which the release test installs the package with). The package under test is installed by the
       # test itself, into a venv it creates, from the index - installing it
       # here as well would put a second copy on the path and the assertions
       # would be reading the wrong one.
       - name: Test harness only
-        run: python -m pip install --upgrade pip pytest packaging
+        run: python -m pip install --upgrade pip pytest packaging uv
+
+      # ⛔ THE VERSION OF A LEDGER PULL REQUEST IS THE ONE IT ADDS TO PUBLISHED.json, NOT THE ONE THE TREE DECLARES.
+      # The ledger PR of a release is merged after this job is green, and the next release's tree can already be on main: ledger #534 recorded
+      # 0.56.0 while the tree said 0.57.0, which is not published until that ledger is merged (its tag asks for it), so a wait on the version of
+      # pyproject.toml could never end and the PR could never merge. The versions are compared as data: the ledger at the base of the pull
+      # request against the ledger at its head. Nothing added is an error (there is no release to check), and so is more than one (the job
+      # installs and launches one version). INVPW_E2E_VERSION then carries it to the wait, the install and the launch below, in every step.
+      # A scheduled or dispatched run has no pull request and no such version: it installs the latest, as before.
+      - name: the version this ledger pull request records
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git show "$BASE_SHA:PUBLISHED.json" > "$RUNNER_TEMP/ledger-base.json"
+          git show "$HEAD_SHA:PUBLISHED.json" > "$RUNNER_TEMP/ledger-head.json"
+          version="$(python scripts/ci_ledger_added_versions.py --base "$RUNNER_TEMP/ledger-base.json" --head "$RUNNER_TEMP/ledger-head.json" --tree-pyproject pyproject.toml)"
+          echo "INVPW_E2E_VERSION=$version" >> "$GITHUB_ENV"
+          echo "::notice::this ledger pull request records invisible-playwright $version"
 
       # PyPI does not serve a new version to pip the instant twine finishes, and
       # this workflow runs on the ledger pull request, which the publish run
@@ -107,43 +131,70 @@ jobs:
       # 0.2.5. The job reported a forgotten publish that had happened two minutes
       # earlier, which is the most expensive kind of red: it looks exactly like the
       # real defect this workflow exists to catch.
+      # MEASURED AGAIN 2026-11-12 (0.50.1, ledger #476): the per-version JSON endpoint
+      # of PyPI answered at once, `pip index versions` listed 0.50.1, and the
+      # `pip install --upgrade` of the Linux job still resolved 0.49.1 (the Windows job,
+      # started later, was green). Those are three different pages of the index, and
+      # the job only needs the one pip installs from.
       #
-      # Bounded at five minutes, so a genuinely forgotten publish still fails. The
-      # PER-VERSION endpoint is the authority; the aggregate `info.version` lags it
-      # by minutes and has its own trap, so this asks for the exact URL.
+      # So the question asked here is the INSTALLERS' own, both: the upgrade test installs with pip, the release test with uv (the README's
+      # way in), so each round asks `pip download invisible-playwright==X` AND `uv pip compile` of it (no cache, nothing installed), and the
+      # job goes on only after three rounds in a row in which both said yes, 15 s apart (one yes proves that one request saw the version, not
+      # that the next is served by the same node of the index); a no restarts the count and a call that does not answer in two minutes is
+      # a no. Bounded at ten minutes: a forgotten publish still fails, and it fails HERE, saying that the index does not have the
+      # version, instead of three steps later as a test that compares two versions.
       #
       # Only on the ledger pull request. A scheduled or dispatched run is not
-      # racing anything, and a wait there would hide a real absence behind five
+      # racing anything, and a wait there would hide a real absence behind ten
       # minutes of polling.
       - name: wait for the index to serve this version
         if: github.event_name == 'pull_request'
         shell: bash
         run: |
           python - <<'PY'
-          import json, os, sys, time, tomllib, urllib.error, urllib.request
+          import os, subprocess, sys, tempfile, time, tomllib
           dist = tomllib.load(open("pyproject.toml", "rb"))["project"]["name"]
-          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
-          url = f"https://pypi.org/pypi/{dist}/{version}/json"
-          deadline = time.monotonic() + 300
-          n = 0
+          # The version the ledger pull request records (the step above), never the tree's: main may already declare the next one.
+          version = os.environ["INVPW_E2E_VERSION"]
+          deadline = time.monotonic() + 600
+          deadline = min(deadline, time.monotonic() + float(os.environ.get("INDEX_WAIT_SECONDS", "600")))
+          poll = float(os.environ.get("INDEX_WAIT_POLL", "15"))
+          need = int(os.environ.get("INDEX_WAIT_CONFIRMATIONS", "3"))
+          call_limit = float(os.environ.get("INDEX_WAIT_CALL_SECONDS", "120"))
+          asks = [
+              ("pip", [sys.executable, "-m", "pip", "download", "--no-deps", "--no-cache-dir", "--disable-pip-version-check", "--quiet",
+                       "-d", tempfile.mkdtemp(), f"{dist}=={version}"], None),
+              ("uv", [sys.executable, "-m", "uv", "pip", "compile", "-", "--no-deps", "--no-cache", "--quiet"], f"{dist}=={version}\n"),
+          ]
+
+
+          def round_says():
+              """An empty string when every installer resolves the version, else what the first that did not said."""
+              for tool, command, stdin in asks:
+                  try:
+                      r = subprocess.run(command, input=stdin, capture_output=True, text=True, timeout=call_limit)
+                  except subprocess.TimeoutExpired:
+                      return f"{tool} did not answer within {call_limit:.0f} s"
+                  if r.returncode != 0:
+                      return f"{tool} said: " + ((r.stderr.strip().splitlines() or [""])[-1])
+              return ""
+
+
+          n = streak = 0
+          said = ""
           while True:
               n += 1
-              try:
-                  with urllib.request.urlopen(url, timeout=30) as r:
-                      if json.load(r).get("urls"):
-                          print(f"::notice::{dist} {version} is on the index (attempt {n})")
-                          sys.exit(0)
-              except urllib.error.HTTPError as e:
-                  if e.code != 404:
-                      print(f"::warning::index returned HTTP {e.code}; not waiting further")
-                      sys.exit(0)
-              except OSError as e:
-                  print(f"index unreachable ({e}); retrying")
-              if time.monotonic() >= deadline:
-                  print(f"::warning::{dist} {version} still not on the index after 300s; "
-                        f"running the checks anyway so a real absence is reported")
+              said = round_says()
+              streak = 0 if said else streak + 1
+              if streak >= need:
+                  print(f"::notice::pip and uv resolve {dist} {version} from the index, {need} rounds in a row (attempt {n})")
                   sys.exit(0)
-              time.sleep(10)
+              if time.monotonic() >= deadline:
+                  minutes = int(float(os.environ.get("INDEX_WAIT_SECONDS", "600")) // 60) or 1
+                  print(f"::error::the index does not have {dist} {version} yet, after {minutes} minutes "
+                        f"and {n} attempts, {streak} of {need} rounds in a row ({said})")
+                  sys.exit(1)
+              time.sleep(poll)
           PY
 
       - name: Linux runtime libraries for the browser
@@ -160,6 +211,8 @@ jobs:
           # rate-limited walk SKIPS, and a skip is not a check.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INVPW_E2E_SOURCE: ${{ github.event.inputs.source || 'index' }}
+          # INVPW_E2E_VERSION (set above on a ledger pull request, absent otherwise) is read by both tests: the release test adds exactly that
+          # version, the upgrade test goes from the one before it to it.
         shell: bash
         run: |
           set -o pipefail   # or the tee below would swallow pytest's exit code

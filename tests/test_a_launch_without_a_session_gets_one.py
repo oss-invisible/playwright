@@ -24,6 +24,7 @@ from invisible_playwright import _session
 from invisible_playwright._juggler import server as module
 from invisible_playwright._juggler.server import (SESSION_SEED_PREF, BrowserTypeDispatcher,
                                                   JugglerServer)
+from _browser_census import closes_with_the_test
 
 # Read with a default so that, on the code before the fix, the test fails on what the
 # profile holds and not on an import.
@@ -35,6 +36,7 @@ _LINE = re.compile(r'^user_pref\("([^"]+)",\s*(.*)\);\s*$')
 class _Engine(EventListeners):
     def __init__(self):
         EventListeners.__init__(self)
+        closes_with_the_test(self)
 
     def send(self, method, params=None, session=None, timeout=30.0):
         return {"browserContextId": "ctx-1", "targetId": "t-1"}
@@ -124,7 +126,7 @@ def test_the_launcher_marks_what_it_composes():
         prefs = _session.build_prefs(
             profile=generate_profile(seed=7), locale=decide_session_locale("en-US"),
             timezone="America/New_York", extra_prefs=None, virtual_display=False,
-            cursor_engine=_session.ENGINE_BINARY, humanize=humanize, session_seed=7)
+            cursor_engine=_session.ENGINE_PYTHON, humanize=humanize, session_seed=7)
         assert prefs.get(COMPOSED_PREF) is True, humanize
 
 

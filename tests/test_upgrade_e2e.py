@@ -67,10 +67,10 @@ _LEAKS = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
           "INVISIBLE_PLAYWRIGHT_ENGINE_DIR", "INVISIBLE_PLAYWRIGHT_CACHE_DIR",
           "INVISIBLE_DOWNLOAD_DEADLINE", "STEALTHFOX_GITHUB_TOKEN", "GITHUB_TOKEN",
           "INVISIBLE_SEAL_FILE", "INVISIBLE_CORE_PIN", "INVISIBLE_CORE_AUTOFIX",
-          "INVISIBLE_CORE_AUTOFIX_TIMEOUT", "UV", "STEALTHFOX_GEOIP_MMDB",
-          "STEALTHFOX_FONT_MANIFEST", "STEALTHFOX_WEBRTC_PUBLIC_IP",
+          "INVISIBLE_CORE_AUTOFIX_TIMEOUT", "UV", "STEALTHFOX_GEOIP_MMDB", "STEALTHFOX_INTERMEDIATES",
+          "STEALTHFOX_FONT_MANIFEST", "STEALTHFOX_WEBRTC_NETWORK",
           "INVPW_CURSOR_TIMER", "INVISIBLE_CORE_AUTOFIX_ATTEMPTED",
-          "INVPW_SESSION_TOKEN", "INVPW_DESKTOP", "STEALTHFOX_WEBRTC_DISABLE_IPV6")
+          "INVPW_SESSION_TOKEN", "INVPW_DESKTOP")
 
 
 def _clean_env(base=None):
@@ -195,6 +195,22 @@ def _pinned_core(py: Path) -> str:
     return m.group(1)
 
 
+def _previous_and_latest(released: list[str], target: str | None = None) -> tuple[str, str]:
+    """The release to upgrade FROM and the one to upgrade TO, both from the one listing the install then uses: the two
+    newest of ``released`` (newest last). A bare ``--upgrade`` asks the index again for "the latest", and an index page
+    that lags (run of the ledger of 0.50.1: the listing had 0.50.1, the upgrade resolved 0.49.1) answers with the old one.
+
+    ``target`` is the version a ledger pull request records (``INVPW_E2E_VERSION``, `user-install.yml`): the upgrade goes TO it and FROM the release
+    before it in the listing, whatever newer ones the index has by then. A target the listing does not have is an error, not a fallback."""
+    if target is None:
+        return released[-2], released[-1]
+    assert target in released, "the index lists no %s (it lists %s)" % (target, ", ".join(released[-5:]))
+    at = released.index(target)
+    if at == 0:
+        pytest.skip("%s is the first release of the index; nothing to upgrade FROM" % target)
+    return released[at - 1], target
+
+
 def _released_versions(py: Path, dist: str) -> list[str]:
     """Versions the index will serve, newest last. Read from pip itself so the
     test does not carry a hardcoded list that goes stale on the next release."""
@@ -230,7 +246,7 @@ def test_upgrading_from_the_previous_release_moves_the_core_too(workspace: Path)
     released = _released_versions(py, WRAPPER)
     if len(released) < 2:
         pytest.skip("only one release on the index; nothing to upgrade FROM")
-    previous = released[-2]
+    previous, latest = _previous_and_latest(released, os.environ.get("INVPW_E2E_VERSION") or None)
 
     _run([str(py), "-m", "pip", "install", "--no-cache-dir",
           f"{WRAPPER}=={previous}"], timeout=900)
@@ -238,10 +254,10 @@ def test_upgrading_from_the_previous_release_moves_the_core_too(workspace: Path)
     assert before["wrapper"] == previous
 
     _run([str(py), "-m", "pip", "install", "--no-cache-dir", "--upgrade",
-          WRAPPER], timeout=900)
+          f"{WRAPPER}=={latest}"], timeout=900)
     after = _versions(py)
 
-    assert after["wrapper"] != previous, "the upgrade did not move the wrapper"
+    assert after["wrapper"] == latest, "the upgrade did not move the wrapper to %s: %s" % (latest, after["wrapper"])
     _run([str(py), "-m", "pip", "check"], timeout=180)
 
     declared = _run([str(py), "-c",

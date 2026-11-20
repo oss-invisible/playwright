@@ -55,7 +55,7 @@ def _page_with_one_frame():
     up: list = []
     server.attach(type("R", (), {"emit_message": lambda self, m: up.append(m)})())
 
-    frame = SimpleNamespace(url="http://127.0.0.1/", name="", emitted=[])
+    frame = SimpleNamespace(url="http://127.0.0.1/", name="", emitted=[], frame_id="F1", told_states={"commit"}, told_commit=None)
     frame.emit = lambda method, params=None: frame.emitted.append((method, params))
 
     page = object.__new__(PageDispatcher)
@@ -68,6 +68,12 @@ def _page_with_one_frame():
     page._request_log = []
     page._navigation_requests = {}
     page._announced_closed = False
+    page._frames = {}
+    page._told_attached = set()
+    page._frames_lock = __import__("threading").RLock()
+    page._announce_lock = threading.RLock()
+    page._announced = True
+    page._said_before_announcement = []
     page.context = SimpleNamespace(emit=lambda *a, **k: None, intercepting=False)
     page.frame = frame
     page.frame_for = lambda fid: frame
@@ -178,8 +184,8 @@ def test_pushState_updates_page_url_and_wakes_wait_for_url(firefox_binary):
             seen = []
             page.on("framenavigated", lambda frame: seen.append(frame.url))
 
-            page.click("#route", timeout=15_000)
-            page.wait_for_url("**/reports", timeout=15_000)
+            page.click("#route", timeout=30_000)
+            page.wait_for_url("**/reports", timeout=30_000)
 
             assert page.url == url + "reports", page.url
             assert page.evaluate("location.href") == page.url

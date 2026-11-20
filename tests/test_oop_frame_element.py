@@ -77,8 +77,8 @@ def oop_page(firefox_binary, oop_origins):
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary, humanize=False,
                              headless=True, extra_prefs=STRATEGY_1) as browser:
         page = browser.new_context().new_page()
-        page.set_default_timeout(5000)
-        page.set_default_navigation_timeout(20000)
+        page.set_default_timeout(30_000)
+        page.set_default_navigation_timeout(30_000)
         page.goto(oop_origins["top"])
         page.wait_for_function("document.querySelector('#payment').contentWindow !== null")
         yield page

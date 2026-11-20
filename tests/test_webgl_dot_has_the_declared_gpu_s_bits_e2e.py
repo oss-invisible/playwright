@@ -131,10 +131,13 @@ PAGE = r"""(args) => {
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) return {error: gl.getProgramInfoLog(p)};
   gl.useProgram(p);
-  const data = new Float32Array(n * 8);
+  // rows hold the float32 BITS (uint32), not floats: the client sends a Python 0.0 as -0 (the vendored
+  // Playwright compares `value == float("-0")`, true for both zeros), which would change the signs of the zeros under test.
+  const bits = new Uint32Array(n * 8);
   for (let i = 0; i < n; i++) {
-    for (let c = 0; c < 4; c++) { data[i * 4 + c] = rows[i][c]; data[(n + i) * 4 + c] = rows[i][4 + c]; }
+    for (let c = 0; c < 4; c++) { bits[i * 4 + c] = rows[i][c]; bits[(n + i) * 4 + c] = rows[i][4 + c]; }
   }
+  const data = new Float32Array(bits.buffer);
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, n, 2, 0, gl.RGBA, gl.FLOAT, data);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -161,7 +164,7 @@ def _mismatches(firefox_binary, alu_class: int, k: int) -> list[tuple[int, int, 
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary, headless=True, extra_prefs=prefs) as browser:
         page = browser.new_context().new_page()
         page.goto("about:blank", timeout=30_000)
-        res = page.evaluate(PAGE, [rows, k])
+        res = page.evaluate(PAGE, [[[_bits(x) for x in row] for row in rows], k])
     if "error" in res:
         pytest.skip("WebGL2 not usable here: %s" % res["error"])
     px = res["bytes"]
@@ -185,6 +188,12 @@ def test_the_model_is_one_fma_chain():
     assert nv_dot([x, 1.0], [x, -1.0]) == 2.0 ** -11
 
 
+def test_the_vectors_reach_the_page_with_both_zero_signs():
+    """The page gets the float32 bits, so a +0 and a -0 stay what they are (the client's float path turns every Python 0.0 into -0)."""
+    bits = {_bits(x) for row in _vectors(2026 + 2) for x in row}
+    assert 0x00000000 in bits and 0x80000000 in bits
+
+
 def test_the_model_keeps_the_sign_of_a_zero_sum():
     """An fma whose product and addend are both -0 is -0; a cancellation is +0."""
     assert _bits(_fma(0.0, -1.0, -0.0)) == 0x80000000
@@ -200,7 +209,7 @@ def test_the_model_keeps_the_sign_of_a_zero_sum():
 @pytest.mark.parametrize("alu_class", (1, 2))
 @pytest.mark.parametrize("k", (2, 3, 4))
 def test_dot_is_the_nvidia_fma_chain_when_declared(firefox_binary, engine_at_least, k, alu_class):
-    engine_at_least("firefox-64")
+    engine_at_least("firefox-68")
     bad = _mismatches(firefox_binary, alu_class, k)
     assert not bad, "dot%d, class %d: %d of %d differ from the chain, first %s" % (
         k, alu_class, len(bad), N, json.dumps(bad[:3]))
@@ -212,7 +221,7 @@ def test_dot_is_the_nvidia_fma_chain_when_declared(firefox_binary, engine_at_lea
 @pytest.mark.parametrize("k", (2, 3, 4))
 def test_dot_without_the_declaration_is_the_hosts_own(firefox_binary, engine_at_least, k):
     """The control: with class 0 the same vectors tell the host's dot() from the chain."""
-    engine_at_least("firefox-64")
+    engine_at_least("firefox-68")
     bad = _mismatches(firefox_binary, 0, k)
     if not bad:
         pytest.skip("this adapter's dot%d() already is the NVIDIA chain: the difference is not visible here" % k)

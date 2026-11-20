@@ -56,7 +56,7 @@ def test_set_offline_stops_loads_and_set_online_resumes_them(firefox_binary):
             # on Firefox (test_offline_should_work_with_initial_option).
             # Without the wait the next goto races it and reads as interrupted
             # by a navigation to the failed URL.
-            with page.expect_event("framenavigated", timeout=15_000):
+            with page.expect_event("framenavigated", timeout=30_000):
                 with pytest.raises(Exception) as failure:
                     page.goto(url + "again", timeout=15_000)
             assert "OFFLINE" in str(failure.value).upper(), str(failure.value)

@@ -7,6 +7,7 @@ receive.
 """
 from __future__ import annotations
 
+from invisible_core.juggler import _pacing
 from invisible_playwright._juggler import pointer as pointer_mod
 from invisible_playwright._juggler.pointer import Pointer
 
@@ -52,6 +53,21 @@ class FakeActions:
     def move(self, x, y, steps=1):
         self._page.moves.append((round(x, 4), round(y, 4)))
         self.position = (x, y)
+        self._page.singles.append(("move", steps))
+
+    def walk(self, events, *, origin=None, buttons=None, modifiers=0, emit_last=True, now=None, sleep=None):
+        """`Actions.walk`: the pacer's loop over the events, one stroke per call. The points land in `moves` and the notches in
+        `wheels`, as the single commands did, and `walks` keeps what was handed over, so a test sees that a path left as a walk."""
+        evs = list(events)
+        self._page.walks.append({"events": evs, "origin": origin, "emit_last": emit_last})
+
+        def move(x, y, t_ms):
+            self._page.moves.append((round(x, 4), round(y, 4)))
+            self.position = (x, y)
+
+        def wheel(dx, dy, t_ms):
+            self._page.wheels.append((dx, dy))
+        return _pacing.drive(evs, move, emit_wheel=wheel, emit_last=emit_last, now=now, sleep=sleep, origin=origin, timed=True)
 
     def wheel(self, dx, dy):
         self._page.wheels.append((dx, dy))
@@ -83,6 +99,8 @@ class FakePage:
         self.hits = hits
         self.moves = []
         self.wheels = []
+        self.walks = []
+        self.singles = []
         self.hit_asked = []
         self.queried = []
         self.disposed = []

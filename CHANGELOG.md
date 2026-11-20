@@ -4,9 +4,274 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.57.0] - 2026-11-20
 
-## [0.50.0] - 2026-11-11
+### Changed
+- Pins invisible-core 67.78.0 (same engine, firefox-67). The core keeps no value in memory between two calls: the seal, the identity of the engine,
+  the GPU tables, the time zones, the keyboard tables, the exit address and the UDP verdict of a proxy are read or measured each time they are needed,
+  so what a launch costs is visible where it is paid.
+- `invisible-playwright fetch` looks for a newer list of intermediate certificates every time it runs (a small request; the list is downloaded only
+  when Mozilla changed it). A launch only reads the list on disk and starts no background check.
+- `new_context(proxy=...)` measures the UDP exit of its proxy every time, instead of reusing a measurement of the same proxy from the last 30 minutes.
+- A launch without a proxy asks for its exit address every time, instead of reusing an answer from the last 2 minutes.
+- The UDP verdict the session measured at launch is handed to the browser's proxy command explicitly.
+
+### Fixed
+- `wait_for_load_state("networkidle")` and `goto(..., wait_until="networkidle")` on a new document count the quiet from that document's
+  commit, as Playwright does: the silence before the commit no longer counts toward its 500 ms.
+
+## [0.56.0] - 2026-11-19
+
+### Engine firefox-67
+- A site that sends an incomplete certificate chain (its certificate without the intermediate that signed it) opens from the first second,
+  as it does on a Firefox that has been in use for days. Firefox completes such chains with the intermediate certificates Mozilla
+  publishes, which a fresh profile only downloads a minute or so after its start; the list is now declared by the core and written into
+  the profile before the first page, so every session has it from its start.
+- The engine no longer downloads that list itself: no request for it leaves the browser, through the proxy or otherwise.
+- The browser tells the client it is ready only once the list is written, so no page can be opened before it is in place.
+
+### Changed
+- Pins invisible-core 67.77.0 and with it the engine firefox-67. The core downloads the list from Mozilla's service once, verifies every
+  certificate against the hash Mozilla publishes for it, keeps it in its cache and asks again at most once a week, after the browser has
+  started, so a launch never waits for it; with no copy and no network the browser starts without the list and a warning is printed.
+- `invisible-playwright fetch` also downloads the list, after the engine, so the first launch does not.
+- The CI legs launch with a fixed, empty list of the repository (`ci/intermediates.json`), so no test asks Mozilla for anything.
+
+## [0.55.0] - 2026-11-19
+
+### Changed
+- Pins invisible-core 66.76.0 (same engine, firefox-66): the core no longer carries its legacy API, and the wrapper no longer reaches any of it.
+- `tests/conftest.py` takes the engine entry table from `invisible_core.seal.DEFAULT_ENTRY_REL`, and a test fails if a file of the wrapper imports a name the core removed.
+- The workflows arm the pre-push gates with `python -m invisible_core.hooks install`.
+
+### Removed
+- The nine modules that only re-exported `invisible_core` (`invisible_playwright._geo`, `_headless`, `_proxy`, `_webgl_personas`, `config`,
+  `constants`, `download`, `prefs`, `_fpforge`) and `invisible_playwright._reaper`: import `invisible_core.<module>` (`invisible_core.process`
+  for the reaper). `resolve_session_timezone` is no longer re-exported from the package root.
+- `INVPW_CURSOR_ENGINE=binary` and the fallback to the browser's own motion when no generator is found: the engine is the Python one, or `off`. The variable is strict: unset, `python` or `off`; any other value (`binary`, `none`, `false`, `0`...) is a `ValueError` that lists them.
+- The test that scanned a driver bundle tree, which only the removed Node driver had.
+- `INVPW_TRANSPORT=driver` and its refusal message: there is one transport.
+- `scripts/install_hooks.py`: `python -m invisible_core.hooks install` (with `--check` to only report) does the same, from the core.
+
+### Fixed
+- The documentation no longer presents `INVPW_BINARY_PATH` as a variable of the library, which reads none; a binary you already have is passed
+  as `binary_path=`.
+
+## [0.54.0] - 2026-11-18
+
+### Engine firefox-66
+- A screenshot on Linux draws text in the fonts the page used. The browser's main process rebuilds each font of a screenshot from its
+  file and asks fontconfig to confirm that file; it now shows the bundled fonts to fontconfig before it builds its font list, so the file
+  is known and kept instead of being replaced by a fallback font (screen and canvas were already right; only screenshots were wrong).
+- A face of a font collection (`.ttc`) keeps its own index when the main process rebuilds it, so it is no longer drawn as another face of
+  the same file (Cambria Math, MS PGothic and NSimSun came out as Cambria, MS Gothic and SimSun). This is Mozilla's fix of bug 2077661,
+  carried as Mozilla wrote it until a Firefox release ships it.
+- Windows was not affected.
+
+### Changed
+- Pins invisible-core 66.75.0 and with it the engine firefox-66.
+
+### Added
+- A test that draws text in each bundled family the identity declares (accents, a typographic apostrophe, Chinese, Japanese, Arabic,
+  Russian, and two faces that are not the first of their collection) and compares the screenshot, byte for byte, with the same text drawn
+  by the page itself into a canvas, on Linux and on Windows.
+- A Linux test that a second launch reads the bundle from fontconfig's cache and does not scan the folder again, measured under strace,
+  with a test of the strace stand-in itself.
+
+## [0.53.1] - 2026-11-16
+
+0.53.0 was tagged but never published; its changes ship in 0.53.1. One of its tests read the page's address too early when the first of
+two navigations wins; 0.53.1 corrects that test.
+
+### Engine firefox-65
+- Keys, clicks and the mouse path stay on their planned timing under load.
+- A second `goto` that starts while a site is changing process no longer hangs.
+- The isolated worlds of init scripts are always created.
+- A worker comes back with its page from the back-forward cache.
+- The names looked up as a context closes go through that context's proxy.
+- `close()` returns when the browser has exited, and never interrupts it while it exits.
+
+### Changed
+- Pins invisible-core 65.74.0 and with it the engine firefox-65.
+- The path of the cursor leaves as one stroke. The approach, the walk before a click, the wheel burst and the idle movement hand their
+  planned timeline to the core's `Actions.walk`, which sends each point at its planned instant on the client's own clock, without waiting
+  for the reply of the one before; the replies are collected at the end. Before, each point was a command of its own that waited for the
+  engine's reply, and a slow reply was a pause in the path that the page saw (2.6 s measured on a GitHub runner), with the points after it
+  crowded together. A lone `mouse.down`, `mouse.up` or one-step `mouse.move` is still a single command that waits for its reply, as in Playwright.
+- `close()` returns when the browser has exited, and the removal of the session's directories and the last reap of its tree are left to the
+  reaper of the launch (invisible-core 65.74.0), instead of being done at once and waiting for the sender of the shutdown pings. A session
+  that is over is forgotten by the registry of reapers, so a long-lived server no longer keeps one entry per session.
+- The download and upload folders of a session are removed by the reapers of its launches, after the tree has ended, and no longer on
+  the server's shutdown thread that the user's exit waits for (4 profiles removed together took up to 2.5 s on Windows). With no reaper
+  they are removed at once, as before.
+
+### Fixed
+- The cursor's motion never fails an action for what the engine or the page answers (a closed target, a detached frame, a refused or
+  unanswered command), and no longer hides a bug of ours: an error of our own in the path (an `AttributeError`, a `TypeError`) comes out of
+  the action instead of being swallowed with one warning and a click that goes out with no path.
+
+### Removed
+- `pytest-rerunfailures` from the `dev` extra. No run of this repository reruns a test (the e2e run refuses the plugin by name, `-p no:rerunfailures`).
+
+### Tests
+- The e2e tests wait for a condition with a deadline of 30 s, not for a clock, and the workers share no port: a Marionette port per launch,
+  the HTTP/3 server serves on the UDP socket its picker held. A test that is red now says what
+  it saw. (#507, #511, #514)
+- The shelved engine line is firefox-66; its 15 tests wait for it. (#509)
+- A loop late in its selector is not held; only the time its thread runs counts. (#508)
+- A check that the e2e tests do not wait on clocks, share ports, write the environment or reach the world; the debt of that check only shrinks.
+- The whole unit suite is a required suite of the candidate: 1988 tests on Linux and 1989 on Windows.
+- The click and pointer benches count a stroke's instants on their virtual clock, and the key-delay test reads the browser's own event
+  time stamps. (#516)
+- The e2e workflow uploads the junit of every pass of the run (Linux, and each Windows part), green or red.
+
+## [0.52.1] - 2026-11-15
+
+### Changed
+- Pins invisible-core 64.73.0 (same engine, firefox-64). The compositor is now declared in software on every machine, as a
+  retail Firefox reports on a machine without a usable GPU, and never read from the host. Before, the hardware compositor
+  was declared over a software adapter, which cost about 6x the CPU in the GPU process.
+- Windows: the engine is created inside a job of its own, so a launch no longer scans every process of the machine to bind
+  the engine's tree. (#498)
+- Several browsers in one async program no longer slow one another down:
+  - `connect()` starts no thread on the event loop (#497).
+  - The virtual display of `headless=True` starts off the event loop (#499).
+  - Closing a browser waits for its processes and removes its profile without holding the loop that serves the others:
+    with four browsers in one process the loop was held for up to about 0.5 s per close, and is not held now (#503).
+- Comments, the fork notes and one test message no longer point at scripts that were deleted (the transport comparison scripts and the prefs byte-parity gate: no round ran them). No behaviour changes. (#458)
+
+### Added
+- `page.expose_function`, `page.expose_binding`, `context.expose_function` and `context.expose_binding`, as in Playwright: the page calls a Python function and gets a promise (the value, a rejection when the function raised, an await when it is async). The page sees the function and nothing else (no name of ours on the window, no init script); an engine without `Page.addBinding` is refused with a clear sentence. Arguments and results cross as JSON. (#471)
+- `Locator.screenshot()` and `ElementHandle.screenshot()`: a picture of the element, as in Playwright, in the page, in a frame of another site and in a frame nested in it. (#470)
+
+### Fixed
+- A context init script added after a page exists runs once in it, not twice. (#469)
+- A CORS preflight (an OPTIONS request that no route holds) is no longer reported to the client, as in Playwright's own server: `page.on("request")`, `route` and a request counter hear of one request fewer for each preflighted fetch of the page. (#467)
+
+### Tests
+- Every test module is checked to leave no browser open (a census of the connection threads, which needs no package to run). (#497, #500)
+- Software compositing is declared: the compositor in use, the CPU of the GPU process, and the bytes a page reads compared
+  against a recorded reference, on Linux and Windows. (#501)
+- The UDP bench survives a loaded Windows machine, and its verdict says what it saw. (#502)
+
+## [0.52.0] - 2026-11-14
+
+### Changed
+- Pins invisible-core 64.71.0 and with it the engine firefox-64. A request a page causes now leaves in the context of that
+  page, by that context's proxy and resolver: the name of a TURN server over TCP, the OCSP request of a certificate, the TLS
+  over a tunnel, the Safe Browsing completion of a page load. Nothing of a context with a proxy goes out DIRECT when a proxy
+  lookup fails or the context has just closed. On Linux the profile lock no longer looks up the machine's host name.
+- Typing: each key is sent at its planned time measured from the start of the action, so a late reply no longer shifts the
+  keys after it, and the engine delivers each key at once with its event born the declared latency in the past. Measured
+  against stock Playwright Firefox, 20 runs per cell, slip of the last key against the plan (median): Windows 635 ms before,
+  6 ms now (stock 122); Linux 554 ms before, -5 ms now (stock 91).
+
+### Fixed
+- Screencast: a frame that arrives while the start of the screencast is being answered is held and acknowledged,
+  not dropped, so the stream no longer dies from its first frame (the engine keeps one frame in flight and waits for its
+  acknowledgement).
+- No thread is started on the engine connection's reader any more (the adoption of a new page and the file chooser hand
+  their work to one long-lived starter). On Windows under load a Thread.start there held every event behind it; without
+  instrumentation, goto(..., wait_until="networkidle") on pages that replace themselves missed 1 in 1200 instead of 4.
+
+### Tests
+- The suites "nothing of a context leaves but through its proxy" (a witness of every direct arrival, the engine's resolver
+  log as the sink of native lookups), on Linux and Windows, including two contexts with their own proxies at once and a
+  PeerConnection of a torn-down window.
+- Windows: the isolated-page test moves the page when the test says so instead of on a 500 ms timer; the sandbox test
+  reads again a process that is still starting.
+
+
+## [0.51.1] - 2026-11-13
+
+### Changed
+- Pins invisible-core 63.68.0 (core fixes on the same firefox-63 engine: two sessions starting together on Windows no longer fail on the shared font-manifest cache; no MOZ_*, GL or toolkit variable of the host reaches the engine; GitHub is asked for the latest GeoIP database once a day, not on every launch; mouse moves carry the pressed buttons; a CORS preflight does not count for networkidle).
+- The project moved to the oss-invisible GitHub organization: every GitHub link, the issue templates and the package URLs point to github.com/oss-invisible/playwright. The PyPI name and the import name do not change; the old addresses redirect.
+
+### Fixed
+- A popup (a `window.open` or a `target=_blank` link) could be handed to the client at `about:blank`, with the blank page's `load`, when it
+  was opened with no route on the context: the commit of its address, or its `DOMContentLoaded` and `load`, arrived while the page was being
+  handed from its buffer to its dispatcher and was told to nobody (`page.url` stayed `about:blank`, or `wait_for_load_state("load")` timed
+  out). Measured on Windows with the library's client in the same process, `test_popups_reach_the_client_e2e.py` x20 on 4 workers: 3 runs
+  red with the published firefox-62 engine and 11 with firefox-63. The page is now handed over in one step: what the client was not told is
+  said once, in order, and nothing the engine sent in that period is lost.
+- The same hand-over dropped every event that is not a request: a `console` message, a `pageError`, a `dialog` (an `alert()` that opened
+  while the popup was being built blocked its page for good, because no client had been told of it and none could answer it), a `crash`, a file chooser. All
+  of them are given back now, in the order they arrived. The only bound left is the memory of the buffer (512 events): an event beyond it is
+  lost and a `RuntimeWarning` says how many, once per page.
+- The hand-over holds when the engine's reader, the adoption and a close run at the same time: a `load` is told to the client once (not twice,
+  so `page.on("load")` runs once); an event the engine sends while the held ones are being given back waits for them (a response is never handled
+  before its request); a document committed at the same address as the previous one is told; a page closed while it was being adopted is not given
+  frames, and is not announced, after its `__dispose__`; one frame never gets two dispatchers.
+- A popup could still be handed to the client at `about:blank` (or with its navigation pending again, and "Execution context was destroyed" in its
+  first evaluate) when the destination committed while the events the page had missed were being replayed to it: the engine's reader went on
+  delivering the live events to the lifecycle, and the replay then brought older ones after them. The page now subscribes its readers and is
+  handed the missed events in one step, with the delivery of the sessions' events held, so a live event never overtakes the replay.
+  With the three corrections together, on Windows with the library's client in the same process, under load: 680/680 and 256/256 popup cases
+  green (run 43261858525).
+- `Control+A` selects all in an `<input>` and a `<textarea>` on Windows, on the published engine and the core this package pins: a new end-to-end
+  test (five ways to press the shortcut, in-process and served to the stock client), run by `e2e.yml` on Windows, 20/20 green (run 43262320744).
+- Tests only: the e2e tests of the test servers take their ports from one sequence (no two servers draw the same one); the two tests that read a
+  consecutive pair of host ports run alone, after the parallel tests; the sandbox e2e (the browser's seccomp filter) runs in a step of its own that
+  turns unprivileged user namespaces on, and is left out of the normal run; every leg launches with a GeoIP database the repository builds (same
+  bytes every run, no download); the CodeQL alerts of the test code are fixed; the install job waits for the package index through both installers;
+  the raw Juggler tests wait for `Page.ready` and the main frame instead of a fixed time.
+
+## [0.51.0] - 2026-11-12
+
+### Changed
+- Engine firefox-63 through invisible-core 63.67.0, which this version pins (63.67.0 is 63.66.0 with the protocol mirror regenerated from the published engine; the mirror of 63.66.0 differed from it). Behind a proxy: names are resolved by the browser's own
+  DNS-over-HTTPS through the proxy (not by the machine's resolver; checked with a resolver trap on Linux), WebRTC and HTTP/3 send
+  their UDP through the proxy's relay when its UDP was measured to leave from the same address as its TCP, and a proxy whose UDP
+  does not hold (including one whose UDP leaves from another address) is treated as a router that drops it (HTTP/3 falls back to
+  HTTP/2, ICE gathers no server-reflexive candidate). A proxy given to a context declares its own measured UDP exit. The interface
+  list WebRTC gathers is the network the session declares.
+- Behind a SOCKS5 proxy the proxy now receives addresses, not names (the names are resolved by the DNS-over-HTTPS through it); a proxy
+  that cannot carry HTTPS to mozilla.cloudflare-dns.com resolves no name.
+- A STUN server list can be given at launch (`udp_stun_servers`) for the measurement of the proxy's UDP.
+- Every context carries the position the core declares for the session (the geolocation override of the context).
+- The package's launcher and server refuse the two prefs that govern the launch counter, `invisible_firefox.usage_ping.enabled` and
+  `invisible_firefox.usage_ping.url`, in `extra_prefs` (and in the `firefoxUserPrefs` of a served launch). The engine counts launches with
+  an anonymous GET to the `usage-counter` release of the engine's repository (`oss-invisible/firefox_antidetect_patch`).
+
+### Added
+- `preload_newtab=False` turns off the preloaded New Tab page, on request only (`InvisiblePlaywright`,
+  `invisible_playwright.async_api.InvisiblePlaywright` and `launch_server`): by default the browser keeps it, as a retail Firefox does.
+  A retail Firefox keeps the New Tab page ready in a content process of its own; with the option it is not started. `None` writes
+  nothing, `True` says the retail value aloud, and a `browser.newtab.preload` in `extra_prefs` wins over it. Needs invisible-core
+  63.66.0 or later. Measured on Windows (run 43211271731), on an engine build of the firefox-63 candidate line (not the published engine), one
+  page of a site, five alternating runs: the browser's processes together take 448-454 MB as shipped and 231-239 MB with the option
+  (private memory 301-307 against 158-171 MB).
+
+### Fixed
+- A request the browser resumed and whose channel is replaced and cancelled before the replacement starts (a `fetch` with
+  `keepalive`, a beacon) is reported as failed, so it no longer keeps `networkidle` from arriving (engine firefox-63).
+- A navigation the page overtakes (`location.replace`) ends, and the document that overtook it is told (engine firefox-63).
+- A click in a frame under a CSS transform is mapped back to the point the frame shows, and a click in a frame scrolls the
+  element in even when its point is inside the main viewport (invisible-core 63.66.0).
+- `request.resource_type` agrees with the pinned driver: a beacon is `beacon` and a CSP report is `cspreport` (it said `other`).
+- A download whose finish is seen before its announcement is marked finished: `save_as`, `path` and `failure` used to wait for ever on it.
+  The early finishes the browser keeps are bounded (64) and forgotten with their context. (That the engine sends a finish before the
+  announcement is not proven; the path is defensive.)
+- The opener kept for the downloads of a target whose adoption failed lives until the engine detaches the target, and none is
+  made for a target already detached.
+- Tests only: the end-to-end tests that look at content processes ask for the processes of a site by its name and no longer compare two counts.
+
+### Known differences from stock Playwright
+What a script that drives the browser can observe, from the configuration of Playwright's own Firefox and of a retail Firefox (no
+comparison run is saved). The result of a `window.open` (`null` or a window) is read by the page; the others are what the script sees.
+
+- **A `window.open` from a script with no user gesture is blocked, as in a retail Firefox.** Playwright's own Firefox turns the popup
+  blocker off (`dom.disable_open_during_load` false in its `playwright.cfg`); a retail Firefox keeps it on, and so does this browser. So
+  `page.evaluate("window.open(url)")` returns `null` to the page and no `page` event comes; the same `window.open` from a click opens
+  the popup on both. To get stock's behaviour: open the popup from a click; or pass
+  `extra_prefs={"dom.disable_open_during_load": False}` for the session, knowing that a page then sees a browser that differs from a
+  retail Firefox.
+
+## [0.50.1] - 2026-11-12
+
+0.50.0 was tagged and never published: its end-to-end gate was red on two tests that counted processes.
+0.50.1 is 0.50.0 with those tests corrected.
 
 ### Changed
 - Engine firefox-62 through invisible-core 62.63.0, which this version pins: firefox-61 plus Fission
@@ -23,6 +288,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   iframe and of its page) run on that engine.
 
 ### Fixed
+- `goto(wait_until="networkidle")` arrives on a page that is reused for many addresses, and on a served browser whose
+  context routes every request, as with a stock Firefox. Two causes, both ours. A route answered after the browser had
+  already closed its request (a fetch the page aborted, an image it replaced, an iframe it removed, a beacon cancelled
+  with its document) came back to the client as an error, which the client kept for the whole connection and raised on the
+  next route command; that command was never sent, its request stayed held in the engine, and so on down the page. The
+  server now takes such an answer as done, whatever wording the engine gives it ("Cannot find request", or "NS_BINDING_ABORTED"
+  when the channel was cancelled while the answer was on its way), as Playwright's own server does. The same defect was found a month earlier by richardpowellus
+  (#351), on the favicon of the page a `goto` had just left; his test is part of this release. And the core counted the requests in flight
+  with one integer per page, never reset by a navigation, so one request whose end never arrived kept every later address
+  from going idle (invisible-core 62.64.0 keeps them by request id, per document, and does not keep the requests of a
+  frame that already left: a beacon sent at `pagehide` is announced after its frame is gone).
+- A `goto` sent right after `new_page` is no longer "interrupted by another navigation to about:blank" on a loaded machine. The page was
+  handed to the caller as soon as its main frame was announced, while the engine had not yet committed the page's own initial
+  `about:blank`; a navigation answered before that commit lost to it. The page is now handed over when the engine says it is
+  ready (`Page.ready`), as Playwright's own page is (invisible-core 62.65.0, `Lifecycle.wait_for_page_ready`; a page closed before
+  it was ready ends the wait with an error at once).
 - A launch that names no session (Playwright's own `BrowserType.launch` against the server) gets a
   session composed the way `InvisiblePlaywright()` composes one: prefs, environment and, behind a
   proxy, the egress the page reads as its WebRTC address. It used to come up with Mozilla's
@@ -37,6 +318,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (`geolocation`, `persistent-storage`, `push`, `notifications`, `screen-wake-lock`); any other name
   raises `Unknown permission`, as it does there, and a grant with no origin is a grant for every
   origin.
+- The end-to-end tests that count content processes count the ones that host a site, not every content
+  process that is new. The engine keeps a pool of preallocated processes and refills it whenever it gets
+  to it, so a refill landing between two reads looked like a process the test had caused (a same-site
+  frame, a closed context with a service worker that never stops). Measured on firefox-62: a closed context
+  leaves no process of its site. On Linux the process is named by the site it hosts; elsewhere these
+  tests skip.
+- A popup (a `target=_blank` link, `window.open`) reaches the client as it does with Playwright's own Firefox: when its
+  destination answers, with no limit of time, with the destination's address as its url, and with `load` reachable on
+  it. It used to be given up on after 20 s, could be announced with `about:blank` as its url, and about one in a
+  hundred was never announced. A destination that never becomes a page (a 204, a server that never answers) is not
+  announced, as on stock. Measured against stock destination by destination, with answers after 4 s and after 25 s: 18
+  cases of 18; and 128 popups announced of 128 across the two transports (the library client, a stock client over
+  `launch_server`).
+- For a popup whose answer is a download, the opener's `download` event comes after the popup's `page` event, as on
+  stock. With little CPU the download could arrive and the page never be announced. Measured on a runner limited to
+  one CPU: 8 runs red of 10 before, 0 of 10 after.
+
+### Known differences from stock Playwright
+Measured against Playwright's own Firefox with the same script, on this version. None of them is a value a page
+reads; they are what a script that drives the browser can observe.
+
+- **The url of a popup that turns into a download.** A link or a `window.open` whose answer is an attachment gives, as on
+  stock, a `page` event, a `download` event on the opener, and a popup that closes at once. The popup's `url` at the `page`
+  event is `about:blank` here and the empty string on stock. Measured: 8 cases of 8 (link and `window.open`, the library
+  client and a stock client over `launch_server`), against 4 of 4 on stock.
+- **The url of a frame of another site at the page's `DOMContentLoaded`.** A frame of another site runs in another process,
+  as in a retail Firefox, and commits its navigation after the page's `DOMContentLoaded`; stock Playwright keeps frames in
+  the page's process. So `frame.url` read right after `goto(..., wait_until="domcontentloaded")` can be the empty string.
+  After `load` it is always set. Measured, 30 runs each: after `load` the url was there 30 times here and 30 on stock; at
+  `DOMContentLoaded` once here and 30 times on stock. Wait for `load`, or for the frame's own navigation, before reading it.
+- **A click takes longer with the library client.** From `click()` on a link to the `page` event of the popup it opens:
+  0.8 to 1.7 s more than stock with the library client, and the same as stock (within 0.1 s) with a stock client over
+  `launch_server`. Measured on 64 popups per transport and on destinations that answer after 4 s and after 25 s. The
+  same run with `humanize=False` was not measured.
+- **Back and forward restore the page from the back-forward cache.** As in a retail Firefox, `go_back` and `go_forward`
+  bring the page back as it was; Playwright's own Firefox loads it again. So a script that runs when the page loads does
+  not run again here. Measured on a 17-step journey with the same script on both: on its three back and forward steps
+  the page's load-time requests were sent again on stock (6 beacons each) and not here (0, 2 and 0, the two being the
+  ones a page sends when it is left); every step ended on the same page, and the other 14 steps sent the same requests.
 
 ## [0.49.1] - 2026-11-10
 
@@ -1116,7 +1436,7 @@ browser reads that decision.
   `new_context` failed with `NS_ERROR_NOT_AVAILABLE`.
 - **A routed request carries its body.** `request.post_data`,
   `post_data_json` and `post_data_buffer` were None for every POST, in a route
-  handler and on the `request` event alike (feder-cr/invisible_core#90). The
+  handler and on the `request` event alike (oss-invisible/core#90). The
   body is there whenever a route is set on the page or its context; without a
   route it stays None, which keeps the engine from copying every POST body.
 - **`go_back()` goes back over a page the script left without a gesture**,
@@ -2113,7 +2433,8 @@ browser reads that decision.
   repository that builds and ships the engine. The engine's compiled default
   says the same from the next build. Engines older than firefox-21 do not read
   the pref and are not counted. To opt out of the ping, set
-  `invisible_firefox.usage_ping.enabled` to `False` in `extra_prefs`.
+  `invisible_firefox.usage_ping.enabled` to `False` in `extra_prefs`. (Since 0.51.0 this is no longer possible: the
+  counter cannot be turned off or redirected.)
 - **The `browser launches` badge is back.** It was removed in 0.7.2 because the
   counter behind it lived on a repository that had been deleted, so the badge
   would have redrawn a frozen number every morning. The counter has lived on
@@ -2725,10 +3046,10 @@ browser reads that decision.
 ## [0.3.1] - 2026-07-13
 
 ### Fixed
-- [#48](https://github.com/feder-cr/invisible_playwright/issues/48): Playwright 1.61 adds an `isMobile` field to the `Browser.setDefaultViewport` Juggler command that the FF150 binary does not accept, which kills the session. The range narrows from `>=1.40,<1.61` to the CI-tested 1.55.x (`>=1.55,<1.56`, single-sourced from `scripts/playwright_pin.txt`) so a fresh install always gets a compatible client. Widened again in 0.3.2, once `firefox-18` rebased onto Firefox 151.
+- [#48](https://github.com/oss-invisible/playwright/issues/48): Playwright 1.61 adds an `isMobile` field to the `Browser.setDefaultViewport` Juggler command that the FF150 binary does not accept, which kills the session. The range narrows from `>=1.40,<1.61` to the CI-tested 1.55.x (`>=1.55,<1.56`, single-sourced from `scripts/playwright_pin.txt`) so a fresh install always gets a compatible client. Widened again in 0.3.2, once `firefox-18` rebased onto Firefox 151.
 
 ### Changed
-- The patched-Firefox source repo is now `feder-cr/firefox_antidetect_patch` (it was `feder-cr/invisible_firefox`, a name the profile manager took over). Release notes, CI references and the release URLs the download tests mock all point at the new name; the binaries themselves are unchanged.
+- The patched-Firefox source repo is now `oss-invisible/firefox_antidetect_patch` (it was `feder-cr/invisible_firefox`, a name the profile manager took over). Release notes, CI references and the release URLs the download tests mock all point at the new name; the binaries themselves are unchanged.
 - The wrapper no longer injects the font-list / system-UI environment variables at launch: the binary ships its own font bundle and is self-contained on that front. The integration tests were adapted and the font-sampling tests dropped.
 
 ### Added
@@ -2778,7 +3099,7 @@ browser reads that decision.
 ## [0.1.8] - 2026-05-23
 
 ### Fixed
-- [#20](https://github.com/feder-cr/invisible_playwright/issues/20): cross-origin iframes were unreachable from Playwright. `element_handle.content_frame()` returned `None`, `frame.evaluate()` threw cross-origin SOP errors, and `frame_locator(...).click()` timed out even with `force=True`. Root cause: FF150 defaults `fission.webContentIsolationStrategy=1` (`IsolateEverything`), which site-isolates every cross-origin iframe into a separate `webIsolated` content process even when `fission.autostart=False`. The parent's Juggler FrameTree then has a Frame placeholder with no docShell and no URL - every protocol op that needs to enter the iframe fails. Fix: pin `fission.webContentIsolationStrategy=0` (`IsolateNothing`) in the baseline prefs. The setting can be flipped back per session via `extra_prefs={"fission.webContentIsolationStrategy": 1}`.
+- [#20](https://github.com/oss-invisible/playwright/issues/20): cross-origin iframes were unreachable from Playwright. `element_handle.content_frame()` returned `None`, `frame.evaluate()` threw cross-origin SOP errors, and `frame_locator(...).click()` timed out even with `force=True`. Root cause: FF150 defaults `fission.webContentIsolationStrategy=1` (`IsolateEverything`), which site-isolates every cross-origin iframe into a separate `webIsolated` content process even when `fission.autostart=False`. The parent's Juggler FrameTree then has a Frame placeholder with no docShell and no URL - every protocol op that needs to enter the iframe fails. Fix: pin `fission.webContentIsolationStrategy=0` (`IsolateNothing`) in the baseline prefs. The setting can be flipped back per session via `extra_prefs={"fission.webContentIsolationStrategy": 1}`.
 
 ### Added
 - `tests/test_cross_origin_iframe.py`: 4 unit + 5 e2e regression sentinels for cross-origin iframe interaction. The e2e layer runs entirely offline against two local HTTP servers on `127.0.0.1` (two ports = two SOP origins) and covers `page.frames` URL tracking, `content_frame()`, `frame.evaluate()`, `frame_locator(...).locator(...)`, and end-to-end `dispatch_event("click")` for plain, sandboxed and titled iframes. A future FF upgrade or fingerprint A/B that flips the pref back to `1` will fail the suite before shipping.
@@ -2789,7 +3110,7 @@ browser reads that decision.
 ## [0.1.7] - 2026-05-21
 
 ### Fixed
-- [#18](https://github.com/feder-cr/invisible_playwright/issues/18): Tab crash when running with `headless=True` on Windows on pages that trigger cross-process navigation. Two separate bugs that only manifested together: (1) the Chromium content sandbox at default level 6 puts content processes on `kAlternateWinstation`, but the wrapper hides the browser window on its own alt-desktop (`CreateDesktop` for headless on Windows). Mismatched desktops → cross-process navigations couldn't reparent windows → content process exits cleanly and Playwright fires `page.on('crash')`. (2) The canvas2d `getImageData` stealth spoof wrote to a read-only mapped `DataSourceSurface`. On GPU-backed canvases that memory is write-protected → segfault during the final `getImageData` at page unload. Wrapper now sets `security.sandbox.content.level=4` in the alt-desktop workaround set, and `firefox-7` ships the source fix that moves the noise to the JS array's writable backing buffer.
+- [#18](https://github.com/oss-invisible/playwright/issues/18): Tab crash when running with `headless=True` on Windows on pages that trigger cross-process navigation. Two separate bugs that only manifested together: (1) the Chromium content sandbox at default level 6 puts content processes on `kAlternateWinstation`, but the wrapper hides the browser window on its own alt-desktop (`CreateDesktop` for headless on Windows). Mismatched desktops → cross-process navigations couldn't reparent windows → content process exits cleanly and Playwright fires `page.on('crash')`. (2) The canvas2d `getImageData` stealth spoof wrote to a read-only mapped `DataSourceSurface`. On GPU-backed canvases that memory is write-protected → segfault during the final `getImageData` at page unload. Wrapper now sets `security.sandbox.content.level=4` in the alt-desktop workaround set, and `firefox-7` ships the source fix that moves the noise to the JS array's writable backing buffer.
 
 ### Changed
 - `BINARY_VERSION` bumped from `firefox-5` to `firefox-7`. `firefox-6` was rolled back when its partial fix turned out to be wrong (the iframe-burst hypothesis was a dead end; bisection in the evening found the real two-bug cause documented above).
@@ -2808,12 +3129,12 @@ browser reads that decision.
 ## [0.1.5] - 2026-05-20
 
 ### Fixed
-- [#15](https://github.com/feder-cr/invisible_playwright/pull/15): `python -m invisible_playwright fetch` raised `RuntimeError: no SHA256 for firefox-150.0.1-stealth-linux-x86_64.tar.gz in checksums.txt` for every user because the parser kept the `*` binary-mode prefix that `sha256sum` writes in front of filenames. Now `.lstrip("*")` is applied to the key. Reporter + patch: [@LostBoxArt](https://github.com/LostBoxArt). Unrelated to the `firefox-N` binary; existing caches still work, only first-time fetches were broken.
+- [#15](https://github.com/oss-invisible/playwright/pull/15): `python -m invisible_playwright fetch` raised `RuntimeError: no SHA256 for firefox-150.0.1-stealth-linux-x86_64.tar.gz in checksums.txt` for every user because the parser kept the `*` binary-mode prefix that `sha256sum` writes in front of filenames. Now `.lstrip("*")` is applied to the key. Reporter + patch: [@LostBoxArt](https://github.com/LostBoxArt). Unrelated to the `firefox-N` binary; existing caches still work, only first-time fetches were broken.
 
 ## [0.1.4] - 2026-05-20
 
 ### Fixed
-- [#13](https://github.com/feder-cr/invisible_playwright/issues/13): every page that threw an uncaught JS error (e.g. bunny.net) crashed the Playwright client with `TypeError: Cannot read properties of undefined (reading 'url')`. Root cause: upstream Playwright Juggler added a required `location` field to the `Page.uncaughtError` event in the 2026-05-07 roll ([microsoft/playwright@c8604ec](https://github.com/microsoft/playwright/commit/c8604ecd97)); our fork was carrying the pre-roll schema in every `firefox-N` build. Fix matches upstream - Runtime.js builds the `errorLocation`, PageAgent.js forwards it on both worker and runtime error paths, Protocol.js declares the schema field. Reporter: [@dionorgua](https://github.com/dionorgua).
+- [#13](https://github.com/oss-invisible/playwright/issues/13): every page that threw an uncaught JS error (e.g. bunny.net) crashed the Playwright client with `TypeError: Cannot read properties of undefined (reading 'url')`. Root cause: upstream Playwright Juggler added a required `location` field to the `Page.uncaughtError` event in the 2026-05-07 roll ([microsoft/playwright@c8604ec](https://github.com/microsoft/playwright/commit/c8604ecd97)); our fork was carrying the pre-roll schema in every `firefox-N` build. Fix matches upstream - Runtime.js builds the `errorLocation`, PageAgent.js forwards it on both worker and runtime error paths, Protocol.js declares the schema field. Reporter: [@dionorgua](https://github.com/dionorgua).
 
 ### Changed
 - `BINARY_VERSION` bumped from `firefox-3` to `firefox-4`. JS-only change inside `chrome/juggler/`; `xul.dll` and `firefox.exe` are byte-identical to `firefox-3`.
@@ -2821,7 +3142,7 @@ browser reads that decision.
 ## [0.1.3] - 2026-05-19
 
 ### Changed
-- `BINARY_VERSION` bumped from `firefox-2` to `firefox-3`. The new archives on both Windows and Linux are built from a clean clone of [feder-cr/firefox_antidetect_patch#stealth/150](https://github.com/feder-cr/firefox_antidetect_patch/tree/stealth/150) - the consolidated source-of-truth fork (renamed from `feder-cr/firefox`; the companion `feder-cr/firefox-stealth` patches repo was deleted, all patches now live as commits on top of `mozilla-firefox/firefox`).
+- `BINARY_VERSION` bumped from `firefox-2` to `firefox-3`. The new archives on both Windows and Linux are built from a clean clone of [oss-invisible/firefox_antidetect_patch#stealth/150](https://github.com/oss-invisible/firefox_antidetect_patch/tree/stealth/150) - the consolidated source-of-truth fork (renamed from `feder-cr/firefox`; the companion `feder-cr/firefox-stealth` patches repo was deleted, all patches now live as commits on top of `mozilla-firefox/firefox`).
 - The patched Firefox archive now ships the **proper C++ implementation** of `windowUtils.jugglerSendMouseEvent`, replacing the JS shim from 0.1.2.
 
 ### C++ fixes landed in this release
@@ -2832,7 +3153,7 @@ browser reads that decision.
 - **C7 (partial)**: storage stub for `nsIDocShell.languageOverride`. Workaround `InvisiblePlaywright(locale="")` recommended until full BC FIELD port lands.
 
 ### Verified
-- Both archives built from same source: feder-cr/firefox_antidetect_patch commit `68906f1f9c55`.
+- Both archives built from same source: oss-invisible/firefox_antidetect_patch commit `68906f1f9c55`.
 - Windows + Linux smoke suite green: launch, `ctx.new_page()`, `page.mouse.{move,down,up,click,wheel}`, `navigator.webdriver=false`, sannysoft 32/33 PASS.
 - SHA256 published in `checksums.txt` on the `firefox-3` release.
 
@@ -2851,7 +3172,7 @@ browser reads that decision.
 ## [0.1.1] - 2026-05-18
 
 ### Fixed
-- **Critical**: every `page.mouse.*`, `page.click(selector)`, `locator.click()`, `page.hover()`, `mouse.wheel()` failed on the patched Firefox 150 binary with `win.windowUtils.jugglerSendMouseEvent is not a function`. The Juggler JS was porting calls to a Playwright-specific C++ method that was never landed in the FF146→FF150 port; replaced with the Mozilla chrome-scope `win.synthesizeMouseEvent` helper which is present in FF150. Six call sites patched across `juggler/protocol/PageHandler.js` and `juggler/content/PageAgent.js`. Reporter: [@trob9](https://github.com/trob9) - [#9](https://github.com/feder-cr/invisible_playwright/issues/9).
+- **Critical**: every `page.mouse.*`, `page.click(selector)`, `locator.click()`, `page.hover()`, `mouse.wheel()` failed on the patched Firefox 150 binary with `win.windowUtils.jugglerSendMouseEvent is not a function`. The Juggler JS was porting calls to a Playwright-specific C++ method that was never landed in the FF146→FF150 port; replaced with the Mozilla chrome-scope `win.synthesizeMouseEvent` helper which is present in FF150. Six call sites patched across `juggler/protocol/PageHandler.js` and `juggler/content/PageAgent.js`. Reporter: [@trob9](https://github.com/trob9) - [#9](https://github.com/oss-invisible/playwright/issues/9).
 - `_linkedBrowser.scrollRectIntoViewIfNeeded()` is now guarded at both call sites in `PageHandler.js` (`dispatchMouseEvent` and `dispatchWheelEvent`) - the method is not present on the shipped FF150 `<browser>` element, so the unguarded call threw before the mouse event was dispatched.
 
 ### Added
@@ -2875,7 +3196,7 @@ browser reads that decision.
 - SOCKS5 / SOCKS4 / HTTP / HTTPS proxy support with auth.
 - Linux x86_64 and Windows x86_64 binary support.
 
-[0.4.3]: https://github.com/feder-cr/invisible_playwright/releases/tag/v0.4.3
+[0.4.3]: https://github.com/oss-invisible/playwright/releases/tag/v0.4.3
 > The two oldest entries point at a COMMIT, not a tag: 0.1.0 and 0.1.1
 > predate arriving on PyPI (the index starts at 0.3.5) and never had
 > a tag. Creating one today is not harmless: `publish.yml` triggers
@@ -2883,8 +3204,8 @@ browser reads that decision.
 > does not short-circuit, so a new tag could kick off a publish
 > attempt. The commit is the same information without that risk.
 
-[0.1.1]: https://github.com/feder-cr/invisible_playwright/compare/7a983e99c53fa1ec1a443651a4dd9de42258dc61...589c848e07a67c459969a2ddfb79851f48b10eff
-[0.1.0]: https://github.com/feder-cr/invisible_playwright/commit/7a983e99c53fa1ec1a443651a4dd9de42258dc61
-[0.4.4]: https://github.com/feder-cr/invisible_playwright/releases/tag/v0.4.4
-[0.4.5]: https://github.com/feder-cr/invisible_playwright/releases/tag/v0.4.5
-[0.4.6]: https://github.com/feder-cr/invisible_playwright/releases/tag/v0.4.6
+[0.1.1]: https://github.com/oss-invisible/playwright/compare/7a983e99c53fa1ec1a443651a4dd9de42258dc61...589c848e07a67c459969a2ddfb79851f48b10eff
+[0.1.0]: https://github.com/oss-invisible/playwright/commit/7a983e99c53fa1ec1a443651a4dd9de42258dc61
+[0.4.4]: https://github.com/oss-invisible/playwright/releases/tag/v0.4.4
+[0.4.5]: https://github.com/oss-invisible/playwright/releases/tag/v0.4.5
+[0.4.6]: https://github.com/oss-invisible/playwright/releases/tag/v0.4.6

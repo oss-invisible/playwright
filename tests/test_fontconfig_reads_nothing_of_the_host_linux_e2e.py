@@ -24,7 +24,8 @@ strace runs through a stand-in tree: a temporary directory with a link to
 every file of the engine's directory, where the executable is a script that
 execs the real one under strace. The core reads the engine's identity from
 the directory of the path it is given, so the seal check passes as it does
-for the real tree.
+for the real tree. The script stays in the engine's place: same pid, same
+process group, the one the core's spawn gives the engine (``_stand_in``).
 """
 from __future__ import annotations
 
@@ -45,8 +46,7 @@ pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(not sys.platform.startswith("linux"),
                        reason="fontconfig is the Linux font system"),
-    pytest.mark.skipif(shutil.which("strace") is None or shutil.which("setsid") is None,
-                       reason="needs strace and setsid (apt install strace util-linux)"),
+    pytest.mark.skipif(shutil.which("strace") is None, reason="needs strace (apt install strace)"),
 ]
 
 _SYSCALLS = ("execve,clone,clone3,fork,vfork,open,openat,stat,lstat,"
@@ -90,13 +90,23 @@ def _require_strace_can_trace(tmp: Path) -> None:
                     pytrace=False)
 
 
-def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path) -> str:
+def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
+              timestamps: bool = False) -> str:
     """A copy of the engine's directory made of links, whose executable runs
-    the real one under strace, in a session of its own.
+    the real one under strace, in the engine's place.
 
-    The script writes its pid and execs ``setsid``: it is not a group leader,
-    so setsid does not fork, the pid stays, and it is the id of a process
-    group that holds strace and everything it traces (``_kill_group``)."""
+    The script writes its pid and execs strace: the pid stays, and so does the
+    process group its launcher gave it. The core spawns the engine as the
+    leader of a process group of its own (``posix_spawn`` with ``setpgroup=0``,
+    as Playwright's launcher does with ``detached: true``), so that group holds
+    strace and everything it traces, and ``_kill_group`` kills the group of the
+    pid (``os.getpgid``). The script used to exec ``setsid``: setsid(1) forks
+    when its caller leads a process group, its parent exited 0 at once, and the
+    core saw the engine exit during startup (candidate 44161687675).
+
+    ``syscalls`` is what strace traces; ``timestamps`` adds ``-ttt`` (the epoch
+    seconds after each pid), which ``_LINE`` does not read: a caller that asks
+    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``)."""
     real = Path(os.path.realpath(binary))
     tree.mkdir()
     for entry in real.parent.iterdir():
@@ -106,9 +116,8 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path) -> str:
     script.write_text(
         "#!/bin/sh\n"
         "echo $$ > %s\n"
-        'exec %s %s %s -o %s -e trace=%s %s "$@"\n'
-        % (pidfile, shutil.which("setsid"), shutil.which("strace"), _strace_options(),
-           log, _SYSCALLS, real))
+        'exec %s %s -o %s -e trace=%s %s "$@"\n'
+        % (pidfile, shutil.which("strace"), _strace_options() + (" -ttt" if timestamps else ""), log, syscalls, real))
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 
@@ -120,10 +129,9 @@ _RESUMED = re.compile(r"^(\d+)\s+<\.\.\. (\w+) resumed>(.*)$")
 _RESULT = re.compile(r"=\s+(\d+)\s*$")
 
 
-def _host_lookups(log: Path, real_binary: str) -> dict:
-    """``{"parent"|"content"|"other": ["<syscall> <line>", ...]}`` for every
-    system call of the browser that names a host font path."""
-    lines = log.read_text(errors="replace").splitlines()
+def _roles(lines: list, real_binary: str):
+    """``(role, argv_of)`` for a strace log read as lines: ``role(pid)`` is ``"parent"``, ``"content"`` or ``"other"`` (walking up the
+    clones to the process that executed the engine), ``argv_of`` maps a pid to the arguments of the last execve of the engine it made."""
     parent_of = {}
     argv_of = {}
     for line in lines:
@@ -151,6 +159,15 @@ def _host_lookups(log: Path, real_binary: str) -> dict:
                 break
             pid = parent_of[pid]
         return "other"
+
+    return role, argv_of
+
+
+def _host_lookups(log: Path, real_binary: str) -> dict:
+    """``{"parent"|"content"|"other": ["<syscall> <line>", ...]}`` for every
+    system call of the browser that names a host font path."""
+    lines = log.read_text(errors="replace").splitlines()
+    role, _argv_of = _roles(lines, real_binary)
 
     paths = _host_font_paths()
     found = defaultdict(list)
@@ -191,27 +208,45 @@ def judge(found: dict) -> dict:
     return bad
 
 
-def _kill_group(pidfile: Path) -> None:
-    """Kill the stand-in's process group: strace, the browser and its children.
+def _group_of(pidfile: Path):
+    """The process group of the stand-in, read from its living pid (``os.getpgid``); None when it is gone or wrote no pid."""
+    try:
+        return os.getpgid(int(pidfile.read_text().strip()))
+    except (OSError, ValueError):
+        return None
+
+
+def _kill_group(pidfile: Path):
+    """Kill the stand-in's process group: strace, the browser and its children. Returns the group killed, or None.
 
     Looking for the stand-in's path in the command lines found nothing (strace
-    and its children carry the real binary's path), so the group is the handle."""
-    try:
-        pgid = int(pidfile.read_text().strip())
-    except (OSError, ValueError):
-        return
+    and its children carry the real binary's path), so the group is the handle:
+    the group of the stand-in's pid, not the pid taken as a group id. Never the
+    group of this test: a stand-in started inside it is killed alone."""
+    pgid = _group_of(pidfile)
+    if pgid is None:
+        return None
+    if pgid == os.getpgrp():
+        try:
+            os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+        return None
     try:
         os.killpg(pgid, signal.SIGKILL)
     except OSError:
         pass
+    return pgid
 
 
-def _group_members(pidfile: Path) -> list:
-    """Pids still in the stand-in's process group."""
-    try:
-        pgid = int(pidfile.read_text().strip())
-    except (OSError, ValueError):
-        return []
+def _detached(argv: list, **kwargs) -> subprocess.Popen:
+    """A process started as the core starts the engine: the leader of a process group of its own (``posix_spawn`` with
+    ``setpgroup=0`` in ``invisible_core.juggler.connection._spawn_posix``)."""
+    return subprocess.Popen(argv, process_group=0, **kwargs)
+
+
+def _group_members(pgid: int) -> list:
+    """Pids still in the process group ``pgid``."""
     members = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
@@ -227,12 +262,12 @@ def _group_members(pidfile: Path) -> list:
     return members
 
 
-def _wait_for_exit(pidfile: Path, seconds: float = 10.0) -> list:
+def _wait_for_exit(pgid: int, seconds: float = 30.0) -> list:
     end = time.monotonic() + seconds
-    left = _group_members(pidfile)
+    left = _group_members(pgid)
     while left and time.monotonic() < end:
         time.sleep(0.1)
-        left = _group_members(pidfile)
+        left = _group_members(pgid)
     return left
 
 
@@ -246,17 +281,19 @@ def test_a_killed_stand_in_leaves_neither_strace_nor_the_browser(firefox_binary,
     stand_in = _stand_in(firefox_binary, tmp_path / "engine", log, pidfile)
     profile = tmp_path / "profile"
     profile.mkdir()
-    proc = subprocess.Popen([stand_in, "-headless", "-no-remote", "-profile", str(profile),
-                             "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = _detached([stand_in, "-headless", "-no-remote", "-profile", str(profile), "about:blank"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         end = time.monotonic() + 30
         while time.monotonic() < end and "-contentproc" not in (
                 log.read_text(errors="replace") if log.exists() else ""):
             time.sleep(0.2)
-        assert len(_group_members(pidfile)) >= 3, "strace and the browser did not come up"
-        _kill_group(pidfile)
-        proc.wait(timeout=10)
-        left = _wait_for_exit(pidfile)
+        pgid = _group_of(pidfile)
+        assert pgid == proc.pid, "the stand-in does not lead the group its launcher gave it (group %s, pid %d)" % (pgid, proc.pid)
+        assert len(_group_members(pgid)) >= 3, "strace and the browser did not come up"
+        assert _kill_group(pidfile) == pgid
+        proc.wait(timeout=30)
+        left = _wait_for_exit(pgid)
     finally:
         _kill_group(pidfile)
     assert not left, "processes left after the kill: %s" % [
@@ -265,7 +302,7 @@ def test_a_killed_stand_in_leaves_neither_strace_nor_the_browser(firefox_binary,
 
 
 def test_no_process_reads_the_host_fontconfig(firefox_binary, tmp_path, engine_at_least):
-    engine_at_least("firefox-64")
+    engine_at_least("firefox-68")
     from invisible_playwright import InvisiblePlaywright
 
     _require_strace_can_trace(tmp_path)
