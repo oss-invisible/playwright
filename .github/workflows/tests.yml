@@ -160,6 +160,12 @@ jobs:
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
+  # Every commit and tag this change makes public must carry a GitHub noreply
+  # email (author, committer, tagger). The judge lives in oss-invisible/core and
+  # is read from its main, never from this branch.
+  noreply-identity:
+    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@main
+
   unit:
     name: pytest (${{ matrix.os }}, py${{ matrix.python }})
     needs: core-on-index
@@ -355,7 +361,7 @@ jobs:
   # exits 1 without saying which of five inputs went red is a gate somebody has
   # to open five tabs to read.
   gate:
-    needs: [core-on-index, unit, docs-api, english, claims, version, way-in, install-job]
+    needs: [core-on-index, unit, docs-api, english, claims, version, way-in, install-job, noreply-identity]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -369,6 +375,7 @@ jobs:
           echo "way-in:        ${{ needs.way-in.result }}"
           echo "version:       ${{ needs.version.result }}"
           echo "install-job:   ${{ needs.install-job.result }}"
+          echo "noreply-identity: ${{ needs.noreply-identity.result }}"
           case "${{ needs.unit.result }}" in
             failure|cancelled) echo "the suite did not pass"; exit 1 ;;
           esac
@@ -393,6 +400,11 @@ jobs:
           case "${{ needs.install-job.result }}" in
             failure|cancelled) echo "the user-install job would not run on a release, or leaks"; exit 1 ;;
           esac
+          # Unlike the checks above this one must be `success`: it runs on every
+          # event this workflow has, so a skip would mean the check never ran.
+          if [ "${{ needs.noreply-identity.result }}" != "success" ]; then
+            echo "a commit or tag of this change has an email that is not a GitHub noreply address"; exit 1
+          fi
           echo "ok"
 
   # Measured 2026-09-04: 0.10.0 was on the index while main sat on 0.10.0 with
