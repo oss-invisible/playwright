@@ -179,6 +179,19 @@ def _summary(opens):
     }
 
 
+def _environ_of(pid: int, name: str):
+    """The value of ``name`` in the environment the process ``pid`` was started with (``/proc/<pid>/environ``); None when it has none or
+    the file cannot be read."""
+    try:
+        for item in Path("/proc/%d/environ" % pid).read_bytes().split(b"\0"):
+            key, _eq, value = item.partition(b"=")
+            if key == name.encode():
+                return value.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return None
+
+
 def _fontconfig_cache(xdg: Path):
     folder = xdg / "fontconfig"
     if not folder.is_dir():
@@ -203,13 +216,14 @@ def _launch(firefox_binary, work: Path, xdg: Path, extra_prefs=None):
     stand_in = _stand_in(firefox_binary, work / "engine", log, pidfile, syscalls=TRACE, timestamps=True)
     real = os.path.realpath(firefox_binary)
     gre_fonts = os.path.join(os.path.dirname(real), "fonts")
-    rss, boundary, pid = {}, None, None
+    rss, boundary, pid, environ_xdg = {}, None, None, None
     try:
         with InvisiblePlaywright(seed=SEED, binary_path=stand_in, headless=True, extra_prefs=extra_prefs) as browser:
             # The launch has returned: the parent has built its font list. No page has been opened yet.
             boundary = log.stat().st_size
             _lines, _times, _role, argv_of, _start = _read(log, real, boundary)
             pid = _parent_pid(argv_of, real)
+            environ_xdg = _environ_of(pid, "XDG_CACHE_HOME")
             page = browser.new_page()
             rss["after_about_blank_kb"] = _vmrss_kb(pid)
             page.set_content(_page_with_every_family())
@@ -226,9 +240,19 @@ def _launch(firefox_binary, work: Path, xdg: Path, extra_prefs=None):
     fonts, left_out = _the_folder(gre_fonts)
     opened = sorted({os.path.basename(o["path"]) for o in scan if o["ok"]})
     cache_dir = str(xdg / "fontconfig")
+    # Evidence for a launch whose cache is missing: every line of the log, by ANY process, that names the bundle's folder, the cache
+    # folder or a ``.uuid``, with the role of the process and the window it is in (the opens above count only the parent's, and only
+    # in the window). The raw lines say who scanned (or did not), and where fontconfig wrote.
+    trace = []
+    for i, line in enumerate(lines):
+        if any(u in line for u in under) or cache_dir in line or "/.uuid" in line:
+            m = _LINE.match(line) or re.match(r"^(\d+)\s", line)
+            who = role(int(m.group(1))) if m else "?"
+            trace.append("%s\t%s\t%s\t%s" % (times[i], "startup" if i < start else "later", who, line[:400]))
     cache_reads = [o for o in _opens_of_the_parent(lines, times, role, 0, start, [cache_dir]) if ".cache-" in o["path"] and o["ok"]]
     return {
         "parent_pid": pid,
+        "parent_environ_xdg_cache_home": environ_xdg,
         "startup": _summary(scan),
         "after_startup": _summary(later),
         "cache_files_read_at_startup": sorted({o["path"] for o in cache_reads}),
@@ -241,6 +265,7 @@ def _launch(firefox_binary, work: Path, xdg: Path, extra_prefs=None):
         "files_opened_at_startup": opened,
         "_scan_opens": scan,
         "_later_opens": later,
+        "_trace": trace,
     }
 
 
@@ -338,6 +363,7 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
                 rows = ["%s\t%s\t%s" % (o["t"], "ok" if o["ok"] else "refused", o["path"])
                         for o in measure["_scan_opens"] + measure["_later_opens"]]
                 (where / ("bundle-opens-%s.tsv" % name)).write_text("\n".join(rows) + "\n", encoding="utf-8")
+                (where / ("trace-%s.tsv" % name)).write_text("\n".join(measure["_trace"]) + "\n", encoding="utf-8")
 
     # The measurement is valid or the test says it cannot judge.
     assert cold_cache, (
