@@ -224,6 +224,23 @@ def _the_lab_declares_the_exit(request, tmp_path_factory):
         yield _lab_egress.install(patch, tmp_path_factory.mktemp("lab-geoip"))
 
 
+@pytest.fixture(autouse=True)
+def _no_test_asks_the_world_where_it_leaves_from():
+    """A test fails when the question of the exit reached a proxy of the tests that forwards for real.
+
+    The product asks "where do I leave from" through the proxy of a launch, HTTPS, to api.ipify.org and its siblings. A proxy of the tests that forwards
+    for real would have carried it to the internet, and the answer is the address of the machine that runs the test: it changes on a runner, in the
+    middle of a session (``ProxyEgressDrifted``). Each such proxy declares its exit and the lab answers with it (``tests/_lab_egress.py``); one that
+    was not declared, or a test that bypassed the lab, makes the proxy REFUSE the question (``_socks_servers.asks_the_world``), and this fixture turns
+    that into a failure with the name of the proxy and of the service, instead of a launch that works until the network of the runner changes."""
+    import _socks_servers
+
+    yield
+    asked = _socks_servers.nobody_asked_the_world()
+    if asked:
+        pytest.fail("the question of the exit went toward the internet: " + "; ".join(asked), pytrace=False)
+
+
 @pytest.fixture
 def local_egress_echo(monkeypatch):
     """The REAL discovery of the exit, for the test that must prove it, against an echo service of its own on loopback: the three services of the
