@@ -269,6 +269,12 @@ def clean_venv(workspace: Path, isolated_cache_env: dict) -> Path:
         add = [i for i, line in enumerate(lines) if line.split()[:3] == ["uv", "add", DIST]]
         assert len(add) == 1, lines
         lines[add[0]] = f'uv add "{DIST} @ git+{REPO_URL}@{REV}"'
+    elif os.environ.get("INVPW_E2E_VERSION"):
+        # A ledger pull request names the version it records (`user-install.yml`): that one is installed, not "the latest" of the index, which
+        # can be a different one (the tree on main may declare, and the index may by then serve, the next release).
+        add = [i for i, line in enumerate(lines) if line.split()[:3] == ["uv", "add", DIST]]
+        assert len(add) == 1, lines
+        lines[add[0]] = f'uv add "{DIST}=={os.environ["INVPW_E2E_VERSION"]}"'
     home = workspace / "home"
     home.mkdir(exist_ok=True)
     run_readme_block(lines, cwd=workspace, home=home, env=isolated_cache_env)
