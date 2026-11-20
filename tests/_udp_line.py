@@ -12,7 +12,7 @@ Nothing here opens a browser; the unit test ``test_the_udp_line_helpers.py`` hol
 from __future__ import annotations
 
 import ipaddress
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: The visits of one page in one context, by kind of road. With NO proxy and the native DNS the retail is measured in loopback
 #: and is exact: h2, h3, h3 over three visits. BEHIND A PROXY the names are resolved by DoH, the browser learns the Alt-Svc
@@ -180,19 +180,42 @@ def no_https_record(host: str, doh: Any = None) -> List[str]:
     return problems
 
 
-def h3_attempts(server: Any) -> List[str]:
-    """What the UDP port of the test server says about a TRY at HTTP/3, as sentences; an empty list when nothing tried.
+def relay_activity(gateway: Any) -> Tuple[int, int]:
+    """What a SOCKS5 gateway of the tests has been asked for so far, as ``(UDP ASSOCIATE requests, datagrams its relay carried)``: the
+    requests answered or refused, the datagrams of every association. Taken twice (before the first visit, which is after the core's own
+    measurement of the gateway, and after the last), the difference is what the ENGINE asked of the relay while it visited the page."""
+    return int(gateway.associates), len(gateway.datagrams)
+
+
+def h3_attempts(server: Any, gateway: Any = None, before: Optional[Tuple[int, int]] = None) -> List[str]:
+    """What the test server (and, behind a SOCKS5 gateway, the gateway) says about a TRY at HTTP/3, as sentences; an empty list when nothing tried.
+
+    Behind a SOCKS5 gateway that is not coherent the engine does not carry UDP (nsSOCKSUDPIOLayer.cpp, ``StealthPutSocksUdpLayer``: the socket of an
+    HTTP/3 connection gets a layer that is ``Blocked``, no association is asked for): an engine that tried would ask the gateway for a UDP
+    ASSOCIATE (a refused one is a request too) or send a datagram to its relay, whether or not the datagram goes on to the server.
+    ``gateway`` and ``before`` (:func:`relay_activity` taken before the first visit) add those two to the answer.
 
     A retail Firefox on a network that drops UDP (and behind an HTTP proxy, which has no UDP at all) never tries HTTP/3: it reads h2 and
     nothing is sent to the h3 port the Alt-Svc announces. An engine that TRIES sends its QUIC Initial there first, and then waits for
     an answer that does not come before it falls back to h2: the wait is the tell, and the datagram is the attempt. The attempt is
     read where it is born, as a datagram that reached the UDP port of ``server`` (``H3Server.udp_datagrams``, every datagram, with
     or without a handshake), never as a duration: how long a fallback takes is the speed of the machine, whether it was tried is the engine."""
+    problems: List[str] = []
     seen = list(getattr(server, "udp_datagrams", ()))
-    if not seen:
-        return []
-    return ["%d UDP datagrams reached the h3 port %s of the server, from %s: the engine tried HTTP/3 (and, where nothing answers, "
-            "waits for a timeout before the fallback to h2)" % (len(seen), getattr(server, "port", "?"), sorted(set(seen)))]
+    if seen:
+        problems.append("%d UDP datagrams reached the h3 port %s of the server, from %s: the engine tried HTTP/3 (and, where nothing answers, "
+                        "waits for a timeout before the fallback to h2)" % (len(seen), getattr(server, "port", "?"), sorted(set(seen))))
+    if gateway is not None:
+        if before is None:
+            raise ValueError("a gateway is judged against what it had been asked before the first visit (relay_activity)")
+        associates, datagrams = (now - was for now, was in zip(relay_activity(gateway), before))
+        if associates:
+            problems.append("the engine asked the gateway for %d UDP ASSOCIATE while it visited the page: it tried to carry UDP (HTTP/3) "
+                            "through a gateway that was not measured coherent" % associates)
+        if datagrams:
+            problems.append("%d datagrams went into the relay of the gateway while the page was visited: the engine tried HTTP/3 "
+                            "through a gateway that was not measured coherent" % datagrams)
+    return problems
 
 
 def judge_visits(road: str, protocols: Sequence[str]) -> List[str]:

@@ -364,6 +364,51 @@ def test_a_relay_that_leaves_from_the_address_of_the_host_reaches_a_server_on_it
             server.close()
 
 
+def test_what_a_gateway_is_asked_after_the_first_visit_is_an_attempt_at_h3_and_what_it_was_asked_before_is_not():
+    """Behind a SOCKS5 gateway that is not coherent the attempt is read at the gateway: a UDP ASSOCIATE (a refused one too) or a datagram into
+    its relay after the visits began. What the core's own measurement asked before them is the base and is not counted."""
+    from _host_address import this_host_address
+    from _socks_servers import coherent, tcp_only
+    from _waits import wait_until
+
+    host = this_host_address()
+    with H3Server(host) as server, coherent(relay_host=host, exit_host=host) as gateway:
+        gateway.forward_only_to = {host}
+        control, relay = _associate(gateway)         # the measurement of the core, before the visits
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.bind((host, 0))
+        try:
+            before = line.relay_activity(gateway)
+            assert before[0] == 1
+            assert line.h3_attempts(server, gateway, before) == []
+            client.sendto(_wrapped("203.0.113.9", 443, b"quic" * 300), relay)      # an Initial into the relay, going nowhere
+            assert wait_until(lambda: line.relay_activity(gateway)[1] > before[1], 30, lambda: time.sleep(0.05))
+            problems = line.h3_attempts(server, gateway, before)
+            assert len(problems) == 1 and "datagrams went into the relay" in problems[0], problems
+            control2, _relay2 = _associate(gateway)                                # a second association, asked by the engine
+            control2.close()
+            problems = line.h3_attempts(server, gateway, before)
+            assert len(problems) == 2 and "1 UDP ASSOCIATE" in problems[0], problems
+        finally:
+            control.close()
+            client.close()
+    with pytest.raises(ValueError):
+        line.h3_attempts(server, gateway)
+    with H3Server(host) as server, tcp_only(relay_host=host, exit_host=host) as refusing:
+        before = line.relay_activity(refusing)
+        refused = socket.create_connection(("127.0.0.1", refusing.port), timeout=5)
+        try:
+            refused.sendall(b"\x05\x01\x00")
+            assert refused.recv(2) == b"\x05\x00"
+            refused.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+            assert refused.recv(10)[1] == 7
+        finally:
+            refused.close()
+        assert wait_until(lambda: line.relay_activity(refusing)[0] > before[0], 30, lambda: time.sleep(0.05))
+        problems = line.h3_attempts(server, refusing, before)
+        assert len(problems) == 1 and "1 UDP ASSOCIATE" in problems[0], problems
+
+
 def test_the_fake_stun_of_a_relay_that_leaves_from_the_address_of_the_host_answers_through_the_relay():
     from _host_address import this_host_address
     from _socks_servers import MEASURE_NUMBER, STUN_PORT, coherent
