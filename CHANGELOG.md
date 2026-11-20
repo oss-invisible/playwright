@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A launch without a proxy asks for its exit address every time, instead of reusing an answer from the last 2 minutes.
 - The UDP verdict the session measured at launch is handed to the browser's proxy command explicitly.
 
+### Fixed
+- `wait_for_load_state("networkidle")` and `goto(..., wait_until="networkidle")` on a new document count the quiet from that document's
+  commit, as Playwright does: the silence before the commit no longer counts toward its 500 ms.
+
 ## [0.56.0] - 2026-11-19
 
 ### Engine firefox-67
