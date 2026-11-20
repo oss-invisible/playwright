@@ -46,11 +46,13 @@ import pytest
 import _turn_chain as chain_mod
 from _doh_servers import DOH_PROVIDER_PREFS
 from _e2e_verdicts import turn_chain_problem
-from _udp_line import declared_udp, egress_by_proxy, measure_servers
+from _udp_line import declared_udp, egress_by_proxy, make_the_gateway_far, measure_servers, the_gateway_was_far
 from _waits import wait_until
 
 pytestmark = pytest.mark.e2e
 
+#: The round trip of the chain from the moment the browser is up (it is launched at 0: see `make_the_gateway_far`).
+RTT_MS = 130
 #: Loopback goes through the proxy too (as in test_doh_through_the_proxy_e2e.py), so the road of the page is observable.
 PREFS = {"network.proxy.allow_hijacking_localhost": True, "network.proxy.no_proxies_on": ""}
 
@@ -86,14 +88,14 @@ def gateway(monkeypatch):
     # address it heard the Allocate from: the gateway's exit. nICEr throws away an answer whose mapped address is loopback as "bogus"
     # (stun_client_ctx.cpp nr_stun_transport_addr_check, unless the pref `media.peerconnection.ice.loopback` is on, which it is not in a
     # product), so the exit is a documentation address held on `lo` (root, Linux: the suite of this test is listed for Linux only).
-    with chain_mod.lab_exit_address() as exit_ip, chain_mod.Chain(rtt_ms=130, exit_host=exit_ip) as chain:
+    with chain_mod.lab_exit_address() as exit_ip, chain_mod.Chain(rtt_ms=0, exit_host=exit_ip) as chain:
         _the_core_is_told_the_exit(monkeypatch, chain)
         yield chain
 
 
 @pytest.fixture
 def gateway_on_loopback(monkeypatch):
-    with chain_mod.Chain(rtt_ms=130) as chain:     # the exit is chain_mod.EXIT_HOST, 127.0.0.2
+    with chain_mod.Chain(rtt_ms=0) as chain:     # the exit is chain_mod.EXIT_HOST, 127.0.0.2
         _the_core_is_told_the_exit(monkeypatch, chain)
         yield chain
 
@@ -117,6 +119,9 @@ def _walk(gateway, firefox_binary, engine_at_least, prefs):
     with InvisiblePlaywright(headless=True, binary_path=firefox_binary, timezone="America/New_York", locale="en-US",
                              proxy=gateway.proxy, udp_stun_servers=measure_servers(gateway),
                              extra_prefs={**prefs, **DOH_PROVIDER_PREFS}) as browser:
+        # The chain is launched near (rtt 0) and is `RTT_MS` away from here on: the core's UDP measure at the launch has a budget of 3 s that
+        # a loaded runner can eat, and what is asked here is the road of the name behind a far gateway (`make_the_gateway_far`).
+        delayed_before = make_the_gateway_far(gateway, RTT_MS)
         page = browser.new_context(ignore_https_errors=True).new_page()
         # An empty page first, through the proxy: Firefox learns the proxy there and its pool makes the associations. The
         # PeerConnection is born once the gateway has granted one (the first granted is the core's own probe, no association of the
@@ -157,6 +162,7 @@ def _walk(gateway, firefox_binary, engine_at_least, prefs):
         allocated_at = gateway.turn.allocations[0][3] - t0 if gateway.turn.allocations else None
         held_starts = [a[0] for a in associations if a[0] >= held_from]
         auth = gateway.user is not None
+        the_gateway_was_far(gateway, delayed_before, RTT_MS)
     declared = declared_udp(gateway.proxy)
     assert declared == "coherent", "the core did not measure the chain's UDP coherent (%s): the engine would not use the relay" % declared + gateway.explain(result)
     ok = result.get("status") == "DONE" and gateway.page.verdicts and gateway.page.verdicts[-1]["ok"]

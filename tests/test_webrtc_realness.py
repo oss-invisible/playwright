@@ -32,7 +32,8 @@ import pytest
 
 from _host_address import this_host_address
 from _socks_servers import MEASURE_NUMBER, STUN_NUMBER, STUN_PORT, Socks5TcpOnly
-from _udp_line import bench_report, declared_udp, declared_udp_or_absent, egress_by_proxy, measure_servers
+from _udp_line import (bench_report, declared_udp, declared_udp_or_absent, egress_by_proxy, make_the_gateway_far, measure_servers,
+                       the_gateway_was_far)
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Pure SDP / ICE-candidate helpers (no I/O) - the heart of the sentinels.
@@ -451,12 +452,7 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
         monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
         extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True, **ice_prefs}
         with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
-            declared = declared_udp_or_absent(gateway.proxy)
-            assert declared == "coherent", (
-                "the core did not measure the UDP exit of this gateway coherent AT LAUNCH, with no delay on it (it declared %r): "
-                "the measure is what failed, not the gather. %s" % (declared, bench_report(gateway, 0, declared)))
-            gateway.rtt = rtt_ms / 1000.0
-            delayed_before = gateway.delays_applied
+            delayed_before = make_the_gateway_far(gateway, rtt_ms)
             page = browser.new_context().new_page()
             page.goto("about:blank")
             res = page.evaluate(_RELAY_PROBE_JS, stun)
@@ -616,10 +612,13 @@ def test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_
     from _socks_servers import STUN_NUMBER, STUN_PORT, WEB_ADDRESS, coherent
     from _waits import wait_until, watch
     stun = f"stun:{STUN_NUMBER}:{STUN_PORT}"
-    with coherent(user="alice", password="s3cret", relay_host=this_host_address(), rtt_ms=250) as gateway:
+    # Launched near, far from the moment the browser is up: the core's UDP measure at the launch has a budget of its own (3 s)
+    # that a loaded runner can eat, and what is asked here is the engine's pool behind a far gateway (`make_the_gateway_far`).
+    with coherent(user="alice", password="s3cret", relay_host=this_host_address()) as gateway:
         monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
         extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True}
         with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
+            delayed_before = make_the_gateway_far(gateway, 250)
             page = browser.new_context().new_page()
             page.goto("http://%s/" % WEB_ADDRESS)       # by address: the browser resolves names itself
             # the pool makes its associations: wait until the gateway has granted one of the engine's (the first granted is the
@@ -630,6 +629,7 @@ def test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_
             srflx = watch(lambda: page.evaluate("window.__gather.srflx"), lambda at: at is not None, 30,
                           lambda: page.wait_for_timeout(50))
             gather = page.evaluate("window.__gather")
+        the_gateway_was_far(gateway, delayed_before, 250)
         associations = [list(a) for a in gateway.associations]
         via = list(gateway.datagram_via)
         born = gather["born"] / 1000.0 - gateway.wall0

@@ -139,6 +139,31 @@ def bench_report(gateway: Any, rtt_ms: int, declared: Optional[str]) -> str:
                len(gateway.accepted), associations, log))
 
 
+def make_the_gateway_far(gateway: Any, rtt_ms: int) -> int:
+    """A gateway that is launched NEAR and made far once the core has measured it. Call it with the browser up, before the page does
+    anything through the gateway; it returns the count to give :func:`the_gateway_was_far`.
+
+    The core measures the UDP exit of a SOCKS5 proxy at the launch with a budget of 3 s for the whole exchange
+    (``invisible_core._udp_exit.BUDGET``). A gateway that is already ``rtt_ms`` away during that measure makes it a test of the speed of
+    the runner: one stall of a second and the verdict is ``unmeasured``, the engine has no relay and the test fails on a clock the page
+    never reads. So the gateway is launched at rtt 0, the verdict ``coherent`` of the launch is asserted here (a red then says whether it
+    is the measure or the engine), and only then the round trip is set (``Gateway.rtt`` is read at every answer and every datagram)."""
+    declared = declared_udp_or_absent(gateway.proxy)
+    assert declared == "coherent", (
+        "the core did not measure the UDP exit of this gateway coherent AT LAUNCH, with no delay on it (it declared %r): the measure is "
+        "what failed, not the gather. %s" % (declared, bench_report(gateway, 0, declared)))
+    gateway.rtt = rtt_ms / 1000.0
+    return int(gateway.delays_applied)
+
+
+def the_gateway_was_far(gateway: Any, before: int, rtt_ms: int) -> int:
+    """How many times the gateway applied its round trip since :func:`make_the_gateway_far`; AssertionError when it never did (a far case
+    that ran as the near one). Never a clock: a counter of the gateway."""
+    applied = int(gateway.delays_applied) - before
+    assert not rtt_ms or applied > 0, "the gateway never applied its round trip of %d ms after the launch" % rtt_ms
+    return applied
+
+
 def visits_for(road: str) -> int:
     """How many times the page is visited on ``road``: three with no proxy, :data:`PROXY_VISITS` behind any proxy."""
     if road == _DIRECT_ROAD:
