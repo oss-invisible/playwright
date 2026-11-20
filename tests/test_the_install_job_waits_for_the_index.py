@@ -71,10 +71,11 @@ def _tool(tmp_path, name, plan):
 def _run_the_wait(tmp_path, pip="y", uv="y", *, seconds=3.0, poll=0.05, call_seconds=None):
     """Run the script of the step in a project named ``invisible-playwright`` 9.9.9, with a ``pip`` and a ``uv`` that answer as their plans say.
     Returns (completed process, pip calls, uv calls)."""
-    (tmp_path / "pyproject.toml").write_text('[project]\nname = "invisible-playwright"\nversion = "9.9.9"\n', encoding="utf-8")
+    # The tree declares 0.99.0 and the ledger pull request records 9.9.9 (what the step before the wait computes): the wait is about the latter.
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "invisible-playwright"\nversion = "0.99.0"\n', encoding="utf-8")
     _tool(tmp_path, "pip", pip)
     _tool(tmp_path, "uv", uv)
-    env = dict(os.environ, PYTHONPATH=str(tmp_path / "shim"), INDEX_WAIT_SECONDS=str(seconds), INDEX_WAIT_POLL=str(poll))
+    env = dict(os.environ, PYTHONPATH=str(tmp_path / "shim"), INDEX_WAIT_SECONDS=str(seconds), INDEX_WAIT_POLL=str(poll), INVPW_E2E_VERSION="9.9.9")
     if call_seconds is not None:
         env["INDEX_WAIT_CALL_SECONDS"] = str(call_seconds)
     try:
@@ -178,3 +179,71 @@ def test_the_wait_step_still_passes_the_gate_of_the_core():
 def test_the_upgrade_goes_from_the_second_newest_to_the_newest_of_one_listing():
     import test_upgrade_e2e as upgrade
     assert upgrade._previous_and_latest(["0.48.0", "0.49.1", "0.50.1"]) == ("0.49.1", "0.50.1")
+
+
+# ---- the version of a ledger pull request is the one it adds to PUBLISHED.json, not the tree's ------------------------------------------------
+# Ledger #534 recorded 0.56.0 while main already declared 0.57.0 (not published until that ledger is merged): the wait asked the index for the
+# version of pyproject.toml, which does not exist, and the pull request could never turn green.
+
+def _ledger(*versions):
+    import json
+    return json.dumps({"comment": "x", "schema": 1, "released": [{"version": v} for v in versions]})
+
+
+def _added_versions_script():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ci_ledger_added_versions_under_test", ROOT / "scripts" / "ci_ledger_added_versions.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_version_of_the_pull_request_is_the_one_it_adds_not_the_one_of_the_tree(tmp_path):
+    """The case of #534: base [..0.55.0], head [..0.55.0, 0.56.0], tree 0.57.0 -> 0.56.0 (through the command the step runs)."""
+    (tmp_path / "base.json").write_text(_ledger("0.54.0", "0.55.0"), encoding="utf-8")
+    (tmp_path / "head.json").write_text(_ledger("0.54.0", "0.55.0", "0.56.0"), encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "invisible-playwright"\nversion = "0.57.0"\n', encoding="utf-8")
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "ci_ledger_added_versions.py"), "--base", "base.json", "--head", "head.json",
+                        "--tree-pyproject", "pyproject.toml"], cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip() == "0.56.0", r.stdout + r.stderr
+    assert "the tree declares 0.57.0 (not used)" in r.stderr
+
+
+def test_a_ledger_pull_request_that_adds_nothing_is_an_error_that_says_so():
+    module = _added_versions_script()
+    with pytest.raises(module.Refused, match="adds no version to PUBLISHED.json"):
+        module.the_version_of_the_pr(_ledger("0.54.0", "0.55.0"), _ledger("0.54.0", "0.55.0"))
+
+
+def test_a_ledger_pull_request_that_adds_two_versions_is_an_error_naming_both():
+    module = _added_versions_script()
+    with pytest.raises(module.Refused, match=r"adds 2 versions .*0\.56\.0, 0\.57\.0"):
+        module.the_version_of_the_pr(_ledger("0.55.0"), _ledger("0.55.0", "0.56.0", "0.57.0"))
+
+
+def test_a_version_the_head_dropped_is_not_an_addition():
+    module = _added_versions_script()
+    assert module.added_versions(_ledger("0.54.0", "0.55.0"), _ledger("0.55.0", "0.56.0")) == ["0.56.0"]
+
+
+def test_the_install_job_takes_the_version_of_a_pull_request_from_the_ledger_and_not_from_the_tree():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert '["project"]["version"]' not in text, "a step reads the version of the tree: a ledger pull request is not about it"
+    step = text.index("- name: the version this ledger pull request records")
+    wait = text.index("- name: wait for the index to serve this version")
+    assert step < wait, "the version is computed after the wait that needs it"
+    block = text[step:wait]
+    assert "if: github.event_name == 'pull_request'" in block
+    assert "github.event.pull_request.base.sha" in block and "scripts/ci_ledger_added_versions.py" in block
+    assert 'INVPW_E2E_VERSION=$version" >> "$GITHUB_ENV"' in block
+    assert 'os.environ["INVPW_E2E_VERSION"]' in text[wait:]
+
+
+def test_the_upgrade_goes_to_the_version_the_pull_request_records_from_the_one_before_it():
+    import test_upgrade_e2e as upgrade
+    listing = ["0.54.0", "0.55.0", "0.56.0", "0.57.0"]
+    assert upgrade._previous_and_latest(listing, "0.56.0") == ("0.55.0", "0.56.0")
+    assert upgrade._previous_and_latest(listing) == ("0.56.0", "0.57.0")
+    with pytest.raises(AssertionError, match="lists no 0.58.0"):
+        upgrade._previous_and_latest(listing, "0.58.0")
