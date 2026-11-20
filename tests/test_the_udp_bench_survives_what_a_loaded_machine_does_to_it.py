@@ -186,3 +186,18 @@ def test_a_core_measure_that_is_not_coherent_is_said_outright_with_the_round_tri
 
 def test_what_the_core_declared_is_absent_not_an_error_when_it_measured_nothing():
     assert declared_udp_or_absent({"server": "socks5://127.0.0.1:1"}) is None
+
+
+def test_a_round_trip_set_after_the_gateway_started_is_applied_and_counted():
+    """A far-gateway test launches the browser next to the gateway (the core's UDP measure has a budget of its own) and sets the round
+    trip afterwards: the gateway reads it at every answer, and counts the answers that waited, so the test reads that the delay
+    reached the gather without a clock."""
+    with coherent() as gateway:
+        assert gateway.rtt == 0 and gateway.delays_applied == 0
+        control, _relay = _associate(gateway)          # the method answer and the ASSOCIATE answer, both at rtt 0
+        control.close()
+        assert gateway.delays_applied == 0, "an answer at rtt 0 was counted as delayed"
+        gateway.rtt = 0.02
+        control, _relay = _associate(gateway)
+        control.close()
+        assert gateway.delays_applied == 2, "the answers after the round trip was set were not delayed and counted"

@@ -427,7 +427,13 @@ _ICE_IDS = ["ice_in_the_socket_process", "the_caller_asks_for_ice_in_the_content
 
 def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_ms):
     """Launch the default engine behind a local gateway with coherent UDP, `rtt_ms` away, gather with a STUN server only
-    its relay reaches, and say whether the page's request took the relay and what the gather looked like."""
+    its relay reaches, and say whether the page's request took the relay and what the gather looked like.
+
+    The gateway is LAUNCHED at rtt 0 and `rtt_ms` is set once the browser is up and before the page gathers. The core's own measure
+    of the UDP exit has a budget of 3 s for the whole exchange (`invisible_core._udp_exit.BUDGET`), and a runner that stalls for a second
+    inside it (four browsers on four cores) makes it `unmeasured`: the engine then has no relay and the test fails on a clock the page
+    never reads. What these tests ask of the engine is the gather behind a far gateway, so the measure runs next to it, at once, and
+    the test asserts that it came out `coherent`: a red then says at once whether it is the measure or the engine."""
     binary = _e2e_binary()
     if not binary:
         pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
@@ -438,16 +444,23 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
     user, password = credentials or (None, None)
     # The relay sits on the address of this host, as a real gateway's does: the engine's ICE sockets are bound to an
     # interface address, and on Windows such a socket cannot send to a relay on loopback.
-    with coherent(user=user, password=password, relay_host=this_host_address(), rtt_ms=rtt_ms) as gateway:
+    with coherent(user=user, password=password, relay_host=this_host_address()) as gateway:
         exit_ip = gateway.tcp_exit
         # The session asks the gateway for its TCP exit over HTTPS, which no local gateway can answer as itself: the
         # answer is the gateway's. The UDP probe that follows is NOT replaced: it runs through the relay, for real.
         monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
         extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True, **ice_prefs}
         with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
+            declared = declared_udp_or_absent(gateway.proxy)
+            assert declared == "coherent", (
+                "the core did not measure the UDP exit of this gateway coherent AT LAUNCH, with no delay on it (it declared %r): "
+                "the measure is what failed, not the gather. %s" % (declared, bench_report(gateway, 0, declared)))
+            gateway.rtt = rtt_ms / 1000.0
+            delayed_before = gateway.delays_applied
             page = browser.new_context().new_page()
             page.goto("about:blank")
             res = page.evaluate(_RELAY_PROBE_JS, stun)
+        delayed = gateway.delays_applied - delayed_before
         carried = [(host, port) for host, port, _payload in gateway.datagrams]
         stun_requests = gateway.stun.requests
         associates = gateway.associates
@@ -458,7 +471,10 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
     verdict = (f"srflx with the gateway's exit {exit_ip}: {srflx}; candidates: {res['candidates']}; "
                f"ICE errors: {res['errors']}; gather timings (ms from the offer): {res['at_ms']}; "
                f"datagrams the relay carried: {carried}; STUN requests the server answered: {stun_requests}; "
-               f"UDP ASSOCIATEs the gateway saw: {associates}; round trip to the gateway: {rtt_ms} ms; {bench}")
+               f"UDP ASSOCIATEs the gateway saw: {associates}; round trip to the gateway: {rtt_ms} ms, applied {delayed} times "
+               f"after the launch; {bench}")
+    # The delay of the case reached the gather: a gateway that never waited would make every far case the near one.
+    assert not rtt_ms or delayed > 0, "the gateway never applied its round trip of %d ms to the gather. %s" % (rtt_ms, verdict)
     return bool(srflx) and (STUN_NUMBER, STUN_PORT) in carried, verdict, res["at_ms"]
 
 
@@ -503,7 +519,11 @@ def test_a_host_with_ipv6_addresses_gathers_through_an_ipv4_relay(monkeypatch):
 def test_a_gateway_that_is_far_away_still_gives_the_page_a_srflx_born_through_its_relay(monkeypatch, ice_prefs, rtt_ms):
     """The same gather with a gateway that is not on loopback: every answer on the control connection waits `rtt_ms`
     and the relay adds half of it each way. The layer opens one association per ICE socket, one after the other, each
-    with a connect, a greeting, an authentication and the ASSOCIATE; a gather must not be over before they are done."""
+    with a connect, a greeting, an authentication and the ASSOCIATE; a gather must not be over before they are done.
+
+    The gateway is near while the core measures its UDP exit at the launch (a budget of 3 s that a loaded runner can eat on its
+    own) and far from the moment the browser is up: the test asserts the verdict `coherent` of the launch and that the round trip
+    was applied to the gather (`Gateway.delays_applied`), so the delay is the page's and not the measure's."""
     took_the_relay, verdict, _timings = _gather_behind_a_coherent_gateway(
         monkeypatch, ("alice", "s3cret"), ice_prefs, rtt_ms)
     print(f"[gather] rtt {rtt_ms} ms, {_ICE_IDS[_ICE_PREFS.index(ice_prefs)]}: {_timings}")
