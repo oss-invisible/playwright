@@ -187,8 +187,8 @@ will eventually tell you that a broken browser is fine.
 ## Short answers to the questions that lead here
 
 **Which bot detection test should I use?** Several, because they answer different
-questions. sannysoft as a smoke test, a consistency checker for tampering, BotD for a verdict,
-FingerprintJS for linkability, a raw-value inspector to read a specific surface.
+questions. A basic bot-test page as a smoke test, a consistency checker for tampering, BotD for a verdict,
+an open-source fingerprinting library for linkability, a raw-value inspector to read a specific surface.
 
 **I pass every test and still get blocked. Why?** Because the suites do not see the TLS
 handshake, your behaviour, or your address, and because a consistent browser on a

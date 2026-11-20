@@ -119,7 +119,7 @@ browsers are indistinguishable on the check that usually catches a patched gette
 A real audit checks a whole fingerprint, not one boolean: descriptor hygiene,
 cross-surface consistency, rendering output, and behaviour. Open any of the public
 fingerprinting test suites and look at what they collect -
-[a consistency checker](consistency-checker-explained.md), [BotD](botd-explained.md), [sannysoft](sannysoft-explained.md), fpscanner - and none of them
+[a consistency checker](consistency-checker-explained.md), [BotD](botd-explained.md), a basic bot-test page, fpscanner - and none of them
 stop at `navigator.webdriver`. They build a picture and then check whether the
 picture is internally consistent.
 

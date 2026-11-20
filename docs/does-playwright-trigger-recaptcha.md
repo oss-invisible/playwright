@@ -184,7 +184,7 @@ machine and network. If the manual visit is also challenged, it is the exit, and
 - Public detector suites (a consistency checker,
   [BotD](https://github.com/fingerprintjs/BotD),
   [FingerprintJS](https://github.com/fingerprintjs/fingerprintjs),
-  [sannysoft](https://bot.sannysoft.com/), a raw-value inspector), each
+  a basic bot-test page, a raw-value inspector), each
   read from its own source, retrieved 2026-08-28, for what a coherence check actually
   inspects.
 

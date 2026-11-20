@@ -195,7 +195,7 @@ is stable rather than randomised per call.
 ## Sources
 
 - The public per-surface and per-suite detectors documented elsewhere in this set
-  (a consistency checker, BotD, FingerprintJS, sannysoft, a raw-value inspector), each read from its own source.
+  (a consistency checker, BotD, an open-source fingerprinting library, a basic bot-test page, a raw-value inspector), each read from its own source.
 - This project's seed-derived generator, which produces canvas, WebGL, font, audio,
   screen and hardware attributes from a single seed so the join is consistent by
   construction.

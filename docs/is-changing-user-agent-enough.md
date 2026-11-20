@@ -173,7 +173,7 @@ which is the entire point.
   identity surface field by field against a stock browser rather than reading a single
   string.
 - The public detection suites this documentation set covers page by page, including
-  A consistency checker, [BotD](https://github.com/fingerprintjs/BotD),
+  A consistency checker, BotD,
   [FingerprintJS](https://github.com/fingerprintjs/fingerprintjs), [sannysoft](https://bot.sannysoft.com/)
   and a raw-value inspector, retrieved 2026-08-28, each of which
   cross-checks self-reported values against measured ones.

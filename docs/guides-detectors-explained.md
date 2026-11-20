@@ -1,6 +1,6 @@
 ---
 title: "Detectors, Explained"
-description: "How specific, well-known detectors actually work - sannysoft, a consistency checker, BotD, FingerprintJS, reCAPTCHA v3 - read from their own source rather than reverse-engineered from behaviour."
+description: "How specific, well-known detectors actually work - a basic bot-test page, a consistency checker, BotD, an open-source fingerprinting library, reCAPTCHA v3 - read from their own source rather than reverse-engineered from behaviour."
 parent: "Guides"
 has_children: true
 nav_order: 6
@@ -24,7 +24,7 @@ whether a browser is telling the truth about what it claims to be.
 - [The canvas and WebGL readback hash, explained](canvas-webgl-readback-hash-explained.md) - the signature is a hash of a pixel readback, not your GPU.
 - [Why a FingerprintJS visitor ID changes](fingerprintjs-visitor-id.md) - a visitor ID is a hash of 41 components; why it changes or stays.
 - [reCAPTCHA v3 score: why a fresh browser scores badly](recaptcha-v3-score.md) - a fresh automated browser scores low even with a clean fingerprint. The reason is history.
-- [Browser trust scores explained: what the number means](browser-trust-score-explained.md) - consistency-checker trust, FingerprintJS confidence and reCAPTCHA v3 score measure different things; one green is not the rest.
+- [Browser trust scores explained: what the number means](browser-trust-score-explained.md) - consistency-checker trust, fingerprinting-library confidence and reCAPTCHA v3 score measure different things; one green is not the rest.
 - [How Cloudflare Turnstile actually works](cloudflare-turnstile-explained.md) - a signal-gathering decision engine, not a puzzle: non-interactive JS checks, proof-of-work, and a risk-scored escalation to a checkbox.
 - [How DataDome's bot detection actually works](datadome-explained.md) - TLS/HTTP fingerprint, a JS device and behavior collector, and a cookie that remembers the verdict.
 - [How Kasada's bot detection actually works](kasada-explained.md) - an obfuscated bytecode VM and a proof-of-work token that keeps renewing through the session.

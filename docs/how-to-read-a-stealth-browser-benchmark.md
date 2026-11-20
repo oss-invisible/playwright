@@ -45,7 +45,7 @@ deciding and credited the browser for it.
 
 **Whether "pass" means the same thing across tools.** This corpus's own [testing
 methodology page](how-to-test-bot-detection.md) makes this point about testing your own
-browser: sannysoft, a consistency checker, BotD, FingerprintJS and a raw-value inspector each answer a different
+browser: a basic bot-test page, a consistency checker, BotD, an open-source fingerprinting library and a raw-value inspector each answer a different
 question, and "we pass every suite" is five different claims wearing one sentence. A
 benchmark comparing two automation tools has the identical problem one level up. A "pass"
 against a sitekey test page, a "pass" meaning no block occurred on a live production

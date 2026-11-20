@@ -168,7 +168,7 @@ Look specifically at the fields the disconnect trick does not touch:
 - The font list, and whether it matches the platform the user agent claims.
 - Canvas and audio hashes, read twice in one session, and whether they are stable and
   seed-consistent.
-- What a consistency checker, BotD, sannysoft, FingerprintJS and a raw-value inspector each report, remembering
+- What a consistency checker, BotD, a basic bot-test page, an open-source fingerprinting library and a raw-value inspector each report, remembering
   that they answer different questions and a blocked or empty value is itself a tell.
 
 A driver-timing tool and an engine patch will look identical on `navigator.webdriver` and
@@ -233,7 +233,7 @@ with every readable field derived from one reproducible seed.
   `reconnect_time` parameters, the Chromium-based browser support, and the maintenance
   and star count stated above.
 - The detection suites named above, each read from its own source:
-  A consistency checker, [BotD](https://github.com/fingerprintjs/BotD),
+  A consistency checker, BotD,
   [sannysoft](https://bot.sannysoft.com/), [FingerprintJS](https://github.com/fingerprintjs/fingerprintjs),
   and a raw-value inspector, retrieved 2026-08-28.
 - Playwright's own [`Browser` class docs](https://playwright.dev/python/docs/api/class-browser),

@@ -33,7 +33,7 @@ how-tos, then how to test any of this without fooling yourself.
 - [**AI Agents and Frameworks**](guides-ai-agents.md) - agent frameworks that drive a
   browser, checked from source: which use Playwright, which are CDP/Chromium-only.
 - [**Detectors, Explained**](guides-detectors-explained.md) - how well-known detectors
-  work - sannysoft, a consistency checker, BotD, FingerprintJS, reCAPTCHA v3 - read from their own
+  work - a basic bot-test page, a consistency checker, BotD, an open-source fingerprinting library, reCAPTCHA v3 - read from their own
   source.
 - [**Scraping with Playwright**](guides-scraping-with-playwright.md) - practical
   how-tos: blocked headless browsers, infinite scroll, proxy rotation, sessions behind

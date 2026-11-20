@@ -1,6 +1,6 @@
 ---
 title: "Browser trust scores explained: what the number means"
-description: "consistency-checker trust, FingerprintJS confidence and reCAPTCHA v3 score measure different things: what each trust score means and why one green does not imply the rest."
+description: "consistency-checker trust, fingerprinting-library confidence and reCAPTCHA v3 score measure different things: what each trust score means and why one green does not imply the rest."
 parent: "Detectors, Explained"
 grand_parent: "Guides"
 nav_order: 8
@@ -9,7 +9,7 @@ nav_order: 8
 
 # Browser trust scores explained: what the number means
 
-consistency-checker trust, FingerprintJS confidence and a reCAPTCHA v3 score all look like the
+consistency-checker trust, fingerprinting-library confidence and a reCAPTCHA v3 score all look like the
 same kind of number, and they are not: one counts contradictions, one measures how
 sure a match is, and one estimates behavioural risk. A high number from one says
 almost nothing about what the next one will read, and treating them as interchangeable
@@ -108,7 +108,7 @@ other two. Put them side by side and the independence is obvious:
 
 - You can score high on consistency-checker trust and low on reCAPTCHA v3, because a perfectly
   consistent browser with no history is exactly what a consistent bot also looks like.
-- You can have a stable, high-confidence FingerprintJS ID and still fail a consistency checker,
+- You can have a stable, high-confidence fingerprinting-library ID and still fail a consistency checker,
   because a stable ID only means your components did not move, not that they are
   telling the truth.
 - You can pass reCAPTCHA v3 on a warmed profile and fail a consistency checker, because behavioural

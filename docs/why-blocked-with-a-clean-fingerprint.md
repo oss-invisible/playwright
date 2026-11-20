@@ -1,6 +1,6 @@
 ---
 title: "Why am I blocked with a clean fingerprint?"
-description: "You pass a consistency checker, BotD and sannysoft and still get blocked. The fingerprint is only one of four independent layers - here is how to isolate which one is failing."
+description: "You pass a consistency checker, BotD and a basic bot-test page and still get blocked. The fingerprint is only one of four independent layers - here is how to isolate which one is failing."
 parent: "Testing and Troubleshooting"
 grand_parent: "Guides"
 nav_order: 8
@@ -10,7 +10,7 @@ nav_order: 8
 # Why am I blocked with a clean fingerprint?
 
 You checked the thing everyone tells you to check. The fingerprint reads as a real
-Firefox: a consistency checker finds nothing contradictory, BotD returns human, sannysoft is all
+Firefox: a consistency checker finds nothing contradictory, BotD returns human, the basic bot-test page is all
 green, the TLS handshake matches the browser you claim to be. And the session still
 gets a challenge, a short body, or the wrong page.
 

@@ -187,7 +187,7 @@ exit.
 for clicks, but the pacing, typing rhythm and request volume come from your code. That
 is the behaviour layer, and it is yours.
 
-**Is a passing sannysoft or a consistency checker result enough to be safe?** No. It means the
+**Is a passing result on a basic bot-test page or a consistency checker enough to be safe?** No. It means the
 browser layer is internally consistent and does not announce automation. The network
 and behaviour layers are not in those tests at all.
 
@@ -197,7 +197,7 @@ and behaviour layers are not in those tests at all.
   against a stock Firefox on the same machine and treat a suppressed signal as a
   failure rather than a pass.
 - The public detection suites named across this documentation set
-  ([sannysoft](https://bot.sannysoft.com/), a consistency checker,
+  (a basic bot-test page, a consistency checker,
   [BotD](https://github.com/fingerprintjs/BotD), [FingerprintJS](https://github.com/fingerprintjs/fingerprintjs),
   a raw-value inspector), each read from its own source rather than its
   rendered verdict, retrieved 2026-08-28.

@@ -141,7 +141,7 @@ Not by star count. By this order of questions:
    about it. Level 1 shipped today beats level 3 abandoned in three months.
 
 And whichever you pick, measure it yourself. Run one of the open test suites,
-[a consistency checker](consistency-checker-explained.md) or [BotD](botd-explained.md) or [sannysoft](sannysoft-explained.md), and read the whole report instead of the headline. The
+[a consistency checker](consistency-checker-explained.md) or [BotD](botd-explained.md) or a basic bot-test page, and read the whole report instead of the headline. The
 published comparisons in this space are mostly written by companies selling a
 managed alternative, and the ones that are not are usually a single run on a single
 machine from a single IP. Your setup is not their setup.

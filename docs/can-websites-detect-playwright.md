@@ -190,7 +190,7 @@ rather than reading the score.
   `navigator.webdriver` property and the automation flag behind it.
 - This project's real API surface, `InvisiblePlaywright(seed=...)` and the returned
   Playwright `Browser`, as documented in the quickstart and configuration pages.
-- The public detection suites (a consistency checker, BotD, FingerprintJS, sannysoft and a raw-value inspector),
+- The public detection suites (a consistency checker, BotD, an open-source fingerprinting library, a basic bot-test page and a raw-value inspector),
   each of which reads one or more of the three signal families described above.
 - This project's release gates, which assert the presence of a real-browser signal rather
   than the absence of a wrong one, and separate browser tells from IP and behaviour.

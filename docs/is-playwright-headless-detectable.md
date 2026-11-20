@@ -196,7 +196,7 @@ it twice and disagree.
 ## Sources
 
 - The classic headless signals as described on the public detector suites named in this set
-  (sannysoft, [a consistency checker](consistency-checker-explained.md)), read from their own source rather than
+  (a basic bot-test page, [a consistency checker](consistency-checker-explained.md)), read from their own source rather than
   their rendered verdict.
 - This project's release gates, which run `headless=True` against those suites and compare
   the fingerprint field by field against the headful run.
