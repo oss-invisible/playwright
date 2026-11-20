@@ -76,12 +76,12 @@ def test_the_body_of_a_document_the_tab_left_is_evicted(firefox_binary, engine_a
             responses = {}
             page.on("response", lambda r: responses.setdefault(r.url.rsplit("/", 1)[-1], r))
 
-            page.goto(base + "/a.html", wait_until="load", timeout=20_000)
+            page.goto(base + "/a.html", wait_until="load", timeout=30_000)
             _heard(page, responses, ("a.html", "a.css", "a.js"))
             assert b"document A" in responses["a.html"].body()
             assert b"/* A */" in responses["a.css"].body(), "the current document's sub-resource is readable"
 
-            page.goto(base + "/b.html", wait_until="load", timeout=20_000)
+            page.goto(base + "/b.html", wait_until="load", timeout=30_000)
             _heard(page, responses, ("b.html", "b.js"))
             assert b"document B" in responses["b.html"].body(), "the document that committed keeps its body"
             assert b"fromB" in responses["b.js"].body()
@@ -103,12 +103,12 @@ def test_nothing_else_is_lost_when_the_bodies_go(firefox_binary, engine_at_least
         with InvisiblePlaywright(seed=4250, binary_path=firefox_binary, headless=True) as browser:
             page = browser.new_page()
             for i in range(6):
-                page.goto(base + "/%s.html" % "ab"[i % 2], wait_until="load", timeout=20_000)
+                page.goto(base + "/%s.html" % "ab"[i % 2], wait_until="load", timeout=30_000)
             second = browser.new_page()
-            second.goto(base + "/a.html", wait_until="load", timeout=20_000)
+            second.goto(base + "/a.html", wait_until="load", timeout=30_000)
             assert "document A" in second.content()
             second.close()
-            page.goto(base + "/b.html", wait_until="load", timeout=20_000)
+            page.goto(base + "/b.html", wait_until="load", timeout=30_000)
             assert "document B" in page.content()
     finally:
         server.shutdown()

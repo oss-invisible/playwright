@@ -233,4 +233,4 @@ def test_a_process_that_reads_no_filter_while_it_starts_is_read_again_and_one_th
 
 def test_the_filter_wait_of_the_sandbox_test_is_bounded():
     import test_the_socket_process_is_sandboxed_e2e as sandbox
-    assert 0 < sandbox.STARTUP_SECONDS <= 15
+    assert 0 < sandbox.STARTUP_SECONDS <= 30

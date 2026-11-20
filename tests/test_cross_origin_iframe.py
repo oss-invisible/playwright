@@ -229,7 +229,7 @@ def test_the_iframe_runs_in_another_process(firefox_binary, cross_origin_harness
         # was there 30 of 30 on both, with no wait: that is what is asserted here, so a `goto` that returns
         # with a cross-site frame still without its url fails this test.
         page.goto(cross_origin_harness["parent_url"], wait_until="load", timeout=30_000)
-        page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
+        page.wait_for_selector("iframe#ifr_plain", timeout=30_000)
         frame = page.query_selector("iframe#ifr_plain").content_frame()
         assert frame is not None and cross_origin_harness["child_origin"] in frame.url, (
             f"after the load of the page the iframe of the other site has url {getattr(frame, 'url', None)!r}")
@@ -250,7 +250,7 @@ def test_cross_origin_iframe_url_appears_in_page_frames(firefox_binary, cross_or
         ctx = browser.new_context()
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
+        page.wait_for_selector("iframe#ifr_plain", timeout=30_000)
 
         # ⛔ WAIT FOR THE CONDITION, NOT FOR A DURATION. This was
         # `wait_for_timeout(500)`, and that measured the machine rather than
@@ -311,7 +311,7 @@ def test_cross_origin_iframe_content_frame_resolves(firefox_binary, cross_origin
         ctx = browser.new_context()
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
+        page.wait_for_selector("iframe#ifr_plain", timeout=30_000)
 
         for sel in ("iframe#ifr_plain", "iframe#ifr_sandbox", "iframe#ifr_titled"):
             handle = page.query_selector(sel)
@@ -337,7 +337,7 @@ def test_cross_origin_iframe_evaluate_returns_real_values(firefox_binary, cross_
         ctx = browser.new_context()
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
+        page.wait_for_selector("iframe#ifr_plain", timeout=30_000)
 
         cf = _child_frame_of(page, page.query_selector("iframe#ifr_plain"), cross_origin_harness["child_origin"])
         assert cf is not None
@@ -358,12 +358,12 @@ def test_cross_origin_iframe_frame_locator_resolves_button(firefox_binary, cross
         ctx = browser.new_context()
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
+        page.wait_for_selector("iframe#ifr_plain", timeout=30_000)
 
         # count() does not wait (Playwright's own semantics): the iframe ELEMENT is in the parent, but its cross-origin document,
         # in a process of its own, can load later on a loaded runner (Windows CI of 13/11, run 43383366904: 0 elements). Wait for
         # the button first, as a script that counts it would.
-        page.frame_locator("iframe#ifr_plain").locator("button#ok").wait_for(timeout=10_000)
+        page.frame_locator("iframe#ifr_plain").locator("button#ok").wait_for(timeout=30_000)
         for selector in ("button#ok", "button.btn-primary"):
             cnt = page.frame_locator("iframe#ifr_plain").locator(selector).count()
             assert cnt == 1, f"locator({selector!r}) found {cnt} elements (expected 1)"
@@ -384,7 +384,7 @@ def test_cross_origin_iframe_dispatch_event_click_works(firefox_binary, cross_or
         ctx = browser.new_context()
         page = ctx.new_page()
         page.goto(cross_origin_harness["parent_url"], wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_selector("iframe#ifr_plain", timeout=10_000)
+        page.wait_for_selector("iframe#ifr_plain", timeout=30_000)
 
         # the button of a document in another process can come later on a loaded runner: wait for it as a script would
         # (Windows CI of 13/11, run 43383366904: "found 0 elements"), then act, both with a deadline of 30 s
@@ -490,7 +490,7 @@ def test_the_geometry_invariant_holds_inside_a_nested_frame(firefox_binary):
             # 2. and the relationship holds on the events received IN THERE
             frame = page.frame_locator("#f")
             page.frames[1].evaluate("() => { window.__ev = []; }")
-            frame.locator("#g").hover(timeout=10000)
+            frame.locator("#g").hover(timeout=30000)
             # until the frame has heard the pointer (its events come from another process, after the hover returned)
             wait_until(lambda: page.frames[1].evaluate("() => window.__ev.length") > 0, 30,
                        lambda: page.wait_for_timeout(100))

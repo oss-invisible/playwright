@@ -22,12 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-from ._cursor import (ENGINE_BINARY,
-                      ENGINE_PYTHON,
+from ._cursor import (ENGINE_PYTHON,
                       enable_for as _enable_cursor_engine,
                       max_seconds_for as _cursor_max_seconds)
 from ._engine import resolve_executable
-from ._juggler.server import COMPOSED_PREF, MOTION_BUDGET_PREF, POINTER_PREF, SESSION_SEED_PREF, UDP_STUN_PREF
+from ._juggler.server import COMPOSED_PREF, MOTION_BUDGET_PREF, POINTER_PREF, SESSION_SEED_PREF, UDP_EXIT_PREF, UDP_STUN_PREF
 from typing import Any, Dict, Optional
 
 from invisible_core import compose_session_prefs, context_geometry, make_virtual_display
@@ -98,6 +97,7 @@ def default_session(executable: Optional[str] = None,
     geo = session_geo(session._timezone, session._proxy, session._locale_requested,
                       seed=session.seed)
     session._timezone, session._locale = geo.timezone, geo.locale
+    session._udp_exit = geo.udp_exit
     session._geolocation = geo.geolocation_override()
     prefs = session._build_prefs()
     env = build_env(network_declared=declared_network(session), profile=session._profile,
@@ -200,6 +200,7 @@ def build_prefs(
     show_cursor: Optional[bool] = None,
     session_seed: Optional[int] = None,
     udp_stun_servers: Optional[Any] = None,
+    udp_exit: Optional[str] = None,
     preload_newtab: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Fingerprint prefs plus the humanize toggle, which is always set explicitly.
@@ -217,13 +218,9 @@ def build_prefs(
     #
     # What stays here is this path's DELIVERY and its two decisions:
     #
-    #   humanize   The pref selects WHICH generator runs, not whether motion
-    #              happens. While the wrapper draws the path it must be false,
-    #              or every waypoint we send would itself be expanded into a
-    #              path by the browser. `max_seconds_for` is applied HERE rather
-    #              than passing `humanize` through, because a falsy-but-numeric
-    #              cap with the binary engine selected has to mean the default,
-    #              not "off".
+    #   humanize   Always false: the wrapper draws the path, and a true value
+    #              would make the browser expand every waypoint we send into a
+    #              path of its own.
     #   show_cursor  Passed through UNTRANSLATED, and that is the difference
     #              from the line above: `humanize` needs a decision here
     #              because two engines compete for it, while the visible dot
@@ -245,12 +242,10 @@ def build_prefs(
         # workarounds meant for that desktop apply only then. Nothing here
         # reads the platform: the fact travels, not a prediction of it.
         virtual_display=virtual_display,
-        humanize=(_cursor_max_seconds(humanize)
-                  if cursor_engine == ENGINE_BINARY else False),
+        humanize=False,
         show_cursor=show_cursor,
-        # Handed to the core only when asked: a core that does not know the option is never called with it,
-        # so a caller who does not use it cannot meet a TypeError from a pairing with an older core.
-        **({} if preload_newtab is None else {"preload_newtab": preload_newtab}),
+        # None (the caller did not say) writes nothing in the core; False / True are declarations.
+        preload_newtab=preload_newtab,
     ).prefs
     # ⛔ THE TYPING SEED RIDES IN THE PREFS AND NEVER REACHES THE PROFILE.
     #
@@ -277,9 +272,8 @@ def build_prefs(
     # nobody is making.
     #
     # ⛔ AND WHO DRAWS THE WALK TRAVELS TOO (`POINTER_PREF`): with the seed
-    # alone the server could not tell the Python generator from the engine's own
-    # expansion or from `INVPW_CURSOR_ENGINE=off`, and a walk drawn on top of
-    # either would humanise twice.
+    # alone the server could not tell the Python generator from
+    # `INVPW_CURSOR_ENGINE=off`, and would draw a walk nobody asked for.
     #
     # Milliseconds, and an int: Gecko has no float pref type, and `1.0` written
     # as a number arrives with the right value and the wrong type - the defect
@@ -291,6 +285,12 @@ def build_prefs(
     # takes the key out before the profile is written, as it does the seed. Not written when the launch named none.
     if udp_stun_servers:
         prefs[UDP_STUN_PREF] = ",".join(udp_stun_servers)
+    # ⛔ AND THE VERDICT OF THAT MEASUREMENT (`SessionGeo.udp_exit`) rides with it (`UDP_EXIT_PREF`): the core keeps no verdict
+    # in memory, so the server is told it here, and `op_launch` takes the key out as it does the list. Not written when nothing
+    # was measured.
+    prefs.pop(UDP_EXIT_PREF, None)        # never what a caller wrote among its own prefs: only the measurement
+    if udp_exit:
+        prefs[UDP_EXIT_PREF] = udp_exit
     if session_seed is not None and humanize:
         prefs[SESSION_SEED_PREF] = int(session_seed)
         prefs[POINTER_PREF] = cursor_engine == ENGINE_PYTHON
@@ -423,6 +423,11 @@ class CommonLaunch:
     #: "ip:port" strings (validated by the core), or None for the two public defaults. Kept on the session so the
     #: launch geo step and the browser's later context proxies use the same list.
     _udp_stun_servers: Optional[list] = None
+
+    #: What the launch's geo step measured of the SOCKS5 proxy's UDP exit (``SessionGeo.udp_exit``: ``coherent``, ``no``,
+    #: ``unmeasured``), or None when nothing was measured. Set by `__enter__` with the timezone; it travels to the server in
+    #: the prefs (`UDP_EXIT_PREF`) because the core remembers none.
+    _udp_exit: Optional[str] = None
 
     def _resolve_headless(self) -> bool:
         """Translate the user's ``headless`` flag.
@@ -581,6 +586,7 @@ class CommonLaunch:
             show_cursor=self._show_cursor,
             session_seed=self.seed,
             udp_stun_servers=self._udp_stun_servers,
+            udp_exit=self._udp_exit,
             preload_newtab=self._preload_newtab,
         )
 

@@ -29,6 +29,7 @@ import statistics
 
 import pytest
 
+from _e2e_verdicts import MDNS_RETRY_MS, opened_at_the_retry_problem
 from test_webrtc_realness import _e2e_binary, _launch, candidates, decode_priority, host_candidates, is_mdns  # noqa: F401
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
@@ -81,8 +82,16 @@ _LOOPBACK_JS = r"""async () => {
   await pc2.setRemoteDescription(pc1.localDescription);
   await pc2.setLocalDescription(await pc2.createAnswer());
   await pc1.setRemoteDescription(pc2.localDescription);
-  const deadline = performance.now() + 8000;
-  while (performance.now() < deadline && !(opened !== null && echoed)) await new Promise(r => setTimeout(r, 5));
+  // Until the channel has opened and echoed, for 30 s (the deadline of the wait). The loop also keeps the longest time it did not run: a page that
+  // was stopped by the machine says so, and the time the connection took is not judged then (`_e2e_verdicts.opened_at_the_retry_problem`).
+  const deadline = performance.now() + 30000;
+  let stalled = 0, last = performance.now();
+  while (performance.now() < deadline && !(opened !== null && echoed)) {
+    await new Promise(r => setTimeout(r, 5));
+    const now = performance.now();
+    stalled = Math.max(stalled, now - last);
+    last = now;
+  }
   // The road the connection took, read from the browser's own statistics: the nominated pair, and the protocol of each end.
   let pair = null;
   try {
@@ -98,7 +107,7 @@ _LOOPBACK_JS = r"""async () => {
     });
   } catch (e) {}
   pc1.close(); pc2.close();
-  return {opened, echoed, pair, gathered};
+  return {opened, echoed, pair, gathered, stalled: Math.round(stalled)};
 }"""
 
 # Retail 159 on Windows, 12 cold launches (``captures/mdns-loopback/retail-159-win-12``): 37-52 ms in ten of twelve, two
@@ -108,7 +117,6 @@ _LOOPBACK_JS = r"""async () => {
 # the machine. What the test judges is the ROAD, which the machine cannot change (see the test), and a ceiling under the
 # first retry of the mDNS responder (3 s), which no machine is slow enough to reach by being slow.
 RETAIL_MEDIAN_WINDOW_MS = (30, 55)       # printed beside the measure, for the reader
-MDNS_RETRY_MS = 3000                     # the responder asks again after 3 s: a run that opens only then took the slow road
 
 
 def _session(declaration, socks, page_url, monkeypatch, seed, script):
@@ -217,7 +225,8 @@ def test_two_connections_on_one_page_connect_in_the_time_of_retail(local_https_p
         socket could not bind and the connection fell back to TCP, about 600 ms on average);
       * the nominated pair is direct and local over UDP at both ends: host or peer-reflexive, never relay or server-reflexive, never
         TCP (a peer-reflexive end is legitimate: the other connection's mDNS name was not resolved yet and its check came first);
-      * it opens in less than the responder's first retry (3 s): a name that does not come back opens only at the retry.
+      * it opens in less than the responder's first retry (3 s) unless the page itself was stopped for a second or more in the meantime: a name that does
+        not come back opens only at the retry, and a machine that stops for seconds opens late on any road.
 
     The time itself is printed with the retail window beside it: a fast machine shows 30-55 ms, a runner shows more, and
     neither is a verdict (an absolute time failed on both GitHub runners with a healthy engine)."""
@@ -243,7 +252,8 @@ def test_two_connections_on_one_page_connect_in_the_time_of_retail(local_https_p
         # network), and never TCP (checked above).
         assert pair["localType"] in ("host", "prflx") and pair["remoteType"] in ("host", "prflx"), (
             "run %d: the pair is not direct and local (a relay or a server-reflexive road): %r" % (n, pair))
-        assert res["opened"] < MDNS_RETRY_MS, "run %d: opened after %d ms, at the responder's retry" % (n, res["opened"])
+        problem = opened_at_the_retry_problem(res["opened"], res["stalled"], MDNS_RETRY_MS)
+        assert problem is None, "run %d: %s" % (n, problem)
     times = sorted(r["opened"] for r in runs)
     low, high = RETAIL_MEDIAN_WINDOW_MS
     with capsys.disabled():

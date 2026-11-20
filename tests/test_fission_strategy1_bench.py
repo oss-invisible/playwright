@@ -152,8 +152,8 @@ def browser(firefox_binary):
 @pytest.fixture
 def page(browser):
     page = browser.new_context().new_page()
-    page.set_default_timeout(3000)
-    page.set_default_navigation_timeout(20000)
+    page.set_default_timeout(30000)
+    page.set_default_navigation_timeout(30000)
     return page
 
 

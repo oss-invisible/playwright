@@ -10,20 +10,22 @@ What is asserted, with a gateway that answers every step of the handshake after 
   1. an association the gateway granted was completed before the PeerConnection was created (the page loaded through the same
      proxy first, which is when Firefox learns the proxy); alone this does not tell the processes apart (the parent's pool is
      warmed by the page load), the second line does;
-  2. the first STUN datagram of the PeerConnection reaches the relay within a fraction of a handshake of its birth (a cold
-     association needs three answered steps, 3 x 130 ms, before it can send).
+  2. the first STUN datagram of the PeerConnection leaves on one of those associations (the gateway says which association carried
+     each datagram), not on one made after the birth: a cold association needs three answered steps, 3 x 130 ms, before it can
+     send, so a datagram that leaves on one is the defect. It is an identity, not a number of milliseconds, so it does not depend
+     on how loaded the machine is (a bound of 250 ms was crossed by 419 and 425 ms on a loaded runner, three reds).
 Hermetic: a local SOCKS5 gateway with a relay and a fake STUN server, a local page reached through the proxy, no external network.
 Red on an engine that warms the pool only in the process of the HTTP connections: measured on the giro 2 binary, the first datagram left
-396 ms after the birth of the PeerConnection (3 x 130 ms) instead of at once.
+396 ms after the birth of the PeerConnection (3 x 130 ms) instead of at once, on an association made after the birth.
 """
 from __future__ import annotations
 
-import time
-
 import pytest
 
+from _e2e_verdicts import cold_association_problem
 from _socks_servers import STUN_NUMBER, STUN_PORT, coherent
 from _udp_line import egress_by_proxy
+from _waits import wait_until
 from test_webrtc_realness import _e2e_binary, _launch  # noqa: F401
 
 # Bound to the engine that carries the UDP line: red before the UDP line (firefox-63): skips on the published engine; runs on the candidate.
@@ -38,7 +40,7 @@ _PC_JS = """async (stun) => {
   let t_srflx = null;
   pc.onicecandidate = e => { if (e.candidate && e.candidate.type === 'srflx' && t_srflx === null) t_srflx = Date.now(); };
   await pc.setLocalDescription(await pc.createOffer());
-  const deadline = Date.now() + 8000;
+  const deadline = Date.now() + 30000;
   while (t_srflx === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 5));
   pc.close();
   return {t_pc, t_srflx};
@@ -62,24 +64,15 @@ def test_the_first_datagram_does_not_wait_for_a_handshake(local_https_page, monk
         with _launch(binary_path=binary, proxy=gateway.proxy, extra_prefs=prefs, seed=7) as browser:
             page = browser.new_context().new_page()
             page.goto(local_https_page, wait_until="load", timeout=60000)   # through the proxy: Firefox learns it here
-            page.wait_for_timeout(2500)                                      # the pool has time to make its associations
+            # the pool makes its associations: wait until the gateway has granted one of the engine's (the first granted is the
+            # core's probe), with a deadline; the verdict below names what it saw if none came
+            wait_until(lambda: len([a for a in gateway.associations if a[1] is not None]) >= 2, 30,
+                       lambda: page.wait_for_timeout(50))
             result = page.evaluate(_PC_JS, "%s:%d" % (STUN_NUMBER, STUN_PORT))
         t_pc = result["t_pc"] / 1000.0
-        granted = [a for a in gateway.associations if a[1] is not None]
-        first = next((t for host, port, _atyp, t in gateway.datagram_log if host == STUN_NUMBER), None)
-    assert granted, "the proxy was never asked for an association"
-    # the first association of the gateway is the core's own UDP probe, made before the browser exists: it is no pool
-    # association of the engine, and counting it made this test pass with an engine that asked for none
-    granted = granted[1:]
-    assert granted, "the engine never asked the proxy for an association (only the core's probe did): the session's UDP was not declared coherent"
-    ready_before = [a for a in granted if gateway.wall0 + a[1] < t_pc]
-    assert ready_before, (
-        "no association was completed before the PeerConnection was born (granted at %s s from the gateway's start, the "
-        "PeerConnection at %.3f s): the first ICE socket made its own, from scratch"
-        % ([round(a[1], 3) for a in granted], t_pc - gateway.wall0))
-    assert first is not None, "no STUN datagram of the PeerConnection reached the relay"
-    wait = gateway.wall0 + first - t_pc
-    assert wait < 0.25, (
-        "the first STUN datagram left %.0f ms after the PeerConnection was born; a ready association sends at once, a cold one "
-        "needs three answered steps of %d ms" % (wait * 1000, RTT_MS))
+        associations = [list(a) for a in gateway.associations]
+        via = list(gateway.datagram_via)
+        wall0 = gateway.wall0
+    problem = cold_association_problem(associations, via, STUN_NUMBER, t_pc - wall0)
+    assert problem is None, "%s; the gateway saw associations %s and datagrams %s" % (problem, associations, via)
     assert result["t_srflx"] is not None, "no srflx candidate came back through the relay"

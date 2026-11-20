@@ -82,7 +82,7 @@ def test_ten_tiny_downloads_of_each_size_are_saved_through_a_served_browser(fire
                 page.goto(served, timeout=30_000)
                 for kind, body in BODIES.items():
                     for i in range(COUNT):
-                        with page.expect_download(timeout=20_000) as info:
+                        with page.expect_download(timeout=30_000) as info:
                             page.click("#%s%d" % (kind, i))
                         target = tmp_path / ("%s%d.bin" % (kind, i))
                         info.value.save_as(target)

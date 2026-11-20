@@ -105,7 +105,7 @@ def test_a_bare_launch_behind_a_proxy_is_composed_through_it(firefox_binary, mon
     from invisible_core._geo import SessionGeo
     from invisible_playwright import _session
     from invisible_playwright._pw.sync_api import sync_playwright
-    from _socks_servers import Socks5TcpOnly
+    from _socks_servers import STUN_NUMBER, STUN_PORT, Socks5TcpOnly
     from test_webrtc_realness import _PROBE_JS, candidates, host_is_mdns
 
     egress = "203.0.113.7"
@@ -141,7 +141,7 @@ def test_a_bare_launch_behind_a_proxy_is_composed_through_it(firefox_binary, mon
             try:
                 page = browser.new_context().new_page()
                 page.goto("http://127.0.0.1:%d/" % httpd.server_address[1], wait_until="domcontentloaded")
-                res = page.evaluate(_PROBE_JS)
+                res = page.evaluate(_PROBE_JS, "stun:%s:%d" % (STUN_NUMBER, STUN_PORT))
             finally:
                 browser.close()
     finally:

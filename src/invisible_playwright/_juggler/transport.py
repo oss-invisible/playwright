@@ -307,48 +307,15 @@ class JsonWireTransport(InProcessTransport):
         super().emit_message(carried)
 
 
-# ── choosing one ────────────────────────────────────────────────────────────
-#
-# ⛔ THIS WAS A MODULE OF ITS OWN UNTIL 2026-08-29, and what it chose between
-# no longer exists. `factory.py` held 88 lines to pick between the Node driver
-# and this transport; the driver went on 2026-08-28, so a module whose whole
-# job was to call another module was left choosing between one thing and an
-# error message.
-#
-# ⛔ AND ITS TYPO GUARD WENT WITH IT, on purpose. It refused an unknown value
-# on the argument that "a typo would run the driver while you believed you
-# were testing the Python path". That was true and is not: there is no driver
-# to run by accident, so the check protected nothing and cost a concept.
-#
-# What was KEPT is the message below. Version 0.7.4 shipped with the driver as
-# the default, so somebody can have `INVPW_TRANSPORT=driver` still set in a
-# shell, and "unknown transport" would tell them nothing about what happened.
+# ── making one ──────────────────────────────────────────────────────────────
 
-CHOICE_ENV = "INVPW_TRANSPORT"
 #: `json` puts the wire between the client and the server (`JsonWireTransport`), as it is
 #: for a remote client. Off by default: local use passes the dicts as it always did.
 WIRE_ENV = "INVPW_WIRE"
-DRIVER = "driver"
-JUGGLER = "juggler"
-
-
-def chosen() -> str:
-    """Which transport this process asked for. Anything but `driver` is us."""
-    return (os.environ.get(CHOICE_ENV) or JUGGLER).strip().lower()
 
 
 def make_transport(loop: asyncio.AbstractEventLoop) -> "InProcessTransport":
     """The transport a `Connection` should speak through."""
-    if chosen() == DRIVER:
-        raise RuntimeError(
-            "the Node driver was removed on 2026-08-28: this package no "
-            "longer ships `_driver/` and no longer downloads node. What "
-            "replaced it is the in-process Python server, which is now the "
-            "only transport - unset %s and it runs. To get the old arm back "
-            "for a COMPARISON (the only thing it was still for): check out "
-            "the last commit that carried it into a git worktree and point "
-            "INVPW_DRIVER_TREE at it, which `scripts/capture_protocol.py` "
-            "reads." % CHOICE_ENV)
     from .server import JugglerServer
     if (os.environ.get(WIRE_ENV) or "").strip().lower() == "json":
         return JsonWireTransport(loop, JugglerServer())

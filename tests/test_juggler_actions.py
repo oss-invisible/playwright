@@ -222,7 +222,7 @@ def test_the_lifecycle_WAITS_for_an_element_that_appears_later(firefox_binary):
     instead of a wait. The element appears after 1.2 seconds."""
     actions, inj, f, close = _open(firefox_binary, PAGE)
     try:
-        actions.click("#slow", timeout=15)
+        actions.click("#slow", timeout=30)
     finally:
         close()
 

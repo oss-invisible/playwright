@@ -26,6 +26,7 @@ import pytest
 
 from _fission_frames import (Sites, assert_other_process, decode_png, launch, near, new_page, wait_for,
                              wait_frame)
+from _waits import watch
 
 pytestmark = pytest.mark.e2e
 
@@ -177,17 +178,17 @@ def test_waiting_for_an_element_that_appears_later_in_a_frame_of_another_site(pa
     frame = {"frame": wait_frame(page, late.url("B"), "/late-b"),
              "nested": wait_frame(page, late.url("C"), "/late-c")}[target]
     # the element is not there yet when the wait starts, or it is by now: either way the wait returns it
-    handle = frame.wait_for_selector("#late", timeout=8000)
+    handle = frame.wait_for_selector("#late", timeout=30000)
     try:
         assert handle.inner_text() == "arrived"
         assert handle.owner_frame() is frame
     finally:
         handle.dispose()
     # the same, by the locator of the frame and by the frame locator of the page
-    frame.locator("#shown").wait_for(state="visible", timeout=8000)
+    frame.locator("#shown").wait_for(state="visible", timeout=30000)
     outer = page.frame_locator("#b")
     scoped = outer.locator("#late") if target == "frame" else outer.frame_locator("#c").locator("#late")
-    scoped.wait_for(state="attached", timeout=8000)
+    scoped.wait_for(state="attached", timeout=30000)
     assert scoped.inner_text() == "arrived"
 
 
@@ -335,12 +336,34 @@ def painted(sites):
     return sites
 
 
+def painted_shot(page, take, probes, seconds=30.0):
+    """``decode_png`` of the first screenshot whose pixel at every probe ``((x, y), colour)`` is the colour asked.
+
+    The frame of another site is painted by its own process, and when that happens depends on the machine (half a second
+    after the frame is listed was not enough on a loaded Windows runner), so the screenshot is taken again until the
+    paint is there, with a deadline; a frame that is never painted is red at the deadline, with the colours seen at each
+    probe on the way. The caller then asserts on the image returned, as before."""
+    last = {}
+
+    def sample():
+        last["png"] = decode_png(take())
+        _, _, pixel = last["png"]
+        return tuple(pixel(*point) for point, _ in probes)
+
+    seen = watch(sample, lambda colours: all(near(c, want) for c, (_, want) in zip(colours, probes)), seconds,
+                 lambda: page.wait_for_timeout(100))
+    assert seen.ok, "the frames were never painted as asked within %.0f s; the colours at %s were: %s" % (
+        seconds, [point for point, _ in probes], seen.render())
+    return last["png"]
+
+
 def test_a_page_screenshot_shows_the_content_of_the_frames_of_other_sites(page, painted):
     page.goto(painted.url("A", "/paint"), wait_until="load")
     wait_frame(page, painted.url("C"), "/paint")
-    page.wait_for_timeout(500)
     assert_other_process(page.main_frame, wait_frame(page, painted.url("B"), "/paint"))
-    _, _, pixel = decode_png(page.screenshot(scale="css"))
+    _, _, pixel = painted_shot(page, lambda: page.screenshot(scale="css"), [
+        ((10, 10), (255, 255, 255)), ((50 + 5, 40 + 5), PINK), ((50 + 20 + 40, 40 + 30 + 30), GREEN),
+        ((50 + 120 + 5, 40 + 20 + 5), BLUE), ((50 + 120 + 10 + 25, 40 + 20 + 10 + 20), GOLD)])
     # outside the frame the page's own white; inside it the frame's pink; its swatch; the nested frame's blue
     assert near(pixel(10, 10), (255, 255, 255)), pixel(10, 10)
     assert near(pixel(50 + 5, 40 + 5), PINK), pixel(55, 45)
@@ -355,8 +378,9 @@ def test_a_locator_screenshot_of_an_element_in_a_frame_of_another_site(page, pai
     page.goto(painted.url("A", "/paint"), wait_until="load")
     frame = {"frame": wait_frame(page, painted.url("B"), "/paint"),
              "nested": wait_frame(page, painted.url("C"), "/paint")}[target]
-    page.wait_for_timeout(500)
-    width, height, pixel = decode_png(frame.locator("#swatch").screenshot(scale="css"))
+    points = ((0, 0), (size[0] - 1, size[1] - 1), (size[0] // 2, size[1] // 2), (size[0] - 1, 0))
+    width, height, pixel = painted_shot(page, lambda: frame.locator("#swatch").screenshot(scale="css"),
+                                        [(point, color) for point in points])
     assert (width, height) == size
     for x, y in ((0, 0), (width - 1, height - 1), (width // 2, height // 2), (width - 1, 0)):
         assert near(pixel(x, y), color), ((x, y), pixel(x, y))
@@ -365,7 +389,7 @@ def test_a_locator_screenshot_of_an_element_in_a_frame_of_another_site(page, pai
 def test_a_locator_screenshot_of_the_iframe_element_shows_the_frame(page, painted):
     page.goto(painted.url("A", "/paint"), wait_until="load")
     wait_frame(page, painted.url("C"), "/paint")
-    page.wait_for_timeout(500)
-    width, height, pixel = decode_png(page.locator("#b").screenshot(scale="css"))
+    width, height, pixel = painted_shot(page, lambda: page.locator("#b").screenshot(scale="css"),
+                                        [((5, 5), PINK), ((60, 60), GREEN), ((125, 25), BLUE)])
     assert (width, height) == (300, 200)
     assert near(pixel(5, 5), PINK) and near(pixel(60, 60), GREEN) and near(pixel(125, 25), BLUE)

@@ -6,9 +6,11 @@ the old process's own stop of the load (it is cut when the navigation changes pr
 navigation. What the client must still see, whatever the process:
 
   * a goto stopped by the page it is leaving raises NS_BINDING_ABORTED (the abort of the old process is its own);
-  * a goto replaced by another navigation, to another site, is "interrupted by another navigation" and the second
-    lands: the abort of the replaced one is told under its own id, not taken for the end of the new one;
-  * a goto whose response is half there when the next one starts is replaced the same way (the swap has happened);
+  * a second goto that starts while the first one changes process (the first response is half there) ends both
+    gotos, each with a commit or with an error the engine tells, never with its timeout; either may win (as in stock
+    Firefox) and the page lands on the winner's address (the first's only once the rest of its response is sent); the
+    loser is "interrupted by another navigation" or an abort, and the abort of the replaced one is told under its own
+    id, not taken for the end of the new one;
   * an iframe whose load is refused ends its load (the events a waiter needs) and its replacement error page is a
     navigation of its own; an iframe removed while it loads is aborted, then detached;
   * an iframe that goes to another site (its src changes) ends with the new address in the frame list: the process
@@ -29,17 +31,22 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from _second_goto_verdicts import landed_on, second_goto_problem
 from _servers import LocalServer
 from _waits import awatch
 
 pytestmark = pytest.mark.e2e
 
 #: The longest any wait of this file lasts; no healthy run comes near it. It is the only clock the verdicts have.
-DEADLINE = 8.0
+DEADLINE = 30.0
 
 #: The timeout of the gotos that are stopped or replaced below. A goto that is not stopped waits for its held answer and
 #: ends at this timeout with another error: it is the bound of the waits that lead up to the stop, nothing narrower.
-GOTO_TIMEOUT_MS = 15000
+GOTO_TIMEOUT_MS = 30000
+
+#: The timeout of the two gotos of the replaced-goto test, which return by themselves: it is not a bound on how long
+#: they take, only the point past which one that has not returned is the defect.
+COMMIT_TIMEOUT_MS = 30000
 
 FISSION_ON = {
     "fission.autostart": True,
@@ -87,9 +94,8 @@ def sites():
                     self.end_headers()
                     self.wfile.write(b"<!doctype html><title>partial</title><p>start")
                     self.wfile.flush()
-                    # the rest after 5 s: the test of the second goto that replaces this one keeps main's form until the verdict on
-                    # the product (branch tests/second-goto-replaces-the-first holds the strict one)
-                    time.sleep(5)
+                    # the rest is sent when the test lets it go, after the second goto has returned
+                    release.wait()
                     self.wfile.write(b" " * 156)
                     return
                 if path == "/slow-frame":
@@ -150,33 +156,51 @@ def test_a_goto_to_another_site_stopped_by_the_page_it_leaves_raises_aborted(fir
     assert url.startswith("http://a.test:"), url
 
 
-def test_a_second_goto_to_a_third_site_interrupts_the_first_and_lands(firefox_binary, sites):
+def test_a_second_goto_that_starts_while_the_first_changes_process_ends_both_gotos_and_one_of_them_lands(
+        firefox_binary, sites):
+    # The contract: each goto returns, with a commit or with an error the engine tells, and the page lands on the address of the
+    # one that won. Which of the two wins is not the contract (stock Firefox 159 with Fission gives the first the win in most runs,
+    # the second in the others); a goto that ends only at its timeout is the defect. The verdicts are in _second_goto_verdicts.
     async def scenario(page):
         await page.goto(sites["at"]("a.test", "/plain"))
+        # The responses the client heard: the one of the first goto is the moment its headers and the start of its body
+        # reached the parent, which is where the navigation is handed to the process of b.test. A document that has its
+        # start but not its end does not commit, so the URL of the page is not the condition; the response is.
+        responses = []
+        page.on("response", lambda r: responses.append(urlsplit(r.url).path))
 
         async def go(url, after=None):
-            while after is not None and after not in sites["arrived"]:
-                await asyncio.sleep(0.02)
             if after is not None:
-                # the first response has arrived and is held: the navigation has changed process
-                await asyncio.sleep(1.0)
+                seen = await awatch(lambda: (after in sites["arrived"], after in responses),
+                                    lambda state: state[0] and state[1],
+                                    COMMIT_TIMEOUT_MS / 1000, lambda: asyncio.sleep(0.02))
+                if not seen.ok:
+                    return "the client never heard the response of the first goto; seen: %s" % seen.render()
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                # "commit": the first goto's domcontentloaded would wait for the body that the server holds
+                await page.goto(url, wait_until="commit", timeout=COMMIT_TIMEOUT_MS)
                 return None
             except Exception as e:
                 return str(e)
 
-        began = time.monotonic()
-        first, second = await asyncio.gather(
-            go(sites["at"]("b.test", "/partial")),
-            go(sites["at"]("c.test", "/second"), after="/partial"))
-        return first, second, time.monotonic() - began, page.url
+        first_goto = asyncio.ensure_future(go(sites["at"]("b.test", "/partial")))
+        try:
+            second = await go(sites["at"]("c.test", "/second"), after="/partial")
+        finally:
+            # the rest of the first response is sent only now, after the second goto has returned: when the first wins, its
+            # navigation commits only with the rest of /partial, and its goto may be waiting for that commit
+            sites["release"].set()
+        first = await first_goto
+        # The page lands on the winner: at once when the second won, only after the rest of /partial when the first did. Read
+        # before that, the address is still a.test, the page that was left (main dd4c623d, Linux: red for that, not for the
+        # product).
+        landed = await awatch(lambda: page.url, lambda url: landed_on(url) is not None, DEADLINE, lambda: asyncio.sleep(0.02))
+        return first, second, page.url, landed.render()
 
-    first, second, took, url = _run(firefox_binary, scenario)
-    assert first is not None and "is interrupted by another navigation" in first, first
-    assert second is None, second
-    assert took < 8, took
-    assert url == "http://c.test:" + url.split(":")[2], url
+    first, second, url, landed = _run(firefox_binary, scenario)
+    # what the server had been asked for: whether the second goto's request left at all, or waited behind the held response
+    problem = second_goto_problem(first, second, url, sites["arrived"])
+    assert problem is None, "%s; the address of the page after the release: %s" % (problem, landed)
 
 
 def test_an_iframe_refused_its_load_ends_it_and_its_error_page_is_a_navigation(firefox_binary, sites):
@@ -215,7 +239,7 @@ def test_an_iframe_removed_while_it_loads_is_aborted_then_gone(firefox_binary, s
         # insertion, whatever the machine: a test that only reads the list could read it before the frame existed)
         seen = await awatch(lambda: (counts["attached"], counts["detached"], len(page.frames)),
                             lambda state: state[0] >= 1 and state[1] >= 1 and state[2] == 1,
-                            DEADLINE + 2, lambda: page.wait_for_timeout(100))
+                            DEADLINE, lambda: page.wait_for_timeout(100))
         return [f.url for f in page.frames], seen.render()
 
     urls, seen = _run(firefox_binary, scenario)

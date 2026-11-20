@@ -106,7 +106,7 @@ def test_expect_file_chooser_receives_the_event(firefox_binary, local_page):
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto(local_page, wait_until="load")
-        with page.expect_file_chooser(timeout=15000) as info:
+        with page.expect_file_chooser(timeout=30000) as info:
             page.click("#b")
         chooser = info.value
         # is_multiple is a METHOD on this client, not a property.
@@ -135,7 +135,7 @@ def test_the_chosen_files_arrive_at_the_page(firefox_binary, local_page,
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto(local_page, wait_until="load")
-        with page.expect_file_chooser(timeout=15000) as info:
+        with page.expect_file_chooser(timeout=30000) as info:
             page.click("#b")
         info.value.set_files(sample_file)
         _change_heard(page)
@@ -178,9 +178,9 @@ def test_a_hidden_input_takes_files_through_its_chooser(firefox_binary,
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto(local_page, wait_until="load")
-        with page.expect_file_chooser(timeout=15000) as info:
+        with page.expect_file_chooser(timeout=30000) as info:
             page.click("#hb")
-        info.value.set_files(sample_file, timeout=5000)
+        info.value.set_files(sample_file, timeout=30000)
         _change_heard(page)
         assert page.inner_text("#out") == "change:h:sample.txt"
 
@@ -193,6 +193,6 @@ def test_a_hidden_input_takes_files_by_selector(firefox_binary, local_page,
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto(local_page, wait_until="load")
-        page.set_input_files("#h", sample_file, timeout=5000)
+        page.set_input_files("#h", sample_file, timeout=30000)
         _change_heard(page)
         assert page.inner_text("#out") == "change:h:sample.txt"

@@ -6,6 +6,15 @@ humanised pointer, computed with the CLIENT-SIDE code of commit 5d9ad70
 
 Run against the OLD tree only:
     PYTHONPATH=<worktree at 5d9ad70>/src python gen_golden.py > pointer_golden.json
+(`--from-old-client`, below, is that run: on any later tree `_cursor._approach` does not exist and the script refuses, naming
+the four sessions it cannot make.)
+
+THE CURRENT SERVER'S RUN, to a file, never over the golden:
+    PYTHONPATH=<this tree>/src python tests/data/pointer_golden_origin.py --from-current OUT.json
+It plays every session of the file through the current `PageDispatcher` on a virtual clock that is BOTH the sleeps AND the core's
+`time.monotonic` (a stroke counts its instants on it), drops the `stroke` and `at` tags the old client did not send, writes the file
+in the golden's own layout and says, per session, whether it is the golden's. The golden is the old client's walk; this is the check
+that the current path still draws it, and it refuses to write onto `pointer_golden.json` itself.
 
 REVISION 1 (feat/rt-dblmove): the `explicit_pointer` session, the only one with
 a `Mouse.click`, no longer carries the duplicate the client's `Mouse._click`
@@ -309,7 +318,7 @@ def dump_golden(g):
         out.append("   ]")
         out.append("  }" + ("," if n < len(names) - 1 else ""))
     out += [" }", "}"]
-    return "\r\n".join(out) + "\r\n"
+    return "\n".join(out) + "\n"
 
 
 def _server_session(spec, name):
@@ -319,14 +328,17 @@ def _server_session(spec, name):
 
     clock = T.VirtualClock()
     pointer_mod._CLOCK = clock
+    # the clock of the sleeps AND of `time.monotonic`: a stroke waits "until instant X" on the latter
     core_actions.time = SimpleNamespace(
-        sleep=clock.sleep, monotonic=time.monotonic,
+        sleep=clock.sleep, monotonic=clock.now,
         perf_counter=time.perf_counter)
     page = T.build_page(clock, T._boxes_of(name), seed=spec["seed"],
                         number=spec["number"], budget=spec["budget"],
                         hits=spec.get("hits", "all"))
     T.play(page, clock, spec["ops"])
-    return json.loads(json.dumps(page.log))
+    # `stroke` and `at` are the tags of the core's strokes, which the old client did not send
+    return [{k: v for k, v in e.items() if k not in ("stroke", "at")}
+            for e in json.loads(json.dumps(page.log))]
 
 
 def _shape(evs):  # the latency is a draw per event ordinal, not an event
@@ -397,6 +409,33 @@ def revise_standstill(path):
     })
 
 
+def from_current(out_path):
+    """The current server's run of every session of the golden, written to `out_path` in the golden's layout. Never over the
+    golden itself. True when every session is what the golden holds, event for event, latency included."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    gp = pathlib.Path(__file__).with_name("pointer_golden.json").resolve()
+    if pathlib.Path(out_path).resolve() == gp:
+        sys.exit("refusing: the golden is the old client's walk, not what the current server draws; write to another file")
+    with open(gp, newline="", encoding="utf-8") as fh:
+        text = fh.read()
+    g = json.loads(text)
+    same = True
+    for name, sc in g["scenarios"].items():
+        new = _server_session(sc["spec"], name)
+        ok = new == sc["engine_events"]
+        same = same and ok
+        print("%-22s %3d events, golden %3d: %s" % (name, len(new), len(sc["engine_events"]),
+                                                    "identical" if ok else "DIFFERS"))
+        sc["engine_events"] = new
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        fh.write(dump_golden(g))
+    print("written %s; byte for byte the golden's: %s" % (out_path, dump_golden(g) == text))
+    return same
+
+
 if __name__ == "__main__":
     import pathlib
     for flag, fn in (("--revise-mouse-click", revise_mouse_click),
@@ -406,6 +445,19 @@ if __name__ == "__main__":
             fn(sys.argv[i + 1] if len(sys.argv) > i + 1 else
                pathlib.Path(__file__).with_name("pointer_golden.json"))
             sys.exit(0)
+    if "--from-current" in sys.argv:
+        i = sys.argv.index("--from-current")
+        if len(sys.argv) <= i + 1:
+            sys.exit("--from-current needs the file to write")
+        sys.exit(0 if from_current(sys.argv[i + 1]) else 1)
+    if "--from-old-client" not in sys.argv:
+        sys.exit("nothing to do: pass --from-current OUT.json (the current server's run, to a file), --revise-mouse-click or "
+                 "--revise-standstill (explicit_pointer, in place), or --from-old-client (the old tree only)")
+    if not hasattr(_cursor, "_approach"):
+        sys.exit("refusing: `_cursor._approach` and the client-side wrappers of the walk do not exist in this tree, so none of "
+                 "the sessions %s can be made from the old client here. They are the golden because commit 5d9ad70 made them; "
+                 "run this against that tree, or use --from-current to check the current server against the file."
+                 % ", ".join(sorted(SCENARIOS)))
     out = {name: {"spec": spec, "engine_events": scenario(spec)}
            for name, spec in SCENARIOS.items()}
     json.dump(out, sys.stdout, indent=1)

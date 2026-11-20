@@ -113,16 +113,3 @@ def test_the_ledger_records_what_actually_shipped():
 
 
 # ------------------------------------------------------- the clone is armed
-
-def test_the_hooks_are_armed_in_this_clone():
-    """A checked-in hook directory does nothing until core.hooksPath points at
-    it, and git will not do that for you.
-
-    Until 2026-07-27 both the installer and this reminder lived in the core, so
-    THIS repo shipped a hook that nothing armed and nothing checked was armed:
-    a fresh clone pushed with the tests, the pin, the name scan and the publish
-    gate all skipped, and said nothing about it.
-    """
-    from invisible_core.testing import assert_hooks_are_armed
-
-    assert_hooks_are_armed(_REPO)

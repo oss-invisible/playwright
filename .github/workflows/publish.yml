@@ -164,7 +164,7 @@ jobs:
           echo "::notice::invisible-core $WANT is on the index"
 
       - name: install the package and its dev extras
-        # Its own step, BEFORE the arming below: install_hooks.py imports
+        # Its own step, BEFORE the arming below: `python -m invisible_core.hooks install` imports
         # invisible_core, and the first version of this file installed inside the
         # suite step, so the arming ran against a runner that had nothing
         # installed and died on ModuleNotFoundError. ci.yml has had this order
@@ -188,7 +188,7 @@ jobs:
 
       - name: arm the pre-push gates
         # The suite asserts core.hooksPath is set and a fresh checkout has none.
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
 
       - name: the suite
         # A tag push does not trigger the ordinary test workflow, which runs on

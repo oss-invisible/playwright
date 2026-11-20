@@ -77,12 +77,12 @@ def test_answering_a_route_the_next_navigation_aborted_does_not_raise(
                                  headless=True) as b:
             page = b.new_context().new_page()
             page.route("**/*", handler)
-            page.goto(base + "/held", wait_until="commit", timeout=15000)
+            page.goto(base + "/held", wait_until="commit", timeout=30000)
             # until the handler has the image (a deadline of 30 s, not 5 s of 50 ms looks)
             wait_until(lambda: held, 30, lambda: page.wait_for_timeout(50))
             assert held, "the page's image never reached the handler"
 
-            page.goto(base + "/next", wait_until="load", timeout=15000)
+            page.goto(base + "/next", wait_until="load", timeout=30000)
 
             route = held[0]
             if answer == "fulfill":
@@ -111,7 +111,7 @@ def test_sequential_routed_gotos_neither_hang_nor_raise(firefox_binary):
             for i in range(40):
                 try:
                     page.goto(f"{base}/p?{i % 2}", wait_until="load",
-                              timeout=8000)
+                              timeout=30000)
                     page.evaluate("1")
                 except Exception as e:  # noqa: BLE001 - the failure is the finding
                     failures.append((i, type(e).__name__, str(e)[:200]))

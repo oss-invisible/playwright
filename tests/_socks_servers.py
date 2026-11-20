@@ -26,9 +26,11 @@ documentation NUMBER of its own, so the datagrams of the measurement are told ap
 ``STUN_NUMBER``). The measurement is a UDP ASSOCIATE of its own: :attr:`Gateway.associates` and :attr:`Gateway.datagrams` count it.
 
 Everything is on loopback, so the "exit address" is made observable and
-controllable instead of real: the TCP exit is what the gateway's fake "what is
-my address" endpoint (``api.ipify.org:80``, the one the product asks) answers,
-and the UDP exit is what the fake STUN server puts in its XOR-MAPPED-ADDRESS.
+controllable instead of real: the TCP exit is what the gateway declares
+(``declare_exit``) and the lab answers when the product asks "what is my address"
+through it (``tests/_lab_egress.py``; the product asks HTTPS, which no gateway can
+answer as the service; the plain-HTTP endpoint ``api.ipify.org:80`` is still
+answered here for the tests that ask it), and the UDP exit is what the fake STUN server puts in its XOR-MAPPED-ADDRESS.
 Both are chosen by the test (``tcp_exit`` and ``udp_exit`` arguments).
 
 Any other CONNECT is really forwarded, and any other UDP datagram is really
@@ -50,7 +52,7 @@ import socket
 import struct
 import threading
 import time
-from typing import List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 #: The name the product's STUN probe sends through the relay. The relay maps it
 #: to the fake STUN server; every other destination is forwarded for real.
@@ -74,6 +76,67 @@ WHOAMI4 = ("api.ipify.org", 80)
 WHOAMI6 = ("api6.ipify.org", 80)
 
 _MAGIC = b"\x21\x12\xa4\x42"
+
+
+# ----------------------------------------------------------------------------------------------------------------
+#  The exit of a proxy that forwards for real. The question "where do I leave from" is HTTPS (api.ipify.org:443), and no gateway
+#  of the tests can answer a TLS request as the service: a proxy that FORWARDS (a CONNECT to anything outside loopback goes out for
+#  real) would carry it to the internet, and the answer would be the address of whatever machine runs the test (a GitHub runner
+#  that changes NAT in the middle of a session: ``ProxyEgressDrifted``). So such a proxy DECLARES its exit (``declare_exit``) and
+#  ``tests/_lab_egress.DeclaredExit`` answers the question with it; and as a backstop each of them refuses to forward the question
+#  (``asks_the_world``), which records it and makes the test fail (``nobody_asked_the_world``), so that a proxy that forgot to declare
+#  is a red with its name and not a flaky green.
+# ----------------------------------------------------------------------------------------------------------------
+#: The hosts of the services of the core that tell a caller its address (``invisible_core._geo._IP_ECHO_ENDPOINTS`` and
+#: ``_IPV6_ECHO_ENDPOINTS``; ``tests/test_a_launch_asks_nobody_on_the_internet_where_it_leaves_from.py`` checks that this list covers them).
+EXIT_SERVICES = ("api.ipify.org", "api6.ipify.org", "icanhazip.com", "ipv6.icanhazip.com", "checkip.amazonaws.com", "ifconfig.me")
+
+#: ``host:port`` of a proxy of the tests that forwards for real -> the exit it declares. Filled by the proxies themselves.
+_DECLARED_EXITS: Dict[str, str] = {}
+#: The questions of the exit that reached a forwarding proxy and were refused there: one sentence each, until a test reads them.
+_WORLD_QUESTIONS: List[str] = []
+
+
+def _endpoint(server: str) -> str:
+    """``host:port`` of a proxy given as ``scheme://host:port`` (or as ``host:port``)."""
+    return server.split("://", 1)[-1].rsplit("@", 1)[-1].rstrip("/")
+
+
+def declare_exit(server: str, exit_ip: str) -> None:
+    """The proxy at ``server`` forwards for real and says its exit is ``exit_ip``."""
+    _DECLARED_EXITS[_endpoint(server)] = exit_ip
+
+
+def forget_exit(server: str) -> None:
+    _DECLARED_EXITS.pop(_endpoint(server), None)
+
+
+def declared_exit_of(server: Optional[str]) -> Optional[str]:
+    """The exit a forwarding proxy of the tests declared, or None for any other proxy (one that refuses the world, or not a proxy of ours)."""
+    return _DECLARED_EXITS.get(_endpoint(server)) if server else None
+
+
+def asks_the_world(server: str, host: str, port: int) -> bool:
+    """True, and the question is recorded, when a CONNECT to ``host:port`` is the question of the exit: the proxy must refuse it, not forward it."""
+    if host.lower() not in EXIT_SERVICES:
+        return False
+    _WORLD_QUESTIONS.append("%s was asked %s:%d: the question of the exit reached a proxy that would have forwarded it to the internet" % (
+        server, host, port))
+    return True
+
+
+def nobody_asked_the_world() -> List[str]:
+    """The questions of the exit refused since the last call (and forgets them): empty when every one was answered by the lab."""
+    asked = list(_WORLD_QUESTIONS)
+    del _WORLD_QUESTIONS[:]
+    return asked
+
+
+def _lab_exit() -> str:
+    """The exit of the lab (``tests/_lab_egress.LAB_EGRESS_IP``), imported when asked."""
+    from _lab_egress import LAB_EGRESS_IP
+
+    return LAB_EGRESS_IP
 
 
 def _recv_exact(s: socket.socket, n: int) -> bytes:
@@ -152,6 +215,11 @@ class FakeStun:
 class Gateway:
     """A SOCKS5 server. ``udp`` is ``"relay"`` or ``"refuse"`` (reply code 7)."""
 
+    #: Whether a CONNECT that is not special is forwarded for real, past loopback: such a gateway declares ``tcp_exit`` as its exit
+    #: (``declare_exit``). A subclass that refuses everything but loopback (``tests/_doh_servers.DohGateway``) sets False: it cannot carry the
+    #: question of the exit anywhere, and the question is left to what answers it.
+    forwards_for_real = True
+
     def __init__(self, *, udp: str, tcp_exit: str, udp_exit: str,
                  user: Optional[str] = None, password: Optional[str] = None,
                  relay_host: str = "127.0.0.1", rtt_ms: int = 0,
@@ -174,6 +242,22 @@ class Gateway:
         #: Whether the TCP connections the gateway opens for a CONNECT also leave from ``exit_host`` (as its datagrams do): a server that
         #: is reachable DIRECT then tells a connection of the proxy from a connection of the browser by the source.
         self.tcp_from_exit = tcp_from_exit
+        #: While this Event is set to a cleared state, every answer of the gateway on a control connection waits for it (a
+        #: handshake the test holds, whatever the speed of the machine): None, the default, holds nothing. A test sets it after
+        #: the launch (the core's own probe goes through the gateway before the browser exists) and opens it when it chooses.
+        self.gate: Optional[threading.Event] = None
+        #: The same hold, one control connection at a time: ``hold(index, kind)`` is asked before each answer of the gateway on a
+        #: control connection, with the ``index`` of that connection in ``accepted`` and what it asked for (``kind``: None while only the
+        #: greeting is known, then ``"connect"``, ``"associate"`` or ``"other"``), and returns the Event the answer waits for (or None: no
+        #: hold). A test holds the handshakes it chooses (the ASSOCIATEs begun from an instant on, one connection by its index) and
+        #: lets every other one run, whatever the speed of the machine; None, the default, holds nothing.
+        self.hold: Optional[Callable[[int, Optional[str]], Optional[threading.Event]]] = None
+        #: Every request the gateway read on a control connection, in order, as (seconds from t0, index of the connection in
+        #: ``accepted``, kind, detail): ``"greeting"`` when the connection was accepted (the first bytes of the client), then
+        #: ``"connect"`` (detail ``host:port``), ``"associate"`` (detail ``association #n`` of ``associations``, ``refused`` when
+        #: UDP is refused) or ``"other"``. The EXCHANGES of a road, counted by what the gateway saw and not by how long they took.
+        self.requests: List[Tuple[float, int, str, str]] = []
+        self._local = threading.local()
         #: Whether each chunk of a forwarded TCP stream also waits half the round trip (a far gateway), as the datagrams do.
         self.tcp_data_delay = tcp_data_delay
         self.tcp_exit = tcp_exit
@@ -193,6 +277,9 @@ class Gateway:
         self.associations: List[List[Optional[float]]] = []
         #: Every datagram the relay carried out, as (host as sent, port, address type, seconds from t0).
         self.datagram_log: List[Tuple[str, int, int, float]] = []
+        #: Every datagram the relay carried out, as (host as sent, port, index in ``associations`` of the association it came
+        #: on, seconds from t0): which association carried a datagram, not only when it left.
+        self.datagram_via: List[Tuple[str, int, int, float]] = []
         #: Every datagram the relay carried out, as (host, port, payload).
         self.datagrams: List[Tuple[str, int, bytes]] = []
         #: The local port of the socket each granted association sends from: what a server behind the gateway sees as the port
@@ -209,6 +296,8 @@ class Gateway:
         self._listener.listen(32)
         self.port: int = self._listener.getsockname()[1]
         self._closed = False
+        if self.forwards_for_real:
+            declare_exit(self.server, tcp_exit)
         threading.Thread(target=self._accept, daemon=True).start()
 
     # --- what the test hands to the product ---------------------------------
@@ -234,6 +323,7 @@ class Gateway:
 
     def close(self) -> None:
         self._closed = True
+        forget_exit(self.server)
         for s in (self._listener,):
             try:
                 s.close()
@@ -248,7 +338,20 @@ class Gateway:
         self.close()
 
     # --- the TCP side --------------------------------------------------------
+    def _request(self, kind: str, detail: str = "") -> None:
+        """Record a request of the client on the control connection of this thread, and what it asked for (``hold`` is told)."""
+        self._local.kind = None if kind == "greeting" else kind
+        self.requests.append((time.monotonic() - self.t0, getattr(self._local, "index", -1), kind, detail))
+
     def _send(self, c: socket.socket, data: bytes) -> None:
+        gate = self.gate
+        if gate is not None:
+            gate.wait(120)
+        hold = self.hold
+        if hold is not None:
+            held = hold(getattr(self._local, "index", -1), getattr(self._local, "kind", None))
+            if held is not None:
+                held.wait(120)
         if self.rtt:
             time.sleep(self.rtt)
         c.sendall(data)
@@ -259,8 +362,16 @@ class Gateway:
                 conn, _ = self._listener.accept()
             except OSError:
                 return
+            index = len(self.accepted)
             self.accepted.append(time.monotonic() - self.t0)
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._run, args=(conn, index), daemon=True).start()
+
+    def _run(self, conn: socket.socket, index: int) -> None:
+        """One control connection: remembers its index (for ``hold`` and ``requests``), then serves it."""
+        self._local.index = index
+        self._local.kind = None
+        self.requests.append((self.accepted[index], index, "greeting", ""))
+        self._handle(conn)
 
     def _greet(self, c: socket.socket) -> bool:
         ver, n = _recv_exact(c, 2)
@@ -309,10 +420,12 @@ class Gateway:
             ver, cmd, _rsv = _recv_exact(c, 3)
             host, port = self._read_address(c)
             if cmd == 1:
+                self._request("connect", "%s:%d" % (host, port))
                 self._connect(c, host, port)
             elif cmd == 3:
                 self._associate(c)
             else:
+                self._request("other", "command %d" % cmd)
                 self._send(c, self._reply(7))
         except (OSError, ConnectionError):
             pass
@@ -332,10 +445,10 @@ class Gateway:
     def _open_upstream(self, target: Tuple[str, int]) -> socket.socket:
         """The TCP connection of a CONNECT: from ``exit_host`` when ``tcp_from_exit``, else from wherever the system chooses."""
         if not self.tcp_from_exit:
-            return socket.create_connection(target, timeout=10)
+            return socket.create_connection(target, timeout=30)
         up = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            up.settimeout(10)
+            up.settimeout(30)
             up.bind((self.exit_host, 0))
             up.connect(target)
         except OSError:
@@ -361,6 +474,9 @@ class Gateway:
             body = b"<html><body>behind the gateway</body></html>"
             self._send(c, b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\n"
                       b"Connection: close\r\n\r\n%s" % (len(body), body))
+            return
+        if self.forwards_for_real and asks_the_world(self.server, host, port):
+            self._send(c, self._reply(2))      # not allowed: the exit of this gateway is declared, it is not asked of the internet
             return
         try:
             up = self._open_upstream(self._target(host, port))
@@ -434,10 +550,13 @@ class Gateway:
     def _associate(self, c: socket.socket) -> None:
         self.associates += 1
         if self.udp == "refuse":
+            self._request("associate", "refused")
             self._send(c, self._reply(7))
             return
         record: List[Optional[float]] = [time.monotonic() - self.t0, None]
         self.associations.append(record)
+        index = next(i for i, r in enumerate(self.associations) if r is record)
+        self._request("associate", "association #%d" % index)
         relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         relay.bind((self.relay_host, 0))
         out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -487,6 +606,7 @@ class Gateway:
                     payload = d[i + 2:]
                     self.datagrams.append((host, dport, payload))
                     self.datagram_log.append((host, dport, atyp, time.monotonic() - self.t0))
+                    self.datagram_via.append((host, dport, index, time.monotonic() - self.t0))
                     routed = self._route(host, dport, atyp, payload, out_port, answer)
                     if routed is None:
                         continue
@@ -573,16 +693,23 @@ class Socks5TcpOnly:
     candidates before Fix C.
     """
 
-    def __init__(self):
+    def __init__(self, exit_ip: Optional[str] = None):
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(16)
         self.port = self._srv.getsockname()[1]
+        #: It relays a CONNECT for real, so it declares its exit (what a launch behind it is told: the lab's, unless a test gives another).
+        self.exit_ip = exit_ip or _lab_exit()
+        declare_exit(self.server, self.exit_ip)
         self.udp_associate_attempts = 0
         self._stop = False
         self._t = threading.Thread(target=self._serve, daemon=True)
         self._t.start()
+
+    @property
+    def server(self) -> str:
+        return "socks5://127.0.0.1:%d" % self.port
 
     def _serve(self):
         while not self._stop:
@@ -631,8 +758,12 @@ class Socks5TcpOnly:
                 conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")  # cmd not supported
                 conn.close()
                 return
+            if asks_the_world(self.server, addr, port):
+                conn.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # not allowed: the exit is declared, not asked of the internet
+                conn.close()
+                return
             try:
-                upstream = socket.create_connection((addr, port), timeout=15)
+                upstream = socket.create_connection((addr, port), timeout=30)
             except OSError:
                 conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # host unreachable
                 conn.close()
@@ -665,6 +796,7 @@ class Socks5TcpOnly:
 
     def close(self):
         self._stop = True
+        forget_exit(self.server)
         try:
             self._srv.close()
         except Exception:

@@ -16,7 +16,8 @@ from invisible_core import SessionLocale, persona_cookies, prepare_session_geo, 
 from ._engine import assert_wire_version, resolve_executable
 from invisible_core import configure_proxy as _configure_proxy_shared
 from invisible_core._offloop import off_the_loop
-from ._reaper import SessionToken, guard_for
+from invisible_core.process import SessionToken, guard_for
+from ._juggler._reaped import final_reap
 
 
 class InvisiblePlaywright(_session.CommonLaunch):
@@ -53,8 +54,8 @@ class InvisiblePlaywright(_session.CommonLaunch):
         self._extra_args = list(extra_args or [])
         self._humanize = humanize
         # See the sync launcher: who draws the cursor path (this package by
-        # default, the browser under INVPW_CURSOR_ENGINE=binary, nobody when
-        # humanize is falsy). Decided here because the prefs depend on it.
+        # default, nobody when humanize is falsy or INVPW_CURSOR_ENGINE=off).
+        # Decided here because the prefs depend on it.
         self._cursor_engine = resolve_cursor_engine(humanize)
         # See the sync launcher: independent of `humanize`, deliberately.
         # ⛔ NOT `bool(...)`: that would collapse None - "the caller did not
@@ -123,6 +124,7 @@ class InvisiblePlaywright(_session.CommonLaunch):
         self._locale = _geo.locale
         self._webrtc_egress_ip = _geo.egress_ip
         self._geolocation = _geo.geolocation_override()
+        self._udp_exit = _geo.udp_exit
         # binary_path= never reaches ensure_binary(), so the engine check lives
         # on the resolved executable rather than inside the fetcher.
         executable = resolve_executable(self._binary_path)
@@ -359,7 +361,7 @@ class InvisiblePlaywright(_session.CommonLaunch):
                 # ⛔ NOT ON THE LOOP: `reap` waits for the tree of the session to be gone. It runs in a thread of its own
                 # (`off_the_loop`); a cancellation of this task stops the waiting and not the reaping, which runs to its end.
                 try:
-                    await off_the_loop(self._lifetime_guard.reap, self._session_token)
+                    await off_the_loop(final_reap, self._lifetime_guard, self._session_token)
                 except asyncio.CancelledError as stop:
                     cancelled = stop
                 except Exception:

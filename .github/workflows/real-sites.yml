@@ -1,0 +1,331 @@
+# real-sites.yml - on real pages, does the published wrapper get the same outcome as stock Firefox driven by stock Playwright, on the same machine, in the same window of time?
+#
+# ONE QUESTION. It does not measure the quality of an address or a percentage of blocks: a GitHub runner has a datacenter address and no proxy is used. Where stock Firefox
+# is blocked as well, the cell carries no information and is written as such. It is red only where stock gets through and the wrapper does not.
+#
+# WHAT RUNS (per system, Linux under Xvfb with a window, and Windows; in a job everything in a row, one browser at a time):
+#   1. two clean venvs: `invisible-playwright==<the version the index serves now>`, and Playwright at scripts/playwright_pin.txt with its Firefox;
+#   2. the pass of stock over the whole list (scripts/run_real_sites.py), then the pass of ours;
+#   3. only for the cells that differ in the first pass: two more passes of those sites, stock, ours, stock, ours;
+#   4. the judge (scripts/judge_real_sites.py): the table, three numbers, the exit code. Its rule is in its own docstring and tests/test_real_sites_judge.py.
+# The cells (JSON) and the summary are the artifacts of the run. The same conditions for both browsers: a window, one viewport, no proxy, the language of the runner.
+#
+# WHEN (never by hand, except to run a whole round again):
+#   * `workflow_run` of publish.yml, completed with success: the round after a publication, on the packages that just went out;
+#   * `push` to main and `pull_request` that touch the five files below: the round proves itself, on the packages published at that moment;
+#   * `workflow_dispatch`: to run a whole round again.
+#
+# VERSION. After a publication the version is the tag of the publish run (`head_branch` without its `v`); a run that is not of a `v*` tag makes the plan red. The other
+# events read the version the index serves now.
+#
+# WHY PER PUSH. The admission judges a list when the list changes; the round measures at every push. A push that does not touch tests/realsites/sites.json does not run the
+# admission again, or every push of the pull request would resample the real sites and could go red for a reason that is nobody's change. The plan decides it per push:
+# a push is compared with the head it replaced; if that compare cannot be made (a forced push, no `before`, an API error) the admission runs, in doubt measure.
+#
+# ADMISSION. A push to a pull request that changes tests/realsites/sites.json runs the admission AND the round (14 jobs: the plan, 2 of the round, 10 passes of the admission and
+# its report). The admission is stock alone, five passes per site and per system (a job per pass, so that a list of thirty sites stays inside the limit of a job). It is
+# red only for a defect of the list, never for the luck of one site: an invalid list (a `min_informative` in the file is one), a pass that is missing, a site never good in
+# any pass of a system that is not of the class protetta (a wrong marker, or a fixed block), more than 4 protetta, more than 20 sites. A site good in some passes stays,
+# and the report gives its count per system ("4 of 5 on linux"): every real site has a rare failure on the side of stock, five passes cannot tell it from instability,
+# and in the round it only removes information from that cell. The minimum of information is not sampled and is not in the file: the judge asks for half the sites,
+# rounded up. Where stock does not find the marker, its cell in the artifact also holds the status, the title and the first 40 element ids of the page, to fix the marker
+# in the same pull request; the judge ignores them.
+#
+# TOKEN. The token of the workflow is in three steps and nowhere else: the plan and the report of the admission (they call `gh`) and the install and fetch of the
+# round (the engine is downloaded from GitHub; that step launches no browser). A step that runs the passes never sees it.
+#
+# No click and no handling of a consent wall anywhere: both browsers see what the page shows.
+
+name: real-sites
+
+on:
+  workflow_run:
+    workflows: [publish]
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - tests/realsites/sites.json
+      - scripts/run_real_sites.py
+      - scripts/judge_real_sites.py
+      - tests/test_real_sites_judge.py
+      - .github/workflows/real-sites.yml
+  pull_request:
+    paths:
+      - tests/realsites/sites.json
+      - scripts/run_real_sites.py
+      - scripts/judge_real_sites.py
+      - tests/test_real_sites_judge.py
+      - .github/workflows/real-sites.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PYTHONUTF8: "1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Whether this run also admits a list, and the version of the package it tests, read ONCE so that both systems test the same one.
+  plan:
+    name: plan
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      admission: ${{ steps.plan.outputs.admission }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          ACTION: ${{ github.event.action }}
+          BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          admission=$(python3 - <<'PY'
+          import os
+          import subprocess
+
+          LIST = "tests/realsites/sites.json"
+          ZEROS = "0" * 40
+
+
+          def gh_files(endpoint, jq):
+              done = subprocess.run(["gh", "api", endpoint, "--paginate", "--jq", jq], capture_output=True, text=True, check=True)
+              return done.stdout.split()
+
+
+          def decide(event, action, before, head, repo, pr, files_of):
+              """Does this run admit the list? Only when this push changes it. A push (synchronize) is compared with the head it replaced; a pull request that is
+              opened or reopened is judged on all its files. A compare that cannot be made (a forced push, no `before`, an API error) runs the admission: in doubt, measure."""
+              if event != "pull_request":
+                  return False
+              if action == "synchronize":
+                  if not before or before == ZEROS or not head:
+                      return True
+                  endpoint, jq = "repos/%s/compare/%s...%s" % (repo, before, head), ".files[].filename"
+              else:
+                  endpoint, jq = "repos/%s/pulls/%s/files" % (repo, pr), ".[].filename"
+              try:
+                  return LIST in files_of(endpoint, jq)
+              except Exception:
+                  return True
+
+
+          if __name__ == "__main__":
+              e = os.environ
+              print("true" if decide(e["EVENT"], e.get("ACTION", ""), e.get("BEFORE", ""), e.get("HEAD_SHA", ""), e["REPO"], e.get("PR", ""), gh_files) else "false")
+          PY
+          )
+          if [ "$EVENT" = workflow_run ]; then
+            case "$HEAD_BRANCH" in
+              v*)
+                version="${HEAD_BRANCH#v}"
+                ;;
+              *)
+                echo "::error::the publish run is of '$HEAD_BRANCH', not of a v* tag: the version of the package is not known"
+                exit 1
+                ;;
+            esac
+          else
+            version=$(python3 -c 'import json, urllib.request; print(json.load(urllib.request.urlopen("https://pypi.org/pypi/invisible-playwright/json", timeout=60))["info"]["version"])')
+          fi
+          echo "admission=$admission" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "admission: $admission, invisible-playwright $version"
+
+  round:
+    name: round (${{ matrix.os }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false      # one system failing must not hide the other's table
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+
+      - name: Linux runtime libraries for the browsers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-0 libdbus-glib-1-2 libasound2t64
+
+      # Two venvs that share nothing: what a user gets from the index, and what a user of stock Playwright gets. The wrapper is installed by its published version
+      # (the index may lag a few minutes behind a publication: only the install is asked again), then its engine is fetched the way a user fetches it.
+      - name: The two clean venvs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}   # the fetch of the engine is a download from GitHub; nothing here opens a page
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then BIN=Scripts; EXE=python.exe; else BIN=bin; EXE=python; fi
+          python -m venv venvs/ours
+          python -m venv venvs/stock
+          echo "OURS_PY=venvs/ours/$BIN/$EXE" >> "$GITHUB_ENV"
+          echo "STOCK_PY=venvs/stock/$BIN/$EXE" >> "$GITHUB_ENV"
+          OURS="venvs/ours/$BIN/$EXE"; STOCK="venvs/stock/$BIN/$EXE"
+          PIN=$(tr -d '[:space:]' < scripts/playwright_pin.txt)
+          "$STOCK" -m pip install --quiet --disable-pip-version-check "playwright==$PIN"
+          if [ "$RUNNER_OS" = Linux ]; then "$STOCK" -m playwright install --with-deps firefox; else "$STOCK" -m playwright install firefox; fi
+          for attempt in 1 2 3 4 5 6; do
+            if "$OURS" -m pip install --quiet --disable-pip-version-check "invisible-playwright==$VERSION"; then break; fi
+            if [ "$attempt" = 6 ]; then echo "::error::the index does not give invisible-playwright==$VERSION"; exit 1; fi
+            sleep 20
+          done
+          "$OURS" -m invisible_playwright fetch
+
+      # The pass of stock, the pass of ours, the cells that differ, and for those only two more passes of each in the order stock, ours, stock, ours.
+      - name: The passes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cells
+          visit() {   # browser, file of the cells, then what run_real_sites.py takes
+            local browser="$1" out="$2" py="$STOCK_PY"
+            shift 2
+            if [ "$browser" = ours ]; then py="$OURS_PY"; fi
+            if [ "$RUNNER_OS" = Linux ]; then
+              xvfb-run -a -s "-screen 0 1920x1080x24" "$py" scripts/run_real_sites.py --browser "$browser" --out "$out" "$@"
+            else
+              "$py" scripts/run_real_sites.py --browser "$browser" --out "$out" "$@"
+            fi
+          }
+          visit stock cells/stock-1.json
+          visit ours cells/ours-1.json
+          IDS=$(python scripts/judge_real_sites.py differing --sites tests/realsites/sites.json --stock cells/stock-1.json --ours cells/ours-1.json)
+          echo "cells that differ: ${IDS:-none}"
+          if [ -n "$IDS" ]; then
+            for n in 2 3; do
+              visit stock "cells/stock-$n.json" --only "$IDS"
+              visit ours "cells/ours-$n.json" --only "$IDS"
+            done
+          fi
+
+      - name: The judge
+        shell: bash
+        run: |
+          set +e
+          python scripts/judge_real_sites.py judge --sites tests/realsites/sites.json \
+            --stock cells/stock-*.json --ours cells/ours-*.json --summary cells/summary.md --result cells/result.json
+          code=$?
+          {
+            echo "### $RUNNER_OS: invisible-playwright $VERSION against stock Playwright $(tr -d '[:space:]' < scripts/playwright_pin.txt)"
+            echo
+            cat cells/summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: The cells and the summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: real-sites-${{ runner.os }}
+          path: cells/
+          if-no-files-found: ignore
+
+  # One pass of stock over the list, on one system: five of them per system make the admission.
+  admit:
+    name: admit (${{ matrix.os }}, pass ${{ matrix.repeat }})
+    needs: plan
+    if: needs.plan.outputs.admission == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+        repeat: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+
+      - name: Linux runtime libraries for the browser
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-0 libdbus-glib-1-2 libasound2t64
+
+      - name: Stock Playwright and its Firefox, then one pass
+        shell: bash
+        env:
+          REPEAT: ${{ matrix.repeat }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then BIN=Scripts; EXE=python.exe; else BIN=bin; EXE=python; fi
+          python -m venv venvs/stock
+          STOCK="venvs/stock/$BIN/$EXE"
+          PIN=$(tr -d '[:space:]' < scripts/playwright_pin.txt)
+          "$STOCK" -m pip install --quiet --disable-pip-version-check "playwright==$PIN"
+          if [ "$RUNNER_OS" = Linux ]; then "$STOCK" -m playwright install --with-deps firefox; else "$STOCK" -m playwright install firefox; fi
+          mkdir -p cells
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a -s "-screen 0 1920x1080x24" "$STOCK" scripts/run_real_sites.py --browser stock --diagnose --out "cells/stock-$REPEAT.json"
+          else
+            "$STOCK" scripts/run_real_sites.py --browser stock --diagnose --out "cells/stock-$REPEAT.json"
+          fi
+
+      - name: The cells
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: admit-${{ runner.os }}-${{ matrix.repeat }}
+          path: cells/
+          if-no-files-found: ignore
+
+  admission:
+    name: admission report
+    needs: admit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+
+      - name: Which sites are the same five of five, and the minimum to write
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'admit-*' --dir admit
+          set +e
+          python scripts/judge_real_sites.py admit --sites tests/realsites/sites.json \
+            --os linux admit/admit-Linux-*/stock-*.json --os windows admit/admit-Windows-*/stock-*.json \
+            --summary admission.md
+          code=$?
+          cat admission.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: The report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: admission
+          path: admission.md
+          if-no-files-found: ignore

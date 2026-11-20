@@ -55,6 +55,8 @@ EXIT_HOST = "127.0.0.2"
 #: The exit of a lab that a browser accepts as a real one: a documentation address (RFC 5737, TEST-NET-2, like the TURN server's) that
 #: the host holds on its loopback interface (`lab_exit_address`). A mapped address in 127/8 is thrown away by nICEr as bogus.
 LAB_EXIT = "198.51.100.9"
+#: The path of an empty page of the page server (no PeerConnection): see :attr:`Page.warm_url`.
+WARM_PATH = "/warm"
 MAGIC = 0x2112A442
 PASSWORD = "qwerty"
 REALM = "hermetic"
@@ -111,6 +113,8 @@ def _message(mtype: int, tid: bytes, attrs: bytes, key: Optional[bytes] = None) 
 
 class TurnServer:
     """UDP TURN server on 127.0.0.1. ``seen`` is every datagram as (source ip, source port, STUN type), in order;
+    ``requests`` the same datagrams as (monotonic time, transaction id, STUN type, carries credentials): a retransmission has the
+    transaction id of the request it repeats, so the TRANSACTIONS of a road are the distinct ids (:meth:`transactions`);
     ``allocations`` the successful Allocates as (source ip, source port, username, time)."""
 
     def __init__(self) -> None:
@@ -119,8 +123,17 @@ class TurnServer:
         self.address: Tuple[str, int] = self.sock.getsockname()
         self.seen: List[Tuple[str, int, int]] = []
         self.allocations: List[Tuple[str, int, str, float]] = []
+        self.requests: List[Tuple[float, bytes, int, bool]] = []
         self._closed = False
         threading.Thread(target=self._serve, daemon=True).start()
+
+    def transactions(self, mtype: int = 0x0003) -> List[Tuple[float, bytes, int, bool]]:
+        """The first datagram of each transaction of type ``mtype`` (Allocate by default), in order: a retransmission is not another one."""
+        first: Dict[bytes, Tuple[float, bytes, int, bool]] = {}
+        for request in list(self.requests):
+            if request[2] == mtype:
+                first.setdefault(request[1], request)
+        return sorted(first.values(), key=lambda r: r[0])
 
     def close(self) -> None:
         self._closed = True
@@ -137,6 +150,7 @@ class TurnServer:
             mtype, tid = struct.unpack("!H", data[:2])[0], data[8:20]
             self.seen.append((src[0], src[1], mtype))
             attrs = _attrs(data)
+            self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
             if mtype == 0x0003:                                   # Allocate
                 if 0x0008 not in attrs or 0x0006 not in attrs:   # no credentials: 401 with a realm and a nonce
                     err = _attr(0x0009, b"\x00\x00\x04\x01Unauthorized") + _attr(0x0014, REALM.encode()) + _attr(0x0015, NONCE.encode())
@@ -257,7 +271,7 @@ class Chain(DohGateway):
             why = "the TURN server heard the browser but no Allocate was answered with credentials: the 401 round trip did not finish"
         elif result.get("status") == "TIMEOUT":
             ends = [e for _s, e in self.associations if e is not None]
-            why = ("the allocation succeeded but too late for the tick of 2000 ms: the association handshakes alone ended at %s s"
+            why = ("the allocation succeeded but the page read no server-reflexive candidate: the association handshakes ended at %s s"
                    % ", ".join("%.2f" % e for e in ends))
         else:
             why = "the srflx of the page is not the address the TURN server saw (%s)" % [("%s:%d" % (a[0], a[1])) for a in self.turn.allocations]
@@ -275,8 +289,11 @@ const finish = (s) => { status = s; window.__result.status = s; window.__done = 
 document.addEventListener('DOMContentLoaded', () => {
   mark('dom');
   // the tick of a leak test: 2 seconds after the page starts. It stops the moment a srflx arrives, before the POST: what the
-  // test asks is whether the srflx came before the tick, not whether the POST came back within it.
+  // test asks is whether the srflx came before the tick, not whether the POST came back within it. The tick is the model of the
+  // page and decides nothing: a srflx that comes after it is still read and posted (`late`), and the test judges the road by the
+  // stamps of the gateway, the DoH and the TURN server.
   const tick = setInterval(() => { if (status === 'PENDING') { mark('tick'); finish('TIMEOUT'); } clearInterval(tick); }, 2000);
+  window.__result.born = Date.now();
   const pc = new RTCPeerConnection({iceServers: [{urls: ['turn:%(turn)s:%(port)d?transport=udp'], username: 'challenge-' + Date.now(), credential: '%(password)s'}]});
   pc.createDataChannel('x');
   mark('pc');
@@ -285,13 +302,18 @@ document.addEventListener('DOMContentLoaded', () => {
   pc.onicecandidate = async (e) => {
     if (!e.candidate) return;
     window.__result.candidates.push(e.candidate.candidate);
-    if (e.candidate.candidate.indexOf(' typ srflx ') < 0 || status !== 'PENDING' || window.__result.srflx) return;
+    if (e.candidate.candidate.indexOf(' typ srflx ') < 0 || window.__result.srflx) return;
+    window.__result.late = status !== 'PENDING';
     clearInterval(tick);
     mark('srflx');
     window.__result.srflx = e.candidate.candidate;
     const r = await fetch('/verdict', {method: 'POST', body: JSON.stringify({srflx: e.candidate.candidate})});
+    const ok = (await r.json()).ok;
+    // `posted` and the final status are set in one step, after the last await: a test that waits for `posted` and reads the status never reads
+    // the one of a page whose verdict has not been read yet (PENDING or the tick's TIMEOUT).
     mark('posted');
-    finish((await r.json()).ok ? 'DONE' : 'REFUSED');
+    window.__result.posted = true;
+    finish(ok ? 'DONE' : 'REFUSED');
   };
   pc.createOffer().then((o) => pc.setLocalDescription(o));
 });
@@ -315,7 +337,8 @@ class Page:
 
             def do_GET(self):
                 outer.hits.append((self.headers.get("Host", ""), self.path))
-                body = (PAGE_HTML % {"turn": TURN_NAME, "port": TURN_PORT, "password": PASSWORD}).encode()
+                body = (b"<!doctype html><meta charset=utf-8><title>warm</title>" if self.path == WARM_PATH else
+                        (PAGE_HTML % {"turn": TURN_NAME, "port": TURN_PORT, "password": PASSWORD}).encode())
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -345,6 +368,11 @@ class Page:
     @property
     def url(self) -> str:
         return "http://%s:%d/" % (PAGE_NAME, self.port)
+
+    @property
+    def warm_url(self) -> str:
+        """An empty page of the same server: opened first, it makes the browser learn the proxy and fill its pool of associations."""
+        return "http://%s:%d%s" % (PAGE_NAME, self.port, WARM_PATH)
 
     def close(self) -> None:
         self.httpd.shutdown()

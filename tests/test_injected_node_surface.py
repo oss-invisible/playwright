@@ -73,11 +73,14 @@ function arrivedFromOutside(el, label) {
 const WATCHED = ['b', 'l', 'i'].map(id => document.getElementById(id));
 WATCHED.forEach(remember);
 
+// The watcher counts its own looks (`window.__looks`), so a test that wants a look made AFTER something it did waits for the counter to move, not for a time.
+window.__looks = 0;
 setInterval(() => {
   const f = [];
   WATCHED.forEach((el, n) => f.push(...arrivedFromOutside(el, 'el' + n)));
   document.getElementById('verdict').textContent =
       f.length ? ('DIRTY ' + f.join(' ')) : 'clean';
+  window.__looks += 1;
 }, 50);
 
 // ⛔ THE CONTROL FOR THE WATCHER ITSELF. The page stamps a fresh element with
@@ -172,8 +175,12 @@ def test_the_aria_snapshot_writes_nothing_the_page_can_see(firefox_binary):
         call = ("(injected, o) => injected.ariaSnapshot("
                 "document.documentElement, o)")
 
+        looks_before = page.evaluate("window.__looks")
         snapshot = d.injected.call(frame, call, {"mode": "ai"})
-        page.wait_for_timeout(200)
+        # until the watcher has looked twice more (a condition with a deadline, not 200 ms): the second look began after the call above had returned,
+        # so the verdict read below is of the page as the snapshot left it. A watcher that stops ends red at the deadline.
+        assert wait_until(lambda: page.evaluate("window.__looks") >= looks_before + 2, 30, lambda: page.wait_for_timeout(50)), (
+            "the watcher of the page did not look again after the snapshot: its verdict below would be of the page before it")
 
         # ⛔ THE BRANCH HAS TO HAVE RUN, or this test goes green on a build
         # where nothing was written and says nothing about confinement. `ref=`
@@ -208,14 +215,18 @@ def test_the_default_path_does_not_even_write_in_the_sandbox(firefox_binary):
             seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto(site.url)
-        page.wait_for_timeout(200)
+        # until the watcher has looked once (a condition with a deadline, not 200 ms)
+        assert wait_until(lambda: page.evaluate("window.__looks") >= 1, 30, lambda: page.wait_for_timeout(50)), "the watcher of the page never ran"
 
         d = _page_dispatcher(page)
         frame = d.actions.lifecycle.main_frame
+        looks_before = page.evaluate("window.__looks")
         d.injected.call(frame,
                         "(injected, o) => injected.ariaSnapshot("
                         "document.documentElement, o)", {"mode": "raw"})
-        page.wait_for_timeout(200)
+        # until it has looked twice more (the second look began after the call returned), not 200 ms: the verdict below is of the page as the call left it
+        assert wait_until(lambda: page.evaluate("window.__looks") >= looks_before + 2, 30, lambda: page.wait_for_timeout(50)), (
+            "the watcher of the page did not look again after the call")
 
         from_sandbox = d.injected.evaluate(
             frame, "(() => { const el = document.getElementById('b');"

@@ -186,6 +186,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # main, for the tests that compare a list of this change with the list of main (tests/test_the_e2e_tests_do_not_wait_on_clocks.py: the debt of
+      # the e2e tests only shrinks). The checkout is one commit deep; without this the comparison has nothing to read and the test says so.
+      - name: main, to compare the lists that may only shrink
+        shell: bash
+        run: git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
+
       - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
@@ -203,10 +209,10 @@ jobs:
         # three repos that existed then made the assertion (two now, since
         # invisible_firefox was deleted on 2026-08-18), but only the core's CI
         # had this step, so both consumers went red on it. Do here what a
-        # developer does once. It also means install_hooks.py is exercised on
+        # developer does once. It also means `python -m invisible_core.hooks install` is exercised on
         # every runner instead of only on the one machine that ever ran it by
         # hand.
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
 
       - name: undefined names and duplicate definitions
         # F821 (undefined name) and F811 (redefinition) only. Not a style pass:
@@ -221,6 +227,12 @@ jobs:
         # gate rather than a cleanup backlog. Keep it that way.
         run: |
           python -m ruff check --select F821,F811,F601 --no-cache --output-format concise .
+
+      # The preloaded-intermediates list is a file of the repository (ci/intermediates.json, empty, the sha256 in ci/intermediates.pin.json): with
+      # STEALTHFOX_INTERMEDIATES set the core neither downloads nor checks Mozilla's.
+      - name: The intermediates list (a fixed file of the repository)
+        shell: bash
+        run: python scripts/ci_lab_intermediates.py set --pin ci/intermediates.pin.json
 
       # The GeoIP database is made by the repository (scripts/ci_lab_geoip.py: the same bytes on every run, the sha256 in ci/geoip.json), never a
       # site and never a licensed file: without STEALTHFOX_GEOIP_MMDB the core asks GitHub which database is the latest on every call

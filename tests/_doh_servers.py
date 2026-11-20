@@ -240,6 +240,11 @@ class FakeDoh:
         self._failed: Set[Tuple[str, int]] = set()
         #: Every query, in order.
         self.queries: List[DohQuery] = []
+        #: The same questions, in the same order, as (name, type, connection): ``connection`` is what the one that handed the
+        #: socket to :meth:`serve` called it (the index of the control connection of the gateway that carried the CONNECT to this
+        #: DoH; None for a socket nobody named). It says WHICH connection carried each question, exactly, with no guess from ports.
+        self.question_connections: List[Tuple[str, int, Optional[int]]] = []
+        self._local = threading.local()
         #: The names for which this server answered a type 65 (HTTPS) query WITH DATA. It never does: the retail Firefox reads
         #: h3 at its first visit when the DNS answer carries that record, so a test that expects h2 first (the h3 e2e) asserts
         #: that this stays empty, and says so if the server learns to serve it.
@@ -316,8 +321,10 @@ class FakeDoh:
                 return
             threading.Thread(target=self.serve, args=(conn, "direct"), daemon=True).start()
 
-    def serve(self, sock: socket.socket, via: str) -> None:
-        """Serve one connection (TLS first) that arrived by ``via``. Blocks until it ends, and closes ``sock``."""
+    def serve(self, sock: socket.socket, via: str, connection: Optional[int] = None) -> None:
+        """Serve one connection (TLS first) that arrived by ``via``, named ``connection`` by whoever hands it over (see
+        :attr:`question_connections`). Blocks until it ends, and closes ``sock``."""
+        self._local.connection = connection
         try:
             sock.settimeout(60)
             tls = self._context.wrap_socket(sock, server_side=True)
@@ -405,6 +412,7 @@ class FakeDoh:
             return bad(400)
         with self._lock:
             self.queries.append(DohQuery(query.name, query.qtype, via))
+            self.question_connections.append((query.name, query.qtype, getattr(self._local, "connection", None)))
             names = dict(self.names)
             kind = self.fail_first.get(query.name)
             if kind is not None and (query.name, query.qtype) in self._failed:
@@ -601,7 +609,12 @@ class DohGateway(Gateway):
     username/password offered, ``first_connection_delay`` holds the first accepted connection that many seconds
     before it is answered (a gateway that is slow to say hello), and :meth:`kill` makes the gateway dead: the port
     refuses, and every open tunnel is closed.
+
+    It carries nothing past loopback, so the question of the exit cannot leave through it (``forwards_for_real`` is False: it declares
+    no exit, and the lab leaves that question to the discovery, which this gateway refuses).
     """
+
+    forwards_for_real = False
 
     def __init__(self, name: str, doh: FakeDoh, *, user: Optional[str] = None, password: Optional[str] = None,
                  first_connection_delay: float = 0.0, **gateway: object):
@@ -666,15 +679,16 @@ class DohGateway(Gateway):
         if (host, port) in DOH_TARGETS:
             self.connects.append((host, port))
             self._send(c, self._reply(0))
+            connection = getattr(self._local, "index", None)     # the control connection that carries this tunnel: said to the DoH
             if self.tcp_data_delay and self.rtt:   # a far gateway: every chunk of the tunnel waits half the round trip
                 near, far = socket.socketpair()
-                threading.Thread(target=self.doh.serve, args=(far, self.name), daemon=True).start()
+                threading.Thread(target=self.doh.serve, args=(far, self.name, connection), daemon=True).start()
                 try:
                     relay(c, near, self.rtt / 2)
                 finally:
                     near.close()
                 return
-            self.doh.serve(c, self.name)
+            self.doh.serve(c, self.name, connection)
             return
         if (host, port) in (WHOAMI4, WHOAMI6, (WEB_NAME, 80)):
             super()._connect(c, host, port)
@@ -686,7 +700,7 @@ class DohGateway(Gateway):
             return
         self.connects.append((host, port))
         try:
-            upstream = socket.create_connection((host, port), timeout=10)
+            upstream = socket.create_connection((host, port), timeout=30)
         except OSError:
             self._send(c, self._reply(5))
             return

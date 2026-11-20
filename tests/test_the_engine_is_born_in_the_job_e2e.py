@@ -68,6 +68,7 @@ def test_a_launch_scans_no_process_of_the_machine(firefox_binary, monkeypatch):
 def test_after_close_no_process_of_the_session_is_left(firefox_binary):
     from invisible_core.process import find_processes, wait_until_gone, SessionToken
     from invisible_playwright import InvisiblePlaywright
+    from invisible_playwright._juggler._reaped import wait_reaped
 
     session = InvisiblePlaywright(seed=7102, binary_path=firefox_binary,
                                   humanize=False, headless=True)
@@ -77,7 +78,10 @@ def test_after_close_no_process_of_the_session_is_left(firefox_binary):
         token = SessionToken(_token_value(session))
         assert len(find_processes(token)) >= 2, "no tree to leave behind"
         browser.close()
-        left = [] if wait_until_gone(token, timeout=30) else find_processes(token)
+    # ⛔ WITH A CORE THAT HAS A REAPER the close returns when the browser has exited and the sender of the pings is the
+    # reaper's: it is waited for here, once the session is over (the removal of the directories is handed to it then).
+    assert wait_reaped(token, timeout=30), "the reaper of the launch did not finish within 30 s"
+    left = [] if wait_until_gone(token, timeout=30) else find_processes(token)
     assert not left, "processes of the session after close(): %s" % [
         (p.pid, p.name()) for p in left]
 

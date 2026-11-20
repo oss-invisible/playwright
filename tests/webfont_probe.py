@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+from unittest import mock
 
 
 
@@ -130,7 +131,7 @@ class _Marionette:
         end = time.time() + timeout
         while True:
             try:
-                self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+                self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
                 self.sock.settimeout(300)
                 self._read()
                 break
@@ -180,15 +181,29 @@ _MINIMIZE = ("let cb = arguments[arguments.length - 1];"
              "Services.tm.mainThread.dispatch(() => { Cu.forceGC(); Cu.forceCC(); cb('ok'); }, 0);")
 
 
-def fonts_mb(marionette: _Marionette, folder: str, name: str) -> float:
-    """The web fonts WebRender holds, in MB, summed over the processes of a fresh memory report."""
-    path = os.path.normpath(os.path.join(folder, name + ".json.gz"))
-    marionette.call("Marionette:SetContext", {"value": "chrome"})
-    marionette.call("WebDriver:ExecuteAsyncScript", {"script": _MINIMIZE, "args": []})
-    time.sleep(2)
+def _fonts_report_mb(marionette: _Marionette, path: str) -> float:
     marionette.call("WebDriver:ExecuteAsyncScript", {"script": _DUMP, "args": [path]})
     reports = json.load(gzip.open(path))["reports"]
     return sum(r["amount"] for r in reports if r["path"] == FONTS_REPORTER) / 2 ** 20
+
+
+def fonts_mb(marionette: _Marionette, folder: str, name: str, settle: float = 30.0) -> float:
+    """The web fonts WebRender holds, in MB, summed over the processes of a memory report taken once the amount has settled.
+
+    The minimize is answered when the main thread has run it; what the render threads release after it is asynchronous and the engine reports no end of it.
+    So the report is taken again, a second apart, until three in a row agree (to 0.05 MB), or `settle` seconds have passed: what is returned is the amount
+    the engine holds still, not the one a fixed pause happened to catch."""
+    marionette.call("Marionette:SetContext", {"value": "chrome"})
+    marionette.call("WebDriver:ExecuteAsyncScript", {"script": _MINIMIZE, "args": []})
+    end = time.monotonic() + settle
+    readings = [_fonts_report_mb(marionette, os.path.normpath(os.path.join(folder, "%s-0.json.gz" % name)))]
+    while time.monotonic() < end:
+        time.sleep(1)
+        path = os.path.normpath(os.path.join(folder, "%s-%d.json.gz" % (name, len(readings))))
+        readings.append(_fonts_report_mb(marionette, path))
+        if len(readings) >= 3 and max(readings[-3:]) - min(readings[-3:]) < 0.05:
+            break
+    return readings[-1]
 
 
 def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, float]:
@@ -228,14 +243,15 @@ def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, flo
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     root = "http://127.0.0.1:%d" % server.server_address[1]
-    os.environ.setdefault("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1")
     folder = tempfile.mkdtemp(prefix="webfont_probe_")
     result: Dict[str, float] = {"contexts": contexts}
     marionette = None
     port = marionette_port()
     try:
-        with InvisiblePlaywright(binary_path=binary, headless=True, humanize=False, extra_args=["-marionette"],
-                                 extra_prefs={"marionette.port": port}) as browser:
+        # the engine reads the variable from the environment it inherits (the launcher takes none): set for this launch only, undone after it
+        with mock.patch.dict(os.environ, {"MOZ_REMOTE_ALLOW_SYSTEM_ACCESS": "1"}), InvisiblePlaywright(
+                binary_path=binary, headless=True, humanize=False, extra_args=["-marionette"],
+                extra_prefs={"marionette.port": port}) as browser:
             keep = browser.new_context()
             keep_page = keep.new_page()
             keep_page.goto(root + "/blank.html")
@@ -249,7 +265,7 @@ def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, flo
                 context = browser.new_context()
                 page = context.new_page()
                 page.goto("%s/page/%d.html" % (root, n))
-                page.wait_for_function("window.__font !== undefined", timeout=20000)
+                page.wait_for_function("window.__font !== undefined", timeout=30000)
                 loaded += 1 if page.evaluate("window.__font") == 1 else 0
                 open_now.append(context)
                 if n == open_at_once:

@@ -172,7 +172,7 @@ def test_networkidle_arrives_on_a_routed_page_through_a_served_browser(firefox_b
             for attempt in range(3):     # fresh pages, the way a client fetches one address after another
                 try:
                     # the timeout of the goto is the detector of a networkidle that never comes
-                    page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=20000)
+                    page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=30000)
                 except Exception as e:
                     pytest.fail("networkidle did not come on attempt %d (answers to a closed request: %s): %s" % (
                         attempt, ANSWER_ERRORS[:3], e))
@@ -215,7 +215,7 @@ def test_networkidle_arrives_when_the_client_answers_all_requests_concurrently_a
             await ctx.route("**/*", route)
             page = await ctx.new_page()
             for attempt in range(3):
-                await page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=25000)
+                await page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=30000)
             await ctx.close()
             await browser.close()
 
@@ -243,7 +243,7 @@ def test_one_page_reused_for_many_addresses_reaches_networkidle_every_time(firef
             page = ctx.new_page()
             kinds = ["cancel_fetch", "cancel_img", "cancel_iframe", "beacon", "cancel_navigation", "oop_iframe"] * 2
             for n, kind in enumerate(kinds):
-                page.goto(site + "?kind=%s&n=%d" % (kind, n), wait_until="networkidle", timeout=20000)
+                page.goto(site + "?kind=%s&n=%d" % (kind, n), wait_until="networkidle", timeout=30000)
             ctx.close()
             browser.close()
     finally:
@@ -277,7 +277,7 @@ def test_a_plain_route_handler_is_not_poisoned_by_a_request_the_page_cancelled(f
             ctx.route("**/*", plain)
             page = ctx.new_page()
             for attempt in range(3):
-                page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=25000)
+                page.goto(site + "?kind=%s&n=%d" % (kind, attempt), wait_until="networkidle", timeout=30000)
             ctx.close()
             browser.close()
     finally:

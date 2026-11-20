@@ -99,8 +99,3 @@ class Transport(ABC):
 # ⛔ The `Transport` ABC above STAYS, and it is not vestigial: it is the
 # seam the in-process transport implements, and the reason the swap was one
 # class rather than a rewrite of the client.
-#
-# ⛔ To get the old arm back for a comparison - which is the only thing it
-# was still for - check out the last commit that carried it into a git
-# worktree and point `INVPW_DRIVER_TREE` at it. `scripts/capture_protocol.py`
-# reads that variable.

@@ -27,6 +27,7 @@ import time
 import pytest
 
 from invisible_core.juggler import Ev, MIN_EVENT_INTERVAL_MS, fit_timeline
+from invisible_core.juggler import _pacing
 from invisible_core.juggler import _motion
 
 from invisible_playwright import _cursor
@@ -53,6 +54,11 @@ def landing_on(monkeypatch):
 # 1. B2 - the schedule survives a platform that cannot keep it
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _drive(evs, emit):
+    """The pacer's loop the core's `Actions.walk` runs, on the pointer's clock (the virtual one when a test put it in place)."""
+    _pacing.drive(evs, emit, now=pointer_mod._CLOCK.now, sleep=pointer_mod._CLOCK.sleep)
+
+
 def _path(seed=42, frm=(120.0, 640.0), to=(980.0, 200.0)):
     return _motion.CursorMotion(seed).path(frm[0], frm[1], to[0], to[1])
 
@@ -76,7 +82,7 @@ def test_lateness_does_not_accumulate(monkeypatch):
     use_clock(monkeypatch, clock)
     sink = []
 
-    pointer_mod._drive(evs, lambda x, y: sink.append(clock.now()))
+    _drive(evs, lambda x, y: sink.append(clock.now()))
 
     delivered_ms = (sink[-1] - sink[0]) * 1000.0
     naive_ms = planned_ms + 6.0 * len(evs)
@@ -98,7 +104,7 @@ def test_a_platform_too_slow_for_the_plan_pays_in_waypoints(monkeypatch):
     use_clock(monkeypatch, clock)
     sink = []
 
-    pointer_mod._drive(evs, lambda x, y: sink.append(clock.now()))
+    _drive(evs, lambda x, y: sink.append(clock.now()))
     assert len(sink) < len(evs) * 0.75, (
         "%d of %d waypoints survived a platform three times too slow"
         % (len(sink), len(evs))
@@ -113,7 +119,7 @@ def test_no_two_events_are_delivered_in_the_same_instant(monkeypatch):
     use_clock(monkeypatch, clock)
     evs = _events(_path())
     sink = []
-    pointer_mod._drive(evs, lambda x, y: sink.append(clock.now()))
+    _drive(evs, lambda x, y: sink.append(clock.now()))
     gaps = [(sink[i] - sink[i - 1]) * 1000.0 for i in range(1, len(sink))]
     assert min(gaps) >= MIN_EVENT_INTERVAL_MS - 1e-6, min(gaps)
 
@@ -125,7 +131,7 @@ def test_a_dropped_waypoint_is_the_one_that_was_superseded(monkeypatch):
     use_clock(monkeypatch, clock)
     evs = _events(_path())
     sink = []
-    pointer_mod._drive(evs, lambda x, y: sink.append((clock.now(), x, y)))
+    _drive(evs, lambda x, y: sink.append((clock.now(), x, y)))
     assert (sink[-1][1], sink[-1][2]) == (evs[-1].x, evs[-1].y), (
         "the endpoint of a movement is never dropped"
     )
@@ -181,9 +187,9 @@ def test_delivered_timing_on_a_real_clock(seed):
     # BOTH dispatchers, so comparing them back to back on the same busy machine
     # is the only form that measures the change instead of the moment. Same
     # rule the project applies to every other A/B.
-    a = run(pointer_mod._drive)   # A
+    a = run(_drive)   # A
     b = run(naive)                # B
-    c = run(pointer_mod._drive)   # A again, so a drifting machine shows up
+    c = run(_drive)   # A again, so a drifting machine shows up
 
     def span_ms(sink):
         return (sink[-1] - sink[0]) * 1000.0

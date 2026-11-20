@@ -114,21 +114,48 @@ def spare_processes(total_memory_bytes: Optional[int], lowmem_mb: int = 4096, fi
     return fission_number
 
 
-def quiet_problem(stamps: Iterable[Tuple[str, float, Optional[float]]], returned: float, quiet: float) -> Optional[str]:
-    """What is wrong with a `networkidle` that came at ``returned`` (None if nothing), from ``(path, arrival, end)``
-    stamps of the requests of the page on the server's clock (``end`` None: not answered yet).
+#: What `networkidle` promises: no request in flight, and this many seconds since the last request ended
+#: (`IDLE_QUIET = 0.5`, invisible_core/juggler/lifecycle.py:56, the core the wrapper pins: the timer is the core's, not this
+#: package's).
+NETWORKIDLE_PROMISE = 0.5
+
+
+def quiet_needed(clock: str = "monotonic") -> float:
+    """The silence a `networkidle` is asked for: the promise less the resolution the clock in use declares, and nothing else.
+
+    The timer that decides `networkidle` is `Lifecycle._settle` in invisible_core/juggler/lifecycle.py (the core pinned by
+    this wrapper; the wrapper's server only forwards the state, `_juggler/server.py` `_hear_lifecycle`). It reads
+    `time.monotonic()` (lifecycle.py:340) and compares it with the instant of the last request event, also
+    `time.monotonic()` (lifecycle.py:541 for a request that begins, :551 for one that ends), against `IDLE_QUIET`
+    (lifecycle.py:352). The stamps of the tests are `time.monotonic()` too, in the same process. A clock that advances in
+    steps of `r` (`time.get_clock_info("monotonic").resolution`: 15.625 ms on Windows, `GetTickCount64`) makes two readings
+    differ from the true interval by less than `r`, so the product that waited the whole promise can be measured up to `r`
+    short. That is a property of the instrument, read from the clock, not an estimate of how loaded a runner is."""
+    return NETWORKIDLE_PROMISE - time.get_clock_info(clock).resolution
+
+
+def quiet_problem(stamps: Iterable[Tuple[str, float, Optional[float]]], returned: float,
+                  clock: str = "monotonic") -> Optional[str]:
+    """What is wrong with a `networkidle` that came at ``returned`` (None if nothing), from ``(path, arrival, sent)``
+    stamps of the requests of the page on the server's clock (``sent`` None: its answer was not yet being written).
 
     `networkidle` promises that no request is in flight and that half a second has passed since the last one ended.
-    Asked here for ``quiet`` (a little under the half second, because the client hears of an end a moment after the
-    server writes it). A late request that has not even arrived is no reason to complain when the network really was
-    quiet before ``returned``, and a request in flight, or an end too near, is."""
-    stamps = list(stamps)
-    in_flight = [path for path, _arrival, end in stamps if end is None or end > returned]
+    ``sent`` is the first instant the browser can have seen a request end: the server takes it after its delay and
+    BEFORE it writes the answer. Judging on it, never on a stamp taken after the write, is what makes the verdict true under
+    any load: a thread of the test process that loses the CPU or the GIL between the write and a later stamp makes that
+    stamp late and the silence measured shorter than it was, while a correct product returns at least half a second
+    after ``sent`` whatever the load, and one that ignores a request of a frame returns sooner. A late request that has
+    not even arrived is no reason to complain when the network really was quiet before ``returned``; a request not yet
+    sent at ``returned``, or an end too near, is."""
+    # a request that arrived after the return was not in flight at the return, and is no complaint (on a slow machine it can
+    # arrive between the return and the read of the stamps)
+    stamps = [stamp for stamp in stamps if stamp[1] <= returned]
+    in_flight = [path for path, _arrival, sent in stamps if sent is None or sent > returned]
     if in_flight:
         return "networkidle came while %s was in flight" % in_flight
     if not stamps:
         return "no request of the page was seen at all"
-    since = returned - max(end for _path, _arrival, end in stamps)
-    if since < quiet:
-        return "networkidle came after only %.3f s without network (it promises 0.5)" % since
+    since = returned - max(sent for _path, _arrival, sent in stamps)
+    if since < quiet_needed(clock):
+        return "networkidle came after only %.3f s without network (it promises %s)" % (since, NETWORKIDLE_PROMISE)
     return None

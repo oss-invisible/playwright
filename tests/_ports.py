@@ -21,7 +21,7 @@ def who_holds(port: int) -> str:
     """What the machine says about the sockets of `port` (ss, or netstat), for the message of a picker or a trap that found no number."""
     for command in (["ss", "-H", "-lntup"], ["netstat", "-lntup"]):
         try:
-            done = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            done = subprocess.run(command, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             continue
         lines = [line for line in done.stdout.splitlines() if (":%d " % port) in line]

@@ -68,9 +68,14 @@ import time
 
 import pytest
 
+from _waits import awatch
+
 pytestmark = pytest.mark.e2e
 
 HELD_S = 1.5
+#: The deadline of every wait for a thing that must happen (the stop of a goto the server holds, the page it lands on): a goto that nothing stops ends at
+#: it with another error, so it is the bound of the wait that leads up to the stop and no healthy run comes near it.
+GOTO_TIMEOUT_MS = 30_000
 ACT = {
     "docopen": "document.open(); document.write('<html><body><h1>rewritten</h1></body></html>'); document.close();",
     "stop": "window.stop();",
@@ -201,7 +206,7 @@ def test_a_goto_stopped_on_its_way_raises_or_lands_and_never_lies(firefox_binary
                 began = time.monotonic()
                 error = None
                 try:
-                    page.goto(target, wait_until="domcontentloaded", timeout=10_000)
+                    page.goto(target, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
                 except Error as e:
                     error = e.message
                 finally:
@@ -217,7 +222,7 @@ def test_a_goto_stopped_on_its_way_raises_or_lands_and_never_lies(firefox_binary
                     expected = same + end
                     if end in ("/old", "/start"):
                         expected = same + "%s?k=%s&i=%d" % (end, kind, i)
-                    page.wait_for_url(expected, timeout=5_000)
+                    page.wait_for_url(expected, timeout=GOTO_TIMEOUT_MS)
                 else:
                     assert error is None, where
                     # It waited for its page, which the server held.
@@ -248,17 +253,16 @@ def test_a_second_goto_interrupts_the_first_and_lands(firefox_binary, server):
                 # the gate, after both gotos have returned: the first can only
                 # end by being replaced.
                 gate = GATES["first=%d" % i] = threading.Event()
-                began = time.monotonic()
 
                 async def go(url, after=None):
                     # The second goto starts once the server has the first's
                     # request, so the first is on its way on any machine. The
                     # first goto's own timeout is the bound of the wait.
-                    while after is not None and after not in ARRIVED:
-                        assert time.monotonic() - began < 10, "the first goto never left"
-                        await asyncio.sleep(0.02)
+                    if after is not None:
+                        left = await awatch(lambda: after in ARRIVED, bool, GOTO_TIMEOUT_MS / 1000, lambda: asyncio.sleep(0.02))
+                        assert left.ok, "the first goto never left: %s" % left.render()
                     try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
                         return None
                     except Exception as e:
                         return str(e)

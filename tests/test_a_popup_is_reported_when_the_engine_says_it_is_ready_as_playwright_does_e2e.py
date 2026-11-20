@@ -124,7 +124,7 @@ def test_a_destination_that_commits_nothing_gives_no_popup_event(firefox_binary,
 def test_a_slow_popup_is_reported_with_the_address_of_its_destination(firefox_binary, site, mode, opener):
     def body(ctx, page):
         page.goto(site, wait_until="load", timeout=30000)
-        with page.expect_popup(timeout=20000) as info:
+        with page.expect_popup(timeout=30000) as info:
             page.click(opener)
         assert info.value.url == site + "slow?ms=1500", "the popup was reported with %r" % info.value.url
         info.value.close()
@@ -163,11 +163,11 @@ def test_a_listener_registered_in_the_page_handler_hears_the_load_of_the_popup(f
         def on_page(popup):
             popup.on("load", lambda p: heard.append(time.monotonic()))
             t = time.monotonic()
-            popup.wait_for_load_state("load", timeout=10000)
+            popup.wait_for_load_state("load", timeout=30000)
             waited.append(time.monotonic() - t)
 
         ctx.on("page", on_page)
-        with page.expect_popup(timeout=20000) as info:
+        with page.expect_popup(timeout=30000) as info:
             page.click(opener)
         deadline = time.monotonic() + 30
         while not heard and time.monotonic() < deadline:

@@ -138,11 +138,11 @@ def test_a_goto_to_the_address_the_page_is_at_ends_every_time(firefox_binary, si
     _, frames = _body(kind, port)
 
     async def scenario(page):
-        await page.goto(url, timeout=15000)
+        await page.goto(url, timeout=30000)
         seen = []
         for i in range(GOTOS):
             began = time.monotonic()
-            response = await page.goto(url, timeout=15000)
+            response = await page.goto(url, timeout=30000)
             took = time.monotonic() - began
             title = await page.title()
             seen.append((i, response.status if response else None, page.url, title, len(page.frames), round(took, 2)))
@@ -156,7 +156,7 @@ def test_a_goto_to_the_address_the_page_is_at_ends_every_time(firefox_binary, si
         assert address == url, seen[i]
         assert title == kind, seen[i]
         assert count == frames, seen[i]
-        # No bound on `took` here: a goto that did not end is the one that raised at its own timeout (15 s), above.
+        # No bound on `took` here: a goto that did not end is the one that raised at its own timeout (30 s), above.
 
 
 def test_a_goto_to_the_same_address_with_a_query_ends_the_second_time_too(firefox_binary, site):
@@ -165,10 +165,10 @@ def test_a_goto_to_the_same_address_with_a_query_ends_the_second_time_too(firefo
     url = "http://a.test:%d/other-site-frame?x=1" % port
 
     async def scenario(page):
-        await page.goto("http://a.test:%d/other-site-frame" % port, timeout=15000)
+        await page.goto("http://a.test:%d/other-site-frame" % port, timeout=30000)
         out = []
         for _ in range(3):
-            response = await page.goto(url, timeout=15000)
+            response = await page.goto(url, timeout=30000)
             out.append((response.status if response else None, page.url, len(page.frames)))
         return out
 

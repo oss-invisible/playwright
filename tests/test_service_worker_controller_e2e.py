@@ -24,10 +24,10 @@ def test_a_reloaded_page_is_controlled_by_its_service_worker(firefox_binary, fix
         if routed:
             ctx.route("**/*", lambda route: route.continue_())
         page = ctx.new_page()
-        page.goto(f"{fixture_server}/", timeout=15_000)
-        page.wait_for_function("window.__swState === 'registered'", timeout=10_000)
+        page.goto(f"{fixture_server}/", timeout=30_000)
+        page.wait_for_function("window.__swState === 'registered'", timeout=30_000)
         page.evaluate("navigator.serviceWorker.ready.then(() => true)")
-        page.reload(timeout=15_000)
+        page.reload(timeout=30_000)
         # until the worker has taken the page (a condition with a deadline, not 500 ms); a page that never gets a
         # controller (the defect above) still ends here, red, at the deadline
         wait_until(lambda: page.evaluate("navigator.serviceWorker.controller !== null"), 30,

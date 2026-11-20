@@ -65,7 +65,7 @@ def test_goto_returns_on_the_page_that_replaced_itself_from_script(firefox_binar
             # waits for the navigation the script replaced never returns on its
             # own and ends at the timeout, with an error. No narrower number.
             try:
-                response = page.goto(url, wait_until="load", timeout=20_000)
+                response = page.goto(url, wait_until="load", timeout=30_000)
             except Error as e:
                 pytest.fail("goto did not return on a page that redirects itself "
                             "before load: it waited for the navigation the script "
@@ -75,7 +75,7 @@ def test_goto_returns_on_the_page_that_replaced_itself_from_script(firefox_binar
             assert response is not None and response.status == 200, response
 
             # and an ordinary goto after it still waits for ITS OWN document
-            page.goto(url + "landed?again", wait_until="load", timeout=20_000)
+            page.goto(url + "landed?again", wait_until="load", timeout=30_000)
             assert page.url.endswith("landed?again"), page.url
     finally:
         srv.shutdown()

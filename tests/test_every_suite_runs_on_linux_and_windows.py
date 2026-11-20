@@ -9,7 +9,8 @@ What this holds, reading the files as text (PyYAML is not a dependency of this p
 
   * every row of ci/required-suites.json names both systems, or names its Windows twin (`windows_twin`: the id of a row
     that runs on Windows), or says why it can only be Linux (`linux_only`: a test of Linux converging on Windows, which has
-    no Windows counterpart because Windows IS the reference);
+    no Windows counterpart because Windows IS the reference); a row that runs on Windows only names its Linux twin
+    (`linux_twin`: the id of a row that runs on Linux), the mirror of the first;
   * the jobs of e2e.yml that run scripts/run_e2e.py run on a Linux and on a Windows runner between them;
   * the unit job of tests.yml runs on both.
 
@@ -34,6 +35,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 def suite_problems(rows: list) -> list:
     out = []
     windows_ids = {r["id"] for r in rows if "windows" in r.get("os", [])}
+    linux_ids = {r["id"] for r in rows if "linux" in r.get("os", [])}
     for r in rows:
         systems = set(r.get("os", []))
         if {"linux", "windows"} <= systems:
@@ -44,11 +46,17 @@ def suite_problems(rows: list) -> list:
             if twin not in windows_ids:
                 out.append("%s: its windows_twin %r is not a row that runs on Windows" % (r["id"], twin))
             continue
+        linux_twin = r.get("linux_twin")
+        if "linux" not in systems and linux_twin:
+            if linux_twin not in linux_ids:
+                out.append("%s: its linux_twin %r is not a row that runs on Linux" % (r["id"], linux_twin))
+            continue
         if "windows" not in systems and reason:
             continue
         missing = sorted({"linux", "windows"} - systems)
-        out.append("%s runs on %s only: it needs %s, a windows_twin, or a linux_only reason"
-                   % (r["id"], "/".join(sorted(systems)) or "nothing", " and ".join(missing)))
+        out.append("%s runs on %s only: it needs %s, a %s, or a linux_only reason"
+                   % (r["id"], "/".join(sorted(systems)) or "nothing", " and ".join(missing),
+                      "linux_twin" if "linux" not in systems and systems else "windows_twin"))
     return out
 
 
@@ -141,3 +149,26 @@ def test_a_twin_or_a_reason_is_accepted():
 def test_the_e2e_of_12_11_is_refused_and_the_unit_job_passes():
     found = workflow_problems(E2E_OF_12_11, TESTS_OF_12_11)
     assert found == ["the jobs of e2e.yml that run scripts/run_e2e.py (e2e) do not run on both a Linux and a Windows runner"], found
+
+
+def test_a_windows_row_with_a_linux_twin_is_accepted():
+    rows = [{"id": "a", "os": ["linux"], "windows_twin": "b"}, {"id": "b", "os": ["windows"], "linux_twin": "a"}]
+    assert suite_problems(rows) == []
+
+
+def test_a_windows_row_with_no_twin_is_refused():
+    found = suite_problems([{"id": "b", "os": ["windows"]}])
+    assert len(found) == 1 and "b runs on windows only" in found[0] and "linux_twin" in found[0], found
+
+
+def test_a_linux_twin_that_does_not_run_on_linux_is_refused():
+    rows = [{"id": "b", "os": ["windows"], "linux_twin": "c"}, {"id": "c", "os": ["windows"], "linux_twin": "a"}]
+    assert any("linux_twin 'c' is not a row that runs on Linux" in p for p in suite_problems(rows))
+    assert any("linux_twin 'nothing' is not a row that runs on Linux" in p
+               for p in suite_problems([{"id": "b", "os": ["windows"], "linux_twin": "nothing"}]))
+
+
+def test_a_twin_of_the_wrong_side_does_not_excuse_a_row():
+    rows = [{"id": "a", "os": ["linux"], "linux_twin": "b"}, {"id": "b", "os": ["windows"], "windows_twin": "a"}]
+    found = suite_problems(rows)
+    assert len(found) == 2 and all("runs on" in p and "only" in p for p in found), found

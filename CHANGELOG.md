@@ -4,7 +4,126 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.57.0] - 2026-11-20
+
+### Changed
+- Pins invisible-core 67.78.0 (same engine, firefox-67). The core keeps no value in memory between two calls: the seal, the identity of the engine,
+  the GPU tables, the time zones, the keyboard tables, the exit address and the UDP verdict of a proxy are read or measured each time they are needed,
+  so what a launch costs is visible where it is paid.
+- `invisible-playwright fetch` looks for a newer list of intermediate certificates every time it runs (a small request; the list is downloaded only
+  when Mozilla changed it). A launch only reads the list on disk and starts no background check.
+- `new_context(proxy=...)` measures the UDP exit of its proxy every time, instead of reusing a measurement of the same proxy from the last 30 minutes.
+- A launch without a proxy asks for its exit address every time, instead of reusing an answer from the last 2 minutes.
+- The UDP verdict the session measured at launch is handed to the browser's proxy command explicitly.
+
+### Fixed
+- `wait_for_load_state("networkidle")` and `goto(..., wait_until="networkidle")` on a new document count the quiet from that document's
+  commit, as Playwright does: the silence before the commit no longer counts toward its 500 ms.
+
+## [0.56.0] - 2026-11-19
+
+### Engine firefox-67
+- A site that sends an incomplete certificate chain (its certificate without the intermediate that signed it) opens from the first second,
+  as it does on a Firefox that has been in use for days. Firefox completes such chains with the intermediate certificates Mozilla
+  publishes, which a fresh profile only downloads a minute or so after its start; the list is now declared by the core and written into
+  the profile before the first page, so every session has it from its start.
+- The engine no longer downloads that list itself: no request for it leaves the browser, through the proxy or otherwise.
+- The browser tells the client it is ready only once the list is written, so no page can be opened before it is in place.
+
+### Changed
+- Pins invisible-core 67.77.0 and with it the engine firefox-67. The core downloads the list from Mozilla's service once, verifies every
+  certificate against the hash Mozilla publishes for it, keeps it in its cache and asks again at most once a week, after the browser has
+  started, so a launch never waits for it; with no copy and no network the browser starts without the list and a warning is printed.
+- `invisible-playwright fetch` also downloads the list, after the engine, so the first launch does not.
+- The CI legs launch with a fixed, empty list of the repository (`ci/intermediates.json`), so no test asks Mozilla for anything.
+
+## [0.55.0] - 2026-11-19
+
+### Changed
+- Pins invisible-core 66.76.0 (same engine, firefox-66): the core no longer carries its legacy API, and the wrapper no longer reaches any of it.
+- `tests/conftest.py` takes the engine entry table from `invisible_core.seal.DEFAULT_ENTRY_REL`, and a test fails if a file of the wrapper imports a name the core removed.
+- The workflows arm the pre-push gates with `python -m invisible_core.hooks install`.
+
+### Removed
+- The nine modules that only re-exported `invisible_core` (`invisible_playwright._geo`, `_headless`, `_proxy`, `_webgl_personas`, `config`,
+  `constants`, `download`, `prefs`, `_fpforge`) and `invisible_playwright._reaper`: import `invisible_core.<module>` (`invisible_core.process`
+  for the reaper). `resolve_session_timezone` is no longer re-exported from the package root.
+- `INVPW_CURSOR_ENGINE=binary` and the fallback to the browser's own motion when no generator is found: the engine is the Python one, or `off`. The variable is strict: unset, `python` or `off`; any other value (`binary`, `none`, `false`, `0`...) is a `ValueError` that lists them.
+- The test that scanned a driver bundle tree, which only the removed Node driver had.
+- `INVPW_TRANSPORT=driver` and its refusal message: there is one transport.
+- `scripts/install_hooks.py`: `python -m invisible_core.hooks install` (with `--check` to only report) does the same, from the core.
+
+### Fixed
+- The documentation no longer presents `INVPW_BINARY_PATH` as a variable of the library, which reads none; a binary you already have is passed
+  as `binary_path=`.
+
+## [0.54.0] - 2026-11-18
+
+### Engine firefox-66
+- A screenshot on Linux draws text in the fonts the page used. The browser's main process rebuilds each font of a screenshot from its
+  file and asks fontconfig to confirm that file; it now shows the bundled fonts to fontconfig before it builds its font list, so the file
+  is known and kept instead of being replaced by a fallback font (screen and canvas were already right; only screenshots were wrong).
+- A face of a font collection (`.ttc`) keeps its own index when the main process rebuilds it, so it is no longer drawn as another face of
+  the same file (Cambria Math, MS PGothic and NSimSun came out as Cambria, MS Gothic and SimSun). This is Mozilla's fix of bug 2077661,
+  carried as Mozilla wrote it until a Firefox release ships it.
+- Windows was not affected.
+
+### Changed
+- Pins invisible-core 66.75.0 and with it the engine firefox-66.
+
+### Added
+- A test that draws text in each bundled family the identity declares (accents, a typographic apostrophe, Chinese, Japanese, Arabic,
+  Russian, and two faces that are not the first of their collection) and compares the screenshot, byte for byte, with the same text drawn
+  by the page itself into a canvas, on Linux and on Windows.
+- A Linux test that a second launch reads the bundle from fontconfig's cache and does not scan the folder again, measured under strace,
+  with a test of the strace stand-in itself.
+
+## [0.53.1] - 2026-11-16
+
+0.53.0 was tagged but never published; its changes ship in 0.53.1. One of its tests read the page's address too early when the first of
+two navigations wins; 0.53.1 corrects that test.
+
+### Engine firefox-65
+- Keys, clicks and the mouse path stay on their planned timing under load.
+- A second `goto` that starts while a site is changing process no longer hangs.
+- The isolated worlds of init scripts are always created.
+- A worker comes back with its page from the back-forward cache.
+- The names looked up as a context closes go through that context's proxy.
+- `close()` returns when the browser has exited, and never interrupts it while it exits.
+
+### Changed
+- Pins invisible-core 65.74.0 and with it the engine firefox-65.
+- The path of the cursor leaves as one stroke. The approach, the walk before a click, the wheel burst and the idle movement hand their
+  planned timeline to the core's `Actions.walk`, which sends each point at its planned instant on the client's own clock, without waiting
+  for the reply of the one before; the replies are collected at the end. Before, each point was a command of its own that waited for the
+  engine's reply, and a slow reply was a pause in the path that the page saw (2.6 s measured on a GitHub runner), with the points after it
+  crowded together. A lone `mouse.down`, `mouse.up` or one-step `mouse.move` is still a single command that waits for its reply, as in Playwright.
+- `close()` returns when the browser has exited, and the removal of the session's directories and the last reap of its tree are left to the
+  reaper of the launch (invisible-core 65.74.0), instead of being done at once and waiting for the sender of the shutdown pings. A session
+  that is over is forgotten by the registry of reapers, so a long-lived server no longer keeps one entry per session.
+- The download and upload folders of a session are removed by the reapers of its launches, after the tree has ended, and no longer on
+  the server's shutdown thread that the user's exit waits for (4 profiles removed together took up to 2.5 s on Windows). With no reaper
+  they are removed at once, as before.
+
+### Fixed
+- The cursor's motion never fails an action for what the engine or the page answers (a closed target, a detached frame, a refused or
+  unanswered command), and no longer hides a bug of ours: an error of our own in the path (an `AttributeError`, a `TypeError`) comes out of
+  the action instead of being swallowed with one warning and a click that goes out with no path.
+
+### Removed
+- `pytest-rerunfailures` from the `dev` extra. No run of this repository reruns a test (the e2e run refuses the plugin by name, `-p no:rerunfailures`).
+
+### Tests
+- The e2e tests wait for a condition with a deadline of 30 s, not for a clock, and the workers share no port: a Marionette port per launch,
+  the HTTP/3 server serves on the UDP socket its picker held. A test that is red now says what
+  it saw. (#507, #511, #514)
+- The shelved engine line is firefox-66; its 15 tests wait for it. (#509)
+- A loop late in its selector is not held; only the time its thread runs counts. (#508)
+- A check that the e2e tests do not wait on clocks, share ports, write the environment or reach the world; the debt of that check only shrinks.
+- The whole unit suite is a required suite of the candidate: 1988 tests on Linux and 1989 on Windows.
+- The click and pointer benches count a stroke's instants on their virtual clock, and the key-delay test reads the browser's own event
+  time stamps. (#516)
+- The e2e workflow uploads the junit of every pass of the run (Linux, and each Windows part), green or red.
 
 ## [0.52.1] - 2026-11-15
 

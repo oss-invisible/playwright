@@ -31,6 +31,7 @@ from invisible_core.juggler.connection import EventListeners
 
 from _screencast_evidence import Stream, engine_screencast_lines
 from _servers import LocalServer
+from _waits import wait_until
 
 PAGE = b"""<!doctype html><html><head><title>screencast</title>
 <style>html,body{margin:0;background:#FF00FF;height:100%}</style>
@@ -205,15 +206,13 @@ def test_a_screencast_frame_is_a_jpeg_of_the_whole_window(firefox_binary):
                     pytest.skip("this engine has no screencast (it needs "
                                 "firefox-28 or later): %s" % refused)
                 raise
-            deadline = time.time() + 15
-            while len(frames) < 3 and time.time() < deadline:
-                time.sleep(0.1)
+            wait_until(lambda: len(frames) >= 3, 30, lambda: time.sleep(0.1))
             page.screencast.stop()
             if not frames:
                 evidence = engine_screencast_lines(page)
     finally:
         srv.shutdown()
-    assert frames, ("no frame arrived in 15 s\n%s\n"
+    assert frames, ("no frame arrived in 30 s\n%s\n"
                     "engine output (lines starting with 'screencast:'):\n%s"
                     % (stream.describe(), evidence))
     first = frames[0]
@@ -304,9 +303,11 @@ def test_asking_for_a_higher_rate_actually_delivers_more_frames(firefox_binary):
 
     Interleaved is not possible here - a screencast is per page and the rate is
     fixed at start - so the arms are two pages of the same browser, same page
-    served, same duration, and the assertion is on the RATIO rather than on
-    either count: the absolute rate depends on the machine, and the claim is
-    that asking for more gets more.
+    served, each waited for until it has delivered a number of frames (not for
+    a fixed time: a loaded machine delivered none in 3 s), and the assertion is
+    on the RATIO of the rates of the frames that came, not on either count: the
+    absolute rate depends on the machine, and the claim is that asking for more
+    gets more.
 
     Measured 2026-09-08 on this machine: 10 asked delivered 9.6-9.8 fps, 25
     asked delivered 23.8-24.0. The floor below is deliberately far from that -
@@ -338,7 +339,9 @@ def test_asking_for_a_higher_rate_actually_delivers_more_frames(firefox_binary):
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
     from invisible_playwright import InvisiblePlaywright
 
-    def count(page, fps, seconds=3.0):
+    def count(page, fps, wanted):
+        """Starts a stream at ``fps`` and waits until ``wanted`` frames have come (a deadline of 30 s, not a pause: a loaded
+        machine takes longer for the same frames), then stops it."""
         stream = Stream("asking for %d fps" % fps)
         page.goto(url)
         try:
@@ -348,50 +351,55 @@ def test_asking_for_a_higher_rate_actually_delivers_more_frames(firefox_binary):
                 pytest.skip("this engine has no screencast (it needs "
                             "firefox-28 or later): %s" % refused)
             raise
-        time.sleep(seconds)
+        wait_until(lambda: len(stream.frames) >= wanted, 30, lambda: time.sleep(0.05))
         page.screencast.stop()
         return stream
 
-    seconds = 3.0
     slow_fps, fast_fps = 2, 25
+    slow_wanted, fast_wanted = 6, 10
     try:
         with InvisiblePlaywright(seed=42, binary_path=firefox_binary,
                                  headless=True) as browser:
             slow_page, fast_page = browser.new_page(), browser.new_page()
-            slow_stream = count(slow_page, slow_fps, seconds)
-            fast_stream = count(fast_page, fast_fps, seconds)
+            slow_stream = count(slow_page, slow_fps, slow_wanted)
+            fast_stream = count(fast_page, fast_fps, fast_wanted)
             # Read while the browser is up: the output goes with the process.
             evidence = engine_screencast_lines(fast_page)
     finally:
         srv.shutdown()
 
     slow, fast = len(slow_stream.frames), len(fast_stream.frames)
-    assert slow and fast, (
-        "no frames at all: %d and %d\n%s\n%s\n"
+    assert slow >= slow_wanted and fast >= fast_wanted, (
+        "not the frames asked for within 30 s: %d of %d and %d of %d\n%s\n%s\n"
         "engine output (lines starting with 'screencast:'):\n%s"
-        % (slow, fast, slow_stream.describe(), fast_stream.describe(), evidence))
+        % (slow, slow_wanted, fast, fast_wanted, slow_stream.describe(), fast_stream.describe(), evidence))
+
+    # The rates are those of the frames that came, from the engine's stamp of the first to that of the last: how long the
+    # first took to start, how long a window was, and a burst a stalled client received at once are no part of them.
+    slow_rate, fast_rate = slow_stream.rate(), fast_stream.rate()
+    assert slow_rate is not None and fast_rate is not None, "no time between the frames: %s / %s" % (
+        slow_stream.stamps, fast_stream.stamps)
 
     # The half that does not depend on the machine: a cap only pushes the rate
     # down, so this one is answerable however slow the runner is.
-    ceiling = slow_fps * seconds * 2
-    assert slow <= ceiling, (
-        "asking for %d frames a second delivered %d in %.0f seconds (%.1f "
-        "fps), which is not a cap being honoured - it is what this machine "
+    ceiling = slow_fps * 2
+    assert slow_rate <= ceiling, (
+        "asking for %d frames a second delivered %d frames at %.1f fps, which is "
+        "not a cap being honoured - it is what this machine "
         "produces when nothing limits it, so the rate the caller asks for is "
         "not reaching the engine"
-        % (slow_fps, slow, seconds, slow / seconds))
+        % (slow_fps, slow, slow_rate))
 
-    assert fast > slow * 1.5, (
-        "asking for %d frames a second delivered %d in %.0f seconds and "
-        "asking for %d delivered %d: the rate the caller asks for is not "
+    assert fast_rate > slow_rate * 1.5, (
+        "asking for %d frames a second delivered %.1f fps and "
+        "asking for %d delivered %.1f fps: the rate the caller asks for is not "
         "reaching the engine.\n"
         "    Before believing that, check the second number against the "
         "machine: the fast arm is limited by what this host can render, not "
-        "by what was asked (%d would be %.0f frames), so a fast arm far below "
+        "by what was asked (%d fps asked), so a fast arm far below "
         "its request means the host is the ceiling and this comparison cannot "
         "answer the question."
-        % (fast_fps, fast, seconds, slow_fps, slow,
-           fast_fps, fast_fps * seconds))
+        % (fast_fps, fast_rate, slow_fps, slow_rate, fast_fps))
 
 
 def test_a_dead_stream_is_described_with_the_engine_lines_and_the_clock():
@@ -407,9 +415,8 @@ def test_a_dead_stream_is_described_with_the_engine_lines_and_the_clock():
         b"JavaScript warning: something\n"
         b"screencast: StartCapture failed\n"
         b"  screencast: this widget has no native window id\n"))
-    deadline = time.time() + 5
-    while len(output.tail()) < 3 and time.time() < deadline:
-        time.sleep(0.01)
+    # the reader thread of the output has taken the three lines (a deadline of 30 s, not 5: a loaded machine runs it late)
+    assert wait_until(lambda: len(output.tail()) >= 3, 30, lambda: time.sleep(0.01)), output.tail()
     server = SimpleNamespace(object=lambda guid: SimpleNamespace(
         conn=SimpleNamespace(output=output)))
     page = SimpleNamespace(_impl_obj=SimpleNamespace(

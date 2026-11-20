@@ -663,9 +663,10 @@ def test_navigation_answers_with_a_real_response(firefox_binary):
             # 0.35.2: 8.0 s and a TimeoutError for `go_back(timeout=8000)`.
             for go, where in ((page.go_back, url), (page.go_forward, url + "#deeper")):
                 # The timeout is the detector: a go_back that waits for a
-                # navigation id a same-document entry never has raises at
-                # 8 s ("it waited out the timeout"), not None.
-                assert go(timeout=8_000) is None
+                # navigation id a same-document entry never has raises at its
+                # timeout ("it waited out the timeout"), not None, whatever
+                # the timeout is; 30 s is the suite's deadline of a wait.
+                assert go(timeout=30_000) is None
                 assert page.url == where, page.url
     finally:
         srv.shutdown()

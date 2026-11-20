@@ -139,7 +139,7 @@ def _commit_order_is_promised():
     return (_engine_number(active_seal().tag) or 0) >= 63
 
 
-def _wait(check, seconds=10.0):
+def _wait(check, seconds=30.0):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if check():
@@ -172,7 +172,7 @@ def test_a_worker_leaves_with_its_page_for_the_cache_and_comes_back_the_same(fir
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary, humanize=False,
                              headless=True, extra_prefs=LAB_PREFS) as browser:
         page = browser.new_context().new_page()
-        page.set_default_timeout(10000)
+        page.set_default_timeout(30000)
         page.goto(sites[where]["page"], wait_until="load")
 
         # 1. the worker starts and is told
@@ -227,7 +227,10 @@ def test_a_worker_leaves_with_its_page_for_the_cache_and_comes_back_the_same(fir
         restored = _index(events, back, "Page.frameDocumentRestored")
         if restored is not None:
             assert restored < again, "the worker was announced before the document was restored: %r" % _methods(events, back)
-        time.sleep(1.0)  # what comes in excess comes now
+        # What comes in excess has come by the time the restored worker answers: the answer travels the page's channel after
+        # everything the restore queued on it (a "worker ended" replayed at the READY of the restore went out first), so it is a
+        # sentinel and no clock decides when to look. The worker keeps its state: its third answer.
+        assert _ask(page, where) == 3, "the worker that came back is not the page's worker with its state"
         after = events[back:]
         assert not [p for m, p in after if m == "Page.workerDestroyed" and p["workerId"] == wid], (
             "the restored worker was told ended: %r" % _methods(events, back))
@@ -242,7 +245,6 @@ def test_a_worker_leaves_with_its_page_for_the_cache_and_comes_back_the_same(fir
             elif m == "Page.workerDestroyed":
                 live.pop(p["workerId"], None)
         assert list(live) == [wid], "live workers after the restore: %r" % list(live.values())
-        assert _ask(page, where) == 3, "the worker that came back is not the page's worker with its state"
 
 
 def _methods(events, start):
@@ -260,7 +262,9 @@ def _assert_a_new_page_with_a_new_worker(page, events, where, old, back):
         return [p["workerId"] for m, p in events[back:] if m == "Page.workerCreated" and p["url"].endswith("/worker.js")]
 
     assert _wait(lambda: bool(created())), "the page built again did not announce its worker: %r" % _methods(events, back)
-    time.sleep(1.0)  # what comes in excess comes now
+    assert _wait(lambda: where == "top" or any(f.url.endswith("/frame-worker") for f in page.frames)), "the frame of the new page is missing"
+    # the sentinel: the new worker's first answer travels the page's channel after anything in excess, and proves it is fresh
+    assert _ask(page, where) == 1, "the worker of the page built again is not a fresh worker"
     new = created()
     assert len(new) == 1 and new[0] != old, "expected one NEW worker, got %r (the old one was %s): %r" % (new, old, _methods(events, back))
     assert not [p for m, p in events[back:] if m == "Page.workerDestroyed" and p["workerId"] == new[0]], (

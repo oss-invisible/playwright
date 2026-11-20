@@ -241,7 +241,7 @@ class _Page:
 
     gone_while_building = False
 
-    def wait_until_ready(self, timeout=20.0):
+    def wait_until_ready(self, timeout=None):
         pass          # the engine of this test says Page.ready at once
 
     def settle_events(self):
@@ -273,7 +273,7 @@ def _new_page_in_thread(engine, number, out):
         out[number] = engine.context.op_new_page({"pageNumber": number})
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    assert engine.arrived.acquire(timeout=10)
+    assert engine.arrived.acquire(timeout=30)
     return t
 
 

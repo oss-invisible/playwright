@@ -103,16 +103,18 @@ def test_the_crash_of_an_iframe_s_process_leaves_the_tab(firefox_binary, engine_
             page.on("crash", lambda p: crashes.append(p))
             page.on("close", lambda p: closes.append(p))
             page.goto("http://a.test:%d/" % port, wait_until="load")
-            assert _wait(lambda: len(page.frames) == 2, 20), "the iframe never became a frame of the page"
+            assert _wait(lambda: len(page.frames) == 2, 30), "the iframe never became a frame of the page"
             # the iframe's document is not read, nor its address: what the client can see of a frame in another
             # process is what the rest of Fission builds
 
             marionette = webfont_probe._Marionette(marionette_port)
             marionette.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {}}})
             marionette.call("Marionette:SetContext", {"value": "chrome"})
-            pids = json.loads(marionette.call("WebDriver:ExecuteScript", {"script": PIDS, "args": []})["value"])
-            assert len(pids) == 1, "one tab with an iframe expected, the engine says %r" % (pids,)
-            top_pid, iframe_pid = pids[0]
+            # the tabs of the engine whose document has a child, each [top pid, child pid]: a count of TABS read from the
+            # browsing contexts, not of the processes of the machine (the spare processes are no part of it)
+            tabs = json.loads(marionette.call("WebDriver:ExecuteScript", {"script": PIDS, "args": []})["value"])
+            assert len(tabs) == 1, "one tab with an iframe expected, the engine says %r" % (tabs,)
+            top_pid, iframe_pid = tabs[0]
             assert top_pid and iframe_pid and top_pid != iframe_pid, \
                 "the iframe is not out of process (top %r, iframe %r): this engine is not running a process per site" % (top_pid, iframe_pid)
 

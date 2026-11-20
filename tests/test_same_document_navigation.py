@@ -184,8 +184,8 @@ def test_pushState_updates_page_url_and_wakes_wait_for_url(firefox_binary):
             seen = []
             page.on("framenavigated", lambda frame: seen.append(frame.url))
 
-            page.click("#route", timeout=15_000)
-            page.wait_for_url("**/reports", timeout=15_000)
+            page.click("#route", timeout=30_000)
+            page.wait_for_url("**/reports", timeout=30_000)
 
             assert page.url == url + "reports", page.url
             assert page.evaluate("location.href") == page.url

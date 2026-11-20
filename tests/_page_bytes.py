@@ -60,9 +60,9 @@ def _paeth(a: int, b: int, c: int) -> int:
     return a if pa <= pb and pa <= pc else (b if pb <= pc else c)
 
 
-def decode_png(png: bytes) -> Dict[str, Any]:
-    """{w, h, ct, sha256} of a non-interlaced 8-bit PNG (grey, RGB, grey+alpha, RGBA): the sha256 is over the unfiltered
-    scanlines, so two files with the same pixels and different ancillary chunks or compression give the same answer."""
+def unfiltered(png: bytes) -> Dict[str, Any]:
+    """{w, h, ct, channels, data} of a non-interlaced 8-bit PNG (grey, RGB, grey+alpha, RGBA): `data` is the scanlines with their filters
+    undone, `w * channels` bytes a row and `h` rows."""
     chunks = png_chunks(png)
     head = [d for t, d in chunks if t == b"IHDR"]
     if not head:
@@ -102,7 +102,64 @@ def decode_png(png: bytes) -> Dict[str, Any]:
             raise NotAPng("filter type %d" % ftype)
         out += line
         prev = line
-    return {"w": w, "h": h, "ct": ct, "sha256": hashlib.sha256(bytes(out)).hexdigest()}
+    return {"w": w, "h": h, "ct": ct, "channels": channels, "data": bytes(out)}
+
+
+def decode_png(png: bytes) -> Dict[str, Any]:
+    """{w, h, ct, sha256} of a non-interlaced 8-bit PNG (grey, RGB, grey+alpha, RGBA): the sha256 is over the unfiltered
+    scanlines, so two files with the same pixels and different ancillary chunks or compression give the same answer."""
+    u = unfiltered(png)
+    return {"w": u["w"], "h": u["h"], "ct": u["ct"], "sha256": hashlib.sha256(u["data"]).hexdigest()}
+
+
+def crop(image: Dict[str, Any], x: int, y: int, w: int, h: int) -> Dict[str, Any]:
+    """The box (x, y, w, h) of an `unfiltered` image, as an image of its own (same colour type). A box that is not inside it is an error:
+    a crop that silently ends at the edge would compare less than it was asked to."""
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > image["w"] or y + h > image["h"]:
+        raise ValueError("the box %r is not inside the %dx%d image" % ((x, y, w, h), image["w"], image["h"]))
+    ch, stride = image["channels"], image["w"] * image["channels"]
+    rows = [image["data"][(y + r) * stride + x * ch:(y + r) * stride + (x + w) * ch] for r in range(h)]
+    return {"w": w, "h": h, "ct": image["ct"], "channels": ch, "data": b"".join(rows)}
+
+
+def encode_png(image: Dict[str, Any]) -> bytes:
+    """The PNG file of an `unfiltered`-shaped image (no filter, one IDAT): what a crop is kept as."""
+    w, h, ch = image["w"], image["h"], image["channels"]
+    stride = w * ch
+    raw = b"".join(b"\x00" + image["data"][r * stride:(r + 1) * stride] for r in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    return (PNG_SIGNATURE + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, image["ct"], 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def pixels_differ(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """How two images of the same size and colour type differ: {pixels, first: [x, y] | None, box: [x0, y0, x1, y1] | None}; a pixel
+    differs when any of its channels does. Different sizes or colour types are an error, not a difference."""
+    if (a["w"], a["h"], a["ct"]) != (b["w"], b["h"], b["ct"]):
+        raise ValueError("%dx%d (colour type %d) against %dx%d (colour type %d)" % (a["w"], a["h"], a["ct"], b["w"], b["h"], b["ct"]))
+    ch, w = a["channels"], a["w"]
+    count, first, x0, y0, x1, y1 = 0, None, w, a["h"], -1, -1
+    da, db = a["data"], b["data"]
+    for i in range(0, len(da), ch):
+        if da[i:i + ch] != db[i:i + ch]:
+            x, y = (i // ch) % w, (i // ch) // w
+            count += 1
+            first = first or [x, y]
+            x0, y0, x1, y1 = min(x0, x), min(y0, y), max(x1, x), max(y1, y)
+    return {"pixels": count, "first": first, "box": [x0, y0, x1, y1] if count else None}
+
+
+def coloured_pixels(image: Dict[str, Any]) -> int:
+    """How many pixels of an RGB or RGBA image have a red, green and blue that are not equal: black text on white that is drawn with grey
+    antialiasing has none, and one drawn with subpixel (LCD) antialiasing has them at its edges."""
+    ch = image["channels"]
+    if ch < 3:
+        return 0
+    d = image["data"]
+    return sum(1 for i in range(0, len(d), ch) if not d[i] == d[i + 1] == d[i + 2])
 
 
 def png_bytes_of(value: Dict[str, Any]) -> Optional[bytes]:

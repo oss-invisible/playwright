@@ -8,8 +8,8 @@ BrowserContext now waits a few seconds for the processes of its container once i
 ones that stay.
 
 The test closes five such contexts in a row. While each page is open it counts the processes that host a site
-(at least one: the page's, or the count would prove nothing), and once `close` has answered it waits a few
-seconds for them to be gone: none may be left (on the old engine every context leaves its own, one more each
+(at least one: the page's, or the count would prove nothing), and once `close` has answered it waits, with a deadline of 30 s
+that only a process that never goes reaches, for them to be gone: none may be left (on the old engine every context leaves its own, one more each
 time). Only the processes of the page's site are counted, asked for by name (tests/_processes.py): the browser is
 launched with `fission.processSiteNames`, which names a content process by the site it hosts (the page is served
 from `http://127.0.0.1:<port>`; a site never includes the port). The browser starts processes of its own, and
@@ -26,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 
 import pytest
 
@@ -35,6 +34,7 @@ from websockets.asyncio.client import connect  # noqa: E402
 
 from _processes import NAMED_BY_SITE, site_processes_below  # noqa: E402
 from _servers import LocalServer  # noqa: E402
+from _waits import awatch  # noqa: E402
 
 pytestmark = pytest.mark.e2e
 
@@ -89,11 +89,25 @@ class _Client:
         await self.call("", "initialize", {"sdkLanguage": "python"})
         self.browser = [g for g, o in self.objects.items() if o["type"] == "Browser"][0]
 
+    async def evaluate(self, frame, expression):
+        """The value of a JavaScript expression in the frame (a promise is awaited by the protocol)."""
+        result = await self.call(frame, "evaluateExpression", {
+            "expression": expression, "isFunction": False, "arg": {"value": {"v": "undefined"}, "handles": []}})
+        value = result["value"]
+        return value["b"] if "b" in value else value   # the protocol's own tag of a boolean
+
     async def new_page(self):
         context = (await self.call(self.browser, "newContext", {}))["context"]["guid"]
         page = (await self.call(context, "newPage", {}))["page"]["guid"]
         frame = self.objects[page]["initializer"]["mainFrame"]["guid"]
         return context, frame
+
+
+#: A deadline no healthy run comes near: every wait below ends on its condition, not on this.
+DEADLINE_S = 30
+
+#: The page asked for a service worker and the browser has taken it (the install handler is the endless loop).
+REGISTERED = ("navigator.serviceWorker.getRegistration().then(r => !!r && !!(r.installing || r.waiting || r.active))")
 
 
 def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(firefox_binary, engine_at_least):
@@ -116,13 +130,24 @@ def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(f
             for i in range(5):
                 context, frame = await client.new_page()
                 await client.call(frame, "goto", {"url": "%s/?i=%d" % (base, i), "waitUntil": "load", "timeout": 30000})
-                await asyncio.sleep(1.0)               # the worker is registered, its install loop is running
-                opened.append(len(sites()))
+                # the worker is registered (asked of the page, not slept for), so its install loop is running
+                state = {"registered": False}
+
+                async def ask():
+                    state["registered"] = await client.evaluate(frame, REGISTERED)
+                    await asyncio.sleep(0.1)
+
+                known = await awatch(lambda: state["registered"], bool, DEADLINE_S, ask)
+                assert known.ok, "the service worker of the page was never registered (round %d): %s" % (i, known.render())
+
+                async def look():
+                    await asyncio.sleep(0.1)
+
+                seen = await awatch(lambda: len(sites()), lambda n: n > 0, DEADLINE_S, look)
+                opened.append(seen.history[-1][1])
                 await client.call(context, "close")    # the engine waits for the context's processes, then kills
-                deadline = time.time() + 5
-                while sites() and time.time() < deadline:
-                    await asyncio.sleep(0.25)
-                left.append(len(sites()))
+                gone = await awatch(lambda: len(sites()), lambda n: n == 0, DEADLINE_S, lambda: asyncio.sleep(0.25))
+                left.append(gone.history[-1][1])
         return opened, left
 
     try:

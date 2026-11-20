@@ -8,17 +8,23 @@ sleep), for the case each test must still call red and the case it must call gre
 * keepalive request: an end that never comes is red when the deadline passes; one that comes late is green;
 * an iframe that has not reached its address, and a count of processes that stays above the bound (a frame process that
   is never released), are red after their deadline, with what was seen in the message;
-* `networkidle`: red when it comes while a request is in flight or too soon after the last one, green after a real
-  silence even when the late requests of the frame never came;
+* `networkidle`: judged on `sent`, the instant before the server writes an answer (the first instant the browser can have
+  seen the end), never on a stamp taken after the write: red when it comes while a request is in flight or too soon after
+  the last one, green after a real silence even when the late requests of the frame never came and when the server's
+  thread was late with its own stamp; the tolerance is the promise less the declared resolution of the clock;
 * the page of the TURN test stops its tick the moment a srflx arrives, before the POST.
 """
 import asyncio
+import inspect
+import time
+import urllib.error
+import urllib.request
 
 import pytest
 
 import _fission_frames as ff
 import _turn_chain as chain_mod
-from _waits import Timeline, awatch, quiet_problem, spare_processes, wait_until, watch, without_end
+from _waits import Timeline, awatch, quiet_needed, quiet_problem, spare_processes, wait_until, watch, without_end
 
 pytestmark = pytest.mark.unit
 
@@ -177,25 +183,86 @@ def test_the_pool_of_spare_content_processes_is_retails():
 
 
 def test_networkidle_is_red_while_a_request_is_in_flight_and_too_soon_after_the_last_end():
-    quiet = 0.4
+    # (path, arrival, sent): `sent` is the instant before the answer starts to be written
     chain = [("/late-top", 0.0, 0.01), ("/late-frame", 0.02, 0.03), ("/late/1", 0.23, 0.53), ("/late/2", 0.53, 0.83)]
-    # a product that comes with the top page alone: at 0.5 /late/1 is still in flight
-    assert "in flight" in quiet_problem(chain[:2] + [("/late/1", 0.23, None)], 0.5, quiet)
-    assert "in flight" in quiet_problem(chain, 0.7, quiet)                   # /late/2 ends at 0.83
+    # a product that comes with the top page alone: at 0.5 /late/1 is not yet sent
+    assert "in flight" in quiet_problem(chain[:2] + [("/late/1", 0.23, None)], 0.5)
+    assert "in flight" in quiet_problem(chain, 0.7)                          # /late/2 is sent at 0.83
     # a product that comes 100 ms after the last end instead of half a second
-    assert "after only 0.100 s" in quiet_problem(chain, 0.93, quiet)
+    assert "after only 0.100 s" in quiet_problem(chain, 0.93)
     # the promise kept: 0.5 s after the last end
-    assert quiet_problem(chain, 1.33, quiet) is None
-    assert quiet_problem([], 1.0, quiet) is not None
+    assert quiet_problem(chain, 1.35) is None
+    assert quiet_problem([], 1.0) is not None
 
 
 def test_networkidle_is_green_after_a_real_silence_even_if_the_late_requests_never_came():
-    quiet = 0.4
     # the frame's script was held up for more than half a second: the page was idle, and networkidle came 0.52 s after
     # the last end, before /late/1 arrived; that is what the product promises, so it is not a failure
     seen = [("/late-top", 0.0, 0.01), ("/late-frame", 0.02, 0.03)]
-    assert quiet_problem(seen, 0.55, quiet) is None
-    assert quiet_problem(seen, 0.20, quiet) is not None                      # but not at 0.2 s
+    assert quiet_problem(seen, 0.55) is None
+    assert quiet_problem(seen, 0.20) is not None                             # but not at 0.2 s
+
+
+# The run 44039376589 (windows, e2e part 3) in the server's stamps, in seconds from the first request: /late/2 arrived at
+# 1.187 and was held 0.3 s, so its answer started to be written at 1.487; the stamp taken AFTER the write said 1.687, 0.2 s
+# later, because the thread of the server (it shares the process with the client) lost the CPU or the GIL in between.
+# The browser heard the end at 1.487 and waited its half second: `goto` returned at 2.015.
+FAILED_RUN = [("/late-top", 0.000, 0.000), ("/late-frame", 0.562, 0.562), ("/late/1", 0.890, 1.190),
+              ("/late/2", 1.187, 1.487)]
+
+
+def test_a_networkidle_that_waited_the_promise_is_green_whatever_the_server_thread_did_after_the_write():
+    # the end the browser could see is `sent` (1.487), not the late stamp of the write (1.687): 0.528 s of quiet
+    assert quiet_problem(FAILED_RUN, 2.015) is None
+    # and a stamp taken at 1.687 would have said 0.328 s, which is the red of that run: it was the stamp, not the network
+    assert quiet_problem(FAILED_RUN[:3] + [("/late/2", 1.187, 1.687)], 2.015) is not None
+
+
+def test_a_networkidle_that_ignores_the_requests_of_the_frame_is_red_under_any_load():
+    # a product that comes 213 ms after the last answer started: the frame's request counts, and this one does not
+    assert "after only 0.213 s" in quiet_problem(FAILED_RUN, 1.700)
+    assert "after only 0.013 s" in quiet_problem(FAILED_RUN, 1.500)
+
+
+def test_a_request_not_yet_written_when_networkidle_came_is_in_flight():
+    assert "/late/2" in quiet_problem(FAILED_RUN[:3] + [("/late/2", 1.187, None)], 2.015)    # held, never written
+    assert "/late/2" in quiet_problem(FAILED_RUN, 1.400)                                      # written after the return
+
+
+def test_a_request_that_arrived_after_the_return_is_not_in_flight_at_it():
+    # it arrived between `goto` returning and the read of the stamps: whether it was written or not, it is no complaint
+    seen = [("/late-top", 0.0, 0.01), ("/late-frame", 0.02, 0.03)]
+    assert quiet_problem(seen + [("/late/1", 0.80, None)], 0.55) is None
+    assert quiet_problem(seen + [("/late/1", 0.80, 1.10)], 0.55) is None
+    # arrived before the return and not yet written: still in flight
+    assert "/late/1" in quiet_problem(seen + [("/late/1", 0.30, None)], 0.55)
+    # nothing but requests that arrived after the return: nothing of the page was seen
+    assert "no request of the page was seen" in quiet_problem([("/late/1", 0.80, None)], 0.55)
+
+
+def test_the_tolerance_is_the_promise_less_the_resolution_the_clock_declares():
+    resolution = time.get_clock_info("monotonic").resolution
+    assert quiet_needed() == pytest.approx(0.5 - resolution)
+    # one resolution short of the promise is read as kept (the clock cannot tell it from the promise), a larger shortfall is not
+    chain = [("/a", 0.0, 1.0)]
+    assert quiet_problem(chain, 1.0 + 0.5 - resolution / 2) is None
+    assert quiet_problem(chain, 1.0 + 0.5 - 2 * resolution - 0.001) is not None
+    assert "QUIET" not in inspect.getsource(quiet_problem)
+
+
+def test_the_fake_server_stamps_sent_after_the_delay_and_before_the_write():
+    with ff.Sites() as sites:
+        sites.route("A", "/held", "late", ctype="text/plain", delay=0.2)
+        sites.route("A", "/now", "now", ctype="text/plain")
+        for path in ("/held", "/now", "/nothing"):
+            try:
+                urllib.request.urlopen(sites.url("A", path), timeout=10).read()
+            except urllib.error.HTTPError:
+                pass
+        entries = {r["path"]: r for r in sites.requests}
+    for entry in entries.values():
+        assert entry["at"] <= entry["sent"] <= entry["done"]
+    assert entries["/held"]["sent"] - entries["/held"]["at"] >= 0.2 - time.get_clock_info("monotonic").resolution
 
 
 def test_the_turn_page_stops_its_tick_before_the_post_not_after_it():
@@ -256,8 +323,9 @@ def test_a_frame_that_shares_the_process_keeps_the_assertion_red_and_one_that_do
         url = "http://localhost:1/grid"
 
     monkeypatch.setattr(ff, "spin_trial", lambda observer, frame: _same_process_trial(2500))
+    seconds = iter(range(0, 10_000, 7))              # a clock that moves 7 s at each look, so the 30 s of the proof are spent without waiting
     with pytest.raises(AssertionError) as red:
-        ff.assert_other_process(Observer(), Frame())
+        ff.assert_other_process(Observer(), Frame(), clock=lambda: next(seconds))
     assert "shares the process of the observer" in str(red.value) and "(0, " in str(red.value)
     calls = []
 
@@ -268,3 +336,20 @@ def test_a_frame_that_shares_the_process_keeps_the_assertion_red_and_one_that_do
     monkeypatch.setattr(ff, "spin_trial", starved_then_healthy)
     ff.assert_other_process(Observer(), Frame())
     assert len(calls) == 3
+    # a machine that starves the observer for more spins than the fixed count of the old proof is still waited for, until the deadline
+    calls.clear()
+
+    def starved_for_a_long_time(observer, frame):
+        calls.append(1)
+        return _other_process_trial(starved=len(calls) <= 2 * ff.TRIALS)
+
+    monkeypatch.setattr(ff, "spin_trial", starved_for_a_long_time)
+    ff.assert_other_process(Observer(), Frame(), clock=lambda: 0)
+    assert len(calls) == 2 * ff.TRIALS + 1
+
+
+def test_the_proof_of_another_process_has_no_fixed_pause_and_no_fixed_count():
+    import inspect
+    spin = inspect.getsource(ff.spin_trial)
+    assert "wait_for_timeout" not in spin, "the spin is waited for as a condition (its end), not for spin_ms + 800 ms"
+    assert "range(TRIALS)" not in inspect.getsource(ff.assert_other_process), "the proof of another process is waited for until a deadline"

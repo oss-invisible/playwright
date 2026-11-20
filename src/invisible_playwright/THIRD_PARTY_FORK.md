@@ -54,16 +54,6 @@ did so on evidence rather than on the code looking finished:
   since 0.30.0, with their extractors in the core's `scripts/`), and the four rules
   the `user.js` writer was compared against (the comparison script and the frozen
   rules file were later deleted; they are in git history).
-- ⛔ And the second arm. A comparison between the two transports only exists
-  while there are two implementations to compare, and the scripts that did it
-  were deleted with the driver arm. To get one back:
-
-      git worktree add /tmp/judge <the last commit that carried _driver/>
-      INVPW_DRIVER_TREE=/tmp/judge python scripts/capture_protocol.py <bin>
-
-  A worktree rather than an installed release, because a published wrapper pins
-  a published core and a sealed engine and therefore cannot drive a locally
-  built binary - which is the only kind worth judging.
 
 ### The changes that used to live in the driver bundle
 

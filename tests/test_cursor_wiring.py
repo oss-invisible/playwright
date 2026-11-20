@@ -39,9 +39,8 @@ from _pointer_fakes import BOX, VirtualClock, make_pointer, use_clock
 class _StubProfile:
     """Deterministic, seed-driven, and records what it was constructed with."""
 
-    def __init__(self, seed: int, max_seconds: float) -> None:
+    def __init__(self, seed: int, *, style=None) -> None:
         self.seed = seed
-        self.max_seconds = max_seconds
         self._rng = random.Random(seed)
 
     def path(self, fx, fy, tx, ty):
@@ -59,7 +58,7 @@ class _StubProfile:
 
 
 class _StubMotionModule:
-    MotionProfile = _StubProfile
+    CursorMotion = _StubProfile
 
 
 @pytest.fixture(autouse=True)
@@ -90,12 +89,6 @@ def stub_motion(monkeypatch):
     monkeypatch.delenv(_cursor.ENGINE_ENV, raising=False)
     monkeypatch.delenv(_cursor.LANDING_ENV, raising=False)
     return _StubMotionModule
-
-
-@pytest.fixture
-def no_motion(monkeypatch):
-    monkeypatch.setattr(_cursor, "_motion_mod", None)
-    monkeypatch.delenv(_cursor.ENGINE_ENV, raising=False)
 
 
 class _FakeBrowser:
@@ -148,15 +141,30 @@ def test_humanize_float_still_means_a_cap_in_seconds(stub_motion):
 
 
 @pytest.mark.unit
-def test_escape_hatch_restores_the_previous_behaviour(stub_motion, monkeypatch):
-    """The way back: INVPW_CURSOR_ENGINE=binary is byte-identical to the old
-    wiring - pref on, cap forwarded, and nothing armed on our side."""
-    monkeypatch.setenv(_cursor.ENGINE_ENV, "binary")
-    ip = InvisiblePlaywright(timezone="America/New_York", seed=42, humanize=3.0)
-    assert ip._cursor_engine == _cursor.ENGINE_BINARY
-    prefs = ip._build_prefs()
-    assert prefs["stealthfox.humanize"] is True
-    assert prefs["stealthfox.humanize.maxTime"] == "3.0"
+@pytest.mark.parametrize("value", ["binary", "juggler", "none", "false", "0", "wrapper", "Python", "OFF", " off", "x"])
+@pytest.mark.parametrize("humanize", [True, False])
+def test_a_value_that_is_not_a_cursor_engine_is_refused(stub_motion, monkeypatch, value, humanize):
+    """Strict, with no aliases: `binary` was a third engine until it was removed,
+    and a value that is read as something else - or ignored - is a setting that
+    does nothing while the caller believes it does something."""
+    monkeypatch.setenv(_cursor.ENGINE_ENV, value)
+    with pytest.raises(ValueError) as caught:
+        InvisiblePlaywright(timezone="America/New_York", seed=42, humanize=humanize)
+    message = str(caught.value)
+    assert _cursor.ENGINE_ENV in message and repr(value) in message
+    for valid in ("''", "'python'", "'off'"):
+        assert valid in message
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value, engine", [("", "python"), ("python", "python"), ("off", "off")])
+def test_the_valid_values_of_the_engine_variable(stub_motion, monkeypatch, value, engine):
+    monkeypatch.setenv(_cursor.ENGINE_ENV, value)
+    assert _cursor.resolve_cursor_engine(True) == engine
+    assert _cursor.resolve_cursor_engine(False) == _cursor.ENGINE_OFF
+    prefs = InvisiblePlaywright(timezone="America/New_York", seed=42, humanize=3.0)._build_prefs()
+    assert prefs["stealthfox.humanize"] is False
+    assert "stealthfox.humanize.maxTime" not in prefs
 
 
 @pytest.mark.unit
@@ -196,16 +204,6 @@ def test_the_dot_and_the_motion_are_two_switches(stub_motion):
                                 show_cursor=True)._build_prefs()
     assert prefs["stealthfox.humanize"] is False
     assert prefs["stealthfox.showcursor"] is True
-
-
-@pytest.mark.unit
-def test_missing_generator_falls_back_to_the_browser(no_motion):
-    """A session must always be able to move. With no generator installed we
-    hand the job back to the browser rather than shipping a teleporting
-    cursor."""
-    ip = InvisiblePlaywright(timezone="America/New_York", seed=42, humanize=True)
-    assert ip._cursor_engine == _cursor.ENGINE_BINARY
-    assert ip._build_prefs()["stealthfox.humanize"] is True
 
 
 @pytest.mark.unit
@@ -265,7 +263,7 @@ def test_session_seed_reaches_the_generator(stub_motion):
     _, pointer = make_pointer(seed=12345, max_seconds=1.25, number=0)
     assert pointer.active
     assert pointer.hand._profile.seed == _cursor.page_motion_seed(12345, 0)
-    assert pointer.hand._profile.max_seconds == 1.25
+    assert pointer.hand.max_seconds == 1.25
 
 
 @pytest.mark.unit
@@ -288,8 +286,8 @@ def test_the_launcher_hands_over_its_own_seed(stub_motion, monkeypatch):
 @pytest.mark.unit
 def test_the_seed_and_who_draws_travel_to_the_server_in_the_prefs(stub_motion):
     """The server draws the walk only when the launcher chose the Python
-    generator; with the engine's own expansion (`binary`) or none (`off`) the
-    same seed and budget arrive and the server must stay out of the way."""
+    generator; with none (`off`) the same seed and budget arrive and the
+    server must stay out of the way."""
     from invisible_playwright._juggler.server import (
         MOTION_BUDGET_PREF, POINTER_PREF, SESSION_SEED_PREF,
         session_draws_pointer)
@@ -297,7 +295,6 @@ def test_the_seed_and_who_draws_travel_to_the_server_in_the_prefs(stub_motion):
     from invisible_core import generate_profile
 
     for engine, draws in ((_cursor.ENGINE_PYTHON, True),
-                          (_cursor.ENGINE_BINARY, False),
                           (_cursor.ENGINE_OFF, False)):
         prefs = build_prefs(
             profile=generate_profile(seed=42), locale="en-US", timezone="UTC",
@@ -316,14 +313,14 @@ def test_the_seed_and_who_draws_travel_to_the_server_in_the_prefs(stub_motion):
 
 
 @pytest.mark.unit
-def test_binary_engine_arms_nothing(stub_motion, monkeypatch):
-    """Under the escape hatch our side must stay completely out of the way."""
+def test_the_off_engine_arms_nothing(stub_motion, monkeypatch):
+    """With the motion off our side must stay completely out of the way."""
     called = []
     monkeypatch.setattr(
         "invisible_playwright._session._enable_cursor_engine",
         lambda *a, **k: called.append(a),
     )
-    monkeypatch.setenv(_cursor.ENGINE_ENV, "binary")
+    monkeypatch.setenv(_cursor.ENGINE_ENV, "off")
     InvisiblePlaywright(timezone="America/New_York", seed=1, humanize=True)._arm_cursor_engine(_FakeBrowser())
     assert called == []
 
@@ -502,7 +499,7 @@ def test_a_page_with_no_viewport_still_does_not_start_at_the_origin(stub_motion)
 @pytest.mark.unit
 def test_a_generator_whose_start_point_is_broken_says_so_once(stub_motion, monkeypatch):
     class _BadStart:
-        def __init__(self, seed, max_seconds):
+        def __init__(self, seed, *, style=None):
             pass
 
         def start_point(self, w, h):
@@ -511,7 +508,7 @@ def test_a_generator_whose_start_point_is_broken_says_so_once(stub_motion, monke
         def path(self, fx, fy, tx, ty):
             return []
 
-    monkeypatch.setattr(_StubMotionModule, "MotionProfile", _BadStart, raising=False)
+    monkeypatch.setattr(_StubMotionModule, "CursorMotion", _BadStart, raising=False)
     _, pointer = make_pointer(seed=5, max_seconds=1.0)
     with pytest.warns(RuntimeWarning, match="start_point"):
         first = pointer.hand.start_point(1280, 720)
@@ -533,13 +530,13 @@ def test_waypoints_stay_inside_the_viewport(stub_motion, monkeypatch):
     it makes the browser park the pointer at the origin, which is worse than
     not moving at all. So the wiring clamps."""
     class _Wild:
-        def __init__(self, seed, max_seconds):
+        def __init__(self, seed, *, style=None):
             pass
 
         def path(self, fx, fy, tx, ty):
             return [(-500.0, -400.0, 0.0), (99999.0, 88888.0, 0.0), (tx, ty, 0.0)]
 
-    monkeypatch.setattr(_StubMotionModule, "MotionProfile", _Wild, raising=False)
+    monkeypatch.setattr(_StubMotionModule, "CursorMotion", _Wild, raising=False)
     page, pointer = make_pointer(seed=5, max_seconds=1.0, width=800, height=600)
     moves = _drive(page, pointer, 400.0, 300.0)
     assert moves, "clamping must not swallow the whole path"
@@ -560,13 +557,13 @@ def test_the_endpoint_is_never_pre_empted(stub_motion, monkeypatch):
     to decide and the dispatcher's to deliver faithfully.
     """
     class _Stuttering:
-        def __init__(self, seed, max_seconds):
+        def __init__(self, seed, *, style=None):
             pass
 
         def path(self, fx, fy, tx, ty):
             return [(300.0, 200.0, 0.02)] * 5 + [(tx, ty, 0.02)] * 4
 
-    monkeypatch.setattr(_StubMotionModule, "MotionProfile", _Stuttering, raising=False)
+    monkeypatch.setattr(_StubMotionModule, "CursorMotion", _Stuttering, raising=False)
     page, pointer = make_pointer(seed=6, max_seconds=1.0)
     moves = _drive(page, pointer, 640.0, 360.0)
     assert (640.0, 360.0) not in moves, "the endpoint is the caller's to emit, once"
@@ -578,7 +575,7 @@ def test_waypoints_that_share_one_instant_become_one_event(stub_motion, monkeypa
     """Merging what cannot be separated in time is the dispatcher's job; it is
     a statement about the wire, not about the shape of the path."""
     class _AllAtOnce:
-        def __init__(self, seed, max_seconds):
+        def __init__(self, seed, *, style=None):
             pass
 
         def path(self, fx, fy, tx, ty):
@@ -586,7 +583,7 @@ def test_waypoints_that_share_one_instant_become_one_event(stub_motion, monkeypa
             return [(300.0, 200.0, 0.05), (301.0, 201.0, 0.0),
                     (302.0, 202.0, 0.0), (tx, ty, 0.05)]
 
-    monkeypatch.setattr(_StubMotionModule, "MotionProfile", _AllAtOnce, raising=False)
+    monkeypatch.setattr(_StubMotionModule, "CursorMotion", _AllAtOnce, raising=False)
     page, pointer = make_pointer(seed=61, max_seconds=1.0)
     moves = _drive(page, pointer, 640.0, 360.0)
     assert moves == [(302.0, 202.0)], moves
@@ -595,13 +592,13 @@ def test_waypoints_that_share_one_instant_become_one_event(stub_motion, monkeypa
 @pytest.mark.unit
 def test_a_broken_generator_never_breaks_an_action(stub_motion, monkeypatch):
     class _Broken:
-        def __init__(self, seed, max_seconds):
+        def __init__(self, seed, *, style=None):
             pass
 
         def path(self, fx, fy, tx, ty):
             raise RuntimeError("generator exploded")
 
-    monkeypatch.setattr(_StubMotionModule, "MotionProfile", _Broken, raising=False)
+    monkeypatch.setattr(_StubMotionModule, "CursorMotion", _Broken, raising=False)
     page, pointer = make_pointer(seed=7, max_seconds=1.0)
     with pytest.warns(RuntimeWarning, match="generator raised"):
         assert _drive(page, pointer, 100.0, 100.0) == []
@@ -920,13 +917,13 @@ def test_a_skipped_waypoint_does_not_shorten_the_movement(stub_motion, monkeypat
     deadline is waited out even though the caller is the one who emits it.
     """
     class _Stuttering:
-        def __init__(self, seed, max_seconds):
+        def __init__(self, seed, *, style=None):
             pass
 
         def path(self, fx, fy, tx, ty):
             return [(300.0, 200.0, 0.05)] * 4 + [(tx, ty, 0.05)]
 
-    monkeypatch.setattr(_StubMotionModule, "MotionProfile", _Stuttering, raising=False)
+    monkeypatch.setattr(_StubMotionModule, "CursorMotion", _Stuttering, raising=False)
     page, pointer = make_pointer(seed=102, max_seconds=1.0)
 
     t0 = pointer_mod._CLOCK.now()

@@ -89,6 +89,53 @@ def test_something_that_is_not_a_png_is_refused():
         pb.decode_png(b"GIF89a....")
 
 
+def test_a_box_cut_out_of_a_screenshot_is_the_pixels_of_that_box():
+    """The crop the screenshot-of-text e2e compares: the rows of the box, in the colour type of the picture, by the pixels the PNG holds."""
+    w, h = 7, 6
+    pixels = bytes((13 * i + 5) % 256 for i in range(w * h * 4))
+    whole = pb.unfiltered(_png(w, h, pixels))
+    box = pb.crop(whole, 2, 1, 3, 4)
+    want = b"".join(pixels[((1 + r) * w + 2) * 4:((1 + r) * w + 5) * 4] for r in range(4))
+    assert (box["w"], box["h"], box["ct"], box["channels"], box["data"]) == (3, 4, 6, 4, want)
+
+
+@pytest.mark.parametrize("bad", [(-1, 0, 2, 2), (0, 0, 8, 2), (0, 0, 2, 7), (6, 5, 2, 2), (0, 0, 0, 2), (0, 0, 2, 0)])
+def test_a_box_that_is_not_inside_the_picture_is_refused_and_not_cut_short(bad):
+    whole = pb.unfiltered(_png(7, 6, bytes(7 * 6 * 4)))
+    with pytest.raises(ValueError):
+        pb.crop(whole, *bad)
+
+
+def test_a_box_written_as_a_png_decodes_to_the_same_box():
+    whole = pb.unfiltered(_png(5, 5, bytes((9 * i) % 256 for i in range(5 * 5 * 4))))
+    box = pb.crop(whole, 1, 2, 3, 2)
+    back = pb.unfiltered(pb.encode_png(box))
+    assert (back["w"], back["h"], back["ct"], back["data"]) == (3, 2, 6, box["data"])
+
+
+def test_two_boxes_are_told_apart_by_one_pixel_and_it_is_named():
+    a = pb.unfiltered(_png(4, 5, PIXELS))
+    same = pb.pixels_differ(a, pb.unfiltered(_png(4, 5, PIXELS)))
+    assert same == {"pixels": 0, "first": None, "box": None}
+    changed = bytearray(PIXELS)
+    changed[(3 * 4 + 1) * 4 + 2] ^= 1        # a blue byte of the pixel (1, 3)
+    changed[(4 * 4 + 2) * 4] ^= 1            # a red byte of the pixel (2, 4)
+    got = pb.pixels_differ(a, pb.unfiltered(_png(4, 5, bytes(changed))))
+    assert got == {"pixels": 2, "first": [1, 3], "box": [1, 3, 2, 4]}
+
+
+def test_boxes_of_two_sizes_are_not_compared_as_different():
+    with pytest.raises(ValueError):
+        pb.pixels_differ(pb.unfiltered(_png(4, 5, PIXELS)), pb.unfiltered(_png(5, 4, PIXELS)))
+
+
+def test_the_pixels_that_are_not_grey_are_the_ones_of_a_subpixel_edge():
+    grey = bytes([0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255])
+    fringe = bytes([0, 0, 0, 255, 128, 129, 128, 255, 255, 255, 255, 255])
+    assert pb.coloured_pixels(pb.unfiltered(_png(3, 1, grey))) == 0
+    assert pb.coloured_pixels(pb.unfiltered(_png(3, 1, fringe))) == 1
+
+
 def _reference_of(measured):
     ref = {"keys": {}, "pngs": {}}
     for key, value in measured.items():

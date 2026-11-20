@@ -69,7 +69,7 @@ def _children_of(binary: str):
 #: start-up, and Firefox pre-launches content processes, so a process sampled while it starts legitimately reads 0 (run 43523960399: the newest tab
 #: process, pid 4090 of [3905, 4002, 4005, 4090], read 0 and the same suite was green on the candidates before). A process that is still 0 after this
 #: long has finished starting and runs without a filter: that is the failure the test is for.
-STARTUP_SECONDS = 10
+STARTUP_SECONDS = 30
 
 
 def _settled_seccomp(pids, seconds: float = STARTUP_SECONDS) -> dict:
@@ -104,7 +104,7 @@ def test_the_socket_process_and_a_tab_process_have_a_seccomp_filter(firefox_bina
           await new Promise(r => setTimeout(r, 1500));
         }""")
         sockets, tabs = [], []
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             kids = _children_of(firefox_binary)
             sockets = [pid for pid, kind in kids if kind == "socket"]

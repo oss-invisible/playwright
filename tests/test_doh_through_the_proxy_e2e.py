@@ -76,6 +76,7 @@ from pathlib import Path
 import pytest
 
 from invisible_core import SessionGeo, decide_session_locale
+from _session_end import EndingPlaywright
 from invisible_playwright import InvisiblePlaywright
 
 import _doh_servers as ds
@@ -120,7 +121,7 @@ def _hermetic_session(monkeypatch):
 # --------------------------------------------------------------------------------------------------------- helpers
 def _launch(binary, proxy, **kwargs):
     # headless=True: a headed browser on a virtual display the wrapper starts itself, as in every other e2e (a runner has no screen).
-    return InvisiblePlaywright(seed=42, binary_path=binary, proxy=proxy, extra_prefs=dict(PREFS), **{"headless": True, **kwargs})
+    return EndingPlaywright(seed=42, binary_path=binary, proxy=proxy, extra_prefs=dict(PREFS), **{"headless": True, **kwargs})
 
 
 def _page_in(browser, proxy=None):
@@ -405,7 +406,7 @@ def test_a_session_without_a_proxy_resolves_with_the_system_resolver(firefox_bin
     if why:
         pytest.fail(why)
     name = "page-d.test" if trapped else "localhost"
-    session = InvisiblePlaywright(seed=42, binary_path=firefox_binary, proxy=None, headless=True)
+    session = EndingPlaywright(seed=42, binary_path=firefox_binary, proxy=None, headless=True)
     session._timezone, session._locale = GEO.timezone, GEO.locale
     prefs = session._build_prefs()
     assert prefs.get("network.trr.mode") != 3, "a session without a proxy turned TRR on: %s" % prefs.get("network.trr.mode")

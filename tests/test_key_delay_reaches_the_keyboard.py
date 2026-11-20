@@ -176,13 +176,16 @@ def test_only_one_place_reads_the_key_delay():
     assert readers == {"_key_delay", "_pointer"}, readers
 
 
+# The time of each event is `e.timeStamp`, which is when the browser CREATED the event, not `performance.now()` read when
+# the handler happens to run: on a loaded machine the content process runs two handlers back to back (74 ms apart for
+# keys the driver sent 150 ms apart, four reds), and the gap between the two reads says nothing about when the keys left.
 PAGE = b"""<!doctype html><meta charset=utf-8>
 <input id=f>
 <script>
 window.__ev = [];
 for (const k of ["keydown", "keyup"])
   document.getElementById("f").addEventListener(k, e =>
-    __ev.push([k, e.key, performance.now()]));
+    __ev.push([k, e.key, e.timeStamp]));
 </script>"""
 
 
