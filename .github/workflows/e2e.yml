@@ -114,11 +114,11 @@ jobs:
           # the fontconfig e2e trace the opens of the browser: strace is not in the runner image (setsid is, util-linux)
           sudo apt-get install -y strace
           sudo "$(which python)" -m playwright install-deps firefox
-      # The preloaded-intermediates list is a file of the repository (ci/intermediates.json, empty, the sha256 in ci/intermediates.pin.json): with
-      # STEALTHFOX_INTERMEDIATES set the core neither downloads nor checks Mozilla's. BEFORE `fetch`, which makes the list present (it would download it).
-      - name: The intermediates list (a fixed file of the repository)
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
         shell: bash
-        run: python scripts/ci_lab_intermediates.py set --pin ci/intermediates.pin.json
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The protocol mirror agrees with the engine it is pinned to
@@ -331,11 +331,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
-      # The intermediates list of the repository (ci/intermediates.json, empty): with STEALTHFOX_INTERMEDIATES set the core asks Mozilla for nothing.
-      # BEFORE `fetch`, which makes the list present (it would download it).
-      - name: The intermediates list (a fixed file of the repository)
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
         shell: bash
-        run: python scripts/ci_lab_intermediates.py set --pin ci/intermediates.pin.json
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       - name: The keyboard shortcut selects all (the browser opens on the runner's desktop, as in e2e-hunt.yml)
@@ -371,11 +371,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      # The preloaded-intermediates list is a file of the repository (ci/intermediates.json, empty, the sha256 in ci/intermediates.pin.json): with
-      # STEALTHFOX_INTERMEDIATES set the core neither downloads nor checks Mozilla's. BEFORE `fetch`, which makes the list present (it would download it).
-      - name: The intermediates list (a fixed file of the repository)
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
         shell: bash
-        run: python scripts/ci_lab_intermediates.py set --pin ci/intermediates.pin.json
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
       - name: Fetch the published firefox binary
         run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
       # The GeoIP database made by the repository, as on the Linux run (no download, the same bytes every run).

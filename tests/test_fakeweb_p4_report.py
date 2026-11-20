@@ -254,9 +254,9 @@ def test_the_workflow_runs_stock_and_ours_and_never_reruns_or_forgives():
     assert "|| true" not in WORKFLOW and "|| echo" not in WORKFLOW
     assert "fetch | tail -1" in WORKFLOW                      # the published engine, as e2e.yml
     assert "gh run download" not in WORKFLOW                 # no engine of a named run: the candidate runs the entry itself
-    # the lab database and the intermediates list are made by the repository before the first launch (the scripts launch the core as the tests do)
+    # the lab database and the security state are made by the repository before the first launch (the scripts launch the core as the tests do)
     first_run = WORKFLOW.index("      - name: Profile P2")
-    assert WORKFLOW.index("scripts/ci_lab_geoip.py build") < first_run and WORKFLOW.index("scripts/ci_lab_intermediates.py set") < WORKFLOW.index("fetch | tail -1")
+    assert WORKFLOW.index("scripts/ci_lab_geoip.py build") < first_run and WORKFLOW.index("scripts/ci_lab_security_state.py set") < WORKFLOW.index("fetch | tail -1")
 
 
 def test_the_workflow_starts_on_the_fake_web_files_of_a_pull_request_and_of_main_and_by_hand():

@@ -234,11 +234,11 @@ jobs:
         run: |
           python -m ruff check --select F821,F811,F601 --no-cache --output-format concise .
 
-      # The preloaded-intermediates list is a file of the repository (ci/intermediates.json, empty, the sha256 in ci/intermediates.pin.json): with
-      # STEALTHFOX_INTERMEDIATES set the core neither downloads nor checks Mozilla's.
-      - name: The intermediates list (a fixed file of the repository)
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one.
+      - name: The security state (a fixed directory of the repository)
         shell: bash
-        run: python scripts/ci_lab_intermediates.py set --pin ci/intermediates.pin.json
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
 
       # The GeoIP database is made by the repository (scripts/ci_lab_geoip.py: the same bytes on every run, the sha256 in ci/geoip.json), never a
       # site and never a licensed file: without STEALTHFOX_GEOIP_MMDB the core asks GitHub which database is the latest on every call
