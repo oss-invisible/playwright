@@ -42,6 +42,30 @@ on:
         options:
           - ubuntu-24.04
           - windows-latest
+      pattern:
+        description: "suite-loop: the e2e suite in a loop (the job above). goto-after-launch: the first goto of a page of a served browser just launched, on Windows (scripts/hunt_goto_after_launch.py)"
+        required: false
+        default: "suite-loop"
+        type: choice
+        options:
+          - suite-loop
+          - goto-after-launch
+      engine_run_id:
+        description: "goto-after-launch: the run of the engine's repository whose asset-win-x86_64 to drive (empty: the published engine)"
+        required: false
+        default: ""
+      seal_tag:
+        description: "goto-after-launch: the tag that engine is sealed under (a candidate: firefox-NN-candidate)"
+        required: false
+        default: "firefox-68-candidate"
+      core_ref:
+        description: "goto-after-launch: the core to install from git over the pinned one (empty: the pin)"
+        required: false
+        default: ""
+      shards:
+        description: "goto-after-launch: the shards, a JSON list, eight at most (the account's queue is shared)"
+        required: false
+        default: "[1,2,3,4,5,6,7,8]"
 
 permissions:
   contents: read
@@ -60,6 +84,7 @@ env:
 
 jobs:
   hunt:
+    if: inputs.pattern != 'goto-after-launch'
     name: hunt (${{ inputs.os }})
     runs-on: ${{ inputs.os }}
     # 18 runs of ~6 minutes plus install time. Deliberately generous: the
@@ -150,5 +175,85 @@ jobs:
           path: |
             evidence/runs
             evidence/e2e-watchdog.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The first goto of a page of a served browser just launched, told started and then neither committed nor aborted
+  # (gate-only 44746170375 on firefox-68, gate 43889076032 on firefox-66: Windows, the stock client, nav-21 both times).
+  # Each shard repeats the shape `runs` times (scripts/hunt_goto_after_launch.py) with the engine's diagnostics on, and
+  # keeps only the folder of the session that caught it: the Juggler's trace (an engine that has INVISIBLE_JUGGLER_TRACE_DIR)
+  # and the MOZ_LOG of the docshell, the document channel and the process isolation. Red means caught.
+  # ───────────────────────────────────────────────────────────────────────────
+  goto-after-launch:
+    if: inputs.pattern == 'goto-after-launch'
+    name: goto after launch (windows, shard ${{ matrix.shard }})
+    runs-on: windows-latest
+    timeout-minutes: 150
+    permissions: { contents: read, actions: read }
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: The engine under test (an asset of the engine's repository)
+        if: inputs.engine_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: asset-win-x86_64
+          path: art
+          run-id: ${{ inputs.engine_run_id }}
+          repository: oss-invisible/firefox_antidetect_patch
+          github-token: ${{ github.token }}
+      - name: Install the wrapper, the stock client and the core under test
+        env:
+          CORE_REF: ${{ inputs.core_ref }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+          if [ -n "$CORE_REF" ]; then python -m pip install --force-reinstall "git+https://github.com/oss-invisible/core@$CORE_REF"; fi
+      - name: The GeoIP database and the intermediates (set by the repository, as the gate does)
+        run: |
+          python scripts/ci_lab_geoip.py build --pin ci/geoip.json
+          python scripts/ci_lab_intermediates.py set --pin ci/intermediates.pin.json
+      - name: Locate the engine (and seal it when it is a candidate)
+        env:
+          SEAL_TAG: ${{ inputs.seal_tag }}
+        run: |
+          set -e
+          if [ -d art ]; then
+            set -- art/firefox-*-stealth-win-x86_64.*
+            [ "$#" -eq 1 ] && [ -e "$1" ] || { echo "ERROR: expected one firefox-*-stealth-win-x86_64 archive in art/, found: $*"; exit 1; }
+            mkdir -p ff
+            python -c "import zipfile, sys; zipfile.ZipFile(sys.argv[1]).extractall('ff')" "$1"
+            FF="$PWD/ff/firefox.exe"
+            export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
+            python -m invisible_core seal --binary "$FF" --tag "$SEAL_TAG" -o hunt.seal.json
+            echo "INVISIBLE_SEAL_FILE=$PWD/hunt.seal.json" >> "$GITHUB_ENV"
+          else
+            FF="$(python -m invisible_playwright fetch | tail -1)"
+          fi
+          echo "FF=$FF" >> "$GITHUB_ENV"
+      - name: Repeat the shape until it catches one
+        env:
+          PYTHONUNBUFFERED: "1"
+          INVISIBLE_CORE_AUTOFIX: "off"
+          INVISIBLE_CORE_PIN: "allow"
+        run: python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence evidence/goto-hunt
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: goto-hunt-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/goto-hunt
           if-no-files-found: warn
           retention-days: 14
