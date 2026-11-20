@@ -232,18 +232,34 @@ def test_the_site_records_what_the_report_reads_and_the_tracer_keeps_what_the_cl
 
 
 # the workflow ------------------------------------------------------------------------------------------------------------
-WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb-p4.yml").read_text(encoding="utf-8")
+WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb.yml").read_text(encoding="utf-8")
 
 
-def test_the_workflow_is_one_job_on_one_linux_runner():
-    assert len(re.findall(r"^  [a-z0-9_-]+:\n    name:", WORKFLOW, re.MULTILINE)) == 1
-    assert WORKFLOW.count("runs-on:") == 1 and "runs-on: ubuntu-24.04" in WORKFLOW
+def test_the_workflow_has_four_legs_and_one_verdict_job():
+    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses):", WORKFLOW, re.MULTILINE)) == 3     # core-on-index, walk, verdict
+    assert WORKFLOW.count("{ profile: ") == 4
+    for leg in ("p2, os: linux", "p2, os: windows", "p4, os: linux", "p4, os: windows"):
+        assert "profile: " + leg in WORKFLOW
+    assert "name: fakeweb verdict" in WORKFLOW and "if: always()" in WORKFLOW.split("name: fakeweb verdict", 1)[1]
+    assert '"${{ needs.walk.result }}" != "success"' in WORKFLOW        # a leg that did not run is not green
 
 
 def test_every_action_is_pinned_to_a_commit():
     uses = re.findall(r"uses: (\S+)", WORKFLOW)
-    assert uses and all(re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", u) for u in uses), uses
+    assert uses and all(re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", u) or u.startswith("./.github/workflows/") for u in uses), uses
 
 
-def test_the_workflow_starts_on_a_push_of_its_own_file_and_on_dispatch():
-    assert re.search(r"on:\n  push:\n    paths:\n      - '\.github/workflows/fakeweb-p4\.yml'\n  workflow_dispatch:", WORKFLOW)
+def test_the_workflow_runs_stock_and_ours_and_never_reruns_or_forgives():
+    assert "--no-stock" not in WORKFLOW and "rerun" not in WORKFLOW.lower() and "continue-on-error" not in WORKFLOW
+    assert "|| true" not in WORKFLOW and "|| echo" not in WORKFLOW
+    assert "fetch | tail -1" in WORKFLOW                      # the published engine, as e2e.yml
+    assert "gh run download" not in WORKFLOW                 # no engine of a named run: the candidate runs the entry itself
+    # the lab database and the intermediates list are made by the repository before the first launch (the scripts launch the core as the tests do)
+    first_run = WORKFLOW.index("      - name: Profile P2")
+    assert WORKFLOW.index("scripts/ci_lab_geoip.py build") < first_run and WORKFLOW.index("scripts/ci_lab_intermediates.py set") < WORKFLOW.index("fetch | tail -1")
+
+
+def test_the_workflow_starts_on_the_fake_web_files_of_a_pull_request_and_of_main_and_by_hand():
+    on = WORKFLOW.split("\npermissions:", 1)[0]
+    assert "  push:\n    branches: [main]\n    paths:" in on and "  pull_request:\n    paths:" in on and "  workflow_dispatch:" in on
+    assert on.count("'tests/fakeweb/**'") == 2 and on.count("'.github/workflows/fakeweb.yml'") == 2

@@ -93,8 +93,9 @@ def main(argv=None):
     origin_a, _origin_o, stop = sites.start((0, 0))
     try:
         kw = {"idle_timeout_ms": args.idle_timeout_ms}
-        candidate = profile_p2.run_on_candidate(sync_playwright, args.binary, origin_a, patterns, args.repetitions, **kw)
+        # stock first, then ours: one browser at a time, the same invocation (ci-release-18)
         stock = [] if args.no_stock else profile_p2.run_on_stock(sync_playwright, origin_a, patterns, args.repetitions, **kw)
+        candidate = profile_p2.run_on_candidate(sync_playwright, args.binary, origin_a, patterns, args.repetitions, **kw)
     finally:
         stop()
 

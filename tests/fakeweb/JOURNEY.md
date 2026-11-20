@@ -26,12 +26,13 @@ stays in flight for ever and holds `networkidle` back. Our client closes such a 
 it is (the correction of a standard API); the noise avoids the case (its aborts cannot race: the server has sent the headers
 before the page aborts), so the verdict does not depend on it.
 
-## On the engine of a series run
+## The workflow
 
-`.github/workflows/fakeweb-p4.yml` runs the journey in one job on `ubuntu-24.04`: the Linux engine of a run of the series
-repository, the core that run was built with, the wrapper of the pushed branch, stock Firefox of the pinned Playwright; stock
-first, ours second, three walks (`--repetitions 3`). The step summary has one table per walk (step, stock ok / idle, ours ok /
-idle, equal or different), the FAIL lines and whether the control is sound (`scripts/fakeweb_p4_report.py journey`). The job is
-red when ours differs on a step of a walk whose control is sound, and red with another message when a control is broken. A second
-step walks once with `--trace` (ours only) and prints, from `scripts/fakeweb_p4_report.py trace`, the resource types the client
-reported for `sendBeacon` and how many keepalive requests the client reported against the server's count.
+`.github/workflows/fakeweb.yml` runs the journey (profile P4) and the hard pages (profile P2) as four legs, a profile on a system each
+(Linux under Xvfb, Windows), on the published engine, with Playwright's own Firefox of the pinned version as the control: stock first, ours
+second, one browser at a time, three walks for the journey (`--repetitions 3`). The step summary has one table per walk (step, stock ok / idle,
+ours ok / idle, equal or different), the FAIL lines and whether the control is sound (`scripts/fakeweb_p4_report.py journey`). A leg is red
+when ours differs on a step of a walk whose control is sound, and red with another message when a control is broken. A second step walks once with
+`--trace` and prints, from `scripts/fakeweb_p4_report.py trace`, the resource types the client reported for `sendBeacon` and how many keepalive
+requests the client reported against the server's count. The one verdict of the workflow is the job `fakeweb verdict`. The candidate of the engine
+runs `scripts/run_fakeweb.py --binary` on its own binary.
