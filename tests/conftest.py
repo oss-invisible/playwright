@@ -371,6 +371,26 @@ def engine_at_least():
     return check
 
 
+@pytest.fixture(scope="session")
+def engine_reaches():
+    """``engine_reaches("firefox-68")``: whether the engine in use is that release or a later one, for a test of a
+    required suite that asserts more on a newer engine and must not skip on an older one (a required suite allows no
+    skip, scripts/ci_verdict.py). A seal whose tag has no number fails the test, as with ``engine_at_least``."""
+    _require_package()
+    from invisible_core.seal import active_seal
+    tag = active_seal().tag
+
+    def check(minimum):
+        want, have = _engine_number(minimum), _engine_number(tag)
+        if want is None:
+            raise pytest.UsageError("engine_reaches wants 'firefox-N', got %r" % (minimum,))
+        if have is None:
+            pytest.fail("the engine's seal has no number: a candidate must be sealed as "
+                        "firefox-N-candidate (seal tag %r)" % (tag,), pytrace=False)
+        return have >= want
+    return check
+
+
 @pytest.fixture
 def the_udp_line(engine_at_least):
     """The UDP line (the declared network, the DoH through the proxy, the SOCKS5 UDP layer, HTTP/3 through it) is the engine
