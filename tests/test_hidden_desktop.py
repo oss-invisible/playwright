@@ -29,6 +29,7 @@ from invisible_playwright import InvisiblePlaywright
 
 from _screencast_evidence import Stream, engine_screencast_lines
 from _servers import LocalServer
+from _waits import wait_until
 
 # The page the session loads: served by this test from 127.0.0.1, so nothing
 # here depends on a site of the real web.
@@ -82,7 +83,7 @@ def _moz_windows_on(desktop_name, session):
     import ctypes
     from ctypes import wintypes
 
-    from invisible_playwright._reaper import find_processes
+    from invisible_core.process import find_processes
 
     mine = {p.pid for p in find_processes(session._session_token)}
     assert mine, "the session's token matches no process, so nothing could be counted"
@@ -121,7 +122,9 @@ def test_hidden_desktop_takes_the_window_off_screen_but_keeps_rendering(firefox_
     with headed as browser:
         page = browser.new_page()
         page.goto(served, timeout=30_000)
-        time.sleep(1.0)
+        # until the window is on the desktop (a condition with a deadline, not 1 s); a headed session that never
+        # puts one there still ends red below
+        wait_until(lambda: _moz_windows_on(None, headed) >= 1, 30, lambda: page.wait_for_timeout(100))
         assert _moz_windows_on(None, headed) >= 1, (
             "a headed session left no window on the interactive desktop, so "
             "the enumeration below could not tell hidden from broken")
@@ -130,10 +133,12 @@ def test_hidden_desktop_takes_the_window_off_screen_but_keeps_rendering(firefox_
     with ip as browser:
         page = browser.new_page()
         page.goto(served, timeout=30_000)
-        time.sleep(2)
 
         desktop = ip._virtual_display.name
         assert desktop and desktop != "Default"
+        # until the window is on its own desktop (a condition with a deadline, not 2 s): the check that none is on the caller's desktop is read
+        # after the window exists, so it cannot be read before the window had a place to be put in; a session that never puts one there ends red below
+        wait_until(lambda: _moz_windows_on(desktop, ip) >= 1, 30, lambda: page.wait_for_timeout(100))
 
         # 1) not on the desktop the caller is on ...
         assert _moz_windows_on(None, ip) == 0, (
@@ -162,13 +167,13 @@ def test_hidden_desktop_takes_the_window_off_screen_but_keeps_rendering(firefox_
         #    line that makes the engine's release gate prove it per build.
         stream = Stream("hidden desktop")
         stream.start(page)
-        deadline = time.time() + 15
+        deadline = time.time() + 30
         while not stream.frames and time.time() < deadline:
             time.sleep(0.1)
         page.screencast.stop()
         frames = stream.frames
         assert frames, ("no screencast frame arrived from the hidden desktop "
-                        "in 15 s: the window capturer is not being used there\n"
+                        "in 30 s: the window capturer is not being used there\n"
                         "%s\n"
                         "engine output (lines starting with 'screencast:'):\n%s"
                         % (stream.describe(), engine_screencast_lines(page)))

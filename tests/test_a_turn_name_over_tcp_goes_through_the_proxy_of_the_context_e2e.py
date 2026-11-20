@@ -43,21 +43,23 @@ TURN_NUMBER = "198.51.100.7"
 TURN_NAME = "turn-a.test"
 TURN_PORT = 3478
 TURN_ZONE = {**ZONE, TURN_NAME: TURN_NUMBER}
-#: How long the page waits for the ICE agent to try the server, in milliseconds.
-WAIT_MS = 6000
-#: How long to wait for the DoH to be asked and for the gateway to be handed the address, in seconds.
-ASKED_SECONDS = 25
+#: How long to wait for the DoH to be asked and for the gateway to be handed the address, in seconds (the deadline of the wait).
+ASKED_SECONDS = 30
 
-_PROBE_JS = """async ([url, waitMs]) => {
-  const errors = [], found = [];
-  const pc = new RTCPeerConnection({iceServers: [{urls: url, username: 'u', credential: 'p'}]});
+#: The page starts the ICE agent and leaves it alive; the test closes it AFTER it has seen the DoH asked and the gateway handed the address, so the agent is never
+#: closed before it has tried the server, whatever the speed of the machine (a timer of the page that closed it would judge that speed).
+_START_JS = """async (url) => {
+  const probe = window.__probe = {errors: [], found: [], pc: null};
+  const pc = probe.pc = new RTCPeerConnection({iceServers: [{urls: url, username: 'u', credential: 'p'}]});
   pc.createDataChannel('d');
-  pc.onicecandidateerror = (e) => errors.push(e.errorCode);
-  pc.onicecandidate = (e) => { if (e.candidate) found.push(e.candidate.candidate); };
+  pc.onicecandidateerror = (e) => probe.errors.push(e.errorCode);
+  pc.onicecandidate = (e) => { if (e.candidate) probe.found.push(e.candidate.candidate); };
   await pc.setLocalDescription(await pc.createOffer());
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
-  pc.close();
-  return {errors, candidates: found.length};
+}"""
+_END_JS = """() => {
+  const probe = window.__probe;
+  probe.pc.close();
+  return {errors: probe.errors, candidates: probe.found.length};
 }"""
 
 
@@ -81,9 +83,10 @@ def test_a_turn_server_named_over_tcp_is_resolved_by_the_doh_through_the_proxy_o
     with _launch(firefox_binary, gw_launch.proxy if gw_launch else None) as browser:
         context, page = _page_in(browser, proxy=gw_context.proxy)
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
-        result = page.evaluate(_PROBE_JS, ["turn:%s:%d?transport=tcp" % (TURN_NAME, TURN_PORT), WAIT_MS])
+        page.evaluate(_START_JS, "turn:%s:%d?transport=tcp" % (TURN_NAME, TURN_PORT))
         asked = ds.wait_until(lambda: doh.queries_for(TURN_NAME, QTYPE_A), ASKED_SECONDS)
         handed = ds.wait_until(lambda: (TURN_NUMBER, TURN_PORT) in gw_context.connects, ASKED_SECONDS)
+        result = page.evaluate(_END_JS)
         context.close()
     watcher.stop()
 

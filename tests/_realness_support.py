@@ -107,7 +107,7 @@ class ExitGateway(DohGateway):
             return
         self.connects.append((host, port))
         try:
-            upstream = socket.create_connection((host, port), timeout=10)
+            upstream = socket.create_connection((host, port), timeout=30)
         except OSError:
             self._send(c, self._reply(5))
             return

@@ -22,8 +22,21 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+from unittest import mock
 
-MARIONETTE_PORT = 28431
+
+
+def marionette_port() -> int:
+    """A port for ONE browser's Marionette, free when it is asked for.
+
+    ⛔ NEVER A FIXED PORT. Three e2e files used 28431 and xdist runs them on different workers at once: the second browser could
+    not bind it while the first held it, its Marionette never listened, and once the first closed every connection was refused
+    (ConnectionRefusedError 10061 for 120 s, e2e Windows part 2, run 43704738537: the font test on gw2 while the iframe-crash test
+    held the port on gw1). The OS picks the port; it is released just before the browser binds it."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
 FONTS_REPORTER = "explicit/gfx/webrender/resource-cache/fonts"
 
 
@@ -61,18 +74,71 @@ def unique_font(base: bytes, n: int) -> bytes:
     raise ValueError("no head table: not a TrueType font")
 
 
+def _runs_firefox(proc) -> bool:
+    try:
+        exe = proc.exe()
+    except Exception:
+        exe = ""
+    return (exe or proc.name()).replace("\\", "/").rsplit("/", 1)[-1].lower().startswith("firefox")
+
+
+def marionette_diagnosis(port: int) -> str:
+    """What the engine says about its Marionette when a connection to it fails: the evidence a refused connection lacks.
+
+    For every engine process below this one: its type, whether it is alive, the TCP ports it listens on. For the parent, its profile:
+    `MarionetteActivePort` (Firefox writes it once Marionette listens, with the port it got) and the `marionette.*` lines of `user.js`
+    (what the launch asked for). And who else listens on `port`. A refused connection then tells a Marionette that never started from
+    one on another port, and an engine that died from one that is still starting."""
+    import psutil
+
+    out = []
+    try:
+        below = psutil.Process().children(recursive=True)
+    except psutil.Error as exc:
+        return "no process tree: %r" % (exc,)
+    engines = [p for p in below if _runs_firefox(p)]
+    if not engines:
+        out.append("no engine process below this one")
+    for proc in engines:
+        try:
+            cmd = proc.cmdline()
+            kind = cmd[-1] if "-contentproc" in cmd else "parent"
+            conns = getattr(proc, "net_connections", None) or proc.connections
+            listening = sorted(c.laddr.port for c in conns(kind="tcp") if c.status == psutil.CONN_LISTEN)
+            line = "engine pid %d (%s, %s) listens on %s" % (proc.pid, kind, proc.status(), listening or "nothing")
+            if kind == "parent" and "-profile" in cmd:
+                profile = Path(cmd[cmd.index("-profile") + 1])
+                active = profile / "MarionetteActivePort"
+                line += "; MarionetteActivePort: %s" % (active.read_text().strip() if active.exists() else "absent")
+                user_js = profile / "user.js"
+                if user_js.exists():
+                    asked = [l.strip() for l in user_js.read_text(encoding="utf-8", errors="replace").splitlines() if "marionette" in l]
+                    line += "; user.js: %s" % (asked or "no marionette line")
+            out.append(line)
+        except (psutil.Error, OSError, ValueError, IndexError) as exc:
+            out.append("engine pid %d unreadable: %r" % (proc.pid, exc))
+    try:
+        holders = sorted({c.pid for c in psutil.net_connections(kind="tcp")
+                          if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN})
+        out.append("listening on %d: %s" % (port, holders or "nobody"))
+    except (psutil.Error, OSError) as exc:
+        out.append("the listeners of %d are unreadable: %r" % (port, exc))
+    return "; ".join(out)
+
+
 class _Marionette:
     def __init__(self, port: int, timeout: float = 120.0):
         end = time.time() + timeout
         while True:
             try:
-                self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+                self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
                 self.sock.settimeout(300)
                 self._read()
                 break
-            except (OSError, ValueError):
+            except (OSError, ValueError) as failure:
                 if time.time() > end:
-                    raise
+                    raise OSError("Marionette did not answer on port %d in %.0f s (%r). %s"
+                                  % (port, timeout, failure, marionette_diagnosis(port))) from failure
                 time.sleep(1)
         self.n = 0
 
@@ -115,15 +181,29 @@ _MINIMIZE = ("let cb = arguments[arguments.length - 1];"
              "Services.tm.mainThread.dispatch(() => { Cu.forceGC(); Cu.forceCC(); cb('ok'); }, 0);")
 
 
-def fonts_mb(marionette: _Marionette, folder: str, name: str) -> float:
-    """The web fonts WebRender holds, in MB, summed over the processes of a fresh memory report."""
-    path = os.path.normpath(os.path.join(folder, name + ".json.gz"))
-    marionette.call("Marionette:SetContext", {"value": "chrome"})
-    marionette.call("WebDriver:ExecuteAsyncScript", {"script": _MINIMIZE, "args": []})
-    time.sleep(2)
+def _fonts_report_mb(marionette: _Marionette, path: str) -> float:
     marionette.call("WebDriver:ExecuteAsyncScript", {"script": _DUMP, "args": [path]})
     reports = json.load(gzip.open(path))["reports"]
     return sum(r["amount"] for r in reports if r["path"] == FONTS_REPORTER) / 2 ** 20
+
+
+def fonts_mb(marionette: _Marionette, folder: str, name: str, settle: float = 30.0) -> float:
+    """The web fonts WebRender holds, in MB, summed over the processes of a memory report taken once the amount has settled.
+
+    The minimize is answered when the main thread has run it; what the render threads release after it is asynchronous and the engine reports no end of it.
+    So the report is taken again, a second apart, until three in a row agree (to 0.05 MB), or `settle` seconds have passed: what is returned is the amount
+    the engine holds still, not the one a fixed pause happened to catch."""
+    marionette.call("Marionette:SetContext", {"value": "chrome"})
+    marionette.call("WebDriver:ExecuteAsyncScript", {"script": _MINIMIZE, "args": []})
+    end = time.monotonic() + settle
+    readings = [_fonts_report_mb(marionette, os.path.normpath(os.path.join(folder, "%s-0.json.gz" % name)))]
+    while time.monotonic() < end:
+        time.sleep(1)
+        path = os.path.normpath(os.path.join(folder, "%s-%d.json.gz" % (name, len(readings))))
+        readings.append(_fonts_report_mb(marionette, path))
+        if len(readings) >= 3 and max(readings[-3:]) - min(readings[-3:]) < 0.05:
+            break
+    return readings[-1]
 
 
 def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, float]:
@@ -163,17 +243,19 @@ def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, flo
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     root = "http://127.0.0.1:%d" % server.server_address[1]
-    os.environ.setdefault("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1")
     folder = tempfile.mkdtemp(prefix="webfont_probe_")
     result: Dict[str, float] = {"contexts": contexts}
     marionette = None
+    port = marionette_port()
     try:
-        with InvisiblePlaywright(binary_path=binary, headless=True, humanize=False, extra_args=["-marionette"],
-                                 extra_prefs={"marionette.port": MARIONETTE_PORT}) as browser:
+        # the engine reads the variable from the environment it inherits (the launcher takes none): set for this launch only, undone after it
+        with mock.patch.dict(os.environ, {"MOZ_REMOTE_ALLOW_SYSTEM_ACCESS": "1"}), InvisiblePlaywright(
+                binary_path=binary, headless=True, humanize=False, extra_args=["-marionette"],
+                extra_prefs={"marionette.port": port}) as browser:
             keep = browser.new_context()
             keep_page = keep.new_page()
             keep_page.goto(root + "/blank.html")
-            marionette = _Marionette(MARIONETTE_PORT)
+            marionette = _Marionette(port)
             marionette.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {}}})
             marionette.call("WebDriver:SetTimeouts", {"script": 240000})
             result["before_mb"] = fonts_mb(marionette, folder, "before")
@@ -183,7 +265,7 @@ def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, flo
                 context = browser.new_context()
                 page = context.new_page()
                 page.goto("%s/page/%d.html" % (root, n))
-                page.wait_for_function("window.__font !== undefined", timeout=20000)
+                page.wait_for_function("window.__font !== undefined", timeout=30000)
                 loaded += 1 if page.evaluate("window.__font") == 1 else 0
                 open_now.append(context)
                 if n == open_at_once:

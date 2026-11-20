@@ -89,12 +89,12 @@ def test_reads_after_the_isolated_page_answer(page, site):
             "the engine did not isolate the page: this round tests nothing")
         # The read on the isolated page is what builds the script that went
         # stale; without it the bug never showed.
-        assert page.locator("#p").inner_text(timeout=10_000) == "isolated"
+        assert page.locator("#p").inner_text(timeout=30_000) == "isolated"
         # The page sends itself on, as a challenge page does: the move is its own location.replace, not a goto of ours.
         page.evaluate("moveOn()")
-        page.wait_for_url("**/plain?i=%d" % i, timeout=10_000)
+        page.wait_for_url("**/plain?i=%d" % i, timeout=30_000)
         assert page.evaluate("self.crossOriginIsolated") is False
-        assert page.locator("#p").inner_text(timeout=10_000) == "plain"
-        assert page.inner_text("#p", timeout=10_000) == "plain"
+        assert page.locator("#p").inner_text(timeout=30_000) == "plain"
+        assert page.inner_text("#p", timeout=30_000) == "plain"
         assert page.query_selector("#p") is not None
         assert page.locator("#p").all_inner_texts() == ["plain"]

@@ -93,7 +93,7 @@ def _check(page, popup_of, site, opener):
     with page.expect_popup(timeout=30000) as info:
         page.click(opener)
     popup = info.value
-    popup.wait_for_load_state("load", timeout=5000)
+    popup.wait_for_load_state("load", timeout=30000)
     expected = (site.replace("127.0.0.1", "localhost") if opener.startswith("#x") else site) + "popup"
     assert popup.url == expected
     assert popup.title() == "popup"

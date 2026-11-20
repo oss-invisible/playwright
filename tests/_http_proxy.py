@@ -188,7 +188,7 @@ class HttpProxy:
             self._answer(conn, 403)
             return
         try:
-            upstream = socket.create_connection((host, port), timeout=10)
+            upstream = socket.create_connection((host, port), timeout=30)
         except OSError:
             self._record("CONNECT", host, port, authorization, 502)
             self._answer(conn, 502)
@@ -209,7 +209,7 @@ class HttpProxy:
             self._answer(conn, 502)
             return
         try:
-            upstream = socket.create_connection((address, port), timeout=10)
+            upstream = socket.create_connection((address, port), timeout=30)
         except OSError:
             self._record("GET", host, port, authorization, 502)
             self._answer(conn, 502)

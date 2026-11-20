@@ -84,9 +84,9 @@ def test_a_routed_post_carries_its_body(firefox_binary, where):
             page = context.new_page()
             page.on("request", on_request)
             (context if where == "context" else page).route("**/*", guard)
-            page.goto(url, wait_until="load", timeout=20_000)
+            page.goto(url, wait_until="load", timeout=30_000)
             page.wait_for_function("document.title.startsWith('post:')",
-                                   timeout=10_000)
+                                   timeout=30_000)
             assert page.title() == "post:204", page.title()
     finally:
         srv.shutdown()
@@ -118,9 +118,9 @@ def test_without_a_route_the_request_still_carries_its_body(firefox_binary):
             page = browser.new_context().new_page()
             page.on("request", lambda r: on_event.append(r.post_data)
                     if r.method == "POST" else None)
-            page.goto(url, wait_until="load", timeout=20_000)
+            page.goto(url, wait_until="load", timeout=30_000)
             page.wait_for_function("document.title.startsWith('post:')",
-                                   timeout=10_000)
+                                   timeout=30_000)
             assert page.title() == "post:204", page.title()
     finally:
         srv.shutdown()

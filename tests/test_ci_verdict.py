@@ -592,26 +592,120 @@ def test_the_real_list_has_unique_ids_and_sane_rows():
         assert isinstance(root, bool) or (isinstance(root, list) and set(root) <= set(r["os"])), r["id"]
 
 
-def test_every_required_file_exists_and_every_node_id_is_defined_in_it():
-    for r in _real():
+WHOLE_SUITE_MARKER = "not slow and not e2e"  # the exact expression of the unit job of tests.yml (pyproject addopts)
+
+
+def _node_problems(sid, path, name, root):
+    file = root / path
+    if not file.is_file():
+        return ["%s: %s does not exist" % (sid, path)]
+    if name:
+        text = file.read_text(encoding="utf-8")
+        base = name.split("[", 1)[0]
+        if not re.search(r"^\s*(async\s+)?def %s\(" % re.escape(base), text, re.M):
+            return ["%s: %s has no def %s" % (sid, path, base)]
+    return []
+
+
+def required_entry_problems(rows, root=ROOT):
+    """What a row may name in `tests`: a file, with an optional `::name` defined in it. A folder (`tests`) and an option
+    (`--deselect=...`, `-k`) are refused: the judge takes files and node ids, and a row that names a folder holds whatever
+    the folder holds today, so a file that is added or that skips is not what the row says."""
+    out = []
+    for r in rows:
         for entry in r["tests"]:
             path, _sep, name = entry.partition("::")
-            file = ROOT / path
-            assert file.is_file(), "%s: %s does not exist" % (r["id"], path)
-            if name:
-                text = file.read_text(encoding="utf-8")
-                base = name.split("[", 1)[0]
-                assert re.search(r"^\s*(async\s+)?def %s\(" % re.escape(base), text, re.M), \
-                    "%s: %s has no def %s" % (r["id"], path, base)
+            if entry.startswith("-"):
+                out.append("%s: %s is an option, and a row names files and node ids" % (r["id"], entry))
+            elif not path.endswith(".py"):
+                out.append("%s: %s is not a file (a folder is refused: name its files)" % (r["id"], entry))
+            else:
+                out += _node_problems(r["id"], path, name, root)
+    return out
+
+
+def marker_problems(rows, root=ROOT):
+    """The marker a row names: unit, e2e, or the expression of the whole unit suite (a row of the files of tests/ that tests.yml runs). A row of the
+    marker unit holds files that carry it."""
+    out = []
+    for r in rows:
+        if r["marker"] not in {"unit", "e2e", WHOLE_SUITE_MARKER}:
+            out.append("%s: the marker %r is not one the gate knows" % (r["id"], r["marker"]))
+        elif r["marker"] == "unit":
+            for entry in r["tests"]:
+                file = root / entry.split("::")[0]
+                text = file.read_text(encoding="utf-8") if file.is_file() else ""
+                if "pytestmark = pytest.mark.unit" not in text and "@pytest.mark.unit" not in text:
+                    out.append("%s: %s does not carry the marker unit" % (r["id"], entry))
+    return out
+
+
+def test_every_required_file_exists_and_every_node_id_is_defined_in_it():
+    assert required_entry_problems(_real()) == []
 
 
 def test_a_required_suite_runs_with_the_marker_it_names():
-    for r in _real():
-        assert r["marker"] in {"unit", "e2e"}, r["id"]
-        if r["marker"] == "unit":
-            for entry in r["tests"]:
-                assert "pytestmark = pytest.mark.unit" in (ROOT / entry.split("::")[0]).read_text(encoding="utf-8") \
-                    or "@pytest.mark.unit" in (ROOT / entry.split("::")[0]).read_text(encoding="utf-8"), entry
+    assert marker_problems(_real()) == []
+
+
+_WHOLE = "wrapper.unit.all.x"
+_FILE = "tests/test_ci_verdict.py"
+
+
+def _whole(*tests, **over):
+    row = {"id": _WHOLE, "marker": WHOLE_SUITE_MARKER, "tests": list(tests) or [_FILE]}
+    row.update(over)
+    return row
+
+
+def test_a_row_of_files_is_accepted_with_the_marker_of_the_whole_suite():
+    rows = [_whole(_FILE, "tests/test_a_unit_test_does_not_read_the_seal_of_the_job.py")]
+    assert required_entry_problems(rows) == [] and marker_problems(rows) == []
+
+
+def test_the_folder_tests_is_refused_in_every_row():
+    for marker in (WHOLE_SUITE_MARKER, "unit", "e2e"):
+        found = required_entry_problems([_whole("tests", marker=marker)])
+        assert len(found) == 1 and "is not a file" in found[0], found
+
+
+def test_another_folder_is_refused():
+    for entry in ("tests/", "tests/data", "tests/unit", "src", "scripts", "."):
+        assert required_entry_problems([_whole(entry)]) != [], entry
+
+
+def test_a_deselect_is_refused_even_of_a_test_that_is_defined():
+    entry = "--deselect=tests/test_ci_verdict.py::test_a_required_suite_runs_with_the_marker_it_names"
+    found = required_entry_problems([_whole(_FILE, entry)])
+    assert len(found) == 1 and "is an option" in found[0], found
+
+
+def test_a_node_id_of_a_name_that_does_not_exist_is_refused():
+    found = required_entry_problems([_whole("tests/test_ci_verdict.py::test_that_is_not_there")])
+    assert len(found) == 1 and "has no def test_that_is_not_there" in found[0], found
+
+
+def test_a_file_that_does_not_exist_is_refused():
+    assert required_entry_problems([_whole("tests/test_nothing_here.py")]) != []
+    assert required_entry_problems([_whole("tests/test_nothing_here.py::test_a")]) != []
+
+
+def test_another_option_is_refused():
+    for entry in ("-k", "-x", "--ignore=tests/test_ci_verdict.py", "--co", "-m"):
+        assert required_entry_problems([_whole(entry)]) != [], entry
+
+
+def test_an_unknown_marker_is_refused():
+    assert marker_problems([_whole(marker="not slow")]) != []
+    assert marker_problems([_whole(marker="unit or e2e")]) != []
+
+
+def test_the_real_whole_suite_rows_name_files_only_and_hold_what_the_unit_job_of_tests_yml_holds():
+    rows = [r for r in _real() if r["marker"] == WHOLE_SUITE_MARKER]
+    assert sorted(r["id"] for r in rows) == ["wrapper.unit.all.linux", "wrapper.unit.all.windows"]
+    for r in rows:
+        assert r["giro"] == "G1" and r["exact"] is True, r["id"]
+        assert [e for e in r["tests"] if "::" in e or e == "tests" or e.startswith("-")] == [], r["id"]
 
 
 def test_a_suite_that_needs_root_only_on_linux_still_runs_on_windows():

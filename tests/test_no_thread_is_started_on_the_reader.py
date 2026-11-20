@@ -4,7 +4,7 @@
 four browsers at once, it was 75% of the reader's lag, and it made `networkidle` miss 7 times in 400 (none in 400 once the start no longer
 waited). Two listeners of this package started a thread from the reader: `Browser.attachedToTarget` (one thread per adoption) and
 `Page.fileChooserOpened` (one thread to announce the chooser). Both now hand the thread to the browser's ONE long-lived starter
-(`_ThreadStarter`, made with the browser), which starts it.
+(`ThreadStarter`, made with the browser), which starts it.
 
 NO BROWSER HERE: the real dispatchers over a scripted Juggler connection, and every event of the engine delivered FROM A THREAD OF ITS OWN
 (the reader's stand-in), the way the connection delivers them. `Thread.start` is replaced by a recorder of the thread that called it.
@@ -127,16 +127,20 @@ def test_an_attached_target_and_a_file_chooser_start_no_thread_on_the_reader(sta
         server.shutdown()
 
 
-def test_the_starter_of_a_browser_ends_with_its_connection(starts):
+def test_the_starter_of_a_browser_ends_with_its_connection_and_the_connections_thread_with_the_server(starts):
     server, conn, browser, context, opener_target = _world(starts)
     try:
         starter = browser.thread_starter
         starter.start(target=lambda: None, name="invpw-test-started")
         assert _wait(lambda: ("invpw-thread-starter", "invpw-test-started") in starts, 3)
         conn.announce_closed()
-        starter._thread.join(5)
-        assert not starter._thread.is_alive(), "the starter outlived the connection"
-        starter.start(target=lambda: None, name="invpw-test-after-the-end")      # after the end: nothing is started, nothing raises
+        starter.start(target=lambda: None, name="invpw-test-after-the-end")      # after the connection's end: nothing is started, nothing raises
+        shared = server.thread_starter
+        assert shared is server.thread_starter, "the server must own ONE starter"
+        assert shared._thread.is_alive(), "the server's starter must outlive one browser's connection"
+        server.shutdown()
+        shared._thread.join(5)
+        assert not shared._thread.is_alive(), "the starter outlived the server"
         assert all(c[1] != "invpw-test-after-the-end" for c in starts)
     finally:
         server.shutdown()

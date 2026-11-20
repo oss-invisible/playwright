@@ -103,7 +103,7 @@ def test_the_product_road_is_the_one_without_the_variable_and_with_a_cold_cache(
 
     monkeypatch.setenv("STEALTHFOX_GEOIP_MMDB", "/somewhere")
     monkeypatch.setenv("INVISIBLE_PLAYWRIGHT_CACHE_DIR", "/before")
-    import invisible_core.download as download
-    monkeypatch.setattr(download, "ensure_geoip_mmdb", fake)
+    import invisible_core
+    monkeypatch.setattr(invisible_core, "ensure_geoip_mmdb", fake)
     assert check.product_download(tmp_path / "cold") == tmp_path / "x.mmdb"
     assert seen == {"variable": None, "cache": str(tmp_path / "cold")}

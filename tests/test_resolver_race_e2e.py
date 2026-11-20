@@ -49,8 +49,8 @@ pytestmark = pytest.mark.e2e
 
 #: Contexts created back-to-back in one session.
 ROUNDS = 8
-#: A navigation that cannot resolve its name must fail fast (NS_ERROR_UNKNOWN_HOST), not wait the default 30 s per round.
-GOTO_MS = 20000
+#: A navigation that cannot resolve its name fails at once (NS_ERROR_UNKNOWN_HOST); one that is slow gets the deadline of the whole suite, 30 s.
+GOTO_MS = 30000
 
 
 def _race_names(prefix):

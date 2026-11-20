@@ -129,15 +129,15 @@ def nested_origins():
 
 
 def _timed(page):
-    """A page whose actions give up fast and whose navigations do not.
+    """A page whose actions and navigations wait 30 s, the deadline of the whole suite.
 
-    The actions are what these tests judge, so a missing element should fail
-    in seconds. Loading three origins is not judged, and with four browsers
-    starting at once (`run_e2e.py`'s default) a first navigation took longer
-    than 3 s, which read as a failure of whatever test it happened to set up.
+    The actions are what these tests judge: a missing element still fails them, only
+    later. A deadline is the time a healthy run is allowed, and with four browsers
+    starting at once (`run_e2e.py`'s default) a loaded runner takes longer than a
+    developer's machine, which read as a failure of whatever test it happened to set up.
     """
-    page.set_default_timeout(3000)
-    page.set_default_navigation_timeout(20000)
+    page.set_default_timeout(30000)
+    page.set_default_navigation_timeout(30000)
     return page
 
 
@@ -630,11 +630,9 @@ def _zoomed_session(firefox_binary, profile_dir, *, dpr, humanize, width=3200,
 
 @pytest.mark.e2e
 @pytest.mark.parametrize("dpr,zoom", [(1.25, 1.2), (1, 0.5)])
-def test_zoomed_binary_motion_and_wheel(firefox_binary, nested_origins, tmp_path,
-                                        monkeypatch, dpr, zoom):
-    """The binary cursor's moves and a wheel land on the input under a saved
+def test_zoomed_motion_and_wheel(firefox_binary, nested_origins, tmp_path, dpr, zoom):
+    """The cursor's moves and a wheel land on the input under a saved
     zoom, in and out, combined with a fractional device scale."""
-    monkeypatch.setenv("INVPW_CURSOR_ENGINE", "binary")
     _save_site_zoom(tmp_path, zoom)
     with _zoomed_session(firefox_binary, tmp_path, dpr=dpr, humanize=True) as context:
         page = _timed(context.new_page())

@@ -160,7 +160,7 @@ def test_a_popup_reaches_the_client(browser, site, kind, target, routed):
             page.click("#%s%s" % (KINDS[kind], tag))
         popup = info.value
         arrived = time.time() - t0
-        popup.wait_for_load_state("load", timeout=10000)
+        popup.wait_for_load_state("load", timeout=30000)
         assert popup.url == "http://%s:%d/p" % (host, site), "the popup is at %s" % popup.url
         assert popup.evaluate("document.title") == "t"
         assert popup.opener() is not None, "no opener (stock Firefox gives one for every kind)"
@@ -186,17 +186,21 @@ def _content_processes(engine_dir):
     return pids
 
 
-def _quiet(engine_dir, seconds=3.0, limit=30.0):
-    """The set of content processes once it has not changed for `seconds` (the engine keeps a spare one)."""
-    end = time.time() + limit
-    last, since = _content_processes(engine_dir), time.time()
-    while time.time() < end:
+def _quiet(engine_dir, samples=13, limit=30.0):
+    """The set of content processes once `samples` reads in a row (0.25 s apart: 3 s when nothing stalls) have given the same set.
+
+    The evidence of quiet is a COUNT of reads, not the seconds on a clock: when the machine stalls for a few seconds, the test and the browser
+    stand still together, the clock still runs, and "unchanged for 3 s" was true of a set that nothing had had the time to change. A stalled
+    read counts as one read, whatever its length. `limit` (30 s) is only the deadline of a set that never settles."""
+    end = time.monotonic() + limit
+    last, same = _content_processes(engine_dir), 1
+    while same < samples and time.monotonic() < end:
         time.sleep(0.25)
         now = _content_processes(engine_dir)
         if now != last:
-            last, since = now, time.time()
-        elif time.time() - since >= seconds:
-            break
+            last, same = now, 1
+        else:
+            same += 1
     return last
 
 
@@ -219,14 +223,14 @@ def _the_process_case_in(quiet_browser, engine_dir, site, psutil):
     page = context.new_page()
     page.goto("http://%s:%d/main" % (OWN, site))
     before = _quiet(engine_dir)
-    with context.expect_page(timeout=10000) as info:
+    with context.expect_page(timeout=30000) as info:
         page.click("#a1s")
     info.value.wait_for_load_state("load")
     same = _quiet(engine_dir)
     info.value.close()
     page.goto("http://%s:%d/main" % (OWN, site))
     base = _quiet(engine_dir)
-    with context.expect_page(timeout=10000) as info:
+    with context.expect_page(timeout=30000) as info:
         page.click("#a1o")
     info.value.wait_for_load_state("load")
     other = _quiet(engine_dir)

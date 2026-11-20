@@ -63,7 +63,7 @@ def test_a_clicked_download_is_reported_and_saved(firefox_binary, served, tmp_pa
     with InvisiblePlaywright(seed=4242, binary_path=firefox_binary, headless=True) as browser:
         page = browser.new_context(accept_downloads=True).new_page()
         page.goto(served, timeout=30_000)
-        with page.expect_download(timeout=20_000) as info:
+        with page.expect_download(timeout=30_000) as info:
             page.click("#dl")
         download = info.value
         assert download.suggested_filename == "report.bin"
@@ -79,7 +79,7 @@ def test_a_navigation_that_ends_in_a_download_is_reported(firefox_binary, served
 
     with InvisiblePlaywright(seed=4242, binary_path=firefox_binary, headless=True) as browser:
         page = browser.new_context(accept_downloads=True).new_page()
-        with page.expect_download(timeout=20_000) as info:
+        with page.expect_download(timeout=30_000) as info:
             with pytest.raises(Exception) as nav:
                 page.goto(served + "file", timeout=20_000)
         # Playwright reports such a goto as "Download is starting"; it must END,

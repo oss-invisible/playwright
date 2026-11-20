@@ -103,8 +103,8 @@ def open_page(firefox_binary):
                                       headless=True, extra_prefs=STRATEGY_1)
         opened.append(browser)
         page = browser.__enter__().new_context().new_page()
-        page.set_default_timeout(5000)
-        page.set_default_navigation_timeout(20000)
+        page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(30000)
         page.goto(url)
         return page
 

@@ -1,35 +1,44 @@
 """The check that no test module leaves a browser open.
 
-A `BrowserDispatcher` starts one daemon thread, "invpw-thread-starter", and stops it only when the connection's close listeners fire. A
-unit test that builds a dispatcher on a fake connection and never closes it leaves that thread alive, and the thread keeps the connection,
+A connection's server owns ONE daemon thread, "invpw-thread-starter" (`Server.thread_starter`, made when the first thread is asked of it), and
+stops it only on `shutdown`. A unit test that builds a dispatcher on a server and never shuts the server down leaves that thread alive, and the thread keeps the connection,
 the browser and every context alive for the rest of the worker (a gc census of a closed context once found 7 of them, and one file alone
 left 635). So the number of live starters, counted when the last test of a module has torn down, must be what it was before the module.
 
 Module level and not per test: a module-scoped browser (the e2e ones) is legitimately open between its tests and closed at the end.
 """
-import threading
+import sys
 import time
 
 import pytest
 
 STARTER_NAME = "invpw-thread-starter"
+_THREADS_MODULE = "invisible_playwright._juggler._threads"
 # `stop` is asynchronous: it queues a None and the thread leaves on its next turn. A moment, not a wait for a leak that will not leave.
 _JOIN_SECONDS = 5.0
 
 
 def starters_alive():
-    return [t for t in threading.enumerate() if t.name == STARTER_NAME and t.is_alive()]
+    """The starters built and not ended, counted from their construction: `ThreadStarter` begins its thread without waiting for it, so
+    one that has not run yet is in no `threading.enumerate()` (a census of live threads missed 2 leaks on a Linux runner).
+
+    NO IMPORT HERE. A module that never loaded `_threads` cannot have built a starter, so the answer is empty without importing anything:
+    the census runs from conftest in every job, including ones that install pytest alone and have no `invisible_core` (the `version`
+    job failed on `invisible_playwright._pin` when this function imported the package)."""
+    threads = sys.modules.get(_THREADS_MODULE)
+    if threads is None:
+        return []
+    return threads.ThreadStarter.open_starters()
 
 
 def wait_until_back_to(before, seconds=_JOIN_SECONDS):
-    """The starters still alive after `seconds` beyond the `before` that were there already (0 when the module closed everything)."""
+    """The starters still open after `seconds` beyond the `before` that were there already (0 when the module closed everything)."""
     deadline = time.monotonic() + seconds
     while True:
         extra = len(starters_alive()) - before
         if extra <= 0 or time.monotonic() >= deadline:
             return max(extra, 0)
-        for t in starters_alive():
-            t.join(0.05)
+        time.sleep(0.05)
 
 
 @pytest.fixture(scope="module", autouse=True)

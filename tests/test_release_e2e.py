@@ -73,7 +73,7 @@ _LEAKS = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
           "INVISIBLE_PLAYWRIGHT_ENGINE_DIR", "INVISIBLE_PLAYWRIGHT_CACHE_DIR",
           "INVISIBLE_DOWNLOAD_DEADLINE", "STEALTHFOX_GITHUB_TOKEN", "GITHUB_TOKEN",
           "INVISIBLE_SEAL_FILE", "INVISIBLE_CORE_PIN", "INVISIBLE_CORE_AUTOFIX",
-          "INVISIBLE_CORE_AUTOFIX_TIMEOUT", "UV", "STEALTHFOX_GEOIP_MMDB",
+          "INVISIBLE_CORE_AUTOFIX_TIMEOUT", "UV", "STEALTHFOX_GEOIP_MMDB", "STEALTHFOX_INTERMEDIATES",
           "STEALTHFOX_FONT_MANIFEST", "STEALTHFOX_WEBRTC_NETWORK",
           "INVPW_CURSOR_TIMER", "INVISIBLE_CORE_AUTOFIX_ATTEMPTED",
           "INVPW_SESSION_TOKEN", "INVPW_DESKTOP")
@@ -214,7 +214,7 @@ def _upstream_version(py: Path) -> str:
     # `PYTHONPATH` redirects to the workbench sources.
     out = subprocess.run(
         [str(py), "-c",
-         "from invisible_playwright.constants import FIREFOX_UPSTREAM_VERSION as v; print(v)"],
+         "from invisible_core.constants import FIREFOX_UPSTREAM_VERSION as v; print(v)"],
         capture_output=True, text=True, timeout=60, env=_clean_env()[0])
     assert out.returncode == 0, (
         "could not read FIREFOX_UPSTREAM_VERSION from the installed package: "
@@ -269,6 +269,12 @@ def clean_venv(workspace: Path, isolated_cache_env: dict) -> Path:
         add = [i for i, line in enumerate(lines) if line.split()[:3] == ["uv", "add", DIST]]
         assert len(add) == 1, lines
         lines[add[0]] = f'uv add "{DIST} @ git+{REPO_URL}@{REV}"'
+    elif os.environ.get("INVPW_E2E_VERSION"):
+        # A ledger pull request names the version it records (`user-install.yml`): that one is installed, not "the latest" of the index, which
+        # can be a different one (the tree on main may declare, and the index may by then serve, the next release).
+        add = [i for i, line in enumerate(lines) if line.split()[:3] == ["uv", "add", DIST]]
+        assert len(add) == 1, lines
+        lines[add[0]] = f'uv add "{DIST}=={os.environ["INVPW_E2E_VERSION"]}"'
     home = workspace / "home"
     home.mkdir(exist_ok=True)
     run_readme_block(lines, cwd=workspace, home=home, env=isolated_cache_env)
@@ -491,7 +497,7 @@ def test_binary_executes_after_fetch(clean_venv: Path, isolated_cache_env: dict)
     """After fetch, the binary cache contains a launchable Firefox."""
     out = _run(
         [str(clean_venv), "-c",
-         "from invisible_playwright.download import ensure_binary; "
+         "from invisible_core.download import ensure_binary; "
          "p = ensure_binary(); print('BINARY', p)"],
         env=isolated_cache_env,
         timeout=60,
@@ -600,33 +606,29 @@ def test_e2e_marker_is_excluded_by_default():
 def test_the_published_version_has_a_github_release():
     """EVERY version on the index needs a tag and a release carrying it.
 
-    Added 2026-07-26, when the three packages had been on PyPI for a day with
-    ZERO tags and ZERO releases between them. Not cosmetic: the release page is
-    where a reader looks for what changed, `git describe` has nothing to say,
-    and there is no commit anybody can point at as "this is the source of the
-    version you have".
+    Not cosmetic: the release page is where a reader looks for what changed,
+    `git describe` needs the tag, and the tag is the commit anybody can point
+    at as "the source of the version you have".
 
-    IT CHECKED ONE VERSION UNTIL 2026-08-02. It read `info.version` - the latest
-    - so the moment a release was published without its page, the next release
-    made the omission invisible: the check moved on to the new version and the
-    old gap stayed behind it. Measured that day: ELEVEN published versions across
-    the three packages had no release, and eight had no tag at all, three of them
-    published AFTER the backfill this test was written to protect. The docstring
-    said "every version" from the first line while the code checked one, which is
-    the same defect this project found three times in two days - a claim written
-    beside the code rather than from it.
+    The check covers the whole index, not just the latest version: PyPI says
+    which versions exist, and the releases of the repository are read with the
+    LIST endpoint (`/releases?per_page=100&page=N`, following pages until one
+    has fewer than 100 entries) into a map tag_name -> release. Then each live
+    version is looked up in that map: absent is `missing`, `draft` not False is
+    a draft, a blank body is empty. That is one or two GitHub calls however many
+    versions the index holds, so a transient 5xx on api.github.com has a single
+    request to hit instead of one per version. An HTTP error on the list is an
+    error and the test is red: it is never retried and never skipped, and when
+    the list breaks at page N the failure says so, together with the drafts and
+    empty bodies already seen on the pages read (the missing ones cannot be
+    told from a partial list).
 
-    It now walks the whole index. That is one API call per version, ~36 across
-    the three packages, and it runs in the install-e2e job rather than the unit
-    suite for exactly that reason.
+    The token is optional and never printed: GITHUB_TOKEN or GH_TOKEN raise the
+    rate limit when present (a GitHub runner always has one).
 
-    NO VENV, deliberately. The first version of this took `clean_venv` and read
-    the version out of the installed package, which made it depend on ANOTHER
-    test in the same file having installed it first - it passed alone in the one
-    repository whose fixture installs, and failed in the two whose fixture does
-    not. A test whose result depends on what ran before it is not measuring what
-    it claims. Both facts here are public: the index says which versions exist,
-    and the releases API says whether each has one.
+    NO VENV. Both facts are public: the index says which versions exist, and
+    the releases API says whether each has a release, so the result does not
+    depend on what another test installed.
 
     One-directional on purpose. A release for a version not yet on the index is
     a normal intermediate state during a publish; an index version with no
@@ -651,44 +653,51 @@ def test_the_published_version_has_a_github_release():
     assert live, "the index serves no usable version of invisible-playwright"
 
     # Authenticated when a token happens to be around, which on a GitHub runner
-    # it always is. Unauthenticated the API allows 60 calls an hour PER IP, and
-    # this walk wants one per version across three repositories: measured
-    # 2026-08-02, the walk hit 403 on its eleventh call. The token is optional,
-    # never required, and never printed.
+    # it always is. The token is optional, never required, and never printed.
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    missing, drafts, empty = [], [], []
-    checked = 0
-    cut_short = None
-    for version in live:
-        url = ("https://api.github.com/repos/oss-invisible/playwright"
-                   f"/releases/tags/v{version}")
+    # One list read, paged: tag_name -> release. A page with fewer than 100
+    # entries is the last one.
+    releases = {}
+    page = 1
+    while True:
+        url = (f"https://api.github.com/repos/oss-invisible/playwright/releases"
+               f"?per_page=100&page={page}")
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=30) as resp:
-                payload = json.load(resp)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                missing.append(version)
-                checked += 1
-                continue
-            if exc.code in (403, 429):
-                # NOT an unconditional skip. The first version of this walk
-                # skipped here, which threw away every violation already in
-                # hand: the mutation that deleted an OLD release passed, because
-                # a rate-limit two versions later abandoned the whole test. A
-                # gate that discards its own findings on an unrelated error is
-                # worse than no gate, because it reports PASS.
-                cut_short = (version, exc.code)
-                break
-            raise
+                batch = json.load(resp)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            seen_drafts = sorted(t for t, r in releases.items()
+                                 if r.get("draft") is not False)
+            seen_empty = sorted(t for t, r in releases.items()
+                                if not (r.get("body") or "").strip())
+            pytest.fail(
+                f"the GitHub releases list broke at page {page} after "
+                f"{len(releases)} releases ({type(exc).__name__}: {exc}), so "
+                f"the check is incomplete and proves nothing about missing "
+                f"releases. Already seen on the pages read: drafts "
+                f"{seen_drafts}, empty bodies {seen_empty}")
+        for release in batch:
+            releases[release["tag_name"]] = release
+        if len(batch) < 100:
+            break
+        page += 1
+
+    missing, drafts, empty = [], [], []
+    checked = 0
+    for version in live:
+        release = releases.get(f"v{version}")
         checked += 1
-        if payload.get("draft") is not False:
+        if release is None:
+            missing.append(version)
+            continue
+        if release.get("draft") is not False:
             drafts.append(version)
-        if not (payload.get("body") or "").strip():
+        if not (release.get("body") or "").strip():
             empty.append(version)
 
     problems = []
@@ -755,19 +764,6 @@ def test_the_published_version_has_a_github_release():
     assert not problems, (
         f"invisible-playwright has {len(live)} usable versions on the index, {checked} were "
         f"checked, and " + "; ".join(problems))
-
-    if cut_short:
-        version, code = cut_short
-        if checked == 0:
-            # "Green because it never ran" is the shape this project met three
-            # times in two days. A skip that reads "all clean so far" after
-            # checking NOTHING is that shape wearing a pass.
-            pytest.skip(f"GitHub API answered {code} on the FIRST call, so NONE "
-                        f"of {len(live)} versions were checked and this proves "
-                        f"nothing. Set GITHUB_TOKEN to raise the rate limit")
-        pytest.skip(f"GitHub API answered {code} at v{version} after {checked} of "
-                    f"{len(live)} versions, clean up to there. Set GITHUB_TOKEN to "
-                    f"raise the rate limit")
 
 
 @pytest.mark.e2e

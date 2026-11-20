@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from invisible_playwright import InvisiblePlaywright
+from _session_end import EndingPlaywright
 
 import _realness_support as rs
 import _trap_policy
@@ -74,15 +74,15 @@ def _start_trap():
 def _truth_of(exit_ip):
     """The zone and the country the core's geo database gives the exit: the truth of these tests."""
     from invisible_core._geo import ip_to_country, ip_to_timezone
-    from invisible_core.download import ensure_geoip_mmdb
+    from invisible_core import ensure_geoip_mmdb
 
     database = ensure_geoip_mmdb()
     return ip_to_timezone(exit_ip, database), ip_to_country(exit_ip, database)
 
 
 def _launch(binary, gateway, **extra):
-    return InvisiblePlaywright(seed=42, headless=True, binary_path=binary, proxy=gateway.proxy,
-                               udp_stun_servers=measure_servers(gateway), extra_prefs=dict(PREFS), **extra)
+    return EndingPlaywright(seed=42, headless=True, binary_path=binary, proxy=gateway.proxy,
+                            udp_stun_servers=measure_servers(gateway), extra_prefs=dict(PREFS), **extra)
 
 
 @pytest.fixture(scope="module", params=list(rs.EXITS), ids=list(rs.EXITS))

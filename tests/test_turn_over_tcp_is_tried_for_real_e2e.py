@@ -32,7 +32,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
 
 DECLARED = "v4=192.168.31.7;v6=0;p6="
 N_MS = 800
-WAIT_MS = 3000
+DEADLINE_MS = 30000     # far beyond a healthy run: the page waits for the end of the gathering, not for a fixed time
 SLACK_MS = 150
 
 
@@ -95,14 +95,20 @@ class _TurnTcp:
         self._s.close()
 
 
-_JS = """async ([url, waitMs]) => {
+_JS = """async ([url, deadlineMs]) => {
   const ev = [];
   const pc = new RTCPeerConnection({iceServers: [{urls: url, username: 'u', credential: 'c'}]});
   pc.addEventListener('icecandidateerror', e => ev.push(['error', Date.now(), e.errorCode]));
   pc.addEventListener('icegatheringstatechange', () => ev.push(['gathering', Date.now(), pc.iceGatheringState]));
   pc.createDataChannel('x');
   await pc.setLocalDescription(await pc.createOffer());
-  await new Promise(r => setTimeout(r, waitMs));
+  // Until the gathering completes (it ends after the TURN error), or the deadline: the order and the times of the events are what the test judges.
+  await new Promise(resolve => {
+    const timer = setTimeout(resolve, deadlineMs);
+    const done = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); } };
+    pc.addEventListener('icegatheringstatechange', done);
+    done();
+  });
   pc.close();
   return ev;
 }"""
@@ -147,7 +153,7 @@ def test_a_turn_server_over_tcp_is_connected_to_and_waited_for(local_page, monke
         with _launch(binary_path=binary, seed=7, **kw) as browser:
             page = browser.new_context().new_page()
             page.goto(local_page, wait_until="domcontentloaded", timeout=60000)
-            events = page.evaluate(_JS, ["turn:%s:%d?transport=tcp" % (_host_ip(), turn.port), WAIT_MS])
+            events = page.evaluate(_JS, ["turn:%s:%d?transport=tcp" % (_host_ip(), turn.port), DEADLINE_MS])
     finally:
         turn.close()
         if socks:

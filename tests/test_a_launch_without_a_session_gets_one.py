@@ -126,7 +126,7 @@ def test_the_launcher_marks_what_it_composes():
         prefs = _session.build_prefs(
             profile=generate_profile(seed=7), locale=decide_session_locale("en-US"),
             timezone="America/New_York", extra_prefs=None, virtual_display=False,
-            cursor_engine=_session.ENGINE_BINARY, humanize=humanize, session_seed=7)
+            cursor_engine=_session.ENGINE_PYTHON, humanize=humanize, session_seed=7)
         assert prefs.get(COMPOSED_PREF) is True, humanize
 
 

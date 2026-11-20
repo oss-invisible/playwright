@@ -48,15 +48,17 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from invisible_core.juggler import (
-    DONE, SLEEP, Ev as _Ev, Pacer, PointerPersona, Step,
-    clamp_to_viewport as _clamp, fine_timer as _fine_timer,
+    Ev as _Ev, PointerPersona, Step,
+    clamp_to_viewport as _clamp,
     fit_timeline as _fit_timeline, initial_pointer, landing_point,
     plan_aimless_move, plan_approach, plan_idle, plan_scroll,
     steps_from_waypoints, tail_within,
 )
-from invisible_core.juggler.connection import ReplyTimeout
+from invisible_core.juggler.connection import (
+    ProtocolError, ReplyTimeout, TargetClosedError)
 from invisible_core.juggler.deadline import Deadline
-from invisible_core.juggler.injected import ContextDestroyed, EvaluationError
+from invisible_core.juggler.injected import (
+    ContextDestroyed, EvaluationError, FrameDetached)
 from invisible_core.seedmix import sub_seed
 
 from .. import _cursor
@@ -88,10 +90,12 @@ _LANDING_MIN_BOX_PX = 12.0
 _LANDING_SPREAD = 0.14
 _LANDING_KEEP = 0.26
 
-#: What a probe of the page can legitimately answer while we are only AIMING:
-#: the element went away, the frame navigated, the page closed.
-_PROBE_ERRORS = (ContextDestroyed, EvaluationError, ReplyTimeout,
-                 ProtocolException, TimeoutError)
+#: What the ENGINE and the page can legitimately answer while we are only AIMING or walking: the element went away, the frame
+#: navigated or detached, the page or the browser closed (`TargetClosedError`), a command was refused or not answered. These are
+#: the errors that motion never turns into the action's failure (the action meets the same state itself and raises its own).
+#: Nothing else is in it on purpose: an AttributeError, a TypeError or a NameError out of the path is OUR bug, and it comes out.
+_PROBE_ERRORS = (ContextDestroyed, EvaluationError, FrameDetached, ReplyTimeout,
+                 ProtocolError, ProtocolException, TargetClosedError, TimeoutError)
 
 
 # ── the clock ───────────────────────────────────────────────────────────────
@@ -179,41 +183,6 @@ def _normalise_waypoints(raw: Iterable[Any], max_seconds: float) -> List[Tuple[f
     return out
 
 
-def _drive(evs: Sequence[_Ev], emit_move: Callable[[float, float], Any],
-           emit_wheel: Optional[Callable[[float, float], Any]] = None, *,
-           emit_last: bool = True,
-           origin: Optional[Tuple[float, float]] = None) -> int:
-    """The synchronous driver of `Pacer`. Returns events sent.
-
-    The rules it obeys - absolute deadlines from one ``t0``, drop rather than
-    send late while the drop stays within reach, never two events in one
-    instant - are the pacer's, the core's, and are the same ones the client's
-    asynchronous driver obeyed. This supplies a clock, a way of waiting and
-    where the pointer starts from; it makes no decision the pacer has not made.
-    """
-    if not evs:
-        return 0
-    clock = _CLOCK
-    pacer = Pacer(evs, emit_last=emit_last, origin=origin)
-    with _fine_timer():
-        while True:
-            what, arg = pacer.step(clock.now())
-            if what == DONE:
-                break
-            if what == SLEEP:
-                clock.sleep(arg)
-                continue
-            if arg.is_wheel:
-                if emit_wheel is None:
-                    pacer.dropped()  # nothing here can carry a notch
-                    continue
-                emit_wheel(arg.dx, arg.dy)
-            else:
-                emit_move(arg.x, arg.y)
-            pacer.emitted(clock.now())
-    return pacer.delivered
-
-
 # ── one page's hand ─────────────────────────────────────────────────────────
 
 class _Hand:
@@ -226,7 +195,7 @@ class _Hand:
                  synced: Any) -> None:
         self.seed = int(seed)
         self.max_seconds = float(max_seconds)
-        self._profile = _cursor._build_profile(factory, self.seed, self.max_seconds)
+        self._profile = factory(self.seed)
         self.persona = PointerPersona.from_seed(self.seed)
         self.x: Optional[float] = None
         self.y: Optional[float] = None
@@ -363,8 +332,6 @@ class Pointer:
         if not draws or session_seed is None or not budget_s:
             return
         factory = _cursor._motion_factory()
-        if factory is None:
-            return
         seed = _cursor.page_motion_seed(session_seed, number)
         try:
             self.hand = _Hand(seed, budget_s, factory,
@@ -409,10 +376,18 @@ class Pointer:
             hand.x, hand.y = hand.start_point(w, h)
         return float(hand.x), float(hand.y)
 
-    def _emit_move(self, x: float, y: float) -> None:
+    def _walk(self, evs: Sequence[_Ev], *, emit_last: bool = True) -> int:
+        """Hand a planned timeline to the core, which walks it as ONE stroke: the pacer's instants on the client's clock, each point
+        carrying `stroke` and `at`, no reply waited for between two points. Returns the events delivered.
+
+        ⛔ THIS IS THE ONLY PLACE A PATH LEAVES. It used to be driven here, one point at a time through `actions.move`, and each point
+        waited for the engine's reply: a slow reply was a pause in the path that the page saw, and the points after it were crowded
+        together. The pacer's decisions are the core's, and so is the loop that applies them (`Actions.walk`)."""
         hand = self.hand
-        self.actions.move(x, y)
+        sent = self.actions.walk(evs, origin=(hand.x, hand.y), emit_last=emit_last,
+                                 now=_CLOCK.now, sleep=_CLOCK.sleep)
         hand.synced = getattr(self.actions, "position", None)
+        return sent
 
     # -- the probes --------------------------------------------------------
 
@@ -505,21 +480,19 @@ class Pointer:
 
     # -- travelling --------------------------------------------------------
 
-    def _run_steps(self, steps: Sequence[Any], emit_wheel: Optional[Callable] = None,
-                   *, budget_s: float, emit_last: bool = True) -> None:
-        """Dispatch a planned ``_behaviour`` timeline, inside a time budget."""
+    def _run_steps(self, steps: Sequence[Any], *, budget_s: float, emit_last: bool = True) -> None:
+        """Dispatch a planned ``_behaviour`` timeline, inside a time budget: moves and wheel notches, as one stroke."""
         hand = self.hand
         evs = _fit_timeline(_timeline(steps), budget_s)
         if not evs:
             return
-
-        def move(x: float, y: float) -> None:
-            self._emit_move(x, y)
-            hand.x, hand.y = x, y
-
-        _drive(evs, move, emit_wheel, emit_last=emit_last,
-               origin=(hand.x, hand.y))
-        if not emit_last and evs:
+        self._walk(evs, emit_last=emit_last)
+        if emit_last:
+            # The pointer is where the last move that went out put it (a notch leaves it where it was).
+            now = getattr(self.actions, "position", None)
+            if now is not None:
+                hand.x, hand.y = float(now[0]), float(now[1])
+        else:
             hand.x, hand.y = evs[-1].x, evs[-1].y
         hand.last_event_at = _CLOCK.now()
 
@@ -654,7 +627,7 @@ class Pointer:
         override = None
         try:
             override = self.approach(frame_id, selector, position, trial)
-        except Exception as exc:  # noqa: BLE001 - motion never fails an action
+        except _PROBE_ERRORS as exc:  # motion never fails an action for what the engine or the page answers; a bug of ours is not that
             _cursor._warn_once(
                 "approach-failed",
                 "the cursor approach raised (%s: %s); the action itself is "
@@ -696,7 +669,7 @@ class Pointer:
         hand.action += 1
         try:
             self._travel(x, y)
-        except Exception as exc:  # noqa: BLE001
+        except _PROBE_ERRORS as exc:  # what the engine or the page answers, not a bug of ours (see `_PROBE_ERRORS`)
             _cursor._warn_once(
                 "move-failed",
                 "the cursor path raised during %s (%s: %s); the action "
@@ -756,11 +729,7 @@ class Pointer:
         # though the caller is the one that emits it.
         evs.append(_Ev(max(t, evs[-1].t_ms if evs else 0.0), to_x, to_y))
 
-        def emit(x: float, y: float) -> None:
-            self._emit_move(x, y)
-            hand.x, hand.y = x, y
-
-        _drive(evs, emit, emit_last=False, origin=(hand.x, hand.y))
+        self._walk(evs, emit_last=False)
         hand.x, hand.y = to_x, to_y
         hand.last_event_at = _CLOCK.now()
 
@@ -799,12 +768,11 @@ class Pointer:
             try:
                 plan = self._scroll_plan(float(dx), float(dy))
                 if plan:
-                    self._run_steps(plan, self.actions.wheel,
-                                    budget_s=hand.max_seconds)
+                    self._run_steps(plan, budget_s=hand.max_seconds)
                     return True
             finally:
                 hand.busy = False
-        except Exception as exc:  # noqa: BLE001
+        except _PROBE_ERRORS as exc:  # what the engine or the page answers, not a bug of ours (see `_PROBE_ERRORS`)
             _cursor._warn_once(
                 "wheel-failed",
                 "the scroll planner raised (%s: %s); the scroll itself is "

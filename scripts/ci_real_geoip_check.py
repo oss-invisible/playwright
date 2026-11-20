@@ -93,7 +93,7 @@ def product_download(cache: Path) -> Path:
     """The core's own road: no variable, a cold cache."""
     os.environ.pop(lab.ENV, None)
     os.environ["INVISIBLE_PLAYWRIGHT_CACHE_DIR"] = str(cache)
-    from invisible_core.download import ensure_geoip_mmdb
+    from invisible_core import ensure_geoip_mmdb
 
     return Path(ensure_geoip_mmdb())
 

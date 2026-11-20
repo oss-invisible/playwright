@@ -171,12 +171,6 @@ def no_geo_lookup(monkeypatch):
                         lambda tz, proxy, locale, **_kw: SessionGeo(
                             "America/New_York", "198.51.100.4",
                             locale=decide_session_locale("en-US")))
-    # And the lifetime guard. `bind` waits for the browser tree to APPEAR -
-    # correct on a real launch, and here Playwright is a MagicMock so no process
-    # ever comes, and each of these four tests sat out the whole 10s deadline.
-    # The guard has its own tests in the core (test_process_guard.py); these
-    # assert which Playwright call the launcher makes.
-    monkeypatch.setattr(InvisiblePlaywright, "_bind_process_tree", lambda self: None)
 
 
 @pytest.mark.unit

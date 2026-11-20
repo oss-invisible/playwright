@@ -65,7 +65,7 @@ from typing import Callable, Dict, Optional
 
 import pytest
 
-from invisible_playwright import InvisiblePlaywright
+from _session_end import EndingPlaywright
 
 # The fixtures and the helpers of the DoH e2e (imported, not copied): the hermetic session (autouse) and the page in a context. `gateway`, `pages`,
 # `trap` and `watcher` are in conftest.py.
@@ -82,10 +82,12 @@ from _witness import Witness
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
 
-#: How long the page waits for the browser to try the target, in milliseconds (the ICE agent retransmits STUN and TURN at 0, 0.1, 0.3, 0.7 s...).
+#: How long the test leaves the probe alive AFTER the road it was meant to take has been seen (or, with no such road to see, after it started), in milliseconds:
+#: the window in which a road around the proxy would show (the ICE agent retransmits STUN and TURN at 0, 0.1, 0.3, 0.7 s...). It looks for something that must
+#: NOT happen, so a slow machine can only make it weaker, never red; the page does not hold the probe with a timer of its own, so the probe is alive for the whole of it.
 WAIT_MS = {"fetch": 2500, "websocket": 2500, "stun": 5000, "turn_udp": 5000, "turn_tcp": 5000, "turns_tcp": 5000}
 #: How long to wait, in seconds, for the proxy or the DoH to have been handed what the probe asked for.
-EVIDENCE_SECONDS = 20
+EVIDENCE_SECONDS = 30
 #: The lab's own prefs, on top of the DoH provider of ``PREFS``. Every name of a probe is answered with the address of THIS host (the witness), and on
 #: a LAN or a runner that is an RFC 1918 address: the engine's DoH client DROPS such an answer unless ``network.trr.allow-rfc1918`` is true
 #: (TRR.cpp / DNSPacket.cpp: ``aAllowRFC1918 || !addr.IsIPAddrLocal()``), so the name would resolve to nothing and the probe would never connect
@@ -143,10 +145,10 @@ WINDOW_CASES = [WindowCase(w, p) for w in ("iframe", "popup") for p in ("socks5"
 CONTROL_CASES = [WindowCase("attached", p) for p in ("socks5", "http")]
 #: The two ICE servers of a window case, by name: the STUN server over UDP and the TURN server over TCP.
 ICE_KINDS = ("stun", "turn")
-#: How long the page waits for the gathering to end, in milliseconds (the witness answers nothing: the ICE agent retries until this ends).
-GATHER_MS = 6000
-#: How long the page waits for a closed popup to say ``closed``, in milliseconds.
-CLOSED_MS = 5000
+#: How long the page waits for the gathering of a window's PeerConnection to start, in milliseconds (the deadline of the wait: a healthy run takes a few hundred).
+GATHER_MS = 30000
+#: How long the page waits for a closed popup to say ``closed``, in milliseconds (the deadline of the wait).
+CLOSED_MS = 30000
 
 #: What each case is expected to do, by engine. "green" is the contract; "RED" names the road that leaves the proxy. Held by
 #: test_the_egress_sink_helpers.py (every id is a case, and a RED has its reason).
@@ -194,24 +196,27 @@ EXPECTED_OCSP: Dict[str, Dict[str, str]] = {
 #: How long the negative control waits for an OCSP request that must not come, in seconds (the soft-fail timeout of the engine is 2 s).
 OCSP_SETTLE_SECONDS = 4
 
-_FETCH_JS = """async ([host, port, waitMs]) => {
+#: The probes START the thing and leave it alive (the page holds no timer of its own that would end it): the test waits for the road it was meant to take, leaves the
+#: window of ``WAIT_MS``, then ends it with ``_STOP_JS``.
+_FETCH_JS = """([host, port]) => {
   fetch('http://' + host + ':' + port + '/f', {mode: 'no-cors'}).catch(() => {});
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
 }"""
 
-_WEBSOCKET_JS = """async ([host, port, waitMs]) => {
-  try { const ws = new WebSocket('ws://' + host + ':' + port + '/s'); ws.onerror = () => {}; } catch (e) {}
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
+_WEBSOCKET_JS = """([host, port]) => {
+  try { window.__ws = new WebSocket('ws://' + host + ':' + port + '/s'); window.__ws.onerror = () => {}; } catch (e) {}
+}"""
+
+_STOP_JS = """() => {
+  try { if (window.__pc) window.__pc.close(); } catch (e) {}
+  try { if (window.__ws) window.__ws.close(); } catch (e) {}
 }"""
 
 
 def _ice_js(url_expression):
-    return """async ([host, port, waitMs]) => {
-  const pc = new RTCPeerConnection({iceServers: [{urls: [%s], username: 'u', credential: 'p'}]});
+    return """async ([host, port]) => {
+  const pc = window.__pc = new RTCPeerConnection({iceServers: [{urls: [%s], username: 'u', credential: 'p'}]});
   pc.createDataChannel('d');
   await pc.setLocalDescription(await pc.createOffer());
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
-  pc.close();
 }""" % url_expression
 
 
@@ -275,11 +280,13 @@ _WINDOW_ICE_JS = """async ([how, stunHost, turnHost, port, gatherMs, closedMs]) 
   } catch (e) { out.error = String(e && e.name ? e.name + ': ' + e.message : e); }
   if (pc) {
     try {
+      // until the gathering has STARTED (the state leaves 'new'), for gatherMs; the PeerConnection stays alive (window.__pc) and the test closes it after it has
+      // seen the road it was meant to take
+      window.__pc = pc;
       const t0 = Date.now();
-      while (pc.iceGatheringState !== 'complete' && Date.now() - t0 < gatherMs) await sleep(100);
+      while (pc.iceGatheringState === 'new' && Date.now() - t0 < gatherMs) await sleep(50);
       out.state = pc.iceGatheringState;
       out.started = out.state !== 'new';
-      pc.close();
     } catch (e) { out.error = (out.error ? out.error + '; ' : '') + String(e && e.name ? e.name + ': ' + e.message : e); }
   }
   return out;
@@ -350,8 +357,8 @@ def engine_log(tmp_path, monkeypatch):
 
 def _launch(binary, proxy=None):
     """The session of the lab: NO proxy unless given (the default context is the machine's own network), the DoH provider of the FakeDoh."""
-    return InvisiblePlaywright(seed=42, binary_path=binary, proxy=proxy, headless=True,
-                               extra_prefs={**PREFS, **LAB_PREFS})
+    return EndingPlaywright(seed=42, binary_path=binary, proxy=proxy, headless=True,
+                            extra_prefs={**PREFS, **LAB_PREFS})
 
 
 def _the_proxy_of(case: Case, doh, gateway):
@@ -393,9 +400,11 @@ def test_a_probe_of_a_context_leaves_only_through_its_proxy(case, firefox_binary
     with _launch(firefox_binary) as browser:
         context, page = _page_in(browser, proxy=proxy.proxy)
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
-        page.evaluate(PROBE_JS[case.kind], [host, port, WAIT_MS[case.kind]])
+        page.evaluate(PROBE_JS[case.kind], [host, port])
         done = _the_work_was_done(case, lab, doh, proxy)
         reached = ds.wait_until(done, EVIDENCE_SECONDS) if done else None
+        ds.wait_until(lambda: False, WAIT_MS[case.kind] / 1000.0)        # the window of a road around the proxy, with the probe alive
+        page.evaluate(_STOP_JS)
         context.close()
     watcher.stop()
 
@@ -423,8 +432,9 @@ def test_the_same_probe_with_no_proxy_is_heard_by_the_witness(kind, firefox_bina
     with _launch(firefox_binary) as browser:
         page = browser.new_context(ignore_https_errors=True).new_page()
         page.goto("about:blank")
-        page.evaluate(PROBE_JS[kind], [lab.witness.address, lab.witness.port, WAIT_MS[kind]])
+        page.evaluate(PROBE_JS[kind], [lab.witness.address, lab.witness.port])
         reached = ds.wait_until(lambda: lab.witness.heard()["tcp" if case.tcp else "udp"], EVIDENCE_SECONDS)
+        page.evaluate(_STOP_JS)
     watcher.stop()
     assert reached, "no proxy, and the %s probe by IP did not reach the witness at %s: %s" % (kind, lab.witness.target, lab.witness.heard())
 
@@ -444,7 +454,7 @@ def test_the_native_sink_hears_a_native_lookup(firefox_binary, lab, trap, watche
     with _launch(firefox_binary) as browser:
         page = browser.new_context().new_page()
         try:
-            page.goto("http://%s:%d/" % (name, lab.witness.port), timeout=15000)
+            page.goto("http://%s:%d/" % (name, lab.witness.port), timeout=30000)
         except Exception:  # noqa: BLE001 - the name has no address: the lookup is what the test is about
             pass
         heard = ds.wait_until(lambda: _native_or_nothing(engine_log, lab.nonce, trap), EVIDENCE_SECONDS)
@@ -466,7 +476,7 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
         if case.window == "popup":
             page.evaluate(_POPUP_BUTTON_JS)
-            page.click("#open-dead", timeout=10000)
+            page.click("#open-dead", timeout=30000)
         outcome = page.evaluate(_WINDOW_ICE_JS, [case.window, stun_host, turn_host, port, GATHER_MS, CLOSED_MS])
         if outcome["started"]:
             def done() -> bool:
@@ -475,6 +485,8 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
                     return _was_handed(case, proxy, turn_host, port)
                 return (lab.witness.address, port) in proxy.connects and bool(doh.queries_for(stun_host, QTYPE_A))
             reached = ds.wait_until(done, EVIDENCE_SECONDS)
+            ds.wait_until(lambda: False, WAIT_MS["turn_tcp"] / 1000.0)    # the window of a road around the proxy, with the PeerConnection alive
+        page.evaluate(_STOP_JS)
         context.close()
     watcher.stop()
     return proxy, outcome, reached
@@ -621,8 +633,8 @@ def ocsp_responder(lab):
 def _launch_trusting(binary, profile):
     """A persistent session on ``profile`` (the lab CA is in its NSS database), with NO proxy: its default context is the machine's own network
     and ``context.browser.new_context(proxy=...)`` makes the contexts that have one. No ``ignore_https_errors`` anywhere."""
-    return InvisiblePlaywright(seed=42, binary_path=binary, headless=True, profile_dir=profile,
-                               extra_prefs={**PREFS, **LAB_PREFS, **OCSP_PREFS})
+    return EndingPlaywright(seed=42, binary_path=binary, headless=True, profile_dir=profile,
+                            extra_prefs={**PREFS, **LAB_PREFS, **OCSP_PREFS})
 
 
 def _trusting_profile(binary, tmp_path, ca: LabCa):
@@ -738,3 +750,62 @@ def test_a_page_of_an_issuer_the_engine_does_not_trust_makes_no_ocsp_request(fir
         assert ocsp_responder.requests == [], "an untrusted issuer made an OCSP request: %s" % ocsp_responder.requests
     finally:
         server.close()
+
+
+# ------------------------------------------------------------------------------------- a lookup a context leaves after it closed
+def test_a_beacon_sent_as_a_context_closes_resolves_through_its_proxy(firefox_binary, engine_at_least, lab, doh, gateway, trap, watcher,
+                                                                       engine_log):
+    """A page of a context behind the gateway sends a beacon on ``pagehide`` to a name it never looked up; the context is closed. The
+    beacon leaves after ``context.close()`` returns, so its name is looked up once the context is gone: it must still be asked of the DoH
+    through the context's proxy, never of the machine's resolver. On firefox-64 every one of these lookups went native (the engine dropped
+    an ended context from the list its resolver reads; hunt 43733181674: 10 of 10 on Linux and on Windows, ``Calling getaddrinfo``); it is
+    how the OCSP request of a closing context leaked once (run 43717860248). Fixed in firefox-65."""
+    engine_at_least("firefox-65")
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    first, late = "beacon-%s.lab.test" % lab.nonce, "late-%s.lab.test" % lab.nonce
+    arrived = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _answer(self):
+            arrived.append(self.path)
+            if self.path.startswith("/page"):
+                body = ("<!doctype html><title>beacon</title><script>addEventListener('pagehide', () => "
+                        "navigator.sendBeacon('http://%s:%d/late', 'x'));</script>" % (late, port)).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(204)
+                self.end_headers()
+
+        do_GET = do_POST = _answer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    _threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        doh.names[first] = "127.0.0.1"
+        doh.names[late] = "127.0.0.1"
+        proxy = gateway("gw-context")
+        with _launch(firefox_binary) as browser:
+            context = browser.new_context(proxy=proxy.proxy, ignore_https_errors=True)
+            page = context.new_page()
+            page.goto("http://%s:%d/page" % (first, port), wait_until="load", timeout=30000)
+            context.close()
+            beacon = ds.wait_until(lambda: "/late" in arrived, EVIDENCE_SECONDS)
+        watcher.stop()
+        sink = EgressSink(lab.witness, watcher, engine_log, lab.nonce, trap)
+        why = "\n  requests that arrived: %s; DoH vias of %s: %s" % (arrived, late, sorted(doh.vias_of(late, QTYPE_A))) + _why(doh, proxy)
+        assert sink.blind_problems() == [], "the sink cannot be trusted: %s" % sink.blind_problems() + why
+        assert sink.leak_problems() == [], "; ".join(sink.leak_problems()) + why
+        # The work was done, by the road of the context: the beacon arrived, and its name was asked of the DoH by the context's gateway.
+        assert beacon, "the beacon sent as the context closed never arrived (nothing was looked up, so nothing was proved)" + why
+        assert doh.vias_of(late, QTYPE_A) == {proxy.name}, "%s was not asked of the DoH by the gateway of the context only" % late + why
+    finally:
+        server.shutdown()

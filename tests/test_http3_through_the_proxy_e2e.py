@@ -11,8 +11,8 @@ not have to come at the second visit. THE THIRD RUN (Windows, DoH and UDP free) 
 (h3, h2, h2): behind a proxy "visit 1 is always h2" is NOT a retail fact. With UDP blocked it is h2/h2/h2 in 15 of 15, with no
 delay of the load: the only outcome of the retail that repeats every time. With no
 proxy and the native DNS (measured in loopback) it is h2, h3, h3. The method is the retail's: one context, the same page again
-and again (``?v=N`` keeps each visit off the HTTP cache), a pause of two seconds after each load so that the Alt-Svc it carries
-settles, and the ``nextHopProtocol`` of the navigation entry of the document,
+and again (``?v=N`` keeps each visit off the HTTP cache), after each load a wait (with a deadline) until the server has seen the QUIC connection that the
+Alt-Svc it carries makes, on the roads where UDP is free, and a pause of two seconds, and the ``nextHopProtocol`` of the navigation entry of the document,
 ``performance.getEntriesByType('navigation')[0].nextHopProtocol``. What each road reads is in ``_udp_line.expected_protocols``
 and is judged by ``_udp_line.judge_visits``.
 
@@ -51,6 +51,7 @@ import time
 import pytest
 
 from _host_address import this_host_address
+from _waits import wait_until
 from _udp_line import (declared_udp, egress_by_proxy, expected_protocols, judge_visits, measure_servers, no_https_record,
                        visits_for)
 
@@ -62,6 +63,8 @@ EXIT_DIRECT = "203.0.113.7"
 _DECLARED = {"socks5_coherent": "coherent", "socks5_no_udp": "no", "socks5_mismatched": "no", "socks5_unmeasured": "unmeasured"}
 #: The pause after each load (the retail method), and the nextHopProtocol of the document.
 PAUSE_MS = 2000
+#: The roads where QUIC can reach the server, so a QUIC connection of the browser is what its Alt-Svc turns into.
+_UDP_FREE_ROADS = ("direct", "socks5_coherent")
 _NAV_JS = "() => performance.getEntriesByType('navigation')[0].nextHopProtocol"
 
 
@@ -108,7 +111,13 @@ def _visits(road, server, monkeypatch, discover, **launch):
             started = time.monotonic()
             page.goto(url, wait_until="load", timeout=60000)
             walls.append(round((time.monotonic() - started) * 1000))
-            page.wait_for_timeout(PAUSE_MS)           # let the later resources and the Alt-Svc settle
+            if road in _UDP_FREE_ROADS:
+                # The Alt-Svc of the document is absorbed when the browser has made its own QUIC connection to the server (the
+                # server sees it): the next visit reads h3 from then on, and not before. Waited for as a condition with a
+                # deadline, not slept for: on a loaded machine that connection comes later than any pause. A road whose UDP
+                # leads nowhere has nothing to wait for (every visit is h2 and no QUIC arrives): it keeps the pause.
+                wait_until(lambda: server.quic_peers, 30, lambda: page.wait_for_timeout(100))
+            page.wait_for_timeout(PAUSE_MS)           # let the later resources settle
             protocols.append(page.evaluate(_NAV_JS))
     return protocols, walls
 
@@ -146,7 +155,7 @@ def test_a_page_behind_a_gateway_that_relays_udp_starts_on_h2_reaches_h3_within_
         protocols, walls = _visits("socks5_coherent", server, monkeypatch, egress_by_proxy(gateway), proxy=gateway.proxy,
                                   udp_stun_servers=measure_servers(gateway))
         carried = [(h, p) for h, p, _data in gateway.datagrams if (h, p) == (host, server.port)]
-        declared = declared_udp(gateway.proxy, measure_servers(gateway))
+        declared = declared_udp(gateway.proxy)
         said = _report("socks5_coherent", protocols, walls, server, gateway)
     assert declared == "coherent", "the core measured the gateway %s, not coherent: the engine would not use its relay. %s" % (declared, said)
     problems = judge_visits("socks5_coherent", protocols, walls)
@@ -171,7 +180,7 @@ def test_a_page_behind_a_socks5_proxy_that_is_not_coherent_reads_h2_on_every_vis
         protocols, walls = _visits(road, server, monkeypatch, egress_by_proxy(gateway), proxy=gateway.proxy,
                                   udp_stun_servers=measure_servers(gateway))
         to_the_server = [(h, p) for h, p, _data in gateway.datagrams if (h, p) == (host, server.port)]
-        declared = declared_udp(gateway.proxy, measure_servers(gateway))
+        declared = declared_udp(gateway.proxy)
         said = _report(road, protocols, walls, server, gateway)
     assert declared == _DECLARED[road], "the core declared udp=%s, the road is %s. %s" % (declared, _DECLARED[road], said)
     problems = judge_visits(road, protocols, walls)
@@ -194,7 +203,7 @@ def test_a_page_behind_an_http_proxy_reads_h2_on_every_visit_and_loads_without_d
         def _connect(self, conn, host, port, authorization):
             if (host, port) != self.target:
                 return super()._connect(conn, host, port, authorization)
-            upstream = socket.create_connection((host, port), timeout=10)
+            upstream = socket.create_connection((host, port), timeout=30)
             self._record("CONNECT", host, port, authorization, 200)
             self._answer(conn, 200)
             try:

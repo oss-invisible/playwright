@@ -163,7 +163,7 @@ def test_the_trap_goes_to_the_next_loopback_address_when_the_first_has_its_port_
     of TRAP_ADDRESSES it can bind, says which, and that is the address a resolv.conf is written with (run 43146661635: the
     trap could not bind and eight tests ended in error at setup)."""
     import _leaks
-    from _ports import bind_tcp_and_probe_udp
+    from _ports import bind_tcp_and_hold_udp
 
     class _Listener:
         """A TCP listener the picker can open and close, and the number it holds."""
@@ -182,10 +182,8 @@ def test_the_trap_goes_to_the_next_loopback_address_when_the_first_has_its_port_
             self.sock.close()
 
     # The number is one that TCP and UDP both bind (the system's own pick can fall in a block of ports UDP may not bind on Windows: the shared picker).
-    holder_tcp, port = bind_tcp_and_probe_udp("127.0.0.1", _Listener)
-    holder_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    holder_tcp, port, holder_udp = bind_tcp_and_hold_udp("127.0.0.1", _Listener)
     try:
-        holder_udp.bind(("127.0.0.1", port))
         # port != 0 is the case of port 53: the addresses are tried in order
         with ResolverTrap(port=port, rewrite_resolv_conf=False) as trap:
             assert trap.address != "127.0.0.1" and trap.address in _leaks.TRAP_ADDRESSES, trap.address

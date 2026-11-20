@@ -11,9 +11,9 @@ from pathlib import Path
 TESTS = str(Path(__file__).resolve().parent)
 
 _BUILD = """
-    from invisible_playwright._juggler.server import _ThreadStarter
+    from invisible_playwright._juggler._threads import ThreadStarter
     def build():
-        return _ThreadStarter(on_error=lambda message: None)
+        return ThreadStarter(on_error=lambda message: None)
 """
 
 
@@ -81,3 +81,29 @@ def test_a_browser_shared_by_the_tests_of_a_module_may_stay_open_until_the_modul
     out = done.stdout + done.stderr
     assert done.returncode == 0, out
     assert "2 passed" in out, out
+
+
+def test_the_census_counts_a_starter_whose_thread_has_not_begun(monkeypatch):
+    """The starter's thread is begun without waiting for it, so right after the constructor it can be in no `threading.enumerate()`:
+    the census must still count it (it missed both leaks of a module on a Linux runner, 3 of 3 jobs)."""
+    import threading
+    import time
+
+    sys.path.insert(0, TESTS)
+    import _browser_census as census
+    from invisible_playwright._juggler._threads import ThreadStarter
+
+    original = threading.Thread.start
+
+    def slow_start(self):
+        time.sleep(0.3)
+        return original(self)
+    monkeypatch.setattr(threading.Thread, "start", slow_start)
+
+    before = len(census.starters_alive())
+    starter = ThreadStarter(on_error=lambda message: None)
+    try:
+        assert len(census.starters_alive()) == before + 1
+    finally:
+        starter.stop()
+    assert census.wait_until_back_to(before) == 0

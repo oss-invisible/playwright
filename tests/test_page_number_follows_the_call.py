@@ -241,7 +241,7 @@ class _Page:
 
     gone_while_building = False
 
-    def wait_until_ready(self, timeout=20.0):
+    def wait_until_ready(self, timeout=None):
         pass          # the engine of this test says Page.ready at once
 
     def settle_events(self):
@@ -258,12 +258,14 @@ class _Page:
 def engine(monkeypatch):
     monkeypatch.setattr(srv, "PageDispatcher", _Page)
     e = _Engine()
-    browser = BrowserDispatcher(Server(), None, e, "151.0", session_seed=1)
+    server = Server()
+    browser = BrowserDispatcher(server, None, e, "151.0", session_seed=1)
     e.browser = browser
     context = BrowserContextDispatcher(browser.server, browser, {}, "C1")
     browser.contexts.append(context)
     e.context = context
-    return e
+    yield e
+    server.shutdown()      # the connection's one starter ends with its server
 
 
 def _new_page_in_thread(engine, number, out):
@@ -271,7 +273,7 @@ def _new_page_in_thread(engine, number, out):
         out[number] = engine.context.op_new_page({"pageNumber": number})
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    assert engine.arrived.acquire(timeout=10)
+    assert engine.arrived.acquire(timeout=30)
     return t
 
 

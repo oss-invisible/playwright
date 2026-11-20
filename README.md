@@ -16,6 +16,11 @@
 This one runs on an anti-detect Firefox with an undetected fingerprint, compatible with your existing Playwright code.</h3>
 </div>
 
+<p align="center">
+<a href="https://decodo.com/deals/residential-offer?utm_medium=affiliate&utm_source=Federico+Elia&promoter_id=15854270&fpr=7859773"><img alt="Decodo residential proxies, free trial (sponsored)" src="https://raw.githubusercontent.com/oss-invisible/playwright/main/docs/decodo-residential-proxies-trial.png" width="560"></a><br>
+<sub>Sponsored</sub>
+</p>
+
 ![invisible_playwright - 5/5 detection suites passed](https://raw.githubusercontent.com/oss-invisible/playwright/7a8693c6b4386e9a84dd93bedc479ca8654482e1/docs/screenshots/hero.gif)
 
 ## How it works

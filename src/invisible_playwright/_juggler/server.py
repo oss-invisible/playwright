@@ -36,6 +36,7 @@ import pathlib
 import queue
 import sys
 import tempfile
+import secrets
 import threading
 import collections
 import time
@@ -46,7 +47,9 @@ from invisible_core.juggler import PageActs, popup_number
 from invisible_core.juggler import connection as juggler
 from invisible_core.juggler.actions import Actions
 from invisible_core.juggler.deadline import Deadline
-from . import dialogs
+from . import _bindings, dialogs
+from ._reaped import SessionRemoval
+from ._threads import ThreadStarterLease
 from .pointer import Pointer
 from .dispatcher import (Dispatcher, ExpectNotMet, ProtocolException,
                          Server, current_call)
@@ -72,6 +75,7 @@ from ._marshal import (_js_number, _as_script, _button, _caller_timeout,
 # here for the length of one fix. Two readings of what a proxy is would be
 # the same duplication that produced the defect, one layer down.
 from invisible_core import SessionLocale, parse_proxy
+from invisible_core._proxy import UDP_EXIT_VALUES
 from invisible_core._udp_exit import context_proxy_command, launch_proxy_command, stun_servers
 
 from invisible_core import write_user_js
@@ -255,6 +259,11 @@ COMPOSED_PREF = "invisible.server.composed"
 #: a parameter of the Python launch, never a browser declaration. The server keeps it on the browser, so the launch
 #: and every later `new_context(proxy=...)` measure with the SAME list.
 UDP_STUN_PREF = "invisible.server.udp_stun_servers"
+#: THE VERDICT OF THAT MEASUREMENT (`SessionGeo.udp_exit`: `coherent`, `no`, `unmeasured`), made by the launcher's geo step
+#: and handed to this server the same way as the list above: in the prefs, taken out in `op_launch` before the profile is
+#: written. The core keeps no verdict in memory, so this is the only road it travels: `launch_proxy_command` declares what
+#: it is given, and `unmeasured` when it is given none. Not written when nothing was measured (no proxy, or not SOCKS5).
+UDP_EXIT_PREF = "invisible.server.udp_exit"
 #: The persona's keyboards, as Windows writes its input profiles (LANGID:KLID
 #: joined by semicolons, the language's first), decided by the core from the
 #: session's language AND country (`keyboard.profiles_for`). Server-only, like
@@ -283,6 +292,7 @@ def take_session_motion(prefs: Dict) -> tuple:
     rest.pop(POINTER_PREF, None)
     rest.pop(COMPOSED_PREF, None)
     rest.pop(UDP_STUN_PREF, None)
+    rest.pop(UDP_EXIT_PREF, None)
     return (rest,
             (None if seed is None else int(seed)),
             (None if budget_ms is None else int(budget_ms) / 1000.0))
@@ -295,6 +305,13 @@ def session_udp_stun_servers(prefs: Dict) -> Optional[list]:
     if not value:
         return None
     return ["%s:%d" % server for server in stun_servers(str(value).split(","))]
+
+
+def session_udp_exit(prefs: Dict) -> Optional[str]:
+    """The verdict the launcher measured (`UDP_EXIT_PREF`), or None when it named none or a value the core does not
+    declare: such a proxy is declared `unmeasured`, never `coherent`. Read BEFORE `take_session_motion` takes the key out."""
+    value = prefs.get(UDP_EXIT_PREF)
+    return value if value in UDP_EXIT_VALUES else None
 
 
 def session_for_launch(prefs: Dict, executable: str, proxy: Optional[Dict] = None) -> tuple:
@@ -330,7 +347,8 @@ def session_for_launch(prefs: Dict, executable: str, proxy: Optional[Dict] = Non
         return dict(prefs), {}
     from invisible_playwright._session import default_session
     session_prefs, session_env = default_session(executable, proxy)
-    return dict(session_prefs, **prefs), dict(session_env)
+    # The verdict of the UDP measurement is the one `default_session` made, never one the caller wrote.
+    return dict(session_prefs, **{k: v for k, v in prefs.items() if k != UDP_EXIT_PREF}), dict(session_env)
 
 
 def session_draws_pointer(prefs: Dict) -> bool:
@@ -547,6 +565,12 @@ def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
     return remote
 
 
+def _round_px(value: float) -> int:
+    """To the nearest whole pixel, halves up (Python's `round` goes to even: 0.5 -> 0, 1.5 -> 2)."""
+    import math
+    return int(math.floor(value + 0.5))
+
+
 class ElementHandleDispatcher(Dispatcher):
     TYPE = "ElementHandle"
     METHODS = {
@@ -560,6 +584,7 @@ class ElementHandleDispatcher(Dispatcher):
         "inputValue": "op_input_value",
         "getAttribute": "op_get_attribute",
         "scrollIntoViewIfNeeded": "op_scroll_into_view",
+        "screenshot": "op_screenshot",
         "ownerFrame": "op_owner_frame",
         "contentFrame": "op_content_frame",
         "getProperty": "op_get_property",
@@ -798,6 +823,44 @@ class ElementHandleDispatcher(Dispatcher):
         self.injected.scroll_into_view(self.frame.frame_id, self.object_id,
                                        params.get("rect"))
         return None
+
+    def op_screenshot(self, params: Dict) -> Any:
+        """A picture of this element: scroll it into view, take its box, and
+        ask the page's own screenshot for exactly that rectangle.
+
+        ⛔ THE BOX IS IN THE MAIN FRAME'S VIEWPORT, AND THE ENGINE'S CLIP IS IN
+        DOCUMENT COORDINATES. `Page.getContentQuads` answers in the main frame's
+        space whatever frame the element is in (it carries a node up every
+        `<iframe>`, across processes), so the same box is right for an element
+        of the page, of a frame of another site and of a frame nested in it.
+        What is missing to reach the document is the main frame's scroll, read
+        after the element has been scrolled in. The screenshot itself is the
+        page's (`PageDispatcher.op_screenshot`): a second path would be a second
+        place for the type, the quality and the scale to disagree.
+
+        The rectangle is rounded to whole pixels outward-stable, the way
+        Playwright's screenshotter does: the left and top edges to the nearest
+        pixel, the size from the rounded right and bottom edges.
+        """
+        # An element with no layout object (display: none, detached) cannot be scrolled to: the engine says so
+        # with an exception of its own. For the caller that is the same answer as an empty box.
+        try:
+            self.injected.scroll_into_view(self.frame.frame_id, self.object_id, None)
+            box = self.injected.bounding_box(self.frame.frame_id, self.object_id)
+        except Exception:
+            box = None
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            raise ValueError("Element is not visible")
+        page = self.page
+        scroll = page.injected.evaluate(
+            page.frame.frame_id, "({x: window.scrollX, y: window.scrollY})") or {"x": 0, "y": 0}
+        left = _round_px(box["x"] + scroll["x"])
+        top = _round_px(box["y"] + scroll["y"])
+        right = _round_px(box["x"] + scroll["x"] + box["width"])
+        bottom = _round_px(box["y"] + scroll["y"] + box["height"])
+        clip = {"x": left, "y": top,
+                "width": max(right - left, 1), "height": max(bottom - top, 1)}
+        return page.op_screenshot(dict(params, clip=clip))
 
     def op_owner_frame(self, params: Dict) -> Any:
         return {"frame": self.frame.channel}
@@ -1058,6 +1121,9 @@ class FrameDispatcher(Dispatcher):
         #: The load states the client has been told this frame has (the initializer's, then each `loadstate`): what the hand-over of the
         #: page from its buffer to its dispatcher compares the lifecycle's states with (`PageDispatcher._reconcile_frame`).
         self.told_states = set(load_states or ["commit"])
+        #: The address the client has been TOLD (the initializer's, then each `navigated` once it has gone up). `url`
+        #: is set a moment before the event is sent; a BindingCall waits for this one (`_announce_binding`).
+        self.committed_url = url
         #: Same reason, and both navigation events report it: a same-document
         #: navigation carries no name, so it has to repeat the one the frame
         #: already has rather than blank it.
@@ -2684,6 +2750,48 @@ def _target_is_gone(error: BaseException) -> bool:
         return True
     text = str(error).lower()
     return "cannot find session" in text or "target closed" in text or "session closed" in text
+class BindingCallDispatcher(Dispatcher):
+    """One call of an exposed function, waiting for the client's answer.
+
+    The client runs the Python function and sends `resolve` or `reject`; the answer goes back into the promise the page is
+    holding, in the context the call came from (`controller.deliver`, see `_bindings`)."""
+
+    TYPE = "BindingCall"
+    METHODS = {"resolve": "op_resolve", "reject": "op_reject"}
+
+    def __init__(self, server, page: "PageDispatcher", frame: "FrameDispatcher", context_id: str, native: str,
+                 name: str, seq: int, args: List[Any]) -> None:
+        self.page = page
+        self.context_id = context_id
+        self.native = native
+        self.seq = seq
+        super().__init__(server, page, {
+            "frame": frame.channel, "name": name,
+            "args": [_serialize(a) for a in args]})
+
+    @staticmethod
+    def _deliver(page: "PageDispatcher", context_id: str, native: str, seq: int, ok: bool, value: Any) -> None:
+        end = page._binding_ends.get((context_id, native))
+        if end is None:
+            return          # the document left (or never handed its end over): nobody is waiting
+        try:
+            page.injected.call_raw(context_id, _bindings.DELIVER,
+                                   [{"objectId": end}, {"value": seq}, {"value": ok}, {"value": value}],
+                                   by_value=True, timeout=10.0)
+        except Exception:
+            pass            # the document left: nobody is waiting for the answer
+
+    def op_resolve(self, params: Dict) -> Any:
+        self._deliver(self.page, self.context_id, self.native, self.seq, True, _deserialize(params.get("result")))
+        self.dispose()
+        return None
+
+    def op_reject(self, params: Dict) -> Any:
+        error = (params.get("error") or {}).get("error") or {}
+        self._deliver(self.page, self.context_id, self.native, self.seq, False,
+                      error.get("message") or error.get("name") or "binding failed")
+        self.dispose()
+        return None
 
 
 class PageDispatcher(Dispatcher):
@@ -2718,8 +2826,6 @@ class PageDispatcher(Dispatcher):
         "touchscreenTap": "op_touchscreen_tap",
         "requests": "op_requests",
         "__waitInfo__": "op_noop",
-        "reject": "op_binding_reply",
-        "resolve": "op_binding_reply",
         "requestGC": "op_request_gc",
         "addScriptTag": "op_add_script_tag",
         "addStyleTag": "op_add_style_tag",
@@ -2923,6 +3029,14 @@ class PageDispatcher(Dispatcher):
         #: to answer after a reader's pause, see `dialogs.plan_answer_ms`.
         self._dialogs_open: Dict[str, Any] = {}
         self._dialogs_seen = 0
+        #: `page.expose_binding` names -> the script that makes the function (see `_bindings`).
+        self._exposed: Dict[str, str] = {}
+        #: The calls of exposed functions, announced in the order they were made, by one worker (see `_on_binding_called`).
+        self._binding_jobs: "queue.Queue" = queue.Queue()
+        self._binding_running = False
+        self._binding_lock = threading.Lock()
+        #: (execution context, native name) -> objectId of the function that answers the calls made there (see `_bindings`).
+        self._binding_ends: Dict[tuple, str] = {}
         self.main_frame_id = self._main_frame_unless_gone()
         # ⛔ The Frame is created BEFORE the Page and adopted after: the Page
         # initializer has to name a mainFrame the client can already resolve.
@@ -3179,6 +3293,7 @@ class PageDispatcher(Dispatcher):
             frame.url, frame.name, frame.told_commit = url, name, commit
             navigation = known._commits[-1][1] if known._commits else None
             frame.emit("navigated", {"url": url, "name": name, "newDocument": self.navigation_document(navigation)})
+            frame.committed_url = url
         for state in self.CANON_STATES:
             if state in known.states and state not in frame.told_states:
                 frame.emit("loadstate", {"add": state})
@@ -3261,6 +3376,7 @@ class PageDispatcher(Dispatcher):
                 "newDocument": self.navigation_document(navigation),
             })
             child.emit("loadstate", {"add": "commit"})
+            child.committed_url = child.url
 
     #: Events held while the page is being built. The birth of a page is a
     #: burst of a few dozen; a page that never finishes building must not
@@ -3441,9 +3557,11 @@ class PageDispatcher(Dispatcher):
             # Doing it here would block the reader waiting for a message the
             # reader is the one who has to receive.
             # ⛔ AND NOT STARTED HERE EITHER: `Thread.start` waits for the new thread to run, and this is the reader.
-            # The browser's thread starter does it (`_ThreadStarter`).
+            # The browser's thread starter does it (`ThreadStarter`).
             self.context.browser.thread_starter.start(
                 target=self._announce_file_chooser, args=(params,))
+        elif method == "Page.bindingCalled":
+            self._on_binding_called(params)
         elif method == "Page.crashed":
             self.emit("crash")
         # ⛔ `Page.frameAttached` / `Page.frameDetached` ARE NOT READ HERE: the
@@ -3472,6 +3590,15 @@ class PageDispatcher(Dispatcher):
             # cannot disagree about a request, a redirect or a replay.
             if method == "Network.requestWillBeSent" and params.get("isIntercepted"):
                 self._let_through(params.get("requestId"))
+        elif (method == "Network.requestWillBeSent" and params.get("method") == "OPTIONS"
+              and not params.get("isIntercepted")):
+            # ⛔ AS PLAYWRIGHT'S OWN SERVER (ffNetworkManager `_onRequestWillBeSent`: `if (event.method === "OPTIONS" &&
+            # !event.isIntercepted) return;`): an OPTIONS request that no route holds is a CORS preflight, which the browser
+            # makes for the page and the page cannot see; a client never hears of it. Reported here, a page with a
+            # preflighted fetch showed one request more than on stock Firefox (10 per page on cnbc.com, 18 on scmp.com),
+            # in `page.on("request")`, in `route`, in a request counter. Its response and its end find no request and are
+            # dropped with it.
+            pass
         elif method == "Network.requestWillBeSent":
             request = RequestDispatcher(self.server, self, params)
             self._requests[params.get("requestId")] = request
@@ -4116,39 +4243,83 @@ class PageDispatcher(Dispatcher):
     def op_requests(self, params: Dict) -> Any:
         return {"requests": [r.channel for r in self._request_log]}
 
-    def op_binding_reply(self, params: Dict) -> Any:
-        """⛔ `resolve` and `reject` are the REPLY half of `expose_binding`,
-        and they are unreachable while that is refused: they arrive on a
-        BindingCall object, and no BindingCall is ever created. This exists so
-        the refusal names the feature instead of answering "Page has no method
-        resolve", which would send the reader looking in the wrong place."""
-        raise ProtocolException(
-            "this is the reply path of expose_binding(), which is not "
-            "implemented: no binding is ever installed, so nothing can call "
-            "back into one")
-
+    # ── expose_binding / expose_function ────────────────────────────────────
     def op_expose_binding(self, params: Dict) -> Any:
-        """`expose_binding` / `expose_function`.
+        """`page.expose_binding` / `page.expose_function`: the function `name` on this page, in the page's own world
+        (a site can see it, which is what the caller asked for, and nothing else: see `_bindings`). The engine installs it
+        in every document of the page, present and future, in every process the frames live in."""
+        name = params["name"]
+        native = self.context.binding_native(name)
+        self.context.require_binding_engine()
+        self._exposed[name] = native
+        self.send("Page.addBinding", {"name": native, "script": _bindings.install_script(native, name)})
 
-        ⛔ THE PAGE-FACING HALF IS NOT THE HARD PART. Installing a function on
-        the page is one init script; what makes this a real feature is the
-        REPLY path - the page calls it, the server raises `bindingCalled`, the
-        client runs Python, and the answer has to travel back into the promise
-        the page is holding. That is what `reject` and `resolve` are for, and
-        they are only reachable through the BindingCall object this creates.
+        def undo() -> None:
+            self._exposed.pop(name, None)
+            self.send("Page.addBinding", {"name": native, "script": _bindings.remove_script(native, name)})
+        handle = DisposableDispatcher(self.server, self, undo)
+        return {"disposable": handle.channel}
 
-        ⛔ AND THE FUNCTION MUST LIVE IN THE PAGE'S WORLD. Installed behind the
-        Xray it would be invisible to the site, which is the whole point of the
-        call. Juggler's `Page.addBinding` does that, so the world is not ours
-        to choose here - which is also why it cannot be hidden from the page:
-        a binding is a name the site can enumerate, and a caller asking for one
-        is asking for that trade.
-        """
-        raise ProtocolException(
-            "expose_binding() is not implemented yet: the page-facing half is "
-            "one init script, but the reply path - bindingCalled, then resolve "
-            "or reject into the promise the page holds - is not wired, and a "
-            "binding that never answers hangs the page that called it")
+    def _on_binding_called(self, params: Dict) -> None:
+        """The page called an exposed function. Announced to the client from a worker, in order, and not here.
+
+        OFF THE READER THREAD, because the announcement may need an answer from the engine (the address of the document
+        that called, see `_announce_binding`), which only the reader can deliver. In order, because two calls made one
+        after the other are announced one after the other: one worker per page, started by the first call and gone after
+        thirty idle seconds."""
+        payload = params.get("payload")
+        if isinstance(payload, dict) and payload.get("bindingEnd"):
+            # The page-side end of a binding, handed over by its script once, before any call: kept for the answers.
+            self._binding_ends[(params.get("executionContextId"), params.get("name"))] = payload["bindingEnd"]
+            return
+        call = _bindings.read_call(payload)
+        if call is None:
+            return
+        self._binding_jobs.put((params.get("executionContextId"), call))
+        with self._binding_lock:
+            if self._binding_running:
+                return
+            self._binding_running = True
+        # ⛔ NOT `Thread.start` HERE: this is the reader, and the browser's thread starter does it (`ThreadStarter`).
+        self.context.browser.thread_starter.start(target=self._binding_loop)
+
+    def _binding_loop(self) -> None:
+        while True:
+            try:
+                context_id, call = self._binding_jobs.get(timeout=30.0)
+            except queue.Empty:
+                with self._binding_lock:
+                    if self._binding_jobs.empty():
+                        self._binding_running = False
+                        return
+                continue
+            try:
+                self._announce_binding(context_id, *call)
+            except Exception:
+                pass
+
+    def _announce_binding(self, context_id: str, name: str, seq: int, args: List[Any]) -> None:
+        """A BindingCall to the client, or an error to the page when nobody exposed `name` here (left alone the
+        page's promise would wait for ever).
+
+        THE FRAME THE CLIENT IS TOLD OF HAS TO HAVE ITS ADDRESS. A script that calls the function in its first lines
+        runs before the lifecycle has told the client the document committed, and the call would name a frame whose
+        `url` is still the empty one. The address is asked of the document that called, and the call waits (a second
+        at most) until the client has been told that same address."""
+        injected = self.injected
+        native = self._exposed.get(name) or self.context._exposed.get(name)
+        if native is None:
+            return          # nothing exposed under this name here: the page's promise cannot be answered, and was not offered
+        frame = self.frame_for(injected.frame_of_context(context_id) or self.frame.frame_id)
+        try:
+            href = injected.call_raw(context_id, "() => location.href", [], by_value=True, timeout=5.0).get("value")
+        except Exception:
+            href = None
+        end = time.monotonic() + 1.0
+        while href and frame.committed_url != href and time.monotonic() < end:
+            time.sleep(0.005)
+        binding = BindingCallDispatcher(self.server, self, frame, context_id, native, name, seq, args)
+        self.emit("bindingCall", {"binding": binding.channel})
 
     def op_bring_to_front(self, params: Dict) -> Any:
         self.send("Page.bringToFront", {})
@@ -4342,9 +4513,10 @@ class PageDispatcher(Dispatcher):
         # too, because `_connection.py` only drops an object when it is told
         # to. The driver disposes Page, BrowserContext, Browser, ElementHandle
         # and APIRequestContext; the only one we were missing was Page, which
-        # is why `diff_protocol.py` grew a fifth dimension to see it: the other
-        # four compare `__create__`, initializers, events and parentage, and
-        # the event comparison skips every method starting with `__`.
+        # is why the protocol comparison that used to exist needed a fifth
+        # dimension to see it: the other four compared `__create__`, initializers,
+        # events and parentage, and the event comparison skips every method
+        # starting with `__`.
 
 
 
@@ -4488,6 +4660,7 @@ class BrowserContextDispatcher(Dispatcher):
         "close": "op_close",
         "updateSubscription": "op_noop",
         "addInitScript": "op_context_init_script",
+        "exposeBinding": "op_expose_binding",
         "addCookies": "op_add_cookies",
         "cookies": "op_cookies",
         "clearCookies": "op_clear_cookies",
@@ -4545,10 +4718,50 @@ class BrowserContextDispatcher(Dispatcher):
         #: The caller's context-level init scripts, in order. The engine's
         #: command replaces the list, so the accumulation lives here.
         self._init_scripts: List[str] = []
+        #: `context.expose_binding` names -> the engine's native name for each (see `binding_native`).
+        self._exposed: Dict[str, str] = {}
+        self._native_names: Dict[str, str] = {}
+        self._transport_lock = threading.Lock()
 
     @property
     def conn(self) -> "juggler.Connection":
         return self.browser.conn
+
+    def binding_native(self, name: str) -> str:
+        """The name of the engine's native function for the exposed function `name`: unique to this context and this
+        session, chosen here (the page never sees it: its script takes it off the window before any script of the page)."""
+        with self._transport_lock:
+            native = self._native_names.get(name)
+            if native is None:
+                native = "__%s_%d" % (self.browser.binding_token, len(self._native_names))
+                self._native_names[name] = native
+            return native
+
+    def require_binding_engine(self) -> None:
+        """Exposed functions need the engine that hands the page-side end of a binding over and has `Page.addBinding`.
+        With an engine that does not, they REFUSE: the way around it is a global on the window that a page can list,
+        and that is the tell this design exists to avoid."""
+        if not _bindings.engine_supports(self.browser.engine_dir):
+            raise ProtocolException(
+                "expose_function() and expose_binding() need a newer engine than this one (the one with "
+                "Page.addBinding and the binding that hands its end over): this engine would have to leave a "
+                "name on the page's window to answer the calls, and a page can list its globals")
+
+    def op_expose_binding(self, params: Dict) -> Any:
+        """`context.expose_binding` / `context.expose_function`: the function `name` on every page of the context,
+        present and future. The engine installs it in every document of every page, in every process (see
+        `_bindings`); one registration, no init script, nothing run by this server in the documents."""
+        name = params["name"]
+        native = self.binding_native(name)
+        self.require_binding_engine()
+        self._exposed[name] = native
+        self._browser_send("Browser.addBinding", {"name": native, "script": _bindings.install_script(native, name)})
+
+        def undo() -> None:
+            self._exposed.pop(name, None)
+            self._browser_send("Browser.addBinding", {"name": native, "script": _bindings.remove_script(native, name)})
+        handle = DisposableDispatcher(self.server, self, undo)
+        return {"disposable": handle.channel}
 
     def released(self) -> None:
         """⛔ THE BROWSER'S LIST LET GO TOO. Every way a context ends passes
@@ -4583,11 +4796,6 @@ class BrowserContextDispatcher(Dispatcher):
         self._browser_send("Browser.setInitScripts",
                            {"scripts": [{"script": s}
                                         for s in self._init_scripts]})
-        for page in list(self.pages):
-            try:
-                page.injected.add_init_script(source)
-            except Exception:
-                pass
         handle = DisposableDispatcher(self.server, self,
                                       lambda: self._remove_init_script(source))
         return {"disposable": handle.channel}
@@ -4599,11 +4807,6 @@ class BrowserContextDispatcher(Dispatcher):
         self._browser_send("Browser.setInitScripts",
                            {"scripts": [{"script": s}
                                         for s in self._init_scripts]})
-        for page in list(self.pages):
-            try:
-                page.injected.remove_init_script(source)
-            except Exception:
-                pass
 
     def op_set_storage_state(self, params: Dict) -> Any:
         """⛔ COOKIES ONLY, and it refuses the rest rather than dropping it.
@@ -4830,51 +5033,6 @@ NO_OVERRIDE = "no-override"
 NO_OVERRIDE_OPTIONS = ("colorScheme", "reducedMotion", "forcedColors")
 
 
-class _ThreadStarter:
-    """The ONE long-lived thread that starts the other threads the engine's events ask for.
-
-    ⛔ NO `Thread.start` ON THE CONNECTION'S READER THREAD. `Thread.start` does not return until the new thread is running
-    (`self._started.wait()`), and on Windows under load that wait is milliseconds long: it was the larger part of the reader's delay, and
-    every millisecond the reader is late is a millisecond a `networkidle` quiet is measured late (7 misses in 400 with four browsers at
-    once, none in 400 when the start did not wait). A listener that runs on the reader and needs work done elsewhere hands it to `start`
-    here: a `Thread` that is only BUILT on the reader (building waits for nothing) goes into a queue, and this thread starts it.
-
-    It starts threads and does not run the work itself, on purpose: an adoption waits for the engine as long as the engine takes (a popup
-    whose destination never answers is waited for without a limit), and a worker that ran it would hold every later adoption behind it,
-    `new_page()` included. Each piece of work keeps the thread of its own and the name it always had.
-    """
-
-    def __init__(self, on_error: Callable[[str], None]) -> None:
-        self._queue: "queue.SimpleQueue" = queue.SimpleQueue()
-        self._on_error = on_error
-        self._stopped = False
-        self._thread = threading.Thread(target=self._run, daemon=True, name="invpw-thread-starter")
-        self._thread.start()
-
-    def start(self, **thread_arguments: Any) -> None:
-        """Called from any thread, the reader's included: builds the thread and queues it. Never waits."""
-        if self._stopped:
-            return
-        self._queue.put(threading.Thread(daemon=True, **thread_arguments))
-
-    def stop(self) -> None:
-        self._stopped = True
-        self._queue.put(None)
-
-    def _run(self) -> None:
-        while True:
-            thread = self._queue.get()
-            if thread is None:
-                return
-            try:
-                thread.start()
-            except Exception as failure:
-                try:
-                    self._on_error("%s could not be started: %s" % (thread.name, failure))
-                except Exception:
-                    pass
-
-
 class BrowserDispatcher(Dispatcher):
     TYPE = "Browser"
     METHODS = {"newContext": "op_new_context", "close": "op_close",
@@ -4947,6 +5105,10 @@ class BrowserDispatcher(Dispatcher):
         #: Where this session measures a proxy's UDP exit from (the launch's `udp_stun_servers`, "ip:port"
         #: strings; None = the two public defaults): the launch and every context proxy use the same list.
         self.udp_stun_servers = udp_stun_servers
+        #: Chosen for this browser: the prefix of the native names of its exposed functions (see `_bindings`), and the
+        #: directory of its engine (set by `launch`), which says whether the engine has what they need.
+        self.binding_token = secrets.token_hex(6)
+        self.engine_dir = ""
         #: Whether this browser's pages walk the pointer onto their targets
         #: (`pointer.py`): the launcher chose the Python generator. Off for a
         #: browser built without saying so, which acts as the caller wrote.
@@ -5063,8 +5225,9 @@ class BrowserDispatcher(Dispatcher):
         # subscriber seeing an event before this one records the session, and
         # recording earlier can only shorten the window in which `session_for`
         # is waiting for something that has already arrived.
-        self._starter = _ThreadStarter(
-            lambda why: conn.handler_errors.append(why) if len(conn.handler_errors) < 32 else None)
+        # ⛔ NOT A STARTER OF ITS OWN: the connection's server owns the one (`Server.thread_starter`), and this is the browser's lease on
+        # it, ended by the browser's connection.
+        self._starter = ThreadStarterLease(lambda: server.thread_starter)
         conn.add_close_listener(self._starter.stop)
         conn.add_listener(self._route_browser_event)
         # The last step of starting the browser, under what is left of the
@@ -5090,8 +5253,8 @@ class BrowserDispatcher(Dispatcher):
         self._adopt_enabled = True
 
     @property
-    def thread_starter(self) -> "_ThreadStarter":
-        """The one thread that starts threads on behalf of the engine's reader (`_ThreadStarter`)."""
+    def thread_starter(self) -> "ThreadStarterLease":
+        """What starts threads on behalf of the engine's reader: the connection's one starter (`Server.thread_starter`), while this browser lives."""
         return self._starter
 
     def require_interception(self, what: str) -> None:
@@ -5824,7 +5987,7 @@ class BrowserDispatcher(Dispatcher):
         if root is None:
             import shutil
             root = self._downloads_root = tempfile.mkdtemp(prefix="invpw-downloads-")
-            self.server.after_shutdown(
+            self.server.after_reapers(
                 lambda: shutil.rmtree(root, ignore_errors=True))
         path = os.path.join(root, context_id or "default")
         os.makedirs(path, exist_ok=True)
@@ -6067,11 +6230,17 @@ class BrowserTypeDispatcher(Dispatcher):
             params.get("firefoxUserPrefs") or {}, executable, params.get("proxy"))
         # Read BEFORE `take_session_motion` takes it out: it never reaches the profile.
         udp_stun_servers = session_udp_stun_servers(launch_prefs)
+        udp_exit = session_udp_exit(launch_prefs)
         environment = _launch_environment(params.get("env"))
         named = {e["name"] for e in params.get("env") or []}
         environment.update({k: v for k, v in session_env.items() if k not in named})
         files = SessionFiles(params.get("userDataDir"), environment)
-        self.server.after_shutdown(files.remove)
+        # ⛔ WITH A CORE THAT GIVES THE LAUNCH A REAPER the removal is handed to it once `conn.close` has returned (see
+        # `_reaped`); without one it runs here, after the hooks, as before.
+        session_token = getattr(getattr(files, "token", None), "value", "")
+        removal = SessionRemoval(files.remove, session_token)
+        self.server.note_session_token(session_token)
+        self.server.after_shutdown(removal.after_shutdown)
         env, profile = files.env, files.profile
         # ⛔ THE TYPING SEED TRAVELS IN THE PREFS AND IS TAKEN OUT AGAIN HERE,
         # before a single byte reaches the profile.
@@ -6117,9 +6286,10 @@ class BrowserTypeDispatcher(Dispatcher):
         proxy = None
         if params.get("proxy"):
             try:
-                # The measure is the one the launch's geo step remembered for this proxy and these servers (nothing is
-                # asked of the network here): `unmeasured` when there is none, never a claimed `coherent`.
-                proxy = launch_proxy_command(params["proxy"], udp_stun_servers)
+                # The measure is the one the launch's geo step made for this proxy, handed here in the prefs (nothing is
+                # asked of the network here, and nothing is remembered): `unmeasured` when there is none, never a claimed
+                # `coherent`.
+                proxy = launch_proxy_command(params["proxy"], udp_exit=udp_exit)
             except ValueError as exc:
                 raise ProtocolException("launch(proxy=...) cannot be applied: "
                                         "%s" % exc)
@@ -6134,7 +6304,7 @@ class BrowserTypeDispatcher(Dispatcher):
                               headless=bool(params.get("headless", True)),
                               env=env, argv_extra=params.get("args") or [],
                               ready_timeout=ready, proxy=proxy)
-        self.server.on_shutdown(conn.close)
+        self.server.on_shutdown(lambda: removal.close(conn))
         # ⛔ A LAUNCH THAT FAILS FROM HERE ON CLOSES THE BROWSER IT STARTED.
         # A browser that is running and was never handed to the caller is one
         # nobody will close before the server shuts down.
@@ -6153,6 +6323,7 @@ class BrowserTypeDispatcher(Dispatcher):
         except BaseException:
             conn.close()
             raise
+        browser.engine_dir = os.path.dirname(str(executable))
         return {"browser": browser.channel}
 
 
@@ -6220,7 +6391,7 @@ class JugglerServer(Server):
         if root is None:
             root = tempfile.mkdtemp(prefix="invisible_upload_")
             self._upload_root = root
-            self.after_shutdown(lambda: remove_profile(root))
+            self.after_reapers(lambda: remove_profile(root))
         path = os.path.join(tempfile.mkdtemp(dir=root), name)
         with open(path, "wb") as out:
             out.write(base64.b64decode(payload.get("buffer") or ""))

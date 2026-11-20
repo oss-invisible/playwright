@@ -24,10 +24,8 @@ from invisible_core.prefs import translate_profile_to_prefs
 # Keys every Profile-derived prefs dict MUST carry.
 #
 # CAREFUL: this list is a DUPLICATE of a contract that belongs to another
-# package. `invisible_core.prefs` is a pure alias shim for
-# `invisible_core.prefs`, so this file tests the CORE's function through an
-# alias - against whichever core version pip resolved, which on CI is the
-# PUBLISHED one and locally is the checkout.
+# package. This file tests the CORE's function against whichever core version
+# pip resolved, which on CI is the PUBLISHED one and locally is the checkout.
 #
 # That difference made CI red on 2026-07-27. Two codec prefs were renamed to
 # their real Firefox spellings (`media.webm.enabled` / `media.mp4.enabled`) in

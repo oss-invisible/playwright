@@ -17,6 +17,7 @@ import math
 import pytest
 
 from invisible_playwright._juggler import wire
+from invisible_playwright._juggler.dispatcher import Server
 from invisible_playwright._juggler.transport import InProcessTransport, JsonWireTransport
 
 pytestmark = pytest.mark.unit
@@ -67,10 +68,11 @@ def test_a_lone_surrogate_survives_the_text():
 
 # ── the transport ──────────────────────────────────────────────────────────
 
-class _Server:
-    """What `InProcessTransport` needs of a server: attach, handle, shutdown."""
+class _Server(Server):
+    """What `InProcessTransport` needs of a server: attach, handle, shutdown, and the one starter it starts its workers through."""
 
     def __init__(self, result):
+        super().__init__()
         self._result = result
         self.seen = []
 
@@ -80,9 +82,6 @@ class _Server:
     def handle(self, message):
         self.seen.append(message)
         return self._result
-
-    def shutdown(self):
-        pass
 
 
 def _call(transport_class, result, message):

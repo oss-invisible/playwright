@@ -150,7 +150,7 @@ def test_a_popup_to_a_slow_page_is_announced_when_it_answers(browser, site, how)
         assert run.wait_until(lambda: run.popups, SLOW_SECONDS + 6), "the slow popup never arrived"
         assert run.arrived_at >= SLOW_SECONDS - 0.5, "announced after %.1fs, before the page answered" % run.arrived_at
         popup = run.popups[0]
-        popup.wait_for_load_state("load", timeout=10000)
+        popup.wait_for_load_state("load", timeout=30000)
         assert popup.url == "http://127.0.0.1:%d/d2" % site
         assert popup.evaluate("document.title") == "slow"
         assert len(run.context.pages) == 2

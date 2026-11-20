@@ -23,6 +23,7 @@ import threading
 import pytest
 
 from _servers import LocalServer
+from _waits import wait_until
 
 pytestmark = pytest.mark.e2e
 
@@ -57,6 +58,13 @@ def _serve():
     return server, "http://127.0.0.1:%d" % server.server_address[1]
 
 
+def _heard(page, responses, names):
+    """Until the client has heard the response of each name (the events of a sync client are delivered while it calls
+    the browser), with a deadline far beyond a healthy run: a machine's speed is not the verdict."""
+    assert wait_until(lambda: all(name in responses for name in names), 30, lambda: page.wait_for_timeout(100)), (
+        "the client never heard %r; it heard %r" % ([n for n in names if n not in responses], sorted(responses)))
+
+
 def test_the_body_of_a_document_the_tab_left_is_evicted(firefox_binary, engine_at_least):
     engine_at_least("firefox-60")
     from invisible_playwright import InvisiblePlaywright
@@ -68,13 +76,13 @@ def test_the_body_of_a_document_the_tab_left_is_evicted(firefox_binary, engine_a
             responses = {}
             page.on("response", lambda r: responses.setdefault(r.url.rsplit("/", 1)[-1], r))
 
-            page.goto(base + "/a.html", wait_until="load", timeout=20_000)
-            page.wait_for_timeout(300)
+            page.goto(base + "/a.html", wait_until="load", timeout=30_000)
+            _heard(page, responses, ("a.html", "a.css", "a.js"))
             assert b"document A" in responses["a.html"].body()
             assert b"/* A */" in responses["a.css"].body(), "the current document's sub-resource is readable"
 
-            page.goto(base + "/b.html", wait_until="load", timeout=20_000)
-            page.wait_for_timeout(300)
+            page.goto(base + "/b.html", wait_until="load", timeout=30_000)
+            _heard(page, responses, ("b.html", "b.js"))
             assert b"document B" in responses["b.html"].body(), "the document that committed keeps its body"
             assert b"fromB" in responses["b.js"].body()
 
@@ -95,12 +103,12 @@ def test_nothing_else_is_lost_when_the_bodies_go(firefox_binary, engine_at_least
         with InvisiblePlaywright(seed=4250, binary_path=firefox_binary, headless=True) as browser:
             page = browser.new_page()
             for i in range(6):
-                page.goto(base + "/%s.html" % "ab"[i % 2], wait_until="load", timeout=20_000)
+                page.goto(base + "/%s.html" % "ab"[i % 2], wait_until="load", timeout=30_000)
             second = browser.new_page()
-            second.goto(base + "/a.html", wait_until="load", timeout=20_000)
+            second.goto(base + "/a.html", wait_until="load", timeout=30_000)
             assert "document A" in second.content()
             second.close()
-            page.goto(base + "/b.html", wait_until="load", timeout=20_000)
+            page.goto(base + "/b.html", wait_until="load", timeout=30_000)
             assert "document B" in page.content()
     finally:
         server.shutdown()
