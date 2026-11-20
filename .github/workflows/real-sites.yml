@@ -155,7 +155,11 @@ jobs:
       fail-fast: false      # one system failing must not hide the other's table
       matrix:
         os: [ubuntu-24.04, windows-latest]
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
     env:
+      TEMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
+      TMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -248,6 +252,11 @@ jobs:
     needs: plan
     if: needs.plan.outputs.admission == 'true'
     runs-on: ${{ matrix.os }}
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
+      TMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
     timeout-minutes: 40
     strategy:
       fail-fast: false

@@ -24,7 +24,7 @@ import pytest
 
 from _e2e_verdicts import cold_association_problem
 from _socks_servers import STUN_NUMBER, STUN_PORT, coherent
-from _udp_line import egress_by_proxy
+from _udp_line import egress_by_proxy, make_the_gateway_far, the_gateway_was_far
 from _waits import wait_until
 from test_webrtc_realness import _e2e_binary, _launch  # noqa: F401
 
@@ -53,7 +53,9 @@ def test_the_first_datagram_does_not_wait_for_a_handshake(local_https_page, monk
     if not binary:
         pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
     from invisible_core import _geo
-    with coherent(user="alice", password="s3cret", rtt_ms=RTT_MS) as gateway:
+    # Launched near, far once the browser is up: the core's UDP measure at the launch has a budget of 3 s that a loaded runner can eat
+    # (`make_the_gateway_far` asserts its verdict `coherent` and sets the round trip).
+    with coherent(user="alice", password="s3cret") as gateway:
         # ⛔ THE SESSION'S UDP HAS TO BE DECLARED COHERENT, or the engine treats the proxy as a router that drops UDP (no association is
         # asked, no datagram leaves) - the red of the giro 3 gate. The core declares `coherent` when the UDP probe's mapped address IS
         # the TCP exit it discovered; a hermetic test gives it the gateway's TCP exit as every e2e of the line does (the probe that
@@ -62,6 +64,7 @@ def test_the_first_datagram_does_not_wait_for_a_handshake(local_https_page, monk
         monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
         prefs = {"network.proxy.allow_hijacking_localhost": True, "network.proxy.no_proxies_on": ""}
         with _launch(binary_path=binary, proxy=gateway.proxy, extra_prefs=prefs, seed=7) as browser:
+            delayed_before = make_the_gateway_far(gateway, RTT_MS)
             page = browser.new_context().new_page()
             page.goto(local_https_page, wait_until="load", timeout=60000)   # through the proxy: Firefox learns it here
             # the pool makes its associations: wait until the gateway has granted one of the engine's (the first granted is the
@@ -69,6 +72,7 @@ def test_the_first_datagram_does_not_wait_for_a_handshake(local_https_page, monk
             wait_until(lambda: len([a for a in gateway.associations if a[1] is not None]) >= 2, 30,
                        lambda: page.wait_for_timeout(50))
             result = page.evaluate(_PC_JS, "%s:%d" % (STUN_NUMBER, STUN_PORT))
+        the_gateway_was_far(gateway, delayed_before, RTT_MS)
         t_pc = result["t_pc"] / 1000.0
         associations = [list(a) for a in gateway.associations]
         via = list(gateway.datagram_via)

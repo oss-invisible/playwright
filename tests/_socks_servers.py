@@ -232,6 +232,9 @@ class Gateway:
         #: The round trip to this gateway, in seconds: every answer on the control connection waits for it, and each
         #: datagram the relay carries waits half of it each way. A real gateway is not on loopback.
         self.rtt = rtt_ms / 1000.0
+        #: How many times the gateway waited for ``rtt`` (an answer on a control connection, a datagram it carried): a test that
+        #: sets ``rtt`` AFTER the launch reads here that the delay was applied at all, never from a clock.
+        self.delays_applied = 0
         #: The address of the UDP relay, the BND.ADDR of the association. A real gateway's is a routable address; the
         #: loopback default only suits a client whose UDP socket is not bound to an interface (an engine's ICE
         #: sockets are, and Windows does not send from an interface address to loopback).
@@ -354,6 +357,7 @@ class Gateway:
                 held.wait(120)
         if self.rtt:
             time.sleep(self.rtt)
+            self.delays_applied += 1
         c.sendall(data)
 
     def _accept(self) -> None:
@@ -522,7 +526,11 @@ class Gateway:
             except OSError as e:
                 if not self._closed:
                     self.send_errors.append("%s: %s %s" % (what, type(e).__name__, e))
-        threading.Timer(self.rtt / 2, run).start() if self.rtt else run()
+        if self.rtt:
+            self.delays_applied += 1
+            threading.Timer(self.rtt / 2, run).start()
+        else:
+            run()
 
     def _deliver(self, relay: socket.socket, to: Tuple[str, int], host: str, port: int, payload: bytes) -> None:
         """Wrap ``payload`` as coming from ``host``:``port`` (an IPv4 literal) and send it back to the client."""

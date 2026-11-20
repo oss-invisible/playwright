@@ -12,12 +12,7 @@ Nothing here opens a browser; the unit test ``test_the_udp_line_helpers.py`` hol
 from __future__ import annotations
 
 import ipaddress
-from typing import Any, Callable, Dict, List, Optional, Sequence
-
-#: How much slower than the first visit a later visit may load, in milliseconds, on the roads where UDP does not work. A
-#: retail Firefox on a network that drops UDP loads the later visits as fast as the first (15 of 15 sessions, h2/h2/h2): an h3
-#: attempt that waits for a timeout before it falls back to h2 would be seconds.
-LOAD_MARGIN_MS = 1500
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: The visits of one page in one context, by kind of road. With NO proxy and the native DNS the retail is measured in loopback
 #: and is exact: h2, h3, h3 over three visits. BEHIND A PROXY the names are resolved by DoH, the browser learns the Alt-Svc
@@ -144,6 +139,31 @@ def bench_report(gateway: Any, rtt_ms: int, declared: Optional[str]) -> str:
                len(gateway.accepted), associations, log))
 
 
+def make_the_gateway_far(gateway: Any, rtt_ms: int) -> int:
+    """A gateway that is launched NEAR and made far once the core has measured it. Call it with the browser up, before the page does
+    anything through the gateway; it returns the count to give :func:`the_gateway_was_far`.
+
+    The core measures the UDP exit of a SOCKS5 proxy at the launch with a budget of 3 s for the whole exchange
+    (``invisible_core._udp_exit.BUDGET``). A gateway that is already ``rtt_ms`` away during that measure makes it a test of the speed of
+    the runner: one stall of a second and the verdict is ``unmeasured``, the engine has no relay and the test fails on a clock the page
+    never reads. So the gateway is launched at rtt 0, the verdict ``coherent`` of the launch is asserted here (a red then says whether it
+    is the measure or the engine), and only then the round trip is set (``Gateway.rtt`` is read at every answer and every datagram)."""
+    declared = declared_udp_or_absent(gateway.proxy)
+    assert declared == "coherent", (
+        "the core did not measure the UDP exit of this gateway coherent AT LAUNCH, with no delay on it (it declared %r): the measure is "
+        "what failed, not the gather. %s" % (declared, bench_report(gateway, 0, declared)))
+    gateway.rtt = rtt_ms / 1000.0
+    return int(gateway.delays_applied)
+
+
+def the_gateway_was_far(gateway: Any, before: int, rtt_ms: int) -> int:
+    """How many times the gateway applied its round trip since :func:`make_the_gateway_far`; AssertionError when it never did (a far case
+    that ran as the near one). Never a clock: a counter of the gateway."""
+    applied = int(gateway.delays_applied) - before
+    assert not rtt_ms or applied > 0, "the gateway never applied its round trip of %d ms after the launch" % rtt_ms
+    return applied
+
+
 def visits_for(road: str) -> int:
     """How many times the page is visited on ``road``: three with no proxy, :data:`PROXY_VISITS` behind any proxy."""
     if road == _DIRECT_ROAD:
@@ -162,7 +182,7 @@ def expected_protocols(road: str) -> str:
         return ("h2 on the first visit, then h3 from a later visit on and h3 on every one after it, within %d visits "
                 "(retail with DoH and UDP free: h2/h2/h3 in 9 of 15, h2/h2/h2 in 4, h2/h3/h3 in 2, and h3 first in 3 of 15 in the "
                 "third run when the DNS answer carries the HTTPS record; this fixture has none: h2 first)" % visits)
-    return "h2 on every one of %d visits, as fast as the first (retail with UDP dropped: h2/h2/h2 in 15 of 15)" % visits
+    return "h2 on every one of %d visits, with no attempt at h3 (retail with UDP dropped: h2/h2/h2 in 15 of 15)" % visits
 
 
 def no_https_record(host: str, doh: Any = None) -> List[str]:
@@ -185,27 +205,62 @@ def no_https_record(host: str, doh: Any = None) -> List[str]:
     return problems
 
 
-def judge_visits(road: str, protocols: Sequence[str], walls_ms: Sequence[float]) -> List[str]:
+def relay_activity(gateway: Any) -> Tuple[int, int]:
+    """What a SOCKS5 gateway of the tests has been asked for so far, as ``(UDP ASSOCIATE requests, datagrams its relay carried)``: the
+    requests answered or refused, the datagrams of every association. Taken twice (before the first visit, which is after the core's own
+    measurement of the gateway, and after the last), the difference is what the ENGINE asked of the relay while it visited the page."""
+    return int(gateway.associates), len(gateway.datagrams)
+
+
+def h3_attempts(server: Any, gateway: Any = None, before: Optional[Tuple[int, int]] = None) -> List[str]:
+    """What the test server (and, behind a SOCKS5 gateway, the gateway) says about a TRY at HTTP/3, as sentences; an empty list when nothing tried.
+
+    Behind a SOCKS5 gateway that is not coherent the engine does not carry UDP (nsSOCKSUDPIOLayer.cpp, ``StealthPutSocksUdpLayer``: the socket of an
+    HTTP/3 connection gets a layer that is ``Blocked``, no association is asked for): an engine that tried would ask the gateway for a UDP
+    ASSOCIATE (a refused one is a request too) or send a datagram to its relay, whether or not the datagram goes on to the server.
+    ``gateway`` and ``before`` (:func:`relay_activity` taken before the first visit) add those two to the answer.
+
+    A retail Firefox on a network that drops UDP (and behind an HTTP proxy, which has no UDP at all) never tries HTTP/3: it reads h2 and
+    nothing is sent to the h3 port the Alt-Svc announces. An engine that TRIES sends its QUIC Initial there first, and then waits for
+    an answer that does not come before it falls back to h2: the wait is the tell, and the datagram is the attempt. The attempt is
+    read where it is born, as a datagram that reached the UDP port of ``server`` (``H3Server.udp_datagrams``, every datagram, with
+    or without a handshake), never as a duration: how long a fallback takes is the speed of the machine, whether it was tried is the engine."""
+    problems: List[str] = []
+    seen = list(getattr(server, "udp_datagrams", ()))
+    if seen:
+        problems.append("%d UDP datagrams reached the h3 port %s of the server, from %s: the engine tried HTTP/3 (and, where nothing answers, "
+                        "waits for a timeout before the fallback to h2)" % (len(seen), getattr(server, "port", "?"), sorted(set(seen))))
+    if gateway is not None:
+        if before is None:
+            raise ValueError("a gateway is judged against what it had been asked before the first visit (relay_activity)")
+        associates, datagrams = (now - was for now, was in zip(relay_activity(gateway), before))
+        if associates:
+            problems.append("the engine asked the gateway for %d UDP ASSOCIATE while it visited the page: it tried to carry UDP (HTTP/3) "
+                            "through a gateway that was not measured coherent" % associates)
+        if datagrams:
+            problems.append("%d datagrams went into the relay of the gateway while the page was visited: the engine tried HTTP/3 "
+                            "through a gateway that was not measured coherent" % datagrams)
+    return problems
+
+
+def judge_visits(road: str, protocols: Sequence[str]) -> List[str]:
     """What is wrong with the visits of one page on ``road``, as sentences; an empty list when nothing is.
 
-    ``protocols`` is the ``nextHopProtocol`` of each visit and ``walls_ms`` the time ``page.goto`` took to the load event;
-    both have :func:`visits_for` entries. The rules, from the retail:
+    ``protocols`` is the ``nextHopProtocol`` of each visit, :func:`visits_for` entries. No duration is judged: that an h3 attempt
+    waited for a timeout is read as the attempt itself (:func:`h3_attempts`). The rules, from the retail:
 
     * ``direct``: exactly h2, h3, h3.
     * ``socks5_coherent``: the first visit is h2 (the fixture is reached by an address: no HTTPS record exists, so nothing
       tells the browser about h3 before the first connection; the retail itself reads h3 first when the DNS answer carries
       the record, so this is a rule of the fixture, checked with :func:`no_https_record`); every later visit is h2 or h3, but once one is h3 all the following are (h3 never goes back to h2); and at
       least one visit is h3 (it is NOT required at the second: h2/h2/h3 is the commonest retail sequence).
-    * the roads where UDP is dropped: h2 on every visit, and no visit loads more than :data:`LOAD_MARGIN_MS` slower than the
-      first (a fallback that waits for a timeout is a tell)."""
+    * the roads where UDP is dropped: h2 on every visit (and no attempt at h3: :func:`h3_attempts`, read by the test)."""
     problems: List[str] = []
-    protocols, walls_ms = list(protocols), list(walls_ms)
+    protocols = list(protocols)
     visits = visits_for(road)
     said = "a retail Firefox reads %s on this road" % expected_protocols(road)
     if len(protocols) != visits:
         problems.append("%d protocols for %d visits: %s" % (len(protocols), visits, protocols))
-    if len(walls_ms) != visits:
-        problems.append("%d load times for %d visits: %s" % (len(walls_ms), visits, walls_ms))
     if protocols and protocols[0] == "h3":
         problems.append("visit 1 read h3: in this fixture nothing had told the browser yet that the server speaks h3 (no "
                         "name, no HTTPS record): something told it, or the fixture changed")
@@ -221,9 +276,4 @@ def judge_visits(road: str, protocols: Sequence[str], walls_ms: Sequence[float])
                 problems.append("the protocols of the %d visits are %s, %s" % (visits, protocols, said))
         elif protocols != ["h2"] * visits:
             problems.append("the protocols of the %d visits are %s, %s" % (visits, protocols, said))
-    if len(walls_ms) == visits and road in _H2_ROADS:
-        for number in range(2, visits + 1):
-            if walls_ms[number - 1] > walls_ms[0] + LOAD_MARGIN_MS:
-                problems.append("visit %d loaded in %d ms against %d ms for visit 1 (more than %d ms slower): an h3 attempt "
-                                "that waited for a timeout before the fallback" % (number, walls_ms[number - 1], walls_ms[0], LOAD_MARGIN_MS))
     return problems

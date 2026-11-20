@@ -23,7 +23,9 @@ import time
 import pytest
 
 from _socks_servers import MEASURE_NUMBER, STUN_PORT, FakeStun, coherent
-from _udp_line import bench_report, declared_udp_or_absent, udp_measure_sentence
+import _udp_line
+from _udp_line import (bench_report, declared_udp_or_absent, make_the_gateway_far, the_gateway_was_far,
+                       udp_measure_sentence)
 
 pytestmark = pytest.mark.unit
 
@@ -186,3 +188,41 @@ def test_a_core_measure_that_is_not_coherent_is_said_outright_with_the_round_tri
 
 def test_what_the_core_declared_is_absent_not_an_error_when_it_measured_nothing():
     assert declared_udp_or_absent({"server": "socks5://127.0.0.1:1"}) is None
+
+
+def test_a_round_trip_set_after_the_gateway_started_is_applied_and_counted():
+    """A far-gateway test launches the browser next to the gateway (the core's UDP measure has a budget of its own) and sets the round
+    trip afterwards: the gateway reads it at every answer, and counts the answers that waited, so the test reads that the delay
+    reached the gather without a clock."""
+    with coherent() as gateway:
+        assert gateway.rtt == 0 and gateway.delays_applied == 0
+        control, _relay = _associate(gateway)          # the method answer and the ASSOCIATE answer, both at rtt 0
+        control.close()
+        assert gateway.delays_applied == 0, "an answer at rtt 0 was counted as delayed"
+        gateway.rtt = 0.02
+        control, _relay = _associate(gateway)
+        control.close()
+        assert gateway.delays_applied == 2, "the answers after the round trip was set were not delayed and counted"
+
+
+@pytest.mark.parametrize("declared", [None, "unmeasured", "no"])
+def test_a_gateway_is_not_made_far_when_the_core_did_not_declare_it_coherent(monkeypatch, declared):
+    """A far-gateway test says at once that the MEASURE of the launch is what failed, and puts no delay on the gateway."""
+    with coherent() as gateway:
+        monkeypatch.setitem(_udp_line.DECLARED, gateway.server, [declared] if declared else [])
+        with pytest.raises(AssertionError, match="did not measure the UDP exit of this gateway coherent AT LAUNCH"):
+            make_the_gateway_far(gateway, 250)
+        assert gateway.rtt == 0
+
+
+def test_a_gateway_made_far_after_a_coherent_launch_is_judged_on_the_delay_it_applied(monkeypatch):
+    with coherent() as gateway:
+        monkeypatch.setitem(_udp_line.DECLARED, gateway.server, ["coherent"])
+        before = make_the_gateway_far(gateway, 20)
+        assert gateway.rtt == 0.02 and before == 0
+        with pytest.raises(AssertionError, match="never applied its round trip of 20 ms"):
+            the_gateway_was_far(gateway, before, 20)            # nothing went through it yet
+        control, _relay = _associate(gateway)
+        control.close()
+        assert the_gateway_was_far(gateway, before, 20) == 2
+        assert the_gateway_was_far(gateway, gateway.delays_applied, 0) == 0   # a near case asks nothing of it
