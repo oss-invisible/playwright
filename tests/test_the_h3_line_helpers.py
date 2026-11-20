@@ -144,11 +144,12 @@ def test_the_same_document_is_answered_over_http3_and_the_peer_is_recorded():
         status, body = asyncio.run(fetch(server))
         assert status == b"200" and body == PAGE
         assert server.quic_peers == ["127.0.0.1"] and server.h3_requests == ["/?v=2"]
+        assert server.udp_datagrams and {a for a, _p in server.udp_datagrams} == {"127.0.0.1"}     # the attempt itself is in the log
+        assert line.h3_attempts(server)
 
 
 # -- the sequence a retail Firefox reads, and the judge -------------------------------------------------------------------
 H2 = ["h2"] * 5
-FAST = [900, 300, 310, 305, 290]
 PROXY_ROADS = ("socks5_coherent", "socks5_no_udp", "socks5_mismatched", "socks5_unmeasured", "http_proxy")
 H2_ROADS = ("socks5_no_udp", "socks5_mismatched", "socks5_unmeasured", "http_proxy")
 
@@ -160,9 +161,9 @@ def test_the_number_of_visits_of_each_road():
 
 
 def test_with_no_proxy_the_sequence_is_h2_h3_h3_and_nothing_else():
-    assert line.judge_visits("direct", ["h2", "h3", "h3"], [900, 300, 310]) == []
+    assert line.judge_visits("direct", ["h2", "h3", "h3"]) == []
     for wrong in (["h2", "h2", "h3"], ["h2", "h2", "h2"], ["h3", "h3", "h3"], ["h2", "h3", "h2"]):
-        assert line.judge_visits("direct", wrong, [900, 300, 310]), wrong
+        assert line.judge_visits("direct", wrong), wrong
 
 
 @pytest.mark.parametrize("sequence", [
@@ -172,7 +173,7 @@ def test_with_no_proxy_the_sequence_is_h2_h3_h3_and_nothing_else():
     ["h2", "h2", "h2", "h3", "h3"],
 ])
 def test_behind_a_gateway_with_udp_free_h3_may_come_at_any_visit_after_the_first(sequence):
-    assert line.judge_visits("socks5_coherent", sequence, FAST) == []
+    assert line.judge_visits("socks5_coherent", sequence) == []
 
 
 @pytest.mark.parametrize("sequence", [
@@ -183,28 +184,28 @@ def test_behind_a_gateway_with_udp_free_h3_may_come_at_any_visit_after_the_first
     ["h2", "h2", "h3", "h3", "h2"],
 ])
 def test_behind_a_gateway_with_udp_free_these_sequences_are_errors(sequence):
-    assert line.judge_visits("socks5_coherent", sequence, FAST), sequence
+    assert line.judge_visits("socks5_coherent", sequence), sequence
 
 
 def test_h3_on_the_first_visit_is_an_error_and_says_so_on_every_road():
-    assert any("visit 1 read h3" in p for p in line.judge_visits("direct", ["h3", "h3", "h3"], [900, 300, 310]))
+    assert any("visit 1 read h3" in p for p in line.judge_visits("direct", ["h3", "h3", "h3"]))
     for road in PROXY_ROADS:
-        problems = line.judge_visits(road, ["h3", "h3", "h3", "h3", "h3"], FAST)
+        problems = line.judge_visits(road, ["h3", "h3", "h3", "h3", "h3"])
         assert any("visit 1 read h3" in p for p in problems), (road, problems)
 
 
 def test_the_judge_names_what_the_retail_reads():
-    problems = line.judge_visits("socks5_coherent", H2, FAST)
+    problems = line.judge_visits("socks5_coherent", H2)
     assert len(problems) == 1 and "none of the 5 visits read h3" in problems[0] and "9 of 15" in problems[0], problems
-    problems = line.judge_visits("socks5_no_udp", ["h2", "h2", "h3", "h3", "h3"], FAST)
+    problems = line.judge_visits("socks5_no_udp", ["h2", "h2", "h3", "h3", "h3"])
     assert any("15 of 15" in p for p in problems), problems
 
 
 def test_h3_where_udp_is_dropped_is_an_error():
     for road in H2_ROADS:
         for sequence in (["h2", "h2", "h3", "h3", "h3"], ["h2", "h2", "h2", "h2", "h3"], ["h2", "h3", "h3", "h3", "h3"]):
-            assert line.judge_visits(road, sequence, FAST), (road, sequence)
-        assert line.judge_visits(road, H2, FAST) == [], road
+            assert line.judge_visits(road, sequence), (road, sequence)
+        assert line.judge_visits(road, H2) == [], road
 
 
 def test_an_unknown_road_is_refused():
@@ -213,27 +214,51 @@ def test_an_unknown_road_is_refused():
             call("socks5_maybe")
 
 
-def test_a_later_load_that_waits_for_a_fallback_is_an_error_where_udp_is_dropped_and_only_there():
-    slow = [900, 900 + line.LOAD_MARGIN_MS + 1, 310, 305, 290]
-    problems = line.judge_visits("socks5_no_udp", H2, slow)
-    assert len(problems) == 1 and "visit 2 loaded" in problems[0], problems
-    assert line.judge_visits("socks5_no_udp", H2, [900, 900 + line.LOAD_MARGIN_MS, 310, 305, 290]) == []
-    for number in (3, 4, 5):             # every later visit is judged, not only the second
-        walls = list(FAST)
-        walls[number - 1] = 900 + line.LOAD_MARGIN_MS + 1
-        problems = line.judge_visits("http_proxy", H2, walls)
-        assert len(problems) == 1 and "visit %d loaded" % number in problems[0], (number, problems)
-    # where UDP is free the loads are not judged (an h3 handshake has its own cost)
-    assert line.judge_visits("socks5_coherent", ["h2", "h2", "h3", "h3", "h3"], slow) == []
-    assert line.judge_visits("direct", ["h2", "h3", "h3"], [900, 900 + line.LOAD_MARGIN_MS + 1, 310]) == []
+# An attempt at h3 is read where it is born, at the UDP port of the server, and never as a duration (how long a fallback takes
+# is the speed of the machine). Where UDP is dropped the retail never sends a datagram there.
+def test_a_server_that_was_sent_nothing_reports_no_attempt():
+    with H3Server("127.0.0.1") as server:
+        assert server.udp_datagrams == []
+        assert line.h3_attempts(server) == []
+
+
+def test_a_datagram_that_reaches_the_h3_port_is_an_attempt_even_when_no_handshake_comes_of_it():
+    """The attempt of an engine that tries h3 where nothing answers: a QUIC Initial of a client that is refused (the server speaks
+    h3, the client offers another protocol, so no connection is ever negotiated) and a datagram that is not QUIC at all. The first
+    signal the tests had, ``quic_peers``, stays empty for both: only the datagram sees the attempt."""
+    from aioquic.asyncio.client import connect
+    from aioquic.quic.configuration import QuicConfiguration
+
+    async def refused(server):
+        configuration = QuicConfiguration(is_client=True, alpn_protocols=["not-h3"], verify_mode=ssl.CERT_NONE)
+        try:
+            async with connect(server.address, server.port, configuration=configuration):
+                pass
+        except Exception:        # noqa: BLE001 - the handshake fails by design: the datagram is what is asserted
+            pass
+
+    with H3Server("127.0.0.1") as server:
+        assert line.h3_attempts(server) == []
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sender.sendto(b"not quic", (server.address, server.port))
+            from _waits import wait_until
+            wait_until(lambda: server.udp_datagrams, 30, lambda: time.sleep(0.05))
+        finally:
+            sender.close()
+        assert len(server.udp_datagrams) == 1
+        problems = line.h3_attempts(server)
+        assert len(problems) == 1 and "tried HTTP/3" in problems[0] and "1 UDP datagrams" in problems[0], problems
+        before = len(server.udp_datagrams)
+        asyncio.run(asyncio.wait_for(refused(server), 60))
+        assert len(server.udp_datagrams) > before
+        assert server.quic_peers == []
 
 
 def test_a_series_of_the_wrong_length_is_an_error():
-    assert line.judge_visits("direct", ["h2", "h3"], [900, 300])
-    assert line.judge_visits("direct", ["h2", "h3", "h3"], [900, 300])
-    assert line.judge_visits("socks5_coherent", ["h2", "h2", "h3"], [900, 300, 310])
-    assert line.judge_visits("socks5_coherent", ["h2", "h2", "h3", "h3", "h3"], [900, 300, 310])
-    assert line.judge_visits("socks5_no_udp", ["h2", "h2", "h2"], [900, 300, 310])
+    assert line.judge_visits("direct", ["h2", "h3"])
+    assert line.judge_visits("socks5_coherent", ["h2", "h2", "h3"])
+    assert line.judge_visits("socks5_no_udp", ["h2", "h2", "h2"])
 
 
 # ------------------------------------------------------------------------------------------ the first visit is h2 by fixture
@@ -299,8 +324,8 @@ def test_a_send_the_relay_cannot_make_is_recorded_and_the_report_of_the_e2e_says
         gateway._later(refused, "the datagram to 203.0.113.9:443")
         assert len(gateway.send_errors) == 1 and gateway.send_errors[0].startswith("the datagram to 203.0.113.9:443: OSError")
         class Server:
-            tcp_alpn, quic_peers = ["h2"], []
-        said = e2e._report("socks5_coherent", ["h2"], [1], Server, gateway)
+            tcp_alpn, quic_peers, udp_datagrams = ["h2"], [], []
+        said = e2e._report("socks5_coherent", ["h2"], Server, gateway)
         assert "sends of the relay that failed" in said and "10051" in said
 
 

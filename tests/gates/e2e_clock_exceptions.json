@@ -92,6 +92,6 @@
   {"file": "test_webrtc_realness.py", "scope": "<module>._RELAY_PROBE_JS", "rule": "js-timer", "nth": 1, "kind": "stimulus", "reason": "A timer of the test's own page is the stimulus (the thing appears later); the product waits for it with a deadline and the verdict does not read when it fired."}
  ],
  "debt": [
-  {"file": "_udp_line.py", "scope": "judge_visits", "rule": "bound", "nth": 1, "class": "B", "reason": "An absolute upper bound on a duration is a verdict on the machine: compare with a control measured in the same run, or assert the order of the events."}
+
  ]
 }

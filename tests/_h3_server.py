@@ -159,6 +159,11 @@ class H3Server:
         #: The same peers with the port they sent from: (address, port). On a machine where a gateway's relay sends from an address of
         #: this host (Windows cannot send from 127.0.0.1 to it) the address cannot tell the relay from a client that came direct; its port can.
         self.quic_peer_addrs: List[Tuple[str, int]] = []
+        #: EVERY datagram that reached the UDP port, whether or not a QUIC handshake came out of it: (address, port) of the sender. A browser
+        #: that TRIES h3 sends its Initial here before anything else, so this list is the attempt itself, the one signal of "the engine tried
+        #: HTTP/3" that does not depend on the attempt succeeding or on how long it takes; ``quic_peers`` only has the connections that
+        #: negotiated an ALPN (an attempt that never completes is not in it).
+        self.udp_datagrams: List[Tuple[str, int]] = []
         #: The paths of the requests that were answered over HTTP/3, and over TCP.
         self.h3_requests: List[str] = []
         self.tcp_requests: List[str] = []
@@ -204,6 +209,11 @@ class H3Server:
                             self._http.send_data(http_event.stream_id, PAGE, end_stream=True)
                             self.transmit()
 
+        class Recording(QuicServer):
+            def datagram_received(self, data, addr):
+                server.udp_datagrams.append((addr[0], addr[1]))
+                super().datagram_received(data, addr)
+
         configuration = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
         configuration.load_cert_chain(str(cert), str(key))
         self._loop = asyncio.new_event_loop()
@@ -213,7 +223,7 @@ class H3Server:
             asyncio.set_event_loop(self._loop)
             # What ``aioquic.asyncio.serve(address, port)`` does (1.x), with the socket that already holds the number.
             _transport, self._quic = self._loop.run_until_complete(self._loop.create_datagram_endpoint(
-                lambda: QuicServer(configuration=configuration, create_protocol=Protocol), sock=self._udp))
+                lambda: Recording(configuration=configuration, create_protocol=Protocol), sock=self._udp))
             started.set()
             try:
                 self._loop.run_forever()
