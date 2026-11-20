@@ -348,7 +348,7 @@ spoofed browser is usually caught. Source:
 - The codec table is declared, so a Linux host does not answer a Windows question with Linux support: [codec fingerprinting](docs/codec-fingerprinting.md).
 
 **Network**
-- WebRTC offers one synthetic candidate carrying the proxy exit, instead of leaking the real address or offering none, which is itself a tell: [WebRTC ICE candidate spoofing](docs/webrtc-ice-candidate-spoofing.md), [does the WebRTC IP match the proxy exit](docs/webrtc-ip-match-proxy-exit.md).
+- Behind a proxy, WebRTC's UDP goes through the proxy when the proxy can carry it, so the server-reflexive candidate is the proxy's exit, and otherwise no datagram leaves the machine at all; candidates are real, never patched in the page: [WebRTC ICE candidate spoofing](docs/webrtc-ice-candidate-spoofing.md), [does the WebRTC IP match the proxy exit](docs/webrtc-ip-match-proxy-exit.md).
 - DNS resolves through the proxy, including when the proxy is not in the preferences: [does a proxy leak DNS](docs/does-a-proxy-leak-dns-doh-explained.md), [how to check for a proxy IP leak](docs/how-to-check-proxy-ip-leak.md).
 - The timezone comes from the egress IP, resolved offline, so it matches the exit: [timezone and proxy mismatch](docs/timezone-proxy-mismatch.md), [offline GeoIP timezone](docs/offline-geoip-timezone-proxy.md).
 

@@ -19,6 +19,7 @@ RUNS_PYTEST = {
     "e2e.yml": "      - name: Run the full e2e suite under a virtual display, without the root ones\n",
     "e2e.yml#windows": "      - name: Run this part of the e2e\n",
     "e2e.yml#control-a": "      - name: The keyboard shortcut selects all",
+    "fakeweb.yml": "      - name: Profile P2, stock first and ours second",
 }
 
 
@@ -47,7 +48,7 @@ def test_the_list_is_set_once_before_the_step_that_runs_the_tests(name, pytest_s
     assert text.index(SET) < text.index(pytest_step), "%s sets the list after the tests started" % name
 
 
-@pytest.mark.parametrize("name", ["e2e.yml", "e2e.yml#windows", "e2e.yml#control-a"])
+@pytest.mark.parametrize("name", ["e2e.yml", "e2e.yml#windows", "e2e.yml#control-a", "fakeweb.yml"])
 def test_the_list_is_set_before_the_engine_is_fetched(name):
     text = _scope(name)
     assert FETCH in text, "the fetch step of %s moved: update this test with it" % name
