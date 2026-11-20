@@ -93,10 +93,12 @@ pytestmark = [
 ]
 
 #: Opens, and what is needed to tell the parent from a content process (``_roles`` reads the execve and the clones).
-TRACE = "execve,clone,clone3,fork,vfork,openat,openat2"
+TRACE = "execve,clone,clone3,fork,vfork,openat,openat2,write"
 
 #: What fontconfig prints with ``FC_DEBUG=16`` goes to the descriptor 1 (the core reads it as the browser's output, and keeps 200 lines): the
-#: stand-in saves the writes to 1 and 2 with strace, which can follow only some descriptors (``--trace-fds``, strace 5.x and later).
+#: strace log also holds the ``write`` calls, and ``_fc_debug_text`` keeps those to the descriptors 1 and 2. NOT ``--trace-fds=1,2``: it
+#: filters EVERY traced call by descriptor, so the execve, clone and openat lines (which the parent's identity and the opens are read
+#: from) are gone and the test saw no parent (candidate run 44749623531).
 FC_DEBUG = "16"
 
 SEED = 21
@@ -116,14 +118,6 @@ _SAMPLES = {
     "NSimSun": "中文汉字测试 ABC abc 0123",
 }
 _DEFAULT_SAMPLE = "Hamburgefonstiv 0123456789 éèàü €"
-
-
-def _fd_options() -> tuple:
-    """``(syscalls, extra strace options)`` for a launch: the writes to the descriptors 1 and 2 when this strace can follow only those."""
-    help_text = subprocess.run([shutil.which("strace"), "-h"], capture_output=True, text=True).stdout
-    if "--trace-fds" in help_text:
-        return TRACE + ",write", "--trace-fds=1,2"
-    return TRACE, ""
 
 
 def _page_with_every_family() -> str:
@@ -294,8 +288,7 @@ def _launch(firefox_binary, work: Path, xdg: Path, extra_prefs=None):
 
     work.mkdir(parents=True)
     log, pidfile = work / "strace.log", work / "stand-in.pid"
-    syscalls, extra_options = _fd_options()
-    stand_in = _stand_in(firefox_binary, work / "engine", log, pidfile, syscalls=syscalls, timestamps=True, extra_options=extra_options)
+    stand_in = _stand_in(firefox_binary, work / "engine", log, pidfile, syscalls=TRACE, timestamps=True)
     real = os.path.realpath(firefox_binary)
     gre_fonts = os.path.join(os.path.dirname(real), "fonts")
     rss, boundary, pid, environ_xdg = {}, None, None, None
