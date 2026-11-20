@@ -101,6 +101,28 @@ jobs:
       - name: Test harness only
         run: python -m pip install --upgrade pip pytest packaging uv
 
+      # ⛔ THE VERSION OF A LEDGER PULL REQUEST IS THE ONE IT ADDS TO PUBLISHED.json, NOT THE ONE THE TREE DECLARES.
+      # The ledger PR of a release is merged after this job is green, and the next release's tree can already be on main: ledger #534 recorded
+      # 0.56.0 while the tree said 0.57.0, which is not published until that ledger is merged (its tag asks for it), so a wait on the version of
+      # pyproject.toml could never end and the PR could never merge. The versions are compared as data: the ledger at the base of the pull
+      # request against the ledger at its head. Nothing added is an error (there is no release to check), and so is more than one (the job
+      # installs and launches one version). INVPW_E2E_VERSION then carries it to the wait, the install and the launch below, in every step.
+      # A scheduled or dispatched run has no pull request and no such version: it installs the latest, as before.
+      - name: the version this ledger pull request records
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git show "$BASE_SHA:PUBLISHED.json" > "$RUNNER_TEMP/ledger-base.json"
+          git show "$HEAD_SHA:PUBLISHED.json" > "$RUNNER_TEMP/ledger-head.json"
+          version="$(python scripts/ci_ledger_added_versions.py --base "$RUNNER_TEMP/ledger-base.json" --head "$RUNNER_TEMP/ledger-head.json" --tree-pyproject pyproject.toml)"
+          echo "INVPW_E2E_VERSION=$version" >> "$GITHUB_ENV"
+          echo "::notice::this ledger pull request records invisible-playwright $version"
+
       # PyPI does not serve a new version to pip the instant twine finishes, and
       # this workflow runs on the ledger pull request, which the publish run
       # opens seconds after the upload (it ran on `release:`, just as soon).
@@ -132,7 +154,8 @@ jobs:
           python - <<'PY'
           import os, subprocess, sys, tempfile, time, tomllib
           dist = tomllib.load(open("pyproject.toml", "rb"))["project"]["name"]
-          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          # The version the ledger pull request records (the step above), never the tree's: main may already declare the next one.
+          version = os.environ["INVPW_E2E_VERSION"]
           deadline = time.monotonic() + 600
           deadline = min(deadline, time.monotonic() + float(os.environ.get("INDEX_WAIT_SECONDS", "600")))
           poll = float(os.environ.get("INDEX_WAIT_POLL", "15"))
@@ -188,6 +211,8 @@ jobs:
           # rate-limited walk SKIPS, and a skip is not a check.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INVPW_E2E_SOURCE: ${{ github.event.inputs.source || 'index' }}
+          # INVPW_E2E_VERSION (set above on a ledger pull request, absent otherwise) is read by both tests: the release test adds exactly that
+          # version, the upgrade test goes from the one before it to it.
         shell: bash
         run: |
           set -o pipefail   # or the tee below would swallow pytest's exit code
