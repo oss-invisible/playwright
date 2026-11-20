@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.1] - 2026-11-20
+
+### Fixed
+- Pins invisible-core 67.79.0 (same engine, firefox-67). On Windows, two browsers launched together on an empty cache could fail with
+  «Access is denied» on the font list file the first browser held open: the file is now created once and never replaced or read back.
+
 ## [0.57.0] - 2026-11-20
 
 ### Changed
