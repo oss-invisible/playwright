@@ -124,6 +124,7 @@ class InvisiblePlaywright(_session.CommonLaunch):
         self._locale = _geo.locale
         self._webrtc_egress_ip = _geo.egress_ip
         self._geolocation = _geo.geolocation_override()
+        self._udp_exit = _geo.udp_exit
         # binary_path= never reaches ensure_binary(), so the engine check lives
         # on the resolved executable rather than inside the fetcher.
         executable = resolve_executable(self._binary_path)

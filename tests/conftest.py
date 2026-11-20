@@ -164,13 +164,20 @@ def _offline_session_geo(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _a_unit_test_asks_mozilla_for_no_intermediates_list(request, monkeypatch):
-    """Outside the e2e, a launch declares no intermediates list and starts no check of it.
+def _what_the_core_declares_for_a_proxy_is_recorded(monkeypatch):
+    """The core keeps no UDP verdict in memory, so a test that wants to know what the launch declared reads it where it is
+    written: `_udp_line.record_declared` spies the one function that renders the engine's proxy command (unit and e2e)."""
+    from _udp_line import record_declared
+    record_declared(monkeypatch)
 
-    The core's `write_user_js` (every launch the server makes) declares Mozilla's list: on a cold cache it downloads it in line, on a warm one the launch starts a
-    background check, and the line it writes would differ with the cache of whoever runs the test. The two functions are stubbed, as the core's own suite does
-    (tests/conftest.py of invisible-core): no list, no thread, no request. The tests of `fetch` set their own; a test marked `e2e` gets the real ones (the CI legs
-    point them at the empty file of `ci/intermediates.json`)."""
+
+@pytest.fixture(autouse=True)
+def _a_unit_test_asks_mozilla_for_no_intermediates_list(request, monkeypatch):
+    """Outside the e2e, a launch declares no intermediates list.
+
+    The core's `write_user_js` (every launch the server makes) declares Mozilla's list: on a cold cache it downloads it in line, and the line it writes would
+    differ with the cache of whoever runs the test. The function is stubbed, as the core's own suite does (tests/conftest.py of invisible-core): no list, no
+    request. The tests of `fetch` set their own; a test marked `e2e` gets the real one (the CI legs point it at the empty file of `ci/intermediates.json`)."""
     if request.node.get_closest_marker("e2e") is not None:
         return
     try:
@@ -178,7 +185,6 @@ def _a_unit_test_asks_mozilla_for_no_intermediates_list(request, monkeypatch):
     except Exception:  # the package is absent: the tests that need it say so
         return
     monkeypatch.setattr(_im, "ensure_intermediates", lambda *a, **kw: None)
-    monkeypatch.setattr(_im, "refresh_intermediates_in_background", lambda *a, **kw: None)
 
 
 @pytest.fixture(autouse=True)
@@ -188,21 +194,13 @@ def _a_unit_test_does_not_depend_on_the_seal_of_whoever_runs_it(request, monkeyp
     The CI jobs export it (a LOCAL seal of the candidate, with no published assets) for the e2e tests that launch the engine under test. A unit test
     that composes a launch (``build_env``, ``launch_persistent_context``, a second browser served by a virtual display) reaches ``ensure_binary`` and
     died with ``SealError: the active seal ... is a LOCAL seal with no published assets`` only because of where it ran. Here the variable is taken out
-    of the test's environment (``monkeypatch`` puts it back), and the seal the process had already resolved is dropped, so the test resolves the
+    of the test's environment (``monkeypatch`` puts it back); the core reads the seal on every call, so the test resolves the
     packaged one; a test that wants a seal sets the variable itself, after this. The e2e tests, which are the ones that need it, keep it."""
     if request.node.get_closest_marker("e2e") is not None:
         yield
         return
-    try:
-        from invisible_core.seal import _reset_active_seal_for_tests
-    except Exception:  # the package is absent: the tests that need it say so
-        _reset_active_seal_for_tests = None
     monkeypatch.delenv("INVISIBLE_SEAL_FILE", raising=False)
-    if _reset_active_seal_for_tests is not None:
-        _reset_active_seal_for_tests()
     yield
-    if _reset_active_seal_for_tests is not None:
-        _reset_active_seal_for_tests()
 
 
 @pytest.fixture(scope="session", autouse=True)
