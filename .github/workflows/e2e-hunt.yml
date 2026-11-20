@@ -70,12 +70,21 @@ on:
         description: "goto-after-launch: hunters at once in each shard (the gate runs its e2e on four workers)"
         required: false
         default: "4"
+      temp_drive:
+        description: "goto-after-launch: where the profiles and the temporary folders are. C: the user's %TEMP% (the gate's own). D: D:/a/_temp/hunt (the A/B of a block on the disk of C:)"
+        required: false
+        default: "C"
+        type: choice
+        options:
+          - C
+          - D
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The temp drive is in the group: the A/B of a hunt is two runs of the same ref at once, and one must not cancel the other.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.pattern }}-${{ inputs.temp_drive }}
   cancel-in-progress: true
 
 # Engine and GeoIP downloads go through the release API with this token.
@@ -187,11 +196,14 @@ jobs:
   # (gate-only 44746170375 on firefox-68, gate 43889076032 on firefox-66: Windows, the stock client, nav-21 both times).
   # Each shard repeats the shape `runs` times (scripts/hunt_goto_after_launch.py) with the engine's diagnostics on, and
   # keeps only the folder of the session that caught it: the Juggler's trace (an engine that has INVISIBLE_JUGGLER_TRACE_DIR)
-  # and the MOZ_LOG of the docshell, the document channel and the process isolation. Red means caught.
+  # and the MOZ_LOG of the docshell, the document channel and the process isolation (one file per process). Red means caught.
+  # A round that caught something takes a full minidump of the Firefox parent (and of its GPU process) before it closes anything,
+  # and a counter of the machine (disks, processor, antivirus, memory) runs a sample a second for the whole hunt (perf.csv).
+  # `temp_drive` D puts the profiles on D: instead of the user's %TEMP% on C: (the A/B of a block on the disk of C:).
   # ───────────────────────────────────────────────────────────────────────────
   goto-after-launch:
     if: inputs.pattern == 'goto-after-launch'
-    name: goto after launch (windows, shard ${{ matrix.shard }})
+    name: goto after launch (windows, temp ${{ inputs.temp_drive }}, shard ${{ matrix.shard }})
     runs-on: windows-latest
     timeout-minutes: 150
     permissions: { contents: read, actions: read }
@@ -252,22 +264,51 @@ jobs:
           PYTHONUNBUFFERED: "1"
           INVISIBLE_CORE_AUTOFIX: "off"
           INVISIBLE_CORE_PIN: "allow"
+          TEMP_DRIVE: ${{ inputs.temp_drive }}
         run: |
           # `procs` hunters at once, each with its own folder: the load of the gate's four workers. Red when any caught one.
           mkdir -p evidence/goto-hunt
+          echo "temp drive: ${TEMP_DRIVE:-C}; the user's TEMP before the hunters: $TEMP"
+          # The counters, for the whole hunt: a sample a second, each row written as it is taken (scripts/hunt_perf.ps1).
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/hunt_perf.ps1 -OutFile "$(cygpath -w "$PWD/evidence/goto-hunt/perf.csv")" > evidence/goto-hunt/perf.log 2>&1 &
+          perf_pid=$!
+          sleep 5
+          echo "perf.csv after 5 s:"; head -c 700 evidence/goto-hunt/perf.csv || true; echo; cat evidence/goto-hunt/perf.log
           pids=()
           for i in $(seq 1 "${{ inputs.procs }}"); do
-            python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence "evidence/goto-hunt/p$i" > "evidence/goto-hunt/hunter-$i.log" 2>&1 &
+            python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence "evidence/goto-hunt/p$i" --temp-drive "${TEMP_DRIVE:-C}" > "evidence/goto-hunt/hunter-$i.log" 2>&1 &
             pids+=($!)
           done
           status=0
           for i in "${!pids[@]}"; do wait "${pids[$i]}" || status=1; done
+          # The counters stop with the hunters (the rows already written are whole).
+          kill "$perf_pid" 2>/dev/null || true
+          taskkill //F //T //PID "$(ps -W | awk -v p="$perf_pid" '$1==p {print $4}')" > /dev/null 2>&1 || true
+          echo "perf.csv: $(wc -l < evidence/goto-hunt/perf.csv) rows"
           # A hunter that never wrote its `rounds` line died before the end: its log's last 40 lines say how.
           for f in evidence/goto-hunt/hunter-*.log; do
             echo "== $f"
             if grep -qE "\"rounds\"" "$f"; then grep -E "CAUGHT|\"rounds\"|Traceback" "$f"; else tail -40 "$f"; fi
           done
           exit $status
+      - name: The stacks of the dumps (cdb, when the runner has it; the dumps stay in the evidence either way)
+        if: always()
+        continue-on-error: true
+        run: |
+          cdb=""
+          for c in "/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe" "/c/Program Files/Windows Kits/10/Debuggers/x64/cdb.exe"; do
+            [ -e "$c" ] && { cdb="$c"; break; }
+          done
+          dumps="$(find evidence/goto-hunt -name 'dump-*.dmp')"
+          if [ -z "$dumps" ]; then echo "no dump: nothing was caught"; exit 0; fi
+          echo "$dumps" | xargs -d '\n' ls -l
+          if [ -z "$cdb" ]; then echo "cdb is not on this runner: the dumps are in the evidence, to be read there"; exit 0; fi
+          echo "$dumps" | while read -r f; do
+            # The main thread first, then every thread; the system modules' symbols from Microsoft's server.
+            timeout 240 "$cdb" -z "$(cygpath -w "$f")" -y "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols" \
+              -c "~0kn 80;~*kn 40;lmn;q" > "${f%.dmp}.stacks.txt" 2>&1 || echo "cdb failed or timed out on $f"
+            head -c 3000 "${f%.dmp}.stacks.txt"
+          done
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

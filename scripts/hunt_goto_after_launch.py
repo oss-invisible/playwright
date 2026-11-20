@@ -29,6 +29,16 @@ server; `context`; `page`; `goto`; `close`: the closes of the context, the brows
 the `folder` of the session (kept), and a `kind`: `goto-hung` when the message is the goto's timeout with "neither committed nor been
 aborted" (the defect that is hunted), `other` for anything else (a defect of the hunt or of the machine, not the one hunted). A later
 exception of the same round (a close after a goto that hung) goes to `also`.
+
+What is kept of a round that caught something, BEFORE the browser is closed (the block of the parent's main thread is looked at while it
+lasts): a full minidump of the Firefox parent process (`dump-parent-<pid>.dmp`) and of its GPU process (`dump-gpu-<pid>.dmp`) in the folder
+of the session, written by `MiniDumpWriteDump` through ctypes (nothing to download), and listed under `dumps` in `caught.json`.
+
+The log of the engine is one file per process: `moz-main.<pid>.moz_log` for the parent and `moz-child.<pid>.moz_log` for the others (the
+engine expands `%PID` in MOZ_LOG_FILE), so a child that inherits the variable cannot overwrite the parent's.
+
+`--temp-drive D` puts the temporary folders (the profiles the core makes with `tempfile.mkdtemp`, and the browser's TEMP) on `D:/a/_temp/hunt`
+instead of the user's `%TEMP%` on C:; the hunt prints where they really are.
 """
 from __future__ import annotations
 
@@ -38,6 +48,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -85,13 +96,138 @@ def _serve():
     return srv
 
 
+#: Where the temporary folders go with `--temp-drive D`: the hosted Windows runner's work drive (its RUNNER_TEMP is D:\a\_temp).
+TEMP_ON_D = "D:\\a\\_temp\\hunt"
+DRIVES = ("C", "D")
+
+
+def parse_drive(text):
+    """The `temp_drive` input: `C` (the user's own TEMP, the default) or `D`, in any case and with spaces around; anything else is an error."""
+    drive = str(text).strip().upper().rstrip(":")
+    if drive not in DRIVES:
+        raise ValueError("temp drive must be one of %s, not %r" % (", ".join(DRIVES), text))
+    return drive
+
+
+def temp_dir_for(drive):
+    """The folder the temporary files go to for that drive, None when they stay where the user's environment puts them (C)."""
+    return TEMP_ON_D if parse_drive(drive) == "D" else None
+
+
+def apply_temp_drive(drive, environ=None, tempmodule=tempfile):
+    """Points TEMP and TMP at the drive's folder (made if missing) and makes `tempfile` forget what it cached, so the profiles the core makes
+    with `mkdtemp` and every child of this process use it. Returns the path `tempfile.gettempdir()` gives afterwards."""
+    environ = os.environ if environ is None else environ
+    folder = temp_dir_for(drive)
+    if folder is not None:
+        os.makedirs(folder, exist_ok=True)
+        environ["TEMP"] = environ["TMP"] = folder
+    tempmodule.tempdir = None
+    return tempmodule.gettempdir()
+
+
+#: The engine's log is one file per process: `%PID` in MOZ_LOG_FILE is expanded to `-main.<pid>` for the parent and `-child.<pid>` for
+#: the others, and the extension `.moz_log` is the engine's own (xpcom/base/Logging.cpp, ExpandLogFileName).
+MOZ_LOG_NAME = "moz%PID.moz_log"
+
+
+def moz_log_file(folder):
+    return os.path.join(os.path.abspath(folder), MOZ_LOG_NAME)
+
+
+def dump_name(kind, pid):
+    return "dump-%s-%d.dmp" % (kind, pid)
+
+
+# MiniDumpType: full memory, handle data, unloaded modules, thread info, full memory info.
+_MINIDUMP_TYPE = 0x2 | 0x4 | 0x20 | 0x1000 | 0x800
+
+
+def write_minidump(pid, path):
+    """A full minidump of process `pid` in `path`, through dbghelp. Returns None when it was written, else why not."""
+    if os.name != "nt":
+        return "minidump: not Windows"
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    dbghelp = ctypes.WinDLL("dbghelp", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    dbghelp.MiniDumpWriteDump.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.HANDLE, ctypes.c_int,
+                                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+    dbghelp.MiniDumpWriteDump.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x0400 | 0x0010 | 0x0040, False, pid)      # QUERY_INFORMATION | VM_READ | DUP_HANDLE
+    if not handle:
+        return "OpenProcess(%d) failed: %d" % (pid, ctypes.get_last_error())
+    try:
+        with open(path, "wb") as out:
+            if not dbghelp.MiniDumpWriteDump(handle, pid, msvcrt.get_osfhandle(out.fileno()), _MINIDUMP_TYPE, None, None, None):
+                return "MiniDumpWriteDump(%d) failed: %d" % (pid, ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+    return None
+
+
+def _firefox_by_trace_dir(folder):
+    """The parent process of the browser of that session, found by the folder it was told to trace into (when the launch itself raised, the
+    session has no handle to it): a firefox.exe whose environment has INVISIBLE_JUGGLER_TRACE_DIR = the folder. None when there is none."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    want = os.path.abspath(folder).lower()
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if (proc.info["name"] or "").lower() == "firefox.exe" \
+                    and proc.environ().get("INVISIBLE_JUGGLER_TRACE_DIR", "").lower() == want:
+                return proc.pid
+        except Exception:
+            continue
+    return None
+
+
+def _gpu_children(pid):
+    """The pids of the GPU process(es) of that parent: a Firefox child's command line ends with its type."""
+    try:
+        import psutil
+        return [c.pid for c in psutil.Process(pid).children(recursive=True) if (c.cmdline() or [""])[-1] == "gpu"]
+    except Exception:
+        return []
+
+
+def dump_session(folder, pid=None, writer=write_minidump):
+    """Full minidumps of the session's parent (and of its GPU process) into `folder`, BEFORE anything is closed. Never raises: what was
+    done is returned, one entry per process, `{"kind", "pid", "file", "bytes", "error", "seconds"}`."""
+    out = []
+    try:
+        if pid is None:
+            pid = _firefox_by_trace_dir(folder)
+        if pid is None:
+            return [{"kind": "parent", "pid": None, "file": None, "bytes": 0, "error": "no Firefox parent process found for the session"}]
+        for kind, target in [("parent", pid)] + [("gpu", g) for g in _gpu_children(pid)]:
+            path = os.path.join(folder, dump_name(kind, target))
+            started = time.time()
+            try:
+                error = writer(target, path)
+            except Exception as exc:
+                error = "%s: %s" % (type(exc).__name__, exc)
+            out.append({"kind": kind, "pid": target, "file": os.path.basename(path) if error is None else None,
+                        "bytes": os.path.getsize(path) if error is None and os.path.exists(path) else 0, "error": error,
+                        "seconds": round(time.time() - started, 1)})
+    except Exception as exc:
+        out.append({"kind": "parent", "pid": pid, "file": None, "bytes": 0, "error": "%s: %s" % (type(exc).__name__, exc)})
+    return out
+
+
 def _session_dir(root, label):
     path = os.path.join(root, label)
     os.makedirs(path, exist_ok=True)
     # Read by the engine's parent at launch (the core passes the variable on; MOZ_LOG and MOZ_LOG_FILE are diagnostics it lets through).
     os.environ["INVISIBLE_JUGGLER_TRACE_DIR"] = os.path.abspath(path)
     os.environ["MOZ_LOG"] = MOZ_LOG
-    os.environ["MOZ_LOG_FILE"] = os.path.join(os.path.abspath(path), "moz.log")
+    os.environ["MOZ_LOG_FILE"] = moz_log_file(path)
     return path
 
 
@@ -111,10 +247,19 @@ class Round:
     def __init__(self):
         self.phase = "launch"
         self.errors = []
+        self.dumps = []
+        #: Called with the phase at the FIRST exception of a round that is not a close, before anything is closed (the dumps).
+        self.on_first_error = None
 
     def fail(self, exc, phase=None):
+        phase = phase or self.phase
+        if not self.errors and phase != "close" and self.on_first_error is not None:
+            try:
+                self.dumps.extend(self.on_first_error(phase) or [])
+            except Exception as hook_exc:
+                self.dumps.append({"kind": "hook", "error": "%s: %s" % (type(hook_exc).__name__, hook_exc)})
         text = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-        self.errors.append({"phase": phase or self.phase, "kind": classify(text), "error": text,
+        self.errors.append({"phase": phase, "kind": classify(text), "error": text,
                             "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))})
         return self.errors[-1]
 
@@ -126,6 +271,8 @@ class Round:
         entry = {"round": n, "shape": shape, "phase": first["phase"], "kind": first["kind"],
                  "page_of_browser": page_of_browser, "folder": folder, "error": first["error"],
                  "traceback": first["traceback"], "seconds": round(time.time() - started, 1)}
+        if self.dumps:
+            entry["dumps"] = self.dumps
         if len(self.errors) > 1:
             entry["also"] = self.errors[1:]
         return entry
@@ -188,13 +335,17 @@ def _session_token(server):
     return getattr(getattr(session, "_session_token", None), "value", None)
 
 
-def _run_round(playwright, launch_server, a, port, shape):
-    """One browser session. Returns (Round, pages answered, session token); every exception is in the Round."""
+def _run_round(playwright, launch_server, a, port, shape, folder=None):
+    """One browser session. Returns (Round, pages answered, session token); every exception is in the Round. With a `folder`, the first
+    exception of the round takes the dumps of the browser's processes into it before anything is closed."""
     rnd = Round()
     per_browser = a.reuse if shape == "reuse" else 1
     answered = 0
     server = browser = None
     token = None
+    if folder is not None:
+        rnd.on_first_error = lambda phase: dump_session(
+            folder, getattr(getattr(server, "process", None), "pid", None) if server is not None else None)
     try:
         rnd.phase = "launch"
         server = launch_server(headless=True, binary_path=a.binary, locale="en-US", timezone="Europe/Rome")
@@ -238,7 +389,10 @@ def main() -> int:
     ap.add_argument("--evidence", default="evidence/goto-hunt")
     ap.add_argument("--timeout-ms", type=int, default=30000, help="the goto's own timeout, the tests' (30 s)")
     ap.add_argument("--shapes", default="launch,launch-route,launch,reuse")
+    ap.add_argument("--temp-drive", type=parse_drive, default="C",
+                    help="C: the temporary folders stay on the user's TEMP; D: they go to " + TEMP_ON_D)
     a = ap.parse_args()
+    print("temporary folders (the profiles) are in: %s (temp drive %s)" % (apply_temp_drive(a.temp_drive), a.temp_drive), flush=True)
 
     os.makedirs(a.evidence, exist_ok=True)
     shapes = [s for s in a.shapes.split(",") if s]
@@ -272,7 +426,7 @@ def main() -> int:
             label = "r%04d-%s" % (n, shape)
             folder = _session_dir(a.evidence, label)
             started = time.time()
-            rnd, answered, token = _run_round(pw, launch_server, a, port, shape)
+            rnd, answered, token = _run_round(pw, launch_server, a, port, shape, folder)
             done[shape] += answered
             caught = rnd.caught(n, shape, label, started, page_of_browser=answered)
             n += 1
@@ -280,8 +434,9 @@ def main() -> int:
                 _remove_folder(folder, token)
                 print("round %d (%s x%d) ok in %.1fs" % (n, shape, answered, time.time() - started), flush=True)
             else:
-                print("CAUGHT round %d (%s, phase %s, kind %s): %s\n%s" % (
-                    caught["round"], shape, caught["phase"], caught["kind"], caught["error"], caught["traceback"]), flush=True)
+                print("CAUGHT round %d (%s, phase %s, kind %s): %s\n%s\ndumps: %s" % (
+                    caught["round"], shape, caught["phase"], caught["kind"], caught["error"], caught["traceback"],
+                    json.dumps(caught.get("dumps"))), flush=True)
                 left = _wait_session_gone(token)     # the folder stays; its moz.log is complete once the processes are gone
                 if left:
                     print("session not gone: %s" % "; ".join(left), flush=True)
