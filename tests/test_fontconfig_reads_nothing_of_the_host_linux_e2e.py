@@ -91,7 +91,7 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
-              timestamps: bool = False) -> str:
+              timestamps: bool = False, extra_options: str = "") -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -106,7 +106,8 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
 
     ``syscalls`` is what strace traces; ``timestamps`` adds ``-ttt`` (the epoch
     seconds after each pid), which ``_LINE`` does not read: a caller that asks
-    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``)."""
+    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``). ``extra_options`` is more
+    strace flags, written after the others (that test asks for the writes to the descriptors 1 and 2: what fontconfig prints)."""
     real = Path(os.path.realpath(binary))
     tree.mkdir()
     for entry in real.parent.iterdir():
@@ -117,7 +118,8 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
         "#!/bin/sh\n"
         "echo $$ > %s\n"
         'exec %s %s -o %s -e trace=%s %s "$@"\n'
-        % (pidfile, shutil.which("strace"), _strace_options() + (" -ttt" if timestamps else ""), log, syscalls, real))
+        % (pidfile, shutil.which("strace"), _strace_options() + (" -ttt" if timestamps else "") + (" " + extra_options if extra_options else ""),
+           log, syscalls, real))
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 
