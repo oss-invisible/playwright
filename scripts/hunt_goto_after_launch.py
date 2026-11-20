@@ -16,10 +16,10 @@ engine's MOZ_LOG of the docshell, the document channel and the process isolation
 folder of a session that answered is removed; the one of the session that caught it is kept, with the round written in
 `caught.json`.
 
-Shapes, one per round in turn:
+A round is a browser session. Shapes, one per round in turn:
   launch       a browser launched for the round: launch_server, connect, new_context(accept_downloads=True), new_page, goto
   launch-route the same, with a context route on **/* that continues every request and a page that cancels fetches
-  reuse        one served browser for `--reuse` rounds: new_context, new_page, goto, context.close
+  reuse        one served browser for `--reuse` pages: new_context, new_page, goto, context.close
 
 Exit 1 when it caught one (red means found), 0 when it did not.
 """
@@ -107,11 +107,11 @@ def _one_page(browser, port, shape, timeout_ms):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
-    ap.add_argument("--rounds", type=int, default=200)
-    ap.add_argument("--reuse", type=int, default=10, help="rounds of the reuse shape per served browser")
+    ap.add_argument("--rounds", type=int, default=200, help="browser sessions")
+    ap.add_argument("--reuse", type=int, default=3, help="pages of the reuse shape per served browser")
     ap.add_argument("--evidence", default="evidence/goto-hunt")
     ap.add_argument("--timeout-ms", type=int, default=30000, help="the goto's own timeout, the tests' (30 s)")
-    ap.add_argument("--shapes", default="launch,launch-route,reuse")
+    ap.add_argument("--shapes", default="launch,launch-route,launch,reuse")
     a = ap.parse_args()
 
     sync_playwright = importlib.import_module("playwright.sync_api").sync_playwright
@@ -137,8 +137,6 @@ def main() -> int:
                 browser = p.firefox.connect(server.ws_endpoint)
                 try:
                     for k in range(per_browser):
-                        if n >= a.rounds:
-                            break
                         try:
                             _one_page(browser, port, shape, a.timeout_ms)
                         except Exception as exc:     # the goto's own timeout, or anything else: kept, and the hunt ends
@@ -148,7 +146,6 @@ def main() -> int:
                             print("CAUGHT round %d (%s, page %d of this browser): %s" % (n, shape, k, text), flush=True)
                             break
                         done[shape] += 1
-                        n += 1
                 finally:
                     try:
                         browser.close()
@@ -156,6 +153,7 @@ def main() -> int:
                         pass
             finally:
                 server.close()
+            n += 1
             if caught is None:
                 shutil.rmtree(folder, ignore_errors=True)
                 print("round %d (%s x%d) ok in %.1fs" % (n, shape, per_browser, time.time() - started), flush=True)

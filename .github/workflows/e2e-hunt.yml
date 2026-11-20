@@ -66,6 +66,10 @@ on:
         description: "goto-after-launch: the shards, a JSON list, eight at most (the account's queue is shared)"
         required: false
         default: "[1,2,3,4,5,6,7,8]"
+      procs:
+        description: "goto-after-launch: hunters at once in each shard (the gate runs its e2e on four workers)"
+        required: false
+        default: "4"
 
 permissions:
   contents: read
@@ -248,12 +252,25 @@ jobs:
           PYTHONUNBUFFERED: "1"
           INVISIBLE_CORE_AUTOFIX: "off"
           INVISIBLE_CORE_PIN: "allow"
-        run: python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence evidence/goto-hunt
+        run: |
+          # `procs` hunters at once, each with its own folder: the load of the gate's four workers. Red when any caught one.
+          mkdir -p evidence/goto-hunt
+          pids=()
+          for i in $(seq 1 "${{ inputs.procs }}"); do
+            python -u scripts/hunt_goto_after_launch.py "$FF" --rounds "${{ inputs.runs }}" --evidence "evidence/goto-hunt/p$i" > "evidence/hunter-$i.log" 2>&1 &
+            pids+=($!)
+          done
+          status=0
+          for i in "${!pids[@]}"; do wait "${pids[$i]}" || status=1; done
+          for f in evidence/hunter-*.log; do echo "== $f"; grep -E "CAUGHT|\"rounds\"|Traceback" "$f" || tail -3 "$f"; done
+          exit $status
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: goto-hunt-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: evidence/goto-hunt
+          path: |
+            evidence/goto-hunt
+            evidence/hunter-*.log
           if-no-files-found: warn
           retention-days: 14
