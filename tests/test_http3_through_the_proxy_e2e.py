@@ -56,7 +56,7 @@ from _evidence_with_files import FailureEvidenceWithFiles
 from _host_address import this_host_address
 from _waits import wait_until
 from _udp_line import (declared_udp, egress_by_proxy, expected_protocols, h3_attempts, judge_visits, measure_servers,
-                       no_https_record, visits_for)
+                       no_https_record, relay_activity, visits_for)
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
 
@@ -100,8 +100,10 @@ def _gateway(road: str, host: str):
     return gateway
 
 
-def _visits(road, server, monkeypatch, discover, **launch):
-    """Visit the page of ``server`` ``visits_for(road)`` times in one context; the nextHopProtocol of the document of each visit."""
+def _visits(road, server, monkeypatch, discover, relay=None, trace=None, **launch):
+    """Visit the page of ``server`` ``visits_for(road)`` times in one context; the nextHopProtocol of the document of each visit.
+    With a SOCKS5 gateway as ``relay``, ``trace["before"]`` is what it had been asked when the first visit began (after the core's own
+    measurement of it): the base of ``h3_attempts``."""
     from invisible_core import _geo
     from invisible_playwright import InvisiblePlaywright
 
@@ -123,6 +125,8 @@ def _visits(road, server, monkeypatch, discover, **launch):
                              extra_prefs=prefs, **launch) as browser:
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
+        if relay is not None:
+            trace["before"] = relay_activity(relay)
         for visit in range(1, visits_for(road) + 1):
             url = server.url if visit == 1 else "%s?v=%d" % (server.url, visit)
             started = time.monotonic()
@@ -209,23 +213,25 @@ def test_a_page_behind_a_gateway_that_relays_udp_starts_on_h2_reaches_h3_within_
 @pytest.mark.parametrize("road", ["socks5_no_udp", "socks5_mismatched", "socks5_unmeasured"])
 def test_a_page_behind_a_socks5_proxy_that_is_not_coherent_reads_h2_on_every_visit_and_never_tries_h3(monkeypatch, road):
     """A relay that is refused, that leaves from another address or that never answers is a router that drops UDP: every
-    visit (five) is h2, nothing QUIC reaches the server, nothing of the page goes to the relay, and no attempt at h3 is made
-    (so no visit has a fallback to wait for)."""
+    visit (five) is h2, nothing QUIC reaches the server, nothing of the page goes to the relay, and no attempt at h3 is made: the
+    engine asks the gateway for no UDP ASSOCIATE and sends no datagram into its relay while the page is visited (nothing is measured in time)."""
     import aioquic  # noqa: F401 - the dev extra installs it: a missing one is a failure, never a skip
     from _h3_server import H3Server
 
     host = this_host_address()
+    trace = {}
     with H3Server(host) as server, _gateway(road, host) as gateway:
         assert not no_https_record(host), no_https_record(host)
-        protocols = _visits(road, server, monkeypatch, egress_by_proxy(gateway), proxy=gateway.proxy,
+        protocols = _visits(road, server, monkeypatch, egress_by_proxy(gateway), relay=gateway, trace=trace, proxy=gateway.proxy,
                                   udp_stun_servers=measure_servers(gateway))
+        attempts = h3_attempts(server, gateway, trace["before"])
         to_the_server = [(h, p) for h, p, _data in gateway.datagrams if (h, p) == (host, server.port)]
         declared = declared_udp(gateway.proxy)
         said = _report(road, protocols, server, gateway)
     assert declared == _DECLARED[road], "the core declared udp=%s, the road is %s. %s" % (declared, _DECLARED[road], said)
     problems = judge_visits(road, protocols)
     assert not problems, "; ".join(problems) + ". " + said
-    assert not h3_attempts(server), "; ".join(h3_attempts(server)) + ". " + said
+    assert not attempts, "; ".join(attempts) + ". " + said
     assert not server.quic_peers, "a QUIC connection reached the server: %s. %s" % (server.quic_peers, said)
     assert not to_the_server, "the page's UDP went to a relay that was not measured coherent. " + said
 
