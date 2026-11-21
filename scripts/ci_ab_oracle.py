@@ -3,8 +3,11 @@
 
 A page reads the same values from two engines that differ only by the work of one
 release. This runs the host gate's dump (scripts/ci_host_gate.py dump: the page in
-scripts/host_gate, whole APIs, three seeds at two DPRs) twice on the SAME machine,
-with the same core and the same wrapper:
+scripts/host_gate, whole APIs) twice on the SAME machine, with the same core and the same
+wrapper, over the persona seeds (ci/persona-seeds.json, computed by scripts/persona_cover.py
+from the prefs the core emits: the `candidate` set, 5 seeds that reach every webgl renderer
+and every DPR, or the `final` set, 20 seeds that reach every value of every dimension). Each
+seed runs at its OWN DPR (nothing is pinned):
 
   1. with the published engine (firefox-68 by default): its seal and its archive are
      downloaded the way the core downloads an engine (the release's seal.json, then
@@ -21,8 +24,12 @@ visit compares fewer leaves than MIN_LEAVES says: a page that dumped less than t
 own reference would pass anything.
 
     python ci_ab_oracle.py run <candidate-firefox> --candidate-seal gate.seal.json \\
-        --leg linux-x86_64 --out ab-oracle [--engine-tag firefox-68]
-    python ci_ab_oracle.py compare ab-oracle        (again, from dump-68.json and dump-candidate.json)
+        --leg linux-x86_64 --out ab-oracle [--engine-tag firefox-68] [--seed-set candidate|final] [--shard i/n]
+    python ci_ab_oracle.py compare ab-oracle [--seed-set ...] [--shard i/n]   (again, from the two dumps)
+
+--shard i/n (1-based) takes every n-th seed of the set, from the i-th: the final set can be split over n jobs
+(more runners, not more browsers per runner). The seed set and the shard of `compare` must be those of the run:
+they say which visits were asked for.
 
 Writes, in --out: dump-<N>.json (the published engine's items), dump-candidate.json and
 diff.json (the verdict, the compared leaves per visit, every difference).
@@ -42,6 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ci_host_gate as gate  # noqa: E402
+import persona_cover as personas  # noqa: E402
 
 FORMAT = "ab-oracle/1"
 #: The engine the candidate is held to: the last one published.
@@ -49,8 +57,13 @@ ENGINE_TAG = "firefox-68"
 CANDIDATE = "candidate"
 #: What the host gate's own reference holds per visit (non-diag leaves at each DPR, today).
 #: A visit that compares fewer leaves than this is red. Moves by hand with the reference
-#: (tests/test_ab_oracle.py holds the two together).
+#: (tests/test_ab_oracle.py holds the two together). A DPR the reference does not record (the personas
+#: also have 1.25) is held to the least of the ones it does.
 MIN_LEAVES = {1.0: 16439, 1.5: 16439}
+#: The seeds a run visits, from ci/persona-seeds.json: the smallest set that reaches every webgl renderer and every DPR,
+#: or the one that reaches every value of every dimension the core declares.
+SEED_SETS = ("candidate", "final")
+SEED_SET = "candidate"
 #: A value in diff.json longer than this is replaced by its length and its sha256 (the full value is in the dumps).
 CLIP = 400
 #: How many differences one run prints; diff.json has all of them.
@@ -78,6 +91,31 @@ def _clip(value):
 
 def visit_name(dpr, seed) -> str:
     return "dpr%s_seed%d" % (dpr, seed)
+
+
+def parse_shard(text: str | None) -> tuple:
+    """(i, n) from "i/n" (1-based, 1 <= i <= n); None is the whole set, (1, 1)."""
+    if text is None:
+        return (1, 1)
+    try:
+        i, n = (int(x) for x in text.split("/"))
+    except ValueError:
+        raise SystemExit("--shard is i/n, two whole numbers, not %r" % (text,)) from None
+    if not 1 <= i <= n:
+        raise SystemExit("--shard is i/n with 1 <= i <= n, not %r" % (text,))
+    return (i, n)
+
+
+def select_visits(seed_set: str = SEED_SET, shard: str | None = None, path: Path = personas.DEFAULT_PATH) -> list:
+    """[(dpr, seed)] of the seed set, each seed at its own DPR, the i-th of n shards (every n-th seed from the i-th)."""
+    if seed_set not in SEED_SETS:
+        raise SystemExit("--seed-set is one of %s, not %r" % ("/".join(SEED_SETS), seed_set))
+    i, n = parse_shard(shard)
+    every = [(dpr, seed) for seed, dpr in personas.load_visits(seed_set, path)]
+    mine = every[i - 1::n]
+    if not mine:
+        raise SystemExit("shard %d/%d of the %d seeds of %r is empty" % (i, n, len(every), seed_set))
+    return mine
 
 
 def comparable(items: dict) -> dict:
@@ -121,7 +159,7 @@ def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None
                 differences.append({"seed": seed, "dpr": dpr, "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "what": gate.describe(va, vb)})
         compared[visit_name(dpr, seed)] = count
-        floor = min_leaves.get(dpr, 0)
+        floor = min_leaves.get(dpr, min(min_leaves.values(), default=0))
         if count < floor:
             problems.append("%s compared %d leaves, fewer than the %d of the host gate's reference: "
                             "the page dumped less than it should" % (visit_name(dpr, seed), count, floor))
@@ -154,8 +192,8 @@ def unpack(document: dict) -> dict:
     return {(v["dpr"], v["seed"]): v["items"] for v in document["visits"]}
 
 
-def judge(published: dict, candidate: dict, noise: list, extra_problems=()) -> dict:
-    report = compare_visits(published, candidate, noise)
+def judge(published: dict, candidate: dict, noise: list, extra_problems=(), expected: tuple | None = None) -> dict:
+    report = compare_visits(published, candidate, noise, expected=expected)
     if extra_problems:
         report["problems"] = list(extra_problems) + report["problems"]
         report["verdict"] = "red"
@@ -217,16 +255,21 @@ def fetch_published(tag: str, work: Path) -> tuple:
     return str(binary), seal_path
 
 
-def run_dump(binary: str, seal: Path, leg: str, out: Path) -> int:
+def run_dump(binary: str, seal: Path, leg: str, out: Path, visits: list | None = None) -> int:
+    """The host gate's dump of `visits` ([(dpr, seed)], each seed at its own DPR) as a subprocess; None is the host gate's own grid."""
     env = dict(os.environ, INVISIBLE_SEAL_FILE=str(seal), INVISIBLE_CORE_AUTOFIX="off", INVISIBLE_CORE_PIN="allow")
     for name in ("MOZ_LOG", "MOZ_LOG_FILE"):  # the e2e legs log the engine; a dump runs as the host gate's does
         env.pop(name, None)
     cmd = [sys.executable, str(Path(gate.__file__)), "dump", binary, "--leg", leg, "--out", str(out)]
+    if visits is not None:
+        cmd += ["--no-pin"] + [a for dpr, seed in visits for a in ("--visit", "%d:%s" % (seed, dpr))]
     return subprocess.run(cmd, env=env, timeout=DUMP_TIMEOUT_S).returncode
 
 
 def run(candidate: str, candidate_seal: Path, leg: str, out: Path, engine_tag: str,
-        published: tuple | None = None) -> int:
+        published: tuple | None = None, visits: list | None = None) -> int:
+    """`visits` is [(dpr, seed)] (default: the candidate set of the persona seeds, each at its own DPR)."""
+    visits = select_visits() if visits is None else visits
     out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="ab-oracle-"))
     started = time.time()
@@ -235,10 +278,11 @@ def run(candidate: str, candidate_seal: Path, leg: str, out: Path, engine_tag: s
         binary, seal = published or fetch_published(engine_tag, work)
         for name, exe, seal_file in ((engine_tag, binary, seal), (CANDIDATE, candidate, candidate_seal)):
             target = work / name
-            print("=== dump with %s: %s (seal %s)" % (name, exe, seal_file))
+            print("=== dump with %s: %s (seal %s), seeds %s"
+                  % (name, exe, seal_file, " ".join("%d@%s" % (seed, dpr) for dpr, seed in visits)))
             sys.stdout.flush()
             try:
-                rc = run_dump(exe, Path(seal_file), leg, target)
+                rc = run_dump(exe, Path(seal_file), leg, target, visits)
             except subprocess.TimeoutExpired:
                 rc = "timeout"
             if rc != 0:
@@ -255,18 +299,20 @@ def run(candidate: str, candidate_seal: Path, leg: str, out: Path, engine_tag: s
     finally:
         shutil.rmtree(work, ignore_errors=True)
     noise = gate.load_exceptions().get("noise", [])
-    report = judge(dumps[engine_tag], dumps[CANDIDATE], noise, problems)
-    report.update(format=FORMAT, engine=engine_tag, leg=leg, seconds=round(time.time() - started))
+    report = judge(dumps[engine_tag], dumps[CANDIDATE], noise, problems, expected=tuple(visits))
+    report.update(format=FORMAT, engine=engine_tag, leg=leg, seconds=round(time.time() - started),
+                  visits=["%d@%s" % (seed, dpr) for dpr, seed in visits])
     write_json(out / "diff.json", report)
     print_report(report, engine_tag)
     return 0 if report["verdict"] == "green" else 1
 
 
-def recompare(directory: Path, engine_tag: str) -> int:
+def recompare(directory: Path, engine_tag: str, visits: list | None = None) -> int:
+    visits = select_visits() if visits is None else visits
     published = unpack(json.loads((directory / dump_name(engine_tag)).read_text(encoding="utf-8")))
     candidate = unpack(json.loads((directory / ("dump-%s.json" % CANDIDATE)).read_text(encoding="utf-8")))
-    report = judge(published, candidate, gate.load_exceptions().get("noise", []))
-    report.update(format=FORMAT, engine=engine_tag)
+    report = judge(published, candidate, gate.load_exceptions().get("noise", []), expected=tuple(visits))
+    report.update(format=FORMAT, engine=engine_tag, visits=["%d@%s" % (seed, dpr) for dpr, seed in visits])
     write_json(directory / "diff.json", report)
     print_report(report, engine_tag)
     return 0 if report["verdict"] == "green" else 1
@@ -282,14 +328,19 @@ def main(argv=None) -> int:
     r.add_argument("--leg", required=True)
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--engine-tag", default=ENGINE_TAG)
+    r.add_argument("--seed-set", choices=SEED_SETS, default=SEED_SET,
+                   help="the persona seeds to visit (ci/persona-seeds.json), each at its own DPR")
+    r.add_argument("--shard", help="i/n: every n-th seed of the set from the i-th (the final set over n jobs)")
     r.add_argument("--published-binary", type=Path, help="use this binary for the published engine instead of fetching it")
     r.add_argument("--published-seal", type=Path, help="with --published-binary: the seal of that engine")
     c = sub.add_parser("compare")
     c.add_argument("directory", type=Path)
     c.add_argument("--engine-tag", default=ENGINE_TAG)
+    c.add_argument("--seed-set", choices=SEED_SETS, default=SEED_SET)
+    c.add_argument("--shard")
     args = ap.parse_args(argv)
     if args.cmd == "compare":
-        return recompare(args.directory, args.engine_tag)
+        return recompare(args.directory, args.engine_tag, select_visits(args.seed_set, args.shard))
     if not args.candidate_seal:
         ap.error("--candidate-seal (or INVISIBLE_SEAL_FILE) is required: the candidate runs under its own seal")
     given = None
@@ -297,7 +348,8 @@ def main(argv=None) -> int:
         if not (args.published_binary and args.published_seal):
             ap.error("--published-binary and --published-seal go together")
         given = (str(args.published_binary), args.published_seal)
-    return run(args.candidate, Path(args.candidate_seal), args.leg, args.out, args.engine_tag, given)
+    return run(args.candidate, Path(args.candidate_seal), args.leg, args.out, args.engine_tag, given,
+               select_visits(args.seed_set, args.shard))
 
 
 if __name__ == "__main__":

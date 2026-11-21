@@ -375,19 +375,26 @@ def reference_zone(reference: Path) -> str:
     return reference_items(reference, 1.0)["surface.intl"]["DateTimeFormat"]["timeZone"]
 
 
-def visit_options(firefox: str, seed: int, dpr: float, zone: str) -> dict:
+def visit_options(firefox: str, seed: int, dpr: float | None, zone: str) -> dict:
     """The launch of one (dpr, seed) visit. The DPR is PINNED in the persona
     (screen.dpr), so the core declares a screen, a work area and a window made
     at that scale. It used to be forced through
     extra_prefs={"layout.css.devPixelsPerPx": ...} on whatever persona the seed
     drew: a 100% persona at 1.5 read innerWidth 1920 inside an outerWidth of
     1291 (run 41325657085), an identity no machine has, which the engine now
-    refuses to start with."""
-    return {"seed": seed, "binary_path": firefox, "headless": True, "show_cursor": False,
-            "locale": "en-US", "timezone": zone, "pin": {"screen.dpr": dpr}}
+    refuses to start with. With dpr None nothing is pinned: the seed's own persona decides the scale."""
+    options = {"seed": seed, "binary_path": firefox, "headless": True, "show_cursor": False,
+               "locale": "en-US", "timezone": zone}
+    if dpr is not None:
+        options["pin"] = {"screen.dpr": dpr}
+    return options
 
 
-def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 180_000) -> int:
+def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 180_000,
+         visits: list | None = None, pin_dpr: bool = True) -> int:
+    """`visits` is [(dpr, seed)] (default: every seed of SEEDS at every DPR of DPRS, the DPR pinned). With pin_dpr
+    False the DPR is not pinned: it is the one the seed's persona has, and `dpr` of a visit only names the file and
+    the page's query."""
     from invisible_playwright import InvisiblePlaywright
 
     out.mkdir(parents=True, exist_ok=True)
@@ -396,35 +403,34 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     zone = reference_zone(reference)
     first_diag = None
     try:
-        for dpr in DPRS:
-            for seed in SEEDS:
-                with InvisiblePlaywright(**visit_options(firefox, seed, dpr, zone)) as browser:
-                    page = browser.new_context().new_page()
-                    # The same budget as the wait below: a cold Windows runner took
-                    # more than goto's default 30 s to reach `load` on the first
-                    # visit (candidate 42410156024), and passed locally 6/6.
-                    page.goto("http://127.0.0.1:%d/?dpr%s" % (server.server_address[1], dpr),
-                              timeout=timeout_ms)
-                    page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
-                    result = page.evaluate("window.__hostGate")
-                    if result.get("format") == FORMAT:
-                        result["items"].update(drive_states(page.evaluate, page.mouse.move, page.mouse.click))
-                if result.get("format") != FORMAT:
-                    print("the page answered format %r, not %r" % (result.get("format"), FORMAT))
-                    return 2
-                path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
-                path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
-                                encoding="utf-8")
-                print("dumped %s: %d items" % (path.name, len(result["items"])))
-                visit = "%s dpr %s seed %d" % (leg, dpr, seed)
-                for line in diag_report(visit, result["items"], first_diag):
-                    print(line)
-                # told here too, so the job log says it without the compare step
-                for line in invariant_lines(visit, result["items"]):
-                    print(line)
-                sys.stdout.flush()
-                if first_diag is None:
-                    first_diag = {k: v for k, v in leaves(result["items"]).items() if is_diag(k)}
+        for dpr, seed in (visits if visits is not None else [(d, sd) for d in DPRS for sd in SEEDS]):
+            with InvisiblePlaywright(**visit_options(firefox, seed, dpr if pin_dpr else None, zone)) as browser:
+                page = browser.new_context().new_page()
+                # The same budget as the wait below: a cold Windows runner took
+                # more than goto's default 30 s to reach `load` on the first
+                # visit (candidate 42410156024), and passed locally 6/6.
+                page.goto("http://127.0.0.1:%d/?dpr%s" % (server.server_address[1], dpr),
+                          timeout=timeout_ms)
+                page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
+                result = page.evaluate("window.__hostGate")
+                if result.get("format") == FORMAT:
+                    result["items"].update(drive_states(page.evaluate, page.mouse.move, page.mouse.click))
+            if result.get("format") != FORMAT:
+                print("the page answered format %r, not %r" % (result.get("format"), FORMAT))
+                return 2
+            path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
+            path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
+                            encoding="utf-8")
+            print("dumped %s: %d items" % (path.name, len(result["items"])))
+            visit = "%s dpr %s seed %d" % (leg, dpr, seed)
+            for line in diag_report(visit, result["items"], first_diag):
+                print(line)
+            # told here too, so the job log says it without the compare step
+            for line in invariant_lines(visit, result["items"]):
+                print(line)
+            sys.stdout.flush()
+            if first_diag is None:
+                first_diag = {k: v for k, v in leaves(result["items"]).items() if is_diag(k)}
     finally:
         server.shutdown()
     return 0
@@ -586,12 +592,19 @@ def main(argv=None) -> int:
     d.add_argument("--leg", required=True)
     d.add_argument("--out", type=Path, required=True)
     d.add_argument("--reference", type=Path, default=REFERENCE)
+    d.add_argument("--visit", action="append", metavar="SEED:DPR",
+                   help="visit this seed (repeatable; default: the host gate's own seeds at its own DPRs)")
+    d.add_argument("--no-pin", action="store_true",
+                   help="do not pin the DPR: the seed's persona has its own (the DPR of --visit only names the file)")
     c = sub.add_parser("compare")
     c.add_argument("dumps", type=Path)
     c.add_argument("--reference", type=Path, default=REFERENCE)
     args = ap.parse_args(argv)
     if args.cmd == "dump":
-        return dump(args.firefox, args.leg, args.out, args.reference)
+        visits = None
+        if args.visit:
+            visits = [(float(dpr), int(seed)) for seed, dpr in (v.split(":", 1) for v in args.visit)]
+        return dump(args.firefox, args.leg, args.out, args.reference, visits=visits, pin_dpr=not args.no_pin)
     notes = []
     failures = compare(args.dumps, args.reference, load_exceptions(), notes)
     for n in notes:

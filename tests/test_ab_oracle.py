@@ -214,9 +214,9 @@ def test_the_visits_read_back_from_the_gate_s_dump_and_from_the_packed_file(tmp_
 
 
 def test_compare_from_the_files_writes_the_diff_and_exits_by_the_verdict(tmp_path, capsys):
-    b = visits()
-    ab.write_json(tmp_path / "dump-68.json", ab.pack("firefox-68", visits()))
-    ab.write_json(tmp_path / "dump-candidate.json", ab.pack("candidate", b))
+    asked = {key: items(key[1]) for key in ab.select_visits()}  # the visits `compare` asks for: the persona seeds, each at its own DPR
+    ab.write_json(tmp_path / "dump-68.json", ab.pack("firefox-68", asked))
+    ab.write_json(tmp_path / "dump-candidate.json", ab.pack("candidate", asked))
     # the floor of the real reference does not apply to the fake page: the run is held to it, so this is red for that reason alone
     report = json.loads(_compare(tmp_path, capsys)[1])
     assert report["verdict"] == "red" and report["differences"] == [] and all("fewer than the 16439" in p for p in report["problems"])
@@ -275,7 +275,7 @@ def _fake_run(tmp_path, monkeypatch, candidate, published=None, code=None):
     code = code or {}
     seen = []
 
-    def fake_dump(binary, seal, leg, out):
+    def fake_dump(binary, seal, leg, out, visits_asked):
         name = "candidate" if binary == "cand" else "firefox-68"
         seen.append((binary, str(seal), leg))
         write_gate_dump(out, candidate if name == "candidate" else (published or visits()))
@@ -283,7 +283,7 @@ def _fake_run(tmp_path, monkeypatch, candidate, published=None, code=None):
 
     monkeypatch.setattr(ab, "run_dump", fake_dump)
     rc = ab.run("cand", tmp_path / "cand.seal.json", "linux-x86_64", tmp_path / "out", "firefox-68",
-                published=("pub", tmp_path / "pub.seal.json"))
+                published=("pub", tmp_path / "pub.seal.json"), visits=list(VISITS))  # the fake page is the old grid: its visits are asked for
     assert seen == [("pub", str(tmp_path / "pub.seal.json"), "linux-x86_64"), ("cand", str(tmp_path / "cand.seal.json"), "linux-x86_64")]
     return rc
 
@@ -303,3 +303,73 @@ def test_each_dump_runs_under_its_own_seal_and_without_the_engine_log(tmp_path, 
     assert cmd[1:] == [str(Path(gate.__file__)), "dump", "ff", "--leg", "linux-x86_64", "--out", str(tmp_path / "o")]
     assert env["INVISIBLE_SEAL_FILE"] == str(tmp_path / "s.json") and "MOZ_LOG" not in env and "MOZ_LOG_FILE" not in env
     assert env["INVISIBLE_CORE_AUTOFIX"] == "off" and env["INVISIBLE_CORE_PIN"] == "allow"
+
+
+# --- the seeds: the persona seeds (ci/persona-seeds.json), each at its own DPR, in shards ---------------------------------------------------------
+
+def test_the_default_visits_are_the_candidate_persona_seeds_each_at_its_own_dpr():
+    import persona_cover as personas
+
+    stored = personas.load()
+    asked = ab.select_visits()
+    assert [seed for _, seed in asked] == stored["candidate"] and len(asked) == 5
+    assert all(dpr == stored["dpr"][str(seed)] for dpr, seed in asked)
+    assert {dpr for dpr, _ in asked} == {1.0, 1.25, 1.5}, "the candidate must reach every DPR of the personas"
+
+
+def test_the_final_set_split_in_shards_is_the_final_set_once():
+    import persona_cover as personas
+
+    final = personas.load()["final"]
+    for n in (1, 2, 3, 4, 5, 20):
+        parts = [ab.select_visits("final", "%d/%d" % (i, n)) for i in range(1, n + 1)]
+        seeds = [seed for part in parts for _, seed in part]
+        assert sorted(seeds) == final and len(seeds) == len(set(seeds)), n
+        assert max(map(len, parts)) - min(map(len, parts)) <= 1, "the shards are even: %s" % [len(p) for p in parts]
+
+
+@pytest.mark.parametrize("text", ["0/4", "5/4", "1/0", "a/b", "1", "1/2/3", "-1/4"])
+def test_a_bad_shard_is_refused(text):
+    with pytest.raises(SystemExit):
+        ab.parse_shard(text)
+
+
+def test_a_shard_with_no_seed_and_an_unknown_set_are_refused():
+    with pytest.raises(SystemExit):
+        ab.select_visits("candidate", "6/6")  # 5 seeds, the 6th of 6 shards has none
+    with pytest.raises(SystemExit):
+        ab.select_visits("everything")
+
+
+def test_the_dump_of_the_persona_seeds_pins_no_dpr_and_names_each_visit(tmp_path, monkeypatch):
+    calls = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: calls.append(cmd) or Done())
+    ab.run_dump("ff", tmp_path / "s.json", "linux-x86_64", tmp_path / "o", [(1.25, 6), (1.0, 0)])
+    cmd = calls[0]
+    assert "--no-pin" in cmd and cmd[cmd.index("--visit") + 1] == "6:1.25" and cmd.count("--visit") == 2 and cmd[-1] == "0:1.0"
+    assert "pin" not in gate.visit_options("ff", 6, None, "UTC") and gate.visit_options("ff", 6, 1.25, "UTC")["pin"] == {"screen.dpr": 1.25}
+
+
+def test_a_visit_of_the_persona_set_that_is_missing_or_that_was_not_asked_for_is_red():
+    asked = ab.select_visits()
+    both = {key: items(key[1]) for key in asked}
+    assert ab.compare_visits(both, copy.deepcopy(both), [], SMALL, expected=tuple(asked))["verdict"] == "green"
+    short = dict(both)
+    gone = short.pop(asked[-1])
+    report = ab.compare_visits(both, short, [], SMALL, expected=tuple(asked))
+    assert report["problems"] == ["side B has no dump of %s" % ab.visit_name(*asked[-1])]
+    old_grid = dict(both)
+    old_grid[(1.5, 11)] = gone
+    assert "not asked for: dpr1.5_seed11" in ab.compare_visits(both, old_grid, [], SMALL, expected=tuple(asked))["problems"][0]
+
+
+def test_a_dpr_the_reference_does_not_record_is_held_to_the_least_of_those_it_does():
+    one = {key: items(key[1]) for key in [(1.25, 6)]}
+    report = ab.compare_visits(one, copy.deepcopy(one), [], {1.0: 6, 1.5: 7}, expected=((1.25, 6),))
+    assert report["verdict"] == "green"
+    report = ab.compare_visits(one, copy.deepcopy(one), [], {1.0: 7, 1.5: 8}, expected=((1.25, 6),))
+    assert report["verdict"] == "red" and "fewer than the 7" in report["problems"][0]
