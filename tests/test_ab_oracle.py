@@ -373,3 +373,125 @@ def test_a_dpr_the_reference_does_not_record_is_held_to_the_least_of_those_it_do
     assert report["verdict"] == "green"
     report = ab.compare_visits(one, copy.deepcopy(one), [], {1.0: 7, 1.5: 8}, expected=((1.25, 6),))
     assert report["verdict"] == "red" and "fewer than the 7" in report["problems"][0]
+
+
+# --- the control: the A/A (the published engine twice), alone on a pull request, first with a candidate ----------------------------------------------
+
+def _aa_run(tmp_path, monkeypatch, dumps, candidate=None, published=("pub", None), limit=None, codes=None):
+    """ab.run_ab with the dumps replaced by files made here. `dumps` is the list of visits each successive dump writes; returns the code and the calls."""
+    calls = []
+    codes = list(codes or [])
+    queue = list(dumps)
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        calls.append((binary, None if seal is None else str(seal), leg, list(visits_asked)))
+        write_gate_dump(out, queue.pop(0))
+        return codes.pop(0) if codes else 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    asked = ab.select_visits(limit=limit)
+    full = {key: items(key[1]) for key in asked}
+    queue = [full if d is None else d(full) for d in queue]
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out", "firefox-68", published, candidate, tmp_path / "cand.seal.json" if candidate else None, asked)
+    return rc, calls
+
+
+def _changed(full):
+    other = copy.deepcopy(full)
+    key = sorted(other)[0]
+    other[key]["surface"]["screen"]["width"] = 1366
+    return other
+
+
+def test_the_a_a_alone_runs_the_published_engine_twice_and_is_green_when_it_repeats(tmp_path, monkeypatch, capsys):
+    rc, calls = _aa_run(tmp_path, monkeypatch, [None, None], limit=2)
+    out = capsys.readouterr().out
+    assert rc == 0 and "AB ORACLE A/A OK" in out
+    assert [c[0] for c in calls] == ["pub", "pub"] and all(c[1] is None and len(c[3]) == 2 for c in calls)
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff-a-a.json", "dump-68-again.json", "dump-68.json"]
+    diff = json.loads((tmp_path / "out" / "diff-a-a.json").read_text(encoding="utf-8"))
+    assert diff["verdict"] == "green" and diff["control"] is True and len(diff["visits"]) == 2
+
+
+def test_an_a_a_that_differs_is_a_broken_control_exit_2_and_names_the_leaf(tmp_path, monkeypatch, capsys):
+    rc, calls = _aa_run(tmp_path, monkeypatch, [None, _changed], limit=2)
+    out = capsys.readouterr().out
+    assert rc == 2 and "BROKEN CONTROL" in out and "AB ORACLE A/A FAILED" in out
+    assert "leaf surface.screen.width: firefox-68 1920 | firefox-68-again 1366" in out
+    diff = json.loads((tmp_path / "out" / "diff-a-a.json").read_text(encoding="utf-8"))
+    assert diff["verdict"] == "red" and len(diff["differences"]) == 1
+
+
+def test_a_broken_control_does_not_run_the_candidate(tmp_path, monkeypatch, capsys):
+    rc, calls = _aa_run(tmp_path, monkeypatch, [None, _changed, None], candidate="cand")
+    assert rc == 2 and [c[0] for c in calls] == ["pub", "pub"]
+    assert not (tmp_path / "out" / "dump-candidate.json").exists() and not (tmp_path / "out" / "diff.json").exists()
+
+
+def test_a_dump_of_the_a_a_that_does_not_run_is_a_broken_control(tmp_path, monkeypatch, capsys):
+    rc, _ = _aa_run(tmp_path, monkeypatch, [None, None], codes=[0, 3])
+    out = capsys.readouterr().out
+    assert rc == 2 and "FAIL the dump with firefox-68-again ended with 3" in out
+
+
+def test_with_a_candidate_the_a_a_comes_first_and_the_a_b_is_against_the_first_dump(tmp_path, monkeypatch, capsys):
+    rc, calls = _aa_run(tmp_path, monkeypatch, [None, None, None], candidate="cand")
+    out = capsys.readouterr().out
+    assert rc == 0 and "AB ORACLE A/A OK" in out and "AB ORACLE OK" in out
+    assert [(c[0], c[1]) for c in calls] == [("pub", None), ("pub", None), ("cand", str(tmp_path / "cand.seal.json"))]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
+
+
+def test_with_a_candidate_that_differs_the_a_b_is_red_exit_1_not_a_broken_control(tmp_path, monkeypatch, capsys):
+    rc, _ = _aa_run(tmp_path, monkeypatch, [None, None, _changed], candidate="cand")
+    out = capsys.readouterr().out
+    assert rc == 1 and "BROKEN CONTROL" not in out and "AB ORACLE FAILED" in out and "firefox-68 1920 | candidate 1366" in out
+
+
+def test_a_published_engine_that_cannot_be_fetched_is_a_broken_control(tmp_path, monkeypatch, capsys):
+    def broken(tag, work):
+        raise RuntimeError("the release index is down")
+
+    monkeypatch.setattr(ab, "fetch_published", broken)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out", "firefox-68", None, None, None, ab.select_visits(limit=1))
+    assert rc == 2 and "FAIL RuntimeError: the release index is down" in capsys.readouterr().out
+
+
+def test_the_a_a_floor_still_holds(tmp_path, monkeypatch, capsys):
+    rc, _ = _aa_run(tmp_path, monkeypatch, [lambda full: {k: {"surface": {"x": 1}} for k in full}] * 2, limit=1)
+    assert rc == 2 and "fewer than the 6 of the host gate's reference" in capsys.readouterr().out
+
+
+def test_the_a_a_compares_again_from_the_files(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    asked = ab.select_visits(limit=2)
+    full = {key: items(key[1]) for key in asked}
+    ab.write_json(tmp_path / "dump-68.json", ab.pack("firefox-68", full))
+    ab.write_json(tmp_path / ab.again_name("firefox-68"), ab.pack("firefox-68-again", full))
+    assert ab.main(["compare", str(tmp_path), "--a-a", "--limit", "2"]) == 0
+    ab.write_json(tmp_path / ab.again_name("firefox-68"), ab.pack("firefox-68-again", _changed(full)))
+    assert ab.main(["compare", str(tmp_path), "--a-a", "--limit", "2"]) == 2
+
+
+def test_the_limit_takes_the_first_seeds_and_the_command_line_needs_a_candidate_or_a_published_engine(tmp_path):
+    assert ab.select_visits(limit=2) == ab.select_visits()[:2] and len(ab.select_visits(limit=2)) == 2
+    for argv in (["run", "--leg", "l", "--out", str(tmp_path)],                       # nothing to run
+                 ["run", "--leg", "l", "--out", str(tmp_path), "--published-seal", "s.json"],   # a seal without its binary
+                 ["run", "cand", "--leg", "l", "--out", str(tmp_path), "--candidate-seal", "c.json", "--published-binary", "pub"]):  # a candidate and half a published engine
+        with pytest.raises(SystemExit) as e:
+            ab.main(argv)
+        assert e.value.code == 2
+
+
+def test_a_dump_without_a_seal_runs_under_the_seal_of_the_core(tmp_path, monkeypatch):
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.delenv("INVISIBLE_SEAL_FILE", raising=False)
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append(env) or Done())
+    ab.run_dump("ff", None, "linux-x86_64", tmp_path / "o", [(1.0, 0)])
+    assert "INVISIBLE_SEAL_FILE" not in seen[0]
