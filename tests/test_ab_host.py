@@ -293,7 +293,7 @@ def test_the_kind_of_a_process_is_the_last_argument_with_its_sandbox_and_browser
     ("/memfd:mozilla-ipc", ("ipc", "/memfd:mozilla-ipc")),
     ("/usr/lib/x86_64-linux-gnu/libc.so.6", ("host", "/usr/lib/x86_64-linux-gnu/libc.so.6")),
     ("/etc/fonts/fonts.conf", ("host", "/etc/fonts/fonts.conf")),
-    ("/home/runner/.config/fontconfig/fonts.conf", ("host", "/home/runner/.config/fontconfig/fonts.conf")),
+    ("/srv/lab/runner/.config/fontconfig/fonts.conf", ("host", "/srv/lab/runner/.config/fontconfig/fonts.conf")),
     ("/tmp/somebody-elses-file", ("host", "/tmp/somebody-elses-file")),
     ("/tmp/ab-host-tmp-xyz/other", ("host", "/tmp/ab-host-tmp-xyz/other")),
     ("/proc/4242/maps", ("host", "/proc/N/maps")),
@@ -400,7 +400,7 @@ FILE_LOG = """\
 100 openat(7, "orphan", O_RDONLY) = 8
 100 open("/etc/hosts", O_RDONLY) = 9</etc/hosts>
 101 stat("/etc/localtime", {st_mode=S_IFREG|0644, st_size=2945, ...}) = 0
-101 lstat("/home/runner/.config", 0x7ffe) = -1 ENOENT (No such file or directory)
+101 lstat("/srv/lab/runner/.config", 0x7ffe) = -1 ENOENT (No such file or directory)
 101 newfstatat(AT_FDCWD, "/proc/4242/status", {st_mode=S_IFREG|0444}, 0) = 0
 101 newfstatat(4</proc/4242>, "", {st_mode=S_IFDIR|0555}, AT_EMPTY_PATH) = 0
 101 statx(AT_FDCWD, "fonts.conf", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x7ffe) = 0
@@ -418,7 +418,7 @@ FILE_LOG = """\
 def test_every_path_the_tree_touched_is_collected_failed_attempts_included_and_relative_ones_are_joined_to_their_directory():
     assert host.touched_paths(FILE_LOG.splitlines()) == {
         "/e/firefox/firefox", "/etc/ld.so.cache", "/usr/lib/libmissing.so", "/usr/share/fonts/a.ttf", "<fd>/orphan", "/etc/hosts", "/etc/localtime",
-        "/home/runner/.config", "/proc/4242/status", "<cwd>/fonts.conf", "/etc/fonts/\u00e8.conf", "/proc/self/exe", "/sys/devices/system/cpu/online",
+        "/srv/lab/runner/.config", "/proc/4242/status", "<cwd>/fonts.conf", "/etc/fonts/\u00e8.conf", "/proc/self/exe", "/sys/devices/system/cpu/online",
         "/late/path", "/usr/bin/lsb_release"}
 
 
