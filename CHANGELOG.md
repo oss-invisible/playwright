@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.0] - 2026-11-21
+
+### Changed
+- Pins invisible-core 68.80.0 on the engine firefox-68 (Firefox 159.0).
+- Every profile starts with the security state a retail Firefox has: the intermediate certificates, OneCRL and the CRLite revocation filters.
+  `invisible-playwright fetch` downloads them from Mozilla's service and has the engine build them once; every launch copies the result into its
+  profile. Filters ten days old or more are left out, as a retail Firefox does, with one warning that says to run `fetch`.
+
+### Fixed
+- `networkidle` waits for the end of the document request that is still arriving when the page is cut, instead of ending early.
+- A navigation the page's process reports as aborted while the parent is still carrying its request now waits for that request, so a
+  `goto` no longer fails with a false abort.
+- Behind a SOCKS5 proxy, WebRTC sockets on ports Windows reserves no longer take the proxy's UDP association from the sockets that work.
+
 ## [0.57.1] - 2026-11-20
 
 ### Fixed
