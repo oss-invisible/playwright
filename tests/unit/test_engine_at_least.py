@@ -125,18 +125,20 @@ def test_every_test_waits_for_the_release_that_carries_its_property():
 
 
 def test_the_release_being_made_carries_only_its_own_properties():
-    """firefox-68 holds the one test of a property it carries (networkidle: the held cut of a committed navigation); the accumulated line is firefox-69."""
+    """firefox-68 holds the one test of a property it carries (networkidle: the held cut of a committed navigation); no later release has a row until
+    a test waits for it."""
     registry = _registry()
-    assert sorted(registry) == ["firefox-68", "firefox-69"]
+    assert sorted(registry) == ["firefox-68"]
     assert list(registry["firefox-68"]["files"]) == ["tests/test_a_page_that_moves_on_e2e.py"]
-    assert len(registry["firefox-69"]["files"]) == 15
 
 
 def test_a_test_of_the_accumulated_line_gated_on_the_release_being_made_is_named():
-    """KNOWN BAD: the gates as they were before firefox-68 was cut down (the accumulated line still named firefox-68), file by file."""
+    """KNOWN BAD: a test of the line after the open release that still names the open release (the registry puts it under the later one)."""
+    registry = {"firefox-68": {"files": {"tests/test_a_page_that_moves_on_e2e.py": "p"}},
+                "firefox-69": {"files": {"tests/test_the_line_after.py": "q"}}}
     source = 'def test_a(engine_at_least):\n    engine_at_least("firefox-68")\n'
-    problems = gate_problems({"tests/test_canvas_text_is_windows_e2e.py": source}, _registry())
-    assert any("test_canvas_text_is_windows_e2e.py:2: waits for firefox-68, and the registry puts it in firefox-69" in p for p in problems), problems
+    problems = gate_problems({"tests/test_the_line_after.py": source}, registry)
+    assert any("test_the_line_after.py:2: waits for firefox-68, and the registry puts it in firefox-69" in p for p in problems), problems
     assert any("test_a_page_that_moves_on_e2e.py: the registry has it in firefox-68, and it has no gate" in p for p in problems), problems
 
 

@@ -12,8 +12,7 @@ cache under ``$XDG_CACHE_HOME/fontconfig``. On a WARM cache it must read that ca
 the scan: it is the difference between a start that reads 121 fonts and a start that reads one file.
 
 The measurement. Two launches of the same binary with the same ``XDG_CACHE_HOME``, a new folder of the test: the first is cold, the second
-warm. Each runs under ``strace -f -ttt`` (the same stand-in as ``test_fontconfig_reads_nothing_of_the_host_linux_e2e.py``: its helpers
-are the ones used here) that traces the opens of the browser. The environment reaches the browser as it does for a user: the test sets
+warm. Each runs under ``strace -f -ttt`` (the stand-in of ``tests/_strace_stand_in.py``) that traces the opens of the browser. The environment reaches the browser as it does for a user: the test sets
 ``XDG_CACHE_HOME`` in its own environment, and the core composes the engine's environment from it (``build_launch_env``: it removes the
 host's ``MOZ_*``, ``LANG``, ``TZ`` and the toolkit families, and nothing else); that the variable did arrive is shown by the cache that is
 written under it.
@@ -84,7 +83,7 @@ import pytest
 
 from _waits import wait_until
 from test_a_screenshot_draws_the_text_of_the_bundled_fonts_as_the_content_does_e2e import EVIDENCE_FOLDER, FAMILIES
-from test_fontconfig_reads_nothing_of_the_host_linux_e2e import (
+from _strace_stand_in import (
     _detached, _group_members, _group_of, _kill_group, _LINE, _require_strace_can_trace, _RESUMED, _roles, _stand_in, _wait_for_exit)
 
 pytestmark = [

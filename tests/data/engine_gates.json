@@ -10,27 +10,5 @@
     "files": {
       "tests/test_a_page_that_moves_on_e2e.py": "a navigation that committed is not cut by the parent: goto answers on our own page, networkidle is reached on the one that replaced it"
     }
-  },
-  "firefox-69": {
-    "carries": [
-      "the accumulated line: canvas text from idwr, empty fontconfig, ucrt maths, WebGL blending and ALU, WebCodecs and AAC, system fonts and colours, the colour profile of the canvas, WebGL2 without Mesa"
-    ],
-    "files": {
-      "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py": "the system fonts and colours come from the core's declaration and a missing one refuses the launch",
-      "tests/test_canvas_icc_readback_is_windows_e2e.py": "the canvas converts tagged images with the declared Windows output profile",
-      "tests/test_canvas_text_colors_and_cleartype_is_windows_e2e.py": "canvas text in colour and under other ClearType keys is retail Windows' bytes (idwr)",
-      "tests/test_canvas_text_is_windows_e2e.py": "canvas text is drawn with Skia over idwr, the same bytes on every OS",
-      "tests/test_css_calc_is_windows_e2e.py": "CSS calc() functions give the ucrt's text on every OS",
-      "tests/test_fontconfig_reads_nothing_of_the_host_linux_e2e.py": "fontconfig starts on an empty configuration and reads nothing of the host",
-      "tests/test_math_sin_cos_tan_are_windows_e2e.py": "Math.sin, cos and tan give the ucrt's bytes on every OS",
-      "tests/test_system_fonts_and_colors_are_windows_e2e.py": "the CSS system fonts and colours are Windows retail's, never GTK's",
-      "tests/test_webcodecs_h264_bframe_pts_order_e2e.py": "VideoFrame.timestamp on an H.264 B-frame stream is in retail's order",
-      "tests/test_webcodecs_h264_software_decode_ignores_hardware_request_e2e.py": "WebCodecs decodes in software when the page asks for hardware",
-      "tests/test_webcodecs_h264_without_host_libavcodec_linux_e2e.py": "WebCodecs decodes H.264 on a Linux host with no libavcodec",
-      "tests/test_webgl2_exists_without_host_mesa_linux_e2e.py": "WebGL2 exists on a Linux host with no Mesa",
-      "tests/test_webgl_blending_rounds_once_e2e.py": "WebGL blending is done on the unquantized shader output and rounded once",
-      "tests/test_webgl_dot_has_the_declared_gpu_s_bits_e2e.py": "a WebGL dot() gives the bits of the declared GPU family",
-      "tests/test_webgl_mediump_is_full_precision_e2e.py": "a mediump WebGL shader computes at 32 bit"
-    }
   }
 }
