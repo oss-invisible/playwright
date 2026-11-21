@@ -1,0 +1,5 @@
+{
+  "format": "ab-network-volatile/1",
+  "about": "The leaves of the network transcript that differ between two runs of ONE engine (the A/A of scripts/ci_ab_network.py). Each entry: `pattern` (fnmatch over the leaf path seeds/<seed>/<category>/...), `reason` (why that leaf is noise), `aa_run` (the A/A run that proved it). Born from the evidence of the A/A, never written ahead of it. It may only shrink: an entry that matches no leaf of a run is red as stale.",
+  "entries": []
+}
