@@ -4,8 +4,9 @@ scripts/ci_ab_oracle.py runs the host gate's dump (the page of scripts/host_gate
 DPR. Like the network and host oracles, it has two modes, told by whether there is a candidate:
 
 * on a pull request (no candidate: INVPW_BINARY_PATH is the published engine and INVISIBLE_SEAL_FILE is not set): the A/A, the published engine dumped twice and the two compared leaf by leaf, on
-  the first two seeds of the `candidate` set (the run has a budget per test; the gate's leg runs them all). A difference is a BROKEN CONTROL (exit 2): what is compared is not stable. Both dumps and
-  the diff are saved under $AB_ORACLE_OUT or, on a runner, $RUNNER_TEMP/invpw-evidence/ab-oracle (which the e2e jobs upload);
+  the first two seeds of the `candidate` set (the run has a budget per test; the gate's leg runs them all), or on ALL of them when the pull request changes a file of the oracle: the step of e2e.yml
+  runs scripts/ci_ab_pr_seeds.py and exports AB_ORACLE_PR_SEEDS (5), which `pr_seed_count` reads; the A/A is zero on every seed before any verdict of an A/B is accepted. A difference is a BROKEN CONTROL
+  (exit 2): what is compared is not stable. Both dumps and the diff are saved under $AB_ORACLE_OUT or, on a runner, $RUNNER_TEMP/invpw-evidence/ab-oracle (which the e2e jobs upload);
 * with a candidate (INVPW_BINARY_PATH the candidate's binary, INVISIBLE_SEAL_FILE its seal, as the gate's ab_oracle leg sets them): the A/A first, on every seed of the set, then the published engine
   (fetched the way the core fetches an engine: the release's seal.json and the archive checked against it) against the candidate. If the A/A is broken the A/B is not run. AB_ORACLE_SEED_SET=final and
   AB_ORACLE_SHARD=i/n run the 20 seeds that reach every value of every dimension, split over n jobs.
@@ -29,8 +30,12 @@ pytestmark = pytest.mark.e2e
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_oracle.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
+
 TIMEOUT_S = 40 * 60
-#: The seeds of the A/A on a pull request: the first two of the candidate set (4 launches of the page; the gate's leg runs the A/A on all of them).
+#: The seeds of the A/A on a pull request: the first two of the candidate set (4 launches of the page; the gate's leg runs the A/A on all of them), or every one
+#: when the pull request touches the oracle (AB_ORACLE_PR_SEEDS, from the step of e2e.yml).
 PR_SEEDS = 2
 
 
@@ -61,7 +66,7 @@ def test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_by
     if candidate:
         command[4:4] = [binary, "--candidate-seal", seal]
     else:
-        command += ["--published-binary", binary, "--limit", str(PR_SEEDS)]
+        command += ["--published-binary", binary, "--limit", str(pr_seed_count("AB_ORACLE_PR_SEEDS", PR_SEEDS))]
     if shard:
         command += ["--shard", shard]
     done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)

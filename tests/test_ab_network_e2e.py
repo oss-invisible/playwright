@@ -5,7 +5,8 @@ a witness and the watcher of direct connections, and writes what the lab saw as 
 wire order, the QUIC parameters, the WebRTC candidates and the UDP path. Two transcripts are compared leaf by leaf; a leaf that differs is red with its path and both values. The leaves that differ between two
 runs of ONE engine are the noise (ci/ab-network-volatile.json), and they are born from the A/A: this test is where it runs.
 
-* On a pull request (no candidate: ``INVPW_BINARY_PATH`` is the published engine and no ``INVISIBLE_SEAL_FILE``): the A/A, on the first seed. It saves both transcripts, the diff and a proposal of the volatile
+* On a pull request (no candidate: ``INVPW_BINARY_PATH`` is the published engine and no ``INVISIBLE_SEAL_FILE``): the A/A, on the first seed, or on every seed of the candidate set when the pull request
+  changes a file of this oracle (``AB_NETWORK_PR_SEEDS``, exported by the step of e2e.yml that runs scripts/ci_ab_pr_seeds.py). It saves both transcripts, the diff and a proposal of the volatile
   entries under ``$AB_ORACLE_OUT/network`` or, on a runner, ``$RUNNER_TEMP/invpw-evidence/ab-network`` (which the e2e jobs upload), on Linux and on Windows. A difference is a BROKEN CONTROL and red,
   until the list holds it: the first run is red on purpose, and its evidence (uploaded whatever the verdict) is what the list is filled from, with the run id.
 * With a candidate (``INVPW_BINARY_PATH`` and ``INVISIBLE_SEAL_FILE`` as the gate's ab_oracle leg sets them): the A/A first, then the published engine against the candidate on every seed of
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_network.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import ci_ab_network as oracle  # noqa: E402
+from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 
 #: The fewest leaves a comparison holds, per system. A minimal but complete run of ONE seed (one request on each road, tests/test_ab_network.py) holds about 670; a real one holds several times that. A floor of
 #: 500 says "the run saw something on every road" and nothing more: it is raised to a fraction of the measured count once the A/A has measured it.
@@ -57,7 +59,7 @@ def test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_
     if candidate:
         command += ["--candidate", firefox_binary, "--candidate-seal", seal]
     else:
-        command += ["--a-a", "--published-binary", firefox_binary, "--seeds", str(oracle.default_seeds()[0])]
+        command += ["--a-a", "--published-binary", firefox_binary, "--seeds", ",".join(str(s) for s in oracle.default_seeds()[:pr_seed_count("AB_NETWORK_PR_SEEDS", 1)])]
     done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
     (out / "oracle.log").write_text(done.stdout + "\n--- stderr\n" + done.stderr, encoding="utf-8")
     verdict = [line for line in done.stdout.splitlines() if line.startswith(("DIFF ", "FAIL ", "AB NETWORK", "ERROR "))]

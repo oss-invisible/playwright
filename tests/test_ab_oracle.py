@@ -529,3 +529,88 @@ def test_a_dump_without_a_seal_runs_under_the_seal_of_the_core(tmp_path, monkeyp
     monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append(env) or Done())
     ab.run_dump("ff", None, "linux-x86_64", tmp_path / "o", [(1.0, 0)])
     assert "INVISIBLE_SEAL_FILE" not in seen[0]
+
+
+# -
+# How many seeds the A/A of each oracle visits on a pull request (scripts/ci_ab_pr_seeds.py, the step of e2e.yml, the e2e tests).
+
+import ci_ab_pr_seeds as pr  # noqa: E402
+
+ALL, DEFAULT = {"AB_ORACLE_PR_SEEDS": 5, "AB_NETWORK_PR_SEEDS": 5, "AB_HOST_PR_SEEDS": 5}, {"AB_ORACLE_PR_SEEDS": 2, "AB_NETWORK_PR_SEEDS": 1, "AB_HOST_PR_SEEDS": 2}
+
+
+def test_a_pull_request_that_touches_no_oracle_runs_the_default_seeds():
+    assert pr.pr_seed_counts(["src/invisible_playwright/launcher.py", "README.md", "tests/test_the_wire_is_json.py"], every=5) == DEFAULT
+    assert pr.pr_seed_counts([], every=5) == DEFAULT
+
+
+@pytest.mark.parametrize("path,only", [
+    ("scripts/ci_host_gate.py", "AB_ORACLE_PR_SEEDS"), ("scripts/host_gate/exceptions.json", "AB_ORACLE_PR_SEEDS"), ("scripts/host_gate/page/index.html", "AB_ORACLE_PR_SEEDS"),
+    ("tests/test_ab_oracle.py", "AB_ORACLE_PR_SEEDS"), ("tests/test_ab_oracle_e2e.py", "AB_ORACLE_PR_SEEDS"),
+    ("scripts/ci_ab_network.py", "AB_NETWORK_PR_SEEDS"), ("ci/ab-network-volatile.json", "AB_NETWORK_PR_SEEDS"), ("tests/test_ab_network_e2e.py", "AB_NETWORK_PR_SEEDS"),
+    ("scripts/ci_ab_host.py", "AB_HOST_PR_SEEDS"), ("ci/ab-host-expected.json", "AB_HOST_PR_SEEDS"), ("tests/test_ab_host.py", "AB_HOST_PR_SEEDS"),
+    ("tests/_strace_stand_in.py", "AB_HOST_PR_SEEDS"),
+])
+def test_a_pull_request_that_touches_the_files_of_one_oracle_runs_every_seed_of_that_oracle_only(path, only):
+    got = pr.pr_seed_counts(["README.md", path], every=5)
+    assert got == dict(DEFAULT, **{only: 5}), got
+
+
+@pytest.mark.parametrize("path", ["scripts/ci_ab_oracle.py", "scripts/persona_cover.py", "ci/persona-seeds.json", "scripts/ci_ab_pr_seeds.py"])
+def test_what_the_oracles_share_runs_every_seed_of_all_of_them(path):
+    assert pr.pr_seed_counts([path], every=5) == ALL
+
+
+def test_every_seed_is_the_candidate_set_of_the_persona_seeds_file():
+    assert pr.candidate_seed_count() == len(json.loads((Path(__file__).resolve().parents[1] / "ci" / "persona-seeds.json").read_text(encoding="utf-8"))["candidate"]) == 5
+    assert pr.pr_seed_counts(["scripts/ci_ab_oracle.py"]) == ALL
+
+
+def test_a_test_reads_the_number_from_the_environment_and_falls_back_to_its_default():
+    assert pr.pr_seed_count("AB_ORACLE_PR_SEEDS", 2, {}) == 2
+    assert pr.pr_seed_count("AB_ORACLE_PR_SEEDS", 2, {"AB_ORACLE_PR_SEEDS": ""}) == 2
+    assert pr.pr_seed_count("AB_ORACLE_PR_SEEDS", 2, {"AB_ORACLE_PR_SEEDS": "5"}) == 5
+    assert pr.pr_seed_count("AB_ORACLE_PR_SEEDS", 2, {"AB_ORACLE_PR_SEEDS": "5\r"}) == 5, "a carriage return from a Windows line is not part of the number"
+    for bad in ("0", "-1", "five", "2.5"):
+        with pytest.raises(ValueError, match="AB_ORACLE_PR_SEEDS"):
+            pr.pr_seed_count("AB_ORACLE_PR_SEEDS", 2, {"AB_ORACLE_PR_SEEDS": bad})
+
+
+def test_the_changed_files_are_the_difference_from_the_base_commit_and_the_base_is_fetched_first():
+    calls = []
+
+    class Done:
+        stdout = "scripts/ci_ab_host.py\n\n tests/test_ab_host.py \n"
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return Done()
+
+    assert pr.changed_files("abc123", run=run) == ["scripts/ci_ab_host.py", "tests/test_ab_host.py"]
+    assert calls == [["git", "fetch", "--no-tags", "--depth=1", "origin", "abc123"], ["git", "diff", "--name-only", "abc123", "HEAD"]]
+
+
+def test_the_script_prints_one_variable_per_oracle_with_unix_line_ends_for_the_environment_file(monkeypatch, capsys):
+    monkeypatch.setattr(pr, "changed_files", lambda base: ["tests/test_ab_host_e2e.py"] if base == "base" else [])
+    assert pr.main(["base"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["AB_ORACLE_PR_SEEDS=2", "AB_NETWORK_PR_SEEDS=1", "AB_HOST_PR_SEEDS=5"] and "\r" not in captured.out
+    assert "host oracle: 5 seeds (its files changed: tests/test_ab_host_e2e.py)" in captured.err and "page oracle: 2 seeds (default 2)" in captured.err
+    assert pr.main([]) == 2
+
+
+def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_linux_job_and_the_windows_parts_and_the_e2e_tests_read_its_variables():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    control_a, windows = text.index("\n  e2e-windows-control-a:\n"), text.index("\n  e2e-windows:\n")
+    legs = {"linux": text[text.index("\n  e2e:\n"):control_a], "control-a": text[control_a:windows], "windows": text[windows:]}
+    step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
+            "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
+            '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
+    assert step in legs["linux"] and step in legs["windows"] and step not in legs["control-a"], "the legs that run the oracles' tests, and only those"
+    for leg in ("linux", "windows"):
+        assert legs[leg].index("actions/setup-python") < legs[leg].index(step) < legs[leg].index("Fetch the published firefox binary")
+    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 2 and "uses:" not in step
+    for variable, source in (("AB_ORACLE_PR_SEEDS", "test_ab_oracle_e2e.py"), ("AB_NETWORK_PR_SEEDS", "test_ab_network_e2e.py"), ("AB_HOST_PR_SEEDS", "test_ab_host_e2e.py")):
+        assert 'pr_seed_count("%s"' % variable in (root / "tests" / source).read_text(encoding="utf-8")
+        assert variable in pr.ORACLES
