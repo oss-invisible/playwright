@@ -7,8 +7,7 @@ runs of ONE engine are the noise (ci/ab-network-volatile.json), and they are bor
 
 * On a pull request (no candidate: ``INVPW_BINARY_PATH`` is the published engine and no ``INVISIBLE_SEAL_FILE``): the A/A, on the first seed. It saves both transcripts, the diff and a proposal of the volatile
   entries under ``$AB_ORACLE_OUT/network`` or, on a runner, ``$RUNNER_TEMP/invpw-evidence/ab-network`` (which the e2e jobs upload), on Linux and on Windows. A difference is a BROKEN CONTROL and red,
-  until the list holds it. ``AB_NETWORK_MEASURE=1`` makes the run the MEASUREMENT of the noise: it fails only on what no list can excuse (a connection around the proxy, a run that saw fewer leaves than the
-  floor, a run that did not finish) and says in its message how many leaves differed.
+  until the list holds it: the first run is red on purpose, and its evidence (uploaded whatever the verdict) is what the list is filled from, with the run id.
 * With a candidate (``INVPW_BINARY_PATH`` and ``INVISIBLE_SEAL_FILE`` as the gate's ab_oracle leg sets them): the A/A first, then the published engine against the candidate on every seed of
   ci/persona-seeds.json (key ``candidate``) or, without the file, the seeds of the A/B oracle of the page. The A/A is the control: if it is broken the A/B is not run.
 
@@ -65,12 +64,6 @@ def test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_
     control = out / "diff-a-a.json"
     assert control.is_file(), "the A/A did not run to its end (exit %s):\n%s\n%s" % (done.returncode, "\n".join(verdict[:40]), done.stderr[-1500:])
     aa = json.loads(control.read_text(encoding="utf-8"))
-    measure = os.environ.get("AB_NETWORK_MEASURE") == "1" and not candidate
-    if measure:
-        assert not aa["direct"], "the lab was reached around the proxy:\n" + "\n".join(aa["direct"])
-        assert aa["leaves"] >= floor, "the run compared %d leaves, fewer than the floor of %d" % (aa["leaves"], floor)
-        print("A/A measurement: %d leaves compared (%s), %d differ, %d excused" % (aa["leaves"], aa["by_category"], len(aa["differences"]), aa["excused"]))
-        return
     assert done.returncode != 2 or aa["verdict"] == "green", "BROKEN CONTROL: the published engine differs from itself on %d leaves (the list is ci/ab-network-volatile.json):\n%s" % (
         len(aa["differences"]), "\n".join(verdict[:60]))
     assert done.returncode == 0, "the network oracle is red:\n" + "\n".join(verdict[:60]) + "\n" + done.stderr[-1500:]
