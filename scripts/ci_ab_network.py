@@ -23,6 +23,11 @@ cookie are dropped. ci/ab-network-volatile.json lists the leaves that differ bet
 path, the reason, and the A/A run that proved it. The list is born from the A/A (``ab --a-a``, ``compare --a-a``), never written ahead of it, and it may only shrink: an
 entry that matches no leaf of a run is red as stale.
 
+THE POOL. What a connection and a request SAY is the engine's and is compared; how many connections there are, which one a request rode, its stream, the frames after the first
+request, a connection opened and never used, how many datagrams QUIC sent, and where in the journey a connection landed are the pool's and the timers', and are not compared as such
+(``fold_wire``, ``journey_data``, the h3 ``udp``): one summary per role over the whole walk, the distinct fingerprints of the connections that carried a request, and every request
+with how many times it was made.
+
 THE CONTROL. ``--a-a`` runs the published engine twice and compares: a difference there is a BROKEN CONTROL (exit 2), not a finding about the candidate. With a candidate,
 the A/A comes first; if it is broken the A/B is not run (exit 2) unless ``--measure``, which runs everything and still exits 2.
 
@@ -816,7 +821,10 @@ def journey_data(lab: Lab) -> Dict[str, Any]:
     were first asked, which the engine orders (a name is resolved before its first connection), and how many connections each destination got (a count is the pool's, see
     ci/ab-network-volatile.json)."""
     queries = [(q.name, q.qtype, q.via) for q in lab.rec.slice("doh", "journey")]
-    return {"connects": connect_summary([e["target"] for e in lab.rec.of("journey", "connect")], lab.norm), "dns": dns_summary(queries)}
+    # The CONNECTs of the launch stage too: the connection to the DoH that the engine opens at start-up lands before the journey or in its first step (A/A run 44960767715,
+    # Windows: one CONNECT in the launch stage of one run and none in the other).
+    targets = [e["target"] for e in lab.rec.of("launch", "connect") + lab.rec.of("journey", "connect")]
+    return {"connects": connect_summary(targets, lab.norm), "dns": dns_summary(queries)}
 
 
 def wire_summary(server: Any, phase: str, norm: Normalizer) -> Dict[str, Any]:
@@ -841,6 +849,111 @@ def wire_summary(server: Any, phase: str, norm: Normalizer) -> Dict[str, Any]:
              "requests": [{"pseudo_order": r["pseudo_order"], "header_names": r["header_names"], "headers": r["headers"]} for r in q["requests"]]}
             for q in snapshot["quic"] if inside(q["phase"])]
     return norm.walk({"connections": connections, "quic": quic})
+
+
+#: What HTTP/2 and HTTP/3 each add to a request on their own (Firefox: ``te: trailers`` over HTTP/2, ``alt-used: <origin>`` over HTTP/3, before the referer).
+TRANSPORT_HEADERS = ("te", "alt-used")
+
+
+def _pseudo(headers: List[List[str]]) -> Tuple[Dict[str, str], List[List[str]]]:
+    """The pseudo-headers of a request as a dict (their ORDER is the connection's, see :func:`fold_wire`) and the regular headers in the order they were written."""
+    return ({n: v for n, v in headers if n.startswith(":")}, [[n, v] for n, v in headers if not n.startswith(":")])
+
+
+def _without(value: Any, *names: str) -> Any:
+    """``value`` (a JSON structure) without the keys ``names``, at any depth."""
+    if isinstance(value, dict):
+        return {k: _without(v, *names) for k, v in value.items() if k not in names}
+    if isinstance(value, list):
+        return [_without(v, *names) for v in value]
+    return value
+
+
+def _resumed(tls: Dict[str, Any]) -> bool:
+    return "pre_shared_key" in (tls.get("extensions") or {})
+
+
+def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str, Any]:
+    """What a capture server saw over a whole walk, as what the ENGINE decides and not as what the connection pool did.
+
+    The engine decides what a connection says (the ClientHello, the ALPN, the HTTP/2 SETTINGS and the first WINDOW_UPDATE and PRIORITY frames, the QUIC transport parameters and
+    HTTP/3 SETTINGS, the order of the pseudo-headers) and what a request says (its pseudo-headers, its headers in their order and with their values, its HTTP/2 priority, whether it
+    ended the stream). The pool decides how many connections there are, which connection a request rides, which stream it gets, how many frames follow the first request, whether a
+    connection is opened and never used (a pre-connect), and whether a resumed connection is opened beside the fresh one. A/A run 44960767715 (Linux: a second connection with no
+    request, in the stage of the first visit in one run and of the second in the other, 212 leaves; Windows: the page's requests split 4 and 1 between HTTP/2 over TCP and HTTP/3 over
+    QUIC in one run, 1 and 4 in the other, with the stream numbers, priorities and frame counts that follow, 280 leaves).
+
+    So the summary of a role is: ``connections``, the distinct fingerprints of the connections that carried at least one request and are not resumed (a resumed ClientHello depends on
+    a ticket having arrived first), sorted; ``requests``, every request with how many times it was made, wherever it was made; ``errors``. Not kept: the number of connections, a
+    connection that carried no request, the stream numbers, the frames after the first request. A connection whose ClientHello differs, or a request whose headers differ, is still
+    a difference.
+
+    ``transport_race`` is for the role whose page may be served over HTTP/2 or HTTP/3 (the Alt-Svc of the first answer makes the browser open QUIC, and which of the next requests
+    are already on it is a race): the end of the stream and the priority of an HTTP/2 request are then kept for the requests of the page itself (``/?...``, which always opens the
+    first connection) and not for the resources, which ride either transport; and the headers a transport adds on its own (``TRANSPORT_HEADERS``) are written once in the fingerprint of
+    its connections (``transport_headers``) and not in each request, which is the same request over either (A/A run 44960767715, Windows: ``/wire.css`` with ``te: trailers`` over
+    HTTP/2 in one run and with ``alt-used`` before the referer over HTTP/3 in the other)."""
+    connections: Dict[str, Dict[str, Any]] = {}
+    requests: collections.Counter = collections.Counter()
+    shapes: Dict[str, Any] = {}
+    errors = set()
+
+    def keep(fingerprint: Dict[str, Any], pseudo_orders: set, carried: int, resumed: bool, marks: set = frozenset()) -> None:
+        if carried and not resumed:
+            fingerprint = dict(fingerprint, pseudo_orders=sorted(list(o) for o in pseudo_orders))
+            if transport_race:
+                fingerprint["transport_headers"] = sorted(marks)
+            # the ECH GREASE AEAD is random per connection (ci/ab-network-volatile.json): it does not order the fingerprints
+            connections[json.dumps(_without(fingerprint, "aead"), sort_keys=True)] = fingerprint
+
+    def regular_headers(headers: List[List[str]], marks: set) -> List[List[str]]:
+        """The regular headers of a request; in a race the ones a transport adds on its own (``te: trailers`` on HTTP/2, ``alt-used`` on HTTP/3) are the connection's, not the request's."""
+        pseudo, regular = _pseudo(headers)
+        if transport_race:
+            marks.update("%s: %s" % (n, v) for n, v in regular if n in TRANSPORT_HEADERS)
+            regular = [[n, v] for n, v in regular if n not in TRANSPORT_HEADERS]
+        return regular
+
+    def count(shape: Dict[str, Any]) -> None:
+        key = json.dumps(shape, sort_keys=True)
+        shapes[key] = shape
+        requests[key] += 1
+
+    for c in summary.get("connections") or []:
+        if "error" in c:
+            errors.add(c["error"])
+        if "h2" in c:
+            h2 = c["h2"]
+            orders, marks = set(), set()
+            priority = {p.get("stream"): {k: v for k, v in p.items() if k != "stream"} for p in h2.get("headers_priority") or []}
+            for r in h2.get("requests") or []:
+                pseudo, _regular = _pseudo(r["headers"])
+                regular = regular_headers(r["headers"], marks)
+                orders.add(tuple(r["pseudo_order"]))
+                shape = dict(pseudo=dict(sorted(pseudo.items())), headers=regular)
+                if not transport_race or pseudo.get(":path", "").startswith("/?"):
+                    shape.update(end_stream=r.get("end_stream"), priority=priority.get(r.get("stream")))
+                count(shape)
+            frames = (h2.get("priority") or []) + (h2.get("priority_update") or [])
+            fingerprint = {"transport": "tcp", "alpn": c["alpn"], "tls": c["tls"],
+                           "h2": {"settings": h2.get("settings"), "frame_types_before_the_first_request": h2.get("frame_types_before_the_first_request"),
+                                  "window_updates_before_the_first_request": h2.get("window_updates_before_the_first_request"),
+                                  "settings_ack_sent_by_client": h2.get("settings_ack_sent_by_client"),
+                                  "priority_frames": sorted(json.dumps(_without(f, "stream"), sort_keys=True) for f in frames)}}
+            keep(fingerprint, orders, len(h2.get("requests") or []), _resumed(c["tls"]), marks)
+        else:
+            for r in c.get("http1") or []:
+                count({"request_line": r["request_line"], "headers": r["headers"], "body_length": r["body_length"]})
+            keep({"transport": "tcp", "alpn": c["alpn"], "tls": c["tls"]}, set(), len(c.get("http1") or []), _resumed(c["tls"]))
+    for q in summary.get("quic") or []:
+        orders, marks = set(), set()
+        for r in q["requests"]:
+            pseudo, _regular = _pseudo(r["headers"])
+            regular = regular_headers(r["headers"], marks)
+            orders.add(tuple(r["pseudo_order"]))
+            count(dict(pseudo=dict(sorted(pseudo.items())), headers=regular))
+        keep({"transport": "quic", "alpn": q["alpn"], "transport_parameters": q["transport_parameters"], "h3_settings": q["h3_settings"]}, orders, len(q["requests"]), False, marks)
+    return {"connections": [connections[k] for k in sorted(connections)], "requests": [dict(shapes[k], count=requests[k]) for k in sorted(requests)], "errors": sorted(errors)}
 
 
 class Trusting:
@@ -901,7 +1014,8 @@ def walk_https(browser: Any, lab: Lab, which: str, server: Any, name: str) -> Di
             lab.rec.set_phase(phase)
             page.goto("https://%s:%d/?v=%d" % (name, server.port, visit), wait_until="load", timeout=60000)
             page.evaluate(FETCH_JS)
-            out["v%d" % visit] = dict(wire_summary(server, phase, lab.norm), dns=phase_data(lab, phase)["dns"])
+            out["v%d" % visit] = {"dns": phase_data(lab, phase)["dns"]}
+        out["wire"] = fold_wire(wire_summary(server, "https.%s" % which, lab.norm))     # the whole walk, read once it is over: see fold_wire
         return out
     finally:
         context.close()
@@ -924,12 +1038,15 @@ def walk_h3(browser: Any, lab: Lab) -> Dict[str, Any]:
             out["quic_seen"] = bool(lab.h3.quic)
             protocol = page.evaluate(NAV_JS)
             out["visits"].append(protocol)
-            out["v%d" % visit] = dict(wire_summary(lab.h3, phase, lab.norm), dns=phase_data(lab, phase)["dns"])
+            out["v%d" % visit] = {"dns": phase_data(lab, phase)["dns"]}
             if protocol == "h3" or not out["quic_seen"]:
                 break
-        # The datagrams of the whole walk, not of each visit: the packets a visit leaves in flight (an acknowledgement, a close) arrive in the next visit's stage
-        # (A/A run 44946411675, Linux: 12 and 8 datagrams in one run, 13 and 7 in the other, 20 in both).
-        out["udp"] = phase_data(lab, "h3")["udp"]
+        out["wire"] = fold_wire(wire_summary(lab.h3, "h3", lab.norm), transport_race=True)
+        # The datagrams of the whole walk, not of each visit (the packets a visit leaves in flight arrive in the next visit's stage), and not their NUMBER: how many datagrams
+        # QUIC sends follows its acknowledgements and timers. A/A run 44946411675, Linux: 12+8 and 13+7; run 44960767715: 23 and 22 on Linux, 16 and 25 on Windows.
+        udp = phase_data(lab, "h3")["udp"]
+        udp.pop("counts")
+        out["udp"] = udp
         return out
     finally:
         context.close()
@@ -1005,7 +1122,7 @@ def run_main(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
             if trap is not None:
                 trap.__exit__(None, None, None)
         out["lab"] = {"direct": direct_report(lab, watcher, trap), "resolver_trap_ran": trap is not None,
-                      "launch": lab.norm.walk(phase_data(lab, "launch"))}
+                      "launch": lab.norm.walk(step_data(lab, "launch"))}
     return out
 
 

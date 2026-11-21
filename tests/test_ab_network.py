@@ -194,13 +194,13 @@ def test_the_entries_of_the_repository_list_excuse_the_counts_of_connections_and
     def excused(path):
         return [q for q in patterns if fnmatch.fnmatchcase(path, q)]
 
-    base = "seeds/0/https/h2/v1/connections/0/tls/extensions/encrypted_client_hello/"
+    base = "seeds/0/https/h2/wire/connections/0/tls/extensions/encrypted_client_hello/"
     assert excused(base + "aead") and not excused(base + "kdf") and not excused(base + "payload_length") and not excused(base + "type")
-    assert excused("seeds/0/h3/v1/connections/0/tls/extensions/encrypted_client_hello/aead")
-    assert excused("seeds/0/journey/connects/counts/192.0.2.53:443") and excused("seeds/0/lab/launch/connects/counts/192.0.2.53:443") and excused("seeds/0/webrtc/connects/counts/192.0.2.53:443")
+    assert excused("seeds/0/h3/wire/connections/0/tls/extensions/encrypted_client_hello/aead")
+    assert excused("seeds/0/journey/connects/counts/192.0.2.53:443") and excused("seeds/0/webrtc/connects/counts/192.0.2.53:443")
     for kept in ("seeds/0/journey/connects/order/0", "seeds/0/journey/dns/order/0", "seeds/0/journey/steps/01/requests/GET A//count", "seeds/0/journey/steps/01/requests/GET A//headers/0/1",
                  "seeds/0/journey/steps/01/udp/counts/198.51.100.5:19302", "seeds/0/lab/launch/connects/order/0", "seeds/0/webrtc/connects/order/0", "seeds/0/h3/udp/counts/10.0.0.1:h3",
-                 "seeds/0/https/h2/v1/connections/0/tls/extensions/server_name"):
+                 "seeds/0/https/h2/wire/connections/0/tls/extensions/server_name"):
         assert not excused(kept), kept
 
 
@@ -371,7 +371,7 @@ def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the
     assert {"path": "seeds/11/journey/connects/order/2", "a": ab.MISSING, "b": "192.0.2.77:443"} in red["differences"]
 
 
-def _h3_run(visits):
+def _h3_run(visits, message="quic-short"):
     """``ab.walk_h3`` with a page that answers h2 until the last visit and h3 on it, and a QUIC server that has seen a connection; ``visits`` is the datagrams the relay carries
     in each visit's stage (the last ones of one visit arrive in the next one's, which is what the A/A showed)."""
     from types import SimpleNamespace
@@ -385,7 +385,7 @@ def _h3_run(visits):
         def goto(self, url, **options):
             state["visit"] += 1
             for _ in range(visits[state["visit"] - 1]):
-                rec.event("udp", target="127.0.0.1:5", message="quic-short")
+                rec.event("udp", target="127.0.0.1:5", message=message)
 
         def evaluate(self, script):
             return "h3" if state["visit"] == len(visits) else "h2"
@@ -409,11 +409,145 @@ def _h3_run(visits):
         ab.wire_summary = original
 
 
-def test_the_datagrams_of_the_http3_walk_are_summarised_over_the_walk_because_a_visit_leaves_packets_in_flight_for_the_next():
-    one, two = _h3_run([12, 8]), _h3_run([13, 7])
-    assert one == two and one["udp"]["counts"] == {"127.0.0.1:5": 20} and one["visits"] == ["h2", "h3"]
-    assert all("udp" not in one[v] for v in ("v1", "v2"))
-    assert _h3_run([13, 8])["udp"]["counts"] == {"127.0.0.1:5": 21} != one["udp"]["counts"], "a datagram more in the walk is a difference"
+def test_the_datagrams_of_the_http3_walk_are_summarised_over_the_walk_and_by_kind_not_by_number():
+    """A/A runs 44946411675 and 44960767715: 12+8 and 13+7, 23 and 22, 16 and 25 datagrams for the same walk: how many QUIC sends follows its acknowledgements and timers."""
+    one, two, more = _h3_run([12, 8]), _h3_run([13, 7]), _h3_run([13, 8])
+    assert one == two == more and one["visits"] == ["h2", "h3"]
+    assert one["udp"] == {"order": ["127.0.0.1:5"], "messages": {"127.0.0.1:5": ["quic-short"]}} and all("udp" not in one[v] for v in ("v1", "v2"))
+    assert _h3_run([12, 8], message="quic-long")["udp"] != one["udp"], "another kind of datagram is a difference"
+
+
+def _tls(resumed=False, aead=1, cipher="0x1301"):
+    hello = copy.deepcopy(wc.parse_client_hello(build_hello()))
+    hello["cipher_suites"] = [cipher] + hello["cipher_suites"][1:]
+    hello["extensions"]["encrypted_client_hello"] = {"type": 0, "kdf": 1, "aead": aead, "enc_length": 32, "payload_length": 528 if resumed else 240}
+    hello["extensions"].pop("pre_shared_key", None)
+    if resumed:
+        hello["extensions"]["pre_shared_key"] = {"identities": 1, "binder_lengths": [48]}
+    return hello
+
+
+def _headers(path, kind="*/*", pseudo=(":method", ":path", ":authority", ":scheme")):
+    values = {":method": "GET", ":path": path, ":authority": "h3.lab.test:h3", ":scheme": "https"}
+    return [[n, values[n]] for n in pseudo] + [["user-agent", "Mozilla/5.0"], ["accept", kind], ["accept-language", "en-US,en;q=0.9"]]
+
+
+def _h2(tls, requests, frames_after=3, priority=None, pseudo=(":method", ":path", ":authority", ":scheme")):
+    """An HTTP/2 connection as ``wire_summary`` writes it; ``requests`` is [(stream, path)]."""
+    return {"alpn": "h2", "tls": tls, "h2": {
+        "settings": [[1, 65536], [2, 0], [4, 131072], [5, 16384]], "frame_types_before_the_first_request": ["SETTINGS", "WINDOW_UPDATE"],
+        "window_updates_before_the_first_request": [{"stream": 0, "increment": 12517377}], "priority": [], "priority_update": [], "settings_ack_sent_by_client": True,
+        "frames_after_the_first_request": frames_after,
+        "headers_priority": [{"depends_on": 0, "exclusive": False, "stream": n, "weight": (priority or {}).get(path, 22)} for n, path in requests],
+        "requests": [{"stream": n, "pseudo_order": list(pseudo), "header_names": ["user-agent", "accept", "accept-language"], "headers": _headers(path, pseudo=pseudo), "end_stream": True}
+                     for n, path in requests]}}
+
+
+def _quic(requests, pseudo=(":method", ":scheme", ":authority", ":path")):
+    return {"alpn": "h3", "transport_parameters": {"max_idle_timeout": 30000}, "h3_settings": [["QPACK_MAX_TABLE_CAPACITY", 65536]],
+            "requests": [{"pseudo_order": list(pseudo), "header_names": ["user-agent", "accept", "accept-language"], "headers": _headers(path, pseudo=pseudo)} for path in requests]}
+
+
+def test_the_pool_does_not_show_in_the_fold_of_a_walk_the_number_of_connections_the_streams_the_frames_and_where_a_request_rode_are_not_kept():
+    """A/A run 44960767715: Linux had a second connection with no request in one run (and in another stage); Windows had the page's requests 4 and 1 on HTTP/2 and HTTP/3 in one run, 1 and 4 in the other."""
+    paths = ["/?v=1", "/wire.css", "/wire.js", "/wire.svg", "/favicon.ico"]
+    weight = {"/?v=1": 42}
+    one = {"connections": [_h2(_tls(aead=1), [(3 + 2 * i, p) for i, p in enumerate(paths[:4])], frames_after=9, priority=weight), _h2(_tls(resumed=True), [])], "quic": [_quic(paths[4:])]}
+    two = {"connections": [_h2(_tls(aead=3), [(3, paths[0])], frames_after=3, priority=weight)], "quic": [_quic(paths[1:])]}
+    three = {"connections": [_h2(_tls(aead=1), [(3, paths[0]), (5, paths[1])], priority=weight), _h2(_tls(aead=3), [(3, p) for p in paths[2:4]], frames_after=1),
+                             _h2(_tls(resumed=True), [])], "quic": [_quic(paths[4:]), _quic([])]}
+    folds = [ab.fold_wire(x, transport_race=True) for x in (one, two, three)]
+    for f in folds:
+        assert [c["transport"] for c in f["connections"]] == ["tcp", "quic"] and sum(r["count"] for r in f["requests"]) == 5
+        assert all("frames_after_the_first_request" not in json.dumps(c) and "headers_priority" not in json.dumps(c) for c in f["connections"])
+    assert folds[0]["requests"] == folds[1]["requests"] == folds[2]["requests"]
+    assert [c["h2"] for c in folds[0]["connections"] if c["transport"] == "tcp"] == [c["h2"] for c in folds[2]["connections"] if c["transport"] == "tcp"]
+    a, b, c = transcript(), transcript("b"), transcript("c")
+    for t, wire in ((a, folds[0]), (b, folds[1]), (c, folds[2])):
+        t["seeds"]["11"]["h3"] = {"wire": wire}
+    volatile = [{"pattern": "seeds/*/h3/wire/connections/*/tls/extensions/encrypted_client_hello/aead", "reason": "grease", "aa_run": "x"}]
+    for other in (b, c):
+        report = compare(a, other, volatile)
+        assert report["verdict"] == "green" and report["differences"] == [], report["differences"][:3]
+    # outside the race (a role that is only HTTP/2) every request keeps its priority and its end of stream
+    plain = ab.fold_wire(one)
+    assert all("priority" in r for r in plain["requests"] if r["pseudo"][":path"] != "/favicon.ico")
+
+
+def test_a_connection_whose_clienthello_differs_is_red_and_so_is_a_request_that_differs_and_a_pseudo_header_order_that_changed():
+    paths = ["/?v=1", "/wire.css"]
+    base = {"connections": [_h2(_tls(), [(3, paths[0]), (5, paths[1])])], "quic": []}
+    a = transcript()
+    a["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(base)}}
+
+    def red(change):
+        summary = copy.deepcopy(base)
+        change(summary)
+        b = transcript("b")
+        b["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(summary)}}
+        report = compare(a, b)
+        assert report["verdict"] == "red"
+        return [d["path"] for d in report["differences"]]
+
+    paths_cipher = red(lambda s: s["connections"][0].update(tls=_tls(cipher="0x1302")))
+    assert any("/wire/connections/0/tls/cipher_suites/0" in p for p in paths_cipher), paths_cipher
+    swapped = red(lambda s: s["connections"][0]["h2"].update(settings=[[1, 65536], [2, 0], [4, 262144], [5, 16384]]))
+    assert any("/h2/settings/2/1" in p for p in swapped)
+    header = red(lambda s: s["connections"][0]["h2"]["requests"][1]["headers"].__setitem__(4, ["accept", "text/css"]))
+    assert any(p.startswith("seeds/11/https/h2/wire/requests/") for p in header)
+    weight = red(lambda s: s["connections"][0]["h2"]["headers_priority"][1].update(weight=12))
+    assert any("/priority/weight" in p for p in weight)
+    missing = red(lambda s: s["connections"][0]["h2"]["requests"].pop())
+    assert missing
+    order = ab.fold_wire({"connections": [_h2(_tls(), [(3, paths[0])], pseudo=(":method", ":scheme", ":authority", ":path"))], "quic": []})
+    assert order["connections"][0]["pseudo_orders"] == [[":method", ":scheme", ":authority", ":path"]]
+    assert order != ab.fold_wire({"connections": [_h2(_tls(), [(3, paths[0])])], "quic": []}), "the order of the pseudo-headers is the engine's"
+
+
+def test_what_a_transport_adds_to_a_request_on_its_own_is_the_connections_in_a_race_and_a_change_of_it_is_red():
+    """A/A run 44960767715, Windows: /wire.css with `te: trailers` over HTTP/2 in one run, with `alt-used` before the referer over HTTP/3 in the other."""
+    def over_h2(path):
+        c = _h2(_tls(), [(3, path)])
+        c["h2"]["requests"][0]["headers"].append(["te", "trailers"])
+        return c
+
+    def over_quic(path, alt="h3.lab.test:h3"):
+        q = _quic([path])
+        q["requests"][0]["headers"].insert(7, ["alt-used", alt])
+        return q
+
+    doc = "/?v=1"
+    one = ab.fold_wire({"connections": [over_h2(doc), over_h2("/wire.css")], "quic": [over_quic("/favicon.ico")]}, transport_race=True)
+    two = ab.fold_wire({"connections": [over_h2(doc)], "quic": [over_quic("/wire.css"), over_quic("/favicon.ico")]}, transport_race=True)
+    assert one["requests"] == two["requests"] and one["connections"] == two["connections"]
+    assert all(h[0] not in ("te", "alt-used") for r in one["requests"] for h in r["headers"])
+    assert [c["transport_headers"] for c in one["connections"]] == [["te: trailers"], ["alt-used: h3.lab.test:h3"]]
+    other = ab.fold_wire({"connections": [over_h2(doc)], "quic": [over_quic("/favicon.ico", alt="elsewhere:1")]}, transport_race=True)
+    assert [c["transport_headers"] for c in other["connections"]][1] == ["alt-used: elsewhere:1"] and other["connections"] != two["connections"]
+    assert ab.fold_wire({"connections": [over_h2("/wire.css")], "quic": []})["requests"][0]["headers"][-1] == ["te", "trailers"], "outside a race the request keeps every header"
+
+
+def test_a_connection_that_carried_no_request_or_resumed_one_is_out_of_the_fingerprints_and_the_requests_it_carried_stay():
+    quiet = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [])], "quic": []})
+    alone = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")])], "quic": []})
+    resumed = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []})
+    assert quiet == alone and len(resumed["connections"]) == 1 and [r["pseudo"][":path"] for r in resumed["requests"]] == ["/a", "/b"]
+    errors = ab.fold_wire({"connections": [{"alpn": "h2", "tls": _tls(), "error": "ConnectionResetError"}], "quic": []})
+    assert errors["errors"] == ["ConnectionResetError"] and errors["connections"] == []
+    two = ab.fold_wire({"connections": [_h2(_tls(aead=3), [(3, "/a")]), _h2(_tls(aead=1, cipher="0x1302"), [(3, "/b")])], "quic": []})
+    other = ab.fold_wire({"connections": [_h2(_tls(aead=1), [(3, "/a")]), _h2(_tls(aead=3, cipher="0x1302"), [(3, "/b")])], "quic": []})
+    assert [c["tls"]["cipher_suites"][0] for c in two["connections"]] == [c["tls"]["cipher_suites"][0] for c in other["connections"]], "the random AEAD does not order the fingerprints"
+
+
+def test_the_http1_summary_keeps_the_request_lines_and_the_header_order_and_drops_the_connection_that_never_asked():
+    head = {"request_line": "GET /?v=1 HTTP/1.1", "headers": [["Host", "h1.lab.test:h1"], ["Accept", "*/*"]], "body_length": 0}
+    one = ab.fold_wire({"connections": [{"alpn": "http/1.1", "tls": _tls(), "http1": [head, dict(head, request_line="GET /wire.css HTTP/1.1")]},
+                                        {"alpn": "http/1.1", "tls": _tls(resumed=True), "http1": []}], "quic": []})
+    two = ab.fold_wire({"connections": [{"alpn": "http/1.1", "tls": _tls(), "http1": [head]}, {"alpn": "http/1.1", "tls": _tls(), "http1": [dict(head, request_line="GET /wire.css HTTP/1.1")]}],
+                        "quic": []})
+    assert one == two and [r["request_line"] for r in one["requests"]] == ["GET /?v=1 HTTP/1.1", "GET /wire.css HTTP/1.1"]
+    swapped = ab.fold_wire({"connections": [{"alpn": "http/1.1", "tls": _tls(), "http1": [dict(head, headers=[["Accept", "*/*"], ["Host", "h1.lab.test:h1"]])]}], "quic": []})
+    assert swapped["requests"][0]["headers"][0] == ["Accept", "*/*"] and swapped != ab.fold_wire({"connections": [{"alpn": "http/1.1", "tls": _tls(), "http1": [head]}], "quic": []})
 
 
 def test_an_ice_candidate_loses_what_it_draws_at_random_and_keeps_what_the_client_decides():

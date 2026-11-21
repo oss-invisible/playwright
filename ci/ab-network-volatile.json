@@ -4,12 +4,7 @@
   "entries": [
     {
       "pattern": "seeds/*/journey/connects/counts/*",
-      "reason": "How many TCP connections the browser opens to each destination of the journey (the DoH, the two origins) is the connection pool's: parallel and speculative connections, keep-alive connections that close and reopen, DoH connections. The set of destinations and the order they were first reached stay compared (journey/connects/order). Totals of the two runs: Linux DoH 226 and 225, origin A 14 and 13, origin O 20 and 12; Windows DoH 222 and 230, A 23 and 15, O 22 and 14.",
-      "aa_run": "44946411675 (linux, windows)"
-    },
-    {
-      "pattern": "seeds/*/lab/launch/connects/counts/*",
-      "reason": "The connections to the DoH at start-up, before any page: 2 and 1 on Linux, 1 and 2 on Windows, between the two runs. Same pool as above; the destination (lab/launch/connects/order) stays compared.",
+      "reason": "How many TCP connections the browser opens to each destination of the journey (the DoH, the two origins) is the connection pool's: parallel and speculative connections, keep-alive connections that close and reopen, DoH connections. The CONNECTs of the launch stage are counted with the journey ones (the DoH connection at start-up lands in either). The set of destinations and the order they were first reached stay compared (journey/connects/order). Totals of the two runs: Linux DoH 226 and 225, origin A 14 and 13, origin O 20 and 12; Windows DoH 222 and 230, A 23 and 15, O 22 and 14.",
       "aa_run": "44946411675 (linux, windows)"
     },
     {
@@ -18,12 +13,12 @@
       "aa_run": "44946411675 (windows)"
     },
     {
-      "pattern": "seeds/*/https/*/v*/connections/*/tls/extensions/encrypted_client_hello/aead",
+      "pattern": "seeds/*/https/*/wire/connections/*/tls/extensions/encrypted_client_hello/aead",
       "reason": "The engine sends an ECH extension with no real configuration (GREASE) and its TLS library picks the AEAD of the HPKE suite at random for each connection, 1 (AES-128-GCM) or 3 (ChaCha20-Poly1305): on Windows the h2 connection of the first visit read 1 in one run and 3 in the other, the first h1 connection 3 and 1, both values inside one run. The rest of the extension (type, kdf, enc and payload lengths) stays compared.",
       "aa_run": "44946411675 (windows)"
     },
     {
-      "pattern": "seeds/*/h3/v*/connections/*/tls/extensions/encrypted_client_hello/aead",
+      "pattern": "seeds/*/h3/wire/connections/*/tls/extensions/encrypted_client_hello/aead",
       "reason": "The same ECH GREASE on the HTTP/3 connection: 1 in one run and 3 in the other, on Linux and on Windows.",
       "aa_run": "44946411675 (linux, windows)"
     }
