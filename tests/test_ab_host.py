@@ -173,11 +173,120 @@ def test_in_the_a_a_the_declared_list_is_not_applied():
     assert [d["leaf"] for d in report["differences"]] == ["spawn.glxtest", "spawn.glxtest"]
 
 
+# -
+# The noise of the engine (ci/ab-host-volatile.json).
+
+TAB = {"os": "linux", "leaf": "proc.tab/isForBrowser", "reason": "a timer", "aa_run": "run 1 (linux)"}
+FONT = {"os": "linux", "leaf": "mod.parent:<app>/fonts/tahoma7_04.ttf", "absent_ok": True, "reason": "lazy", "aa_run": "run 1 (linux)"}
+
+
+def with_tabs(tabs, engine="firefox-68 again", platform="linux", modules=None):
+    fp = footprint(engine, platform)
+    for seed in fp["seeds"]:
+        if seed["seed"] == 12:
+            seed["kinds"]["tab/isForBrowser"] = tabs
+            seed["modules"]["parent"] = list(seed["modules"]["parent"]) + list(modules or [])
+    return fp
+
+
+def test_a_leaf_that_varies_between_two_launches_of_one_engine_is_excused_by_the_list_and_the_a_a_is_green():
+    report = judge(footprint(), with_tabs(3), expected=[], a_a=True, volatile=[TAB])
+    assert report["verdict"] == "green" and report["problems"] == [] and report["differences"] == []
+    (excused,) = report["excused"]
+    assert (excused["seed"], excused["leaf"], excused["a"], excused["b"], excused["aa_run"]) == (12, "proc.tab/isForBrowser", 2, 3, "run 1 (linux)")
+    assert report["volatile"] == [{"leaf": "proc.tab/isForBrowser", "leaves": 1, "differing": 1}]
+    red = judge(footprint(), with_tabs(3), expected=[], a_a=True)
+    assert red["verdict"] == "red" and [d["leaf"] for d in red["differences"]] == ["proc.tab/isForBrowser"] and red["excused"] == []
+
+
+def test_the_list_excuses_only_the_leaf_it_names_and_a_real_difference_next_to_it_is_still_red():
+    c = with_tabs(3)
+    c["seeds"][0]["kinds"]["gpu"] = 0
+    c["seeds"][1]["modules"]["tab/isForBrowser"] = c["seeds"][1]["modules"]["tab/isForBrowser"] + ["<app>/libnew.so"]
+    report = judge(footprint(), c, expected=[], a_a=True, volatile=[TAB])
+    assert report["verdict"] == "red"
+    assert sorted(d["leaf"] for d in report["differences"]) == ["mod.tab/isForBrowser:<app>/libnew.so", "proc.gpu"]
+    assert [d["leaf"] for d in report["excused"]] == ["proc.tab/isForBrowser"]
+
+
+def test_a_counter_that_vanishes_is_not_noise_unless_the_entry_says_a_leaf_may_be_absent():
+    gone = footprint("firefox-68 again")
+    del gone["seeds"][1]["kinds"]["tab/isForBrowser"]
+    report = judge(footprint(), gone, expected=[], a_a=True, volatile=[TAB])
+    assert report["verdict"] == "red" and [(d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [("proc.tab/isForBrowser", 2, host.MISSING)]
+    tahoma = with_tabs(2, modules=["<app>/fonts/tahoma7_04.ttf"])
+    both = judge(footprint(), tahoma, expected=[], a_a=True, volatile=[FONT])
+    assert both["verdict"] == "green" and [(d["leaf"], d["a"], d["b"]) for d in both["excused"]] == [("mod.parent:<app>/fonts/tahoma7_04.ttf", host.MISSING, 1)]
+    other = with_tabs(2, modules=["<app>/fonts/verdana5_33.ttf"])
+    assert judge(footprint(), other, expected=[], a_a=True, volatile=[FONT])["verdict"] == "red", "the other fonts the parent maps stay compared"
+
+
+def test_the_list_applies_in_the_a_b_too_and_an_entry_that_matches_no_leaf_is_red_as_stale():
+    report = judge(footprint(), with_tabs(3, "candidate"), expected=expected(), volatile=[TAB])
+    assert report["verdict"] == "red" and report["stale"] == ["glxtest-69"] and report["differences"] == [], "the declared difference still has to show; the tab count is excused"
+    green = judge(footprint(), with_tabs(3, "candidate"), expected=[], volatile=[TAB])
+    assert green["verdict"] == "green" and [d["leaf"] for d in green["excused"]] == ["proc.tab/isForBrowser"]
+    stale = judge(footprint(), footprint(), expected=[], a_a=True, volatile=[dict(TAB, leaf="proc.nothing/there")])
+    assert stale["verdict"] == "red" and stale["stale"] == ["proc.nothing/there"] and any("stale" in p for p in stale["problems"])
+
+
+def test_an_entry_of_another_system_is_neither_applied_nor_stale_here():
+    windows = dict(TAB, os="windows", leaf="short.job_total_processes")
+    report = judge(footprint(), with_tabs(3), expected=[], a_a=True, volatile=[windows])
+    assert report["verdict"] == "red" and report["stale"] == [] and report["excused"] == []
+    on_windows = judge(footprint(platform="win32"), with_tabs(3, platform="win32"), expected=[], a_a=True, volatile=[TAB, windows])
+    assert on_windows["stale"] == ["short.job_total_processes"], "a Windows entry with no short.* leaf in the footprint is stale"
+
+
+def test_the_volatile_list_of_the_repository_is_well_formed_and_names_its_evidence():
+    entries = host.load_volatile()
+    assert entries and {e["os"] for e in entries} == {"linux", "windows"}
+    assert all(e["aa_run"].startswith("44946411675") and e["reason"].strip() for e in entries)
+    assert len({(e["os"], e["leaf"]) for e in entries}) == len(entries)
+
+
+@pytest.mark.parametrize("document,why", [
+    ({"format": "x", "entries": []}, "format"),
+    ({"format": host.VOLATILE_FORMAT, "entries": "no"}, "list"),
+    ({"format": host.VOLATILE_FORMAT, "entries": [dict(TAB, os="mac")]}, "os"),
+    ({"format": host.VOLATILE_FORMAT, "entries": [{k: v for k, v in TAB.items() if k != "aa_run"}]}, "aa_run"),
+    ({"format": host.VOLATILE_FORMAT, "entries": [dict(TAB, reason=" ")]}, "reason"),
+    ({"format": host.VOLATILE_FORMAT, "entries": [dict(TAB, absent_ok="yes")]}, "absent_ok"),
+    ({"format": host.VOLATILE_FORMAT, "entries": [TAB, TAB]}, "twice"),
+])
+def test_a_malformed_volatile_list_is_an_error_not_an_empty_list(tmp_path, document, why):
+    path = tmp_path / "v.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(SystemExit) as raised:
+        host.load_volatile(path)
+    assert why in str(raised.value)
+
+
+def test_each_footprint_run_has_a_cache_folder_of_its_own_that_is_gone_when_it_ends(tmp_path, monkeypatch):
+    """The fontconfig test of the same job needs its first launch cold: the footprint's launches do not leave the cache of the bundle in the user's folders."""
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    original = host.oracle.own_cache_env
+    monkeypatch.setattr(host.oracle, "own_cache_env", lambda env, folder: original(env, folder, platform="linux"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "user"))
+    monkeypatch.setattr(host.subprocess, "run", lambda cmd, env, timeout: seen.append((env["XDG_CACHE_HOME"], Path(env["XDG_CACHE_HOME"]).is_dir())) or Done())
+    assert host.run_subprocess("ff", None, "linux-x86_64", tmp_path / "f.json", "firefox-68", [1], "auto") == 0
+    assert host.run_subprocess("ff", None, "linux-x86_64", tmp_path / "f.json", "firefox-68 again", [1], "auto") == 0
+    (first, there1), (second, there2) = seen
+    assert there1 and there2 and first != second and str(tmp_path / "user") not in (first, second)
+    assert not Path(first).exists() and not Path(second).exists()
+
+
 def test_the_cli_says_broken_control_for_an_a_a_difference(tmp_path, capsys):
     a, b = tmp_path / "a.json", tmp_path / "b.json"
     for path, doc in ((a, footprint()), (b, a_candidate_without_glxtest())):
         path.write_text(json.dumps(doc), encoding="utf-8")
-    assert host.main(["compare", str(a), str(b), "--a-a"]) == 2
+    empty = tmp_path / "volatile.json"
+    empty.write_text(json.dumps({"format": host.VOLATILE_FORMAT, "entries": []}), encoding="utf-8")
+    assert host.main(["compare", str(a), str(b), "--a-a", "--volatile", str(empty)]) == 2
     assert "AB HOST (a-a) FAILED" in capsys.readouterr().out
 
 

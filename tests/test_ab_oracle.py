@@ -305,6 +305,40 @@ def test_each_dump_runs_under_its_own_seal_and_without_the_engine_log(tmp_path, 
     assert env["INVISIBLE_CORE_AUTOFIX"] == "off" and env["INVISIBLE_CORE_PIN"] == "allow"
 
 
+def test_a_launch_of_an_oracle_keeps_its_user_cache_to_itself_and_the_wrapper_keeps_finding_its_engine(tmp_path, monkeypatch):
+    """run 44946411675: a cache of the bundle's fonts left in the user's folders made the first launch of the fontconfig test warm. The oracles' launches write theirs elsewhere."""
+    import platformdirs
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "user"))
+    monkeypatch.delenv("INVISIBLE_PLAYWRIGHT_CACHE_DIR", raising=False)
+    where_the_engine_is = platformdirs.user_cache_dir("invisible-playwright")
+    base = {"A": "1", "XDG_CACHE_HOME": str(tmp_path / "user")}
+    env = ab.own_cache_env(base, str(tmp_path / "mine"), platform="linux")
+    assert env["XDG_CACHE_HOME"] == str(tmp_path / "mine") and env["INVISIBLE_PLAYWRIGHT_CACHE_DIR"] == where_the_engine_is and env["A"] == "1"
+    assert base == {"A": "1", "XDG_CACHE_HOME": str(tmp_path / "user")}, "the environment it was given is not changed"
+    kept = ab.own_cache_env({"INVISIBLE_PLAYWRIGHT_CACHE_DIR": "/the/callers"}, "x", platform="linux")
+    assert kept["INVISIBLE_PLAYWRIGHT_CACHE_DIR"] == "/the/callers", "a cache folder the caller chose is kept"
+    given = {"A": "1"}
+    assert ab.own_cache_env(given, "x", platform="win32") is given, "Windows has no fontconfig: nothing changes"
+
+
+def test_every_dump_of_an_oracle_runs_in_a_cache_folder_of_its_own_that_is_gone_when_it_ends(tmp_path, monkeypatch):
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    original = ab.own_cache_env
+    monkeypatch.setattr(ab, "own_cache_env", lambda env, folder: original(env, folder, platform="linux"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "user"))
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append((env["XDG_CACHE_HOME"], Path(env["XDG_CACHE_HOME"]).is_dir())) or Done())
+    ab.run_dump("ff", None, "linux-x86_64", tmp_path / "o", [(1.0, 0)])
+    ab.run_dump("ff", None, "linux-x86_64", tmp_path / "o", [(1.0, 0)])
+    (first, there1), (second, there2) = seen
+    assert there1 and there2 and first != second and str(tmp_path / "user") not in (first, second)
+    assert not Path(first).exists() and not Path(second).exists()
+
+
 # --- the seeds: the persona seeds (ci/persona-seeds.json), each at its own DPR, in shards ---------------------------------------------------------
 
 def test_the_default_visits_are_the_candidate_persona_seeds_each_at_its_own_dpr():

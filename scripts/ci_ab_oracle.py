@@ -265,6 +265,29 @@ def fetch_published(tag: str, work: Path) -> tuple:
     return str(binary), seal_path
 
 
+def own_cache_env(env: dict, folder: str, platform: str | None = None) -> dict:
+    """`env` with the engine's per-user cache in a folder of this run (Linux: `XDG_CACHE_HOME`), and the wrapper's own cache where it was.
+
+    Why. fontconfig names the cache of the bundle's font folder by the md5 of its path, and writes it to the first writable cache folder
+    it knows, `$XDG_CACHE_HOME/fontconfig` or the legacy `~/.fontconfig`; it reads all of them. Every launch of the published engine of a
+    job has the same bundle path, so a launch that shares the user's folders leaves the cache of the bundle where a later launch of the
+    job reads it and finds it warm: tests/test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e.py needs its first launch
+    COLD (its run 44946411675 found `~/.fontconfig/<md5>-le64.cache-9` already there). The oracles' launches use a folder of their own, so
+    they neither read what an earlier test left nor leave what a later one would read. Both engines of an A/A start from the same empty
+    cache, which is also what makes their first launch the same.
+
+    `XDG_CACHE_HOME` is also where the wrapper looks for its engine (`platformdirs`): `INVISIBLE_PLAYWRIGHT_CACHE_DIR` is pinned to where
+    that is now, and an engine folder or a cache folder the caller set is kept. Windows has no fontconfig: `env` comes back as it was."""
+    if (platform or sys.platform) == "win32":
+        return env
+    import platformdirs
+
+    out = dict(env)
+    out.setdefault("INVISIBLE_PLAYWRIGHT_CACHE_DIR", platformdirs.user_cache_dir("invisible-playwright"))
+    out["XDG_CACHE_HOME"] = str(folder)
+    return out
+
+
 def run_dump(binary: str, seal: Path | None, leg: str, out: Path, visits: list | None = None) -> int:
     """The host gate's dump of `visits` ([(dpr, seed)], each seed at its own DPR) as a subprocess; None is the host gate's own grid."""
     env = dict(os.environ, INVISIBLE_CORE_AUTOFIX="off", INVISIBLE_CORE_PIN="allow")
@@ -275,7 +298,8 @@ def run_dump(binary: str, seal: Path | None, leg: str, out: Path, visits: list |
     cmd = [sys.executable, str(Path(gate.__file__)), "dump", binary, "--leg", leg, "--out", str(out)]
     if visits is not None:
         cmd += ["--no-pin"] + [a for dpr, seed in visits for a in ("--visit", "%d:%s" % (seed, dpr))]
-    return subprocess.run(cmd, env=env, timeout=DUMP_TIMEOUT_S).returncode
+    with tempfile.TemporaryDirectory(prefix="ab-oracle-cache-") as cache:
+        return subprocess.run(cmd, env=own_cache_env(env, cache), timeout=DUMP_TIMEOUT_S).returncode
 
 
 def run(candidate: str, candidate_seal: Path, leg: str, out: Path, engine_tag: str,

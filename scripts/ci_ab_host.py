@@ -27,12 +27,19 @@ stable, the A/B says nothing).
 
 Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, and one that does not show
 is red as stale. Nothing here reads the clock for a verdict.
+
+The leaves that differ between two launches of ONE engine are the noise (ci/ab-host-volatile.json), and they are born from
+the A/A: each entry names the leaf, the system, the reason and the run that proved it. A volatile leaf is excused in the A/A
+and in the A/B alike (it is noise of the engine, not of the candidate), only for the system it is declared for; unless the
+entry says `absent_ok`, the leaf must still be present on both sides, so that a kind or a counter that vanishes is not noise.
+An entry that matches no leaf of the run is red as stale.
 """
 from __future__ import annotations
 
 import argparse
 import codecs
 import collections
+import fnmatch
 import json
 import os
 import re
@@ -54,6 +61,8 @@ import ci_host_gate as gate  # noqa: E402  (SEEDS)
 FORMAT = "ab-host/1"
 EXPECTED_FORMAT = "ab-host-expected/1"
 EXPECTED_FILE = ROOT / "ci" / "ab-host-expected.json"
+VOLATILE_FORMAT = "ab-host-volatile/1"
+VOLATILE_FILE = ROOT / "ci" / "ab-host-volatile.json"
 SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
 #: The steps of the journey (tests/fakeweb/profile_p4.py STEPS, by method name).
 JOURNEY = (("open home", "s1_open_home"),
@@ -608,6 +617,30 @@ def load_expected(path: Path = EXPECTED_FILE) -> list:
     return document["differences"]
 
 
+def load_volatile(path: Path = VOLATILE_FILE) -> list:
+    """The entries of the volatile list: each `{"os", "leaf", "reason", "aa_run"}` and, when the leaf may be absent on one side, `"absent_ok": true`. `leaf` is a
+    pattern (`fnmatch`) over the leaf names of `leaves_of`. A malformed list is an error, not an empty one."""
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    if document.get("format") != VOLATILE_FORMAT:
+        raise SystemExit("%s: format %r, not %r" % (path, document.get("format"), VOLATILE_FORMAT))
+    entries = document.get("entries")
+    if not isinstance(entries, list):
+        raise SystemExit("%s: `entries` is not a list" % path)
+    seen = set()
+    for entry in entries:
+        if entry.get("os") not in ("linux", "windows"):
+            raise SystemExit("%s: every entry needs an os, linux or windows (%r)" % (path, entry))
+        for field in ("leaf", "reason", "aa_run"):
+            if not isinstance(entry.get(field), str) or not entry[field].strip():
+                raise SystemExit("%s: every entry needs a non-empty %s (%r)" % (path, field, entry))
+        if not isinstance(entry.get("absent_ok", False), bool):
+            raise SystemExit("%s: absent_ok is true or false (%r)" % (path, entry))
+        if (entry["os"], entry["leaf"]) in seen:
+            raise SystemExit("%s: the leaf %r is listed twice for %s" % (path, entry["leaf"], entry["os"]))
+        seen.add((entry["os"], entry["leaf"]))
+    return entries
+
+
 def _declared_covers(entry: dict, diff: dict) -> bool:
     """A declared difference covers a difference of `spawn.<name>` that is the published engine having it (count >= 1) and the
     candidate not having it."""
@@ -618,15 +651,17 @@ def _declared_covers(entry: dict, diff: dict) -> bool:
 
 
 def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, platform: str | None = None,
-          floors: dict | None = None) -> dict:
+          floors: dict | None = None, volatile: list | None = None) -> dict:
     """The verdict on two footprints (the document `run` writes). `expected` is the declared differences, applied only when `a_a`
-    is false. Returns {"verdict", "problems", "differences", "declared", "leaves": {seed: {category: n}}, "mode"}."""
+    is false; `volatile` is the noise of the engine (`load_volatile`), applied in both modes. Returns {"verdict", "problems",
+    "differences", "declared", "excused", "volatile", "leaves": {seed: {category: n}}, "mode"}."""
     floors = FLOORS if floors is None else floors
     platform = platform or a.get("platform") or sys.platform
     os_name = "windows" if platform == "win32" else "linux"
     seeds_a = {s["seed"]: s for s in a.get("seeds", [])}
     seeds_b = {s["seed"]: s for s in b.get("seeds", [])}
     problems, differences, declared, counts = [], [], [], {}
+    every_leaf: set = set()
     for side, fp, seeds in (("A", a, seeds_a), ("B", b, seeds_b)):
         for message in fp.get("problems", []):
             problems.append("side %s: %s" % (side, message))
@@ -634,6 +669,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
         problems.append("the two footprints have different seeds: A %s, B %s" % (sorted(seeds_a), sorted(seeds_b)))
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         la, lb = leaves_of(seeds_a[seed]), leaves_of(seeds_b[seed])
+        every_leaf |= set(la) | set(lb)
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
             for u in fp.get("unreadable", []):
                 problems.append("seed %s side %s: the modules of a process cannot be read: %s" % (seed, side, u))
@@ -664,11 +700,25 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             for d in hit:
                 differences.remove(d)
                 declared.append(dict(d, id=entry.get("id")))
+    excused, used = [], []
+    for entry in (e for e in volatile or [] if e["os"] == os_name):
+        matching = sorted(leaf for leaf in every_leaf if fnmatch.fnmatchcase(leaf, entry["leaf"]))
+        if not matching:
+            stale.append({"id": entry["leaf"]})
+            problems.append("the volatile entry %r (%s) matches no leaf of either footprint: it is stale, remove it" % (entry["leaf"], entry["aa_run"]))
+            continue
+        covered = [d for d in differences if fnmatch.fnmatchcase(d["leaf"], entry["leaf"])
+                   and (entry.get("absent_ok") or (d["a"] != MISSING and d["b"] != MISSING))]
+        for d in covered:
+            differences.remove(d)
+            excused.append(dict(d, aa_run=entry["aa_run"]))
+        used.append({"leaf": entry["leaf"], "leaves": len(matching), "differing": len(covered)})
     for d in differences:
         problems.append("seed %s %s: A %s | B %s" % (d["seed"], d["leaf"], json.dumps(d["a"], sort_keys=True)[:160],
                                                      json.dumps(d["b"], sort_keys=True)[:160]))
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
-            "differences": differences, "declared": declared, "stale": [e.get("id") for e in stale], "leaves": counts}
+            "differences": differences, "declared": declared, "excused": excused, "volatile": used,
+            "stale": [e.get("id") for e in stale], "leaves": counts}
 
 
 def print_report(report: dict, a_name: str, b_name: str) -> None:
@@ -679,6 +729,9 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
                                                   b_name, json.dumps(d["b"], sort_keys=True)[:160]))
     for d in report["declared"]:
         print("DECLARED seed %s %s (%s)" % (d["seed"], d["leaf"], d["id"]))
+    for d in report.get("excused", []):
+        print("VOLATILE seed %s %s: %s %s | %s %s (run %s)" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160], b_name,
+                                                              json.dumps(d["b"], sort_keys=True)[:160], d["aa_run"]))
     n = len(report["differences"])
     for p in report["problems"][:len(report["problems"]) - n]:
         print("FAIL " + p)
@@ -849,13 +902,14 @@ def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: s
     cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "run", binary, "--leg", leg, "--out", str(out), "--label", label,
            "--seeds", ",".join(str(s) for s in seeds), "--strace", strace]
     try:
-        return subprocess.run(cmd, env=env, timeout=RUN_TIMEOUT_S).returncode
+        with tempfile.TemporaryDirectory(prefix="ab-host-cache-") as cache:
+            return subprocess.run(cmd, env=oracle.own_cache_env(env, cache), timeout=RUN_TIMEOUT_S).returncode
     except subprocess.TimeoutExpired:
         return 124
 
 
 def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, engine_tag: str, seeds: list, strace: str,
-       published: tuple | None = None, expected_file: Path = EXPECTED_FILE) -> int:
+       published: tuple | None = None, expected_file: Path = EXPECTED_FILE, volatile_file: Path = VOLATILE_FILE) -> int:
     """A/A first (the published engine twice), then, with a candidate, the published engine against it. 0 green, 1 the A/B is red,
     2 the control is broken."""
     out.mkdir(parents=True, exist_ok=True)
@@ -879,7 +933,8 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             print("\n".join("FAIL " + f for f in failed))
             return 2
         first, again = (read_json(out / runs[0][1]), read_json(out / runs[1][1]))
-        control = judge(first, again, a_a=True)
+        volatile = load_volatile(volatile_file)
+        control = judge(first, again, a_a=True, volatile=volatile)
         write_json(out / "diff-a-a.json", control)
         print("--- A/A: %s against itself" % engine_tag)
         print_report(control, engine_tag, engine_tag + " again")
@@ -889,7 +944,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
         if not candidate:
             return 0
         expected = load_expected(expected_file)
-        report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False)
+        report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False, volatile=volatile)
         write_json(out / "diff.json", report)
         print("--- A/B: %s against the candidate" % engine_tag)
         print_report(report, engine_tag, oracle.CANDIDATE)
@@ -914,6 +969,7 @@ def main(argv=None) -> int:
     c.add_argument("--out", type=Path)
     c.add_argument("--a-a", action="store_true", help="the control: no declared difference is applied; a difference is a broken control (exit 2)")
     c.add_argument("--expected", type=Path, default=EXPECTED_FILE)
+    c.add_argument("--volatile", type=Path, default=VOLATILE_FILE)
     x = sub.add_parser("ab", help="A/A, then with a candidate the published engine against it")
     x.add_argument("candidate", nargs="?")
     x.add_argument("--candidate-seal", type=Path, default=os.environ.get("INVISIBLE_SEAL_FILE"))
@@ -927,7 +983,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "compare":
         a, b = read_json(args.a), read_json(args.b)
-        report = judge(a, b, expected=None if args.a_a else load_expected(args.expected), a_a=args.a_a)
+        report = judge(a, b, expected=None if args.a_a else load_expected(args.expected), a_a=args.a_a, volatile=load_volatile(args.volatile))
         if args.out:
             write_json(args.out, report)
         print_report(report, a.get("engine", "A"), b.get("engine", "B"))

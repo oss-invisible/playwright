@@ -31,9 +31,9 @@ def transcript(label="a", seeds=(11, 12)):
     """A small transcript with the categories a real one has: a journey step, a TLS hello, an HTTP/2 connection, a WebRTC gather, an idle window and the lab's direct lists."""
     def seed_body():
         return {
-            "journey": {"order": ["127.0.0.1:A", "127.0.0.1:O"],
+            "journey": {"connects": {"order": ["127.0.0.1:A", "127.0.0.1:O"], "counts": {"127.0.0.1:A": 2, "127.0.0.1:O": 1}},
+                        "dns": {"order": ["journey-a.test"], "types": {"journey-a.test": [1]}},
                         "steps": {"01": {"name": "open home", "ok": True, "idle": True, "url": "A/",
-                                         "connects": {"order": ["127.0.0.1:A"], "counts": {"127.0.0.1:A": 2}},
                                          "requests": {"GET A/": {"count": 1, "headers": [["Host", "journey-a.test:A"], ["Accept", "*/*"]], "name_orders": ["Host,Accept"],
                                                                  "body_length": 0}}}}},
             "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": wc.parse_client_hello(build_hello())}]}}},
@@ -114,13 +114,13 @@ def test_a_direct_connection_on_either_side_is_red_by_itself(side, name):
 
 def test_a_volatile_entry_excuses_the_leaves_it_names_and_only_those():
     b = transcript("b")
-    b["seeds"]["11"]["journey"]["steps"]["01"]["connects"]["counts"]["127.0.0.1:A"] = 3
+    b["seeds"]["11"]["journey"]["connects"]["counts"]["127.0.0.1:A"] = 3
     b["seeds"]["12"]["webrtc"]["gathering"] = "new"
-    entry = {"pattern": "seeds/*/journey/steps/*/connects/counts/*", "reason": "speculative connections", "aa_run": "run 1"}
+    entry = {"pattern": "seeds/*/journey/connects/counts/*", "reason": "speculative connections", "aa_run": "run 1"}
     report = compare(transcript(), b, [entry])
     assert [d["path"] for d in report["differences"]] == ["seeds/12/webrtc/gathering"]
-    assert report["excused"] == 2 and report["volatile"] == [{"pattern": entry["pattern"], "leaves": 2, "differing": 1}]
-    assert report["leaves"] == compare(transcript(), b)["leaves"] - 2
+    assert report["excused"] == 4 and report["volatile"] == [{"pattern": entry["pattern"], "leaves": 4, "differing": 1}]
+    assert report["leaves"] == compare(transcript(), b)["leaves"] - 4
 
 
 def test_a_volatile_entry_that_matches_no_leaf_is_stale_and_red():
@@ -172,15 +172,36 @@ def test_a_file_that_is_not_a_transcript_is_refused(tmp_path):
 
 def test_an_a_a_that_differs_proposes_the_volatile_patterns_without_the_seed_and_the_step():
     b = transcript("b")
-    b["seeds"]["11"]["journey"]["steps"]["01"]["connects"]["counts"]["127.0.0.1:A"] = 3
-    b["seeds"]["12"]["journey"]["steps"]["01"]["connects"]["counts"]["127.0.0.1:A"] = 4
-    assert ab.propose_volatile(compare(transcript(), b)) == ["seeds/*/journey/steps/*/connects/counts/127.0.0.1:A"]
+    b["seeds"]["11"]["journey"]["connects"]["counts"]["127.0.0.1:A"] = 3
+    b["seeds"]["12"]["journey"]["connects"]["counts"]["127.0.0.1:A"] = 4
+    assert ab.propose_volatile(compare(transcript(), b)) == ["seeds/*/journey/connects/counts/127.0.0.1:A"]
+    c = transcript("c")
+    c["seeds"]["11"]["journey"]["steps"]["01"]["requests"]["GET A/"]["count"] = 2
+    c["seeds"]["12"]["journey"]["steps"]["01"]["requests"]["GET A/"]["count"] = 2
+    assert ab.propose_volatile(compare(transcript(), c)) == ["seeds/*/journey/steps/*/requests/GET A//count"]
 
 
 # ------------------------------------------------------------------------------------------------------------------ the volatile list
 def test_the_volatile_list_of_the_repository_is_well_formed_and_every_entry_names_its_evidence():
     entries = ab.load_volatile()
     assert all(e["aa_run"].strip() and e["reason"].strip() for e in entries)
+
+
+def test_the_entries_of_the_repository_list_excuse_the_counts_of_connections_and_the_grease_aead_and_nothing_next_to_them():
+    import fnmatch
+
+    patterns = [e["pattern"] for e in ab.load_volatile()]
+    def excused(path):
+        return [q for q in patterns if fnmatch.fnmatchcase(path, q)]
+
+    base = "seeds/0/https/h2/v1/connections/0/tls/extensions/encrypted_client_hello/"
+    assert excused(base + "aead") and not excused(base + "kdf") and not excused(base + "payload_length") and not excused(base + "type")
+    assert excused("seeds/0/h3/v1/connections/0/tls/extensions/encrypted_client_hello/aead")
+    assert excused("seeds/0/journey/connects/counts/192.0.2.53:443") and excused("seeds/0/lab/launch/connects/counts/192.0.2.53:443") and excused("seeds/0/webrtc/connects/counts/192.0.2.53:443")
+    for kept in ("seeds/0/journey/connects/order/0", "seeds/0/journey/dns/order/0", "seeds/0/journey/steps/01/requests/GET A//count", "seeds/0/journey/steps/01/requests/GET A//headers/0/1",
+                 "seeds/0/journey/steps/01/udp/counts/198.51.100.5:19302", "seeds/0/lab/launch/connects/order/0", "seeds/0/webrtc/connects/order/0", "seeds/0/h3/udp/counts/10.0.0.1:h3",
+                 "seeds/0/https/h2/v1/connections/0/tls/extensions/server_name"):
+        assert not excused(kept), kept
 
 
 @pytest.mark.parametrize("document,why", [
@@ -255,6 +276,144 @@ def test_connects_dns_and_datagrams_keep_the_first_seen_order_and_count_the_rest
     udp = ab.udp_summary([{"target": "198.51.100.5:19302", "message": ab.message_kind(stun)}, {"target": "198.51.100.5:19302", "message": ab.message_kind(stun)}], norm)
     assert udp == {"order": ["198.51.100.5:19302"], "messages": {"198.51.100.5:19302": ["stun-0x0001"]}, "counts": {"198.51.100.5:19302": 2}}
     assert ab.message_kind(b"\xc3" + b"\x00" * 30) == "quic-long" and ab.message_kind(b"\x43abc") == "quic-short" and ab.message_kind(b"\x01") == "other"
+
+
+def test_a_port_inside_a_url_parameter_and_the_token_of_the_slow_frame_are_normalised_so_two_loads_of_the_page_write_the_same_key():
+    """A/A run 44946411675: the ad frame is told its sibling's origin as ``a=http%3A%2F%2Fjourney-a.test%3A<port>`` and the slow frame holds ``id=sf<token><i>``: both
+    differ at every load, so the same request had a different key in each run and 5,500 leaves differed."""
+    first, second = ab.Normalizer({41039: "A", 41040: "O"}), ab.Normalizer({46001: "A", 46002: "O"})
+    ad = "/jf/ad?n=1&a=http%3A%2F%2Fjourney-a.test%3A"
+    assert first.text(ad + "41039") == second.text(ad + "46001") == ad + "A"
+    assert first.text("/jf/ad?n=0&a=http%3A%2F%2Fjourney-o.test%3a41040") == "/jf/ad?n=0&a=http%3A%2F%2Fjourney-o.test%3AO", "the encoded colon may be written in lower case"
+    assert first.text("/hold?id=sfkjpsqn0") == second.text("/hold?id=sfx7q2m90") == "/hold?id=sf<TOK>0"
+    assert first.text("/release?id=sfab12c32") == "/release?id=sf<TOK>2", "a token that ends in a digit leaves the index alone"
+    assert first.text("/hold?id=sfkjpsqn0") != first.text("/hold?id=sfkjpsqn1"), "the index of the request is not random: three held requests stay three keys"
+    assert first.text("/x?a=http%3A%2F%2Fother.test%3A9999") == "/x?a=http%3A%2F%2Fother.test%3A9999", "a number that is no port of the lab is left as it is"
+    assert first.text("/r?kind=json&id=late3&u=sfun") == "/r?kind=json&id=late3&u=sfun"
+
+
+def test_two_loads_of_the_journey_write_the_same_request_summary_and_a_request_that_really_differs_is_still_red():
+    def requests(port_a, port_o, token):
+        norm = ab.Normalizer({port_a: "A", port_o: "O"})
+        head = lambda target, extra=(): {"role": "O", "method": "GET", "target": target, "headers": [["Host", "journey-o.test:%d" % port_o], *extra], "body_length": 0}  # noqa: E731
+        return ab.request_summary([head("/hold?id=sf%s%d" % (token, i)) for i in range(3)] + [head("/release?id=sf%s%d" % (token, i)) for i in range(3)]
+                                  + [head("/jf/ad?n=0&a=http%%3A%%2F%%2Fjourney-a.test%%3A%d" % port_a, [["Referer", "http://journey-o.test:%d/" % port_o]])], norm)
+
+    one, two = requests(41039, 41040, "kjpsqn"), requests(46001, 46002, "x7q2m9")
+    assert one == two and list(one) == ["GET O/hold?id=sf<TOK>0", "GET O/hold?id=sf<TOK>1", "GET O/hold?id=sf<TOK>2", "GET O/jf/ad?n=0&a=http%3A%2F%2Fjourney-a.test%3AA",
+                                         "GET O/release?id=sf<TOK>0", "GET O/release?id=sf<TOK>1", "GET O/release?id=sf<TOK>2"]
+    a, b = transcript(), transcript("b")
+    for t, summary in ((a, one), (b, two)):
+        t["seeds"]["11"]["journey"]["steps"]["01"]["requests"] = summary
+    assert compare(a, b)["verdict"] == "green"
+    two["GET O/jf/ad?n=0&a=http%3A%2F%2Fjourney-a.test%3AA"]["headers"][1] = ["Referer", "http://journey-o.test:O/other"]
+    report = compare(a, b)
+    (difference,) = report["differences"]
+    assert report["verdict"] == "red" and difference["path"] == "seeds/11/journey/steps/01/requests/GET O/jf/ad?n=0&a=http%3A%2F%2Fjourney-a.test%3AA/headers/1/1"
+    assert difference["a"] == "http://journey-o.test:O/" and difference["b"] == "http://journey-o.test:O/other"
+
+
+def test_the_error_scan_names_a_failure_of_the_run_and_not_the_text_a_page_answered():
+    seeds = {"0": {"journey": {"steps": {"14": {"extra": {"error": "Wrong user or password.", "user": "alice"}, "ok": True},
+                                         "15": {"ok": False, "error": "TimeoutError: Page.goto: Timeout Nms exceeded"}}},
+                   "h3": {"error": "RuntimeError: no quic"}, "https": {"h2": {"v1": {"connections": [{"error": "ConnectionResetError"}]}}}}}
+    assert ab.transcript_errors(seeds) == ["seeds/0/h3/error", "seeds/0/https/h2/v1/connections/0/error", "seeds/0/journey/steps/15/error"]
+    assert ab.transcript_errors({"0": {"journey": {"steps": {"14": {"extra": {"error": "Wrong user or password."}}}}}}) == []
+
+
+def _journey_run(monkeypatch, connects_by_step, queries_by_step=None):
+    """``ab.walk_journey`` with the driver replaced by a function that, in each step, makes the browser's connections and DNS questions arrive to the lab as the events that
+    ``connects_by_step`` and ``queries_by_step`` say ({step: [target, ...]}); the requests of every step are the same."""
+    from fakeweb import journey_site, profile_p4
+
+    queries_by_step = queries_by_step or {}
+    with ab.Lab(journey=True, host="127.0.0.1") as lab:
+        port_a = int(lab.origin_a.rsplit(":", 1)[1])
+
+        def drive(browser, origin_a, origin_o, workers, timeout):
+            records = []
+            for n in (1, 2, 3):
+                journey_site.STATE.set_step(n)
+                lab.rec.event("http", role="A", method="GET", target="/page%d" % n, headers=[["Host", "journey-a.test:%d" % port_a]], body_length=0)
+                for target in connects_by_step.get(n, []):
+                    lab.rec.event("connect", target=target.replace("<A>", "127.0.0.1:%d" % port_a))
+                for name in queries_by_step.get(n, []):
+                    lab.doh.queries.append(type("Q", (), {"name": name, "qtype": 1, "via": "lab"})())
+                records.append({"n": n, "name": "step %d" % n, "ok": True, "idle": True, "url": "A/", "title": "t", "marker": "m", "cookies": [], "history_length": n, "pages": 1,
+                                "extra": {}})
+            return records
+
+        monkeypatch.setattr(profile_p4, "drive", drive)
+        return ab.walk_journey(object(), lab)
+
+
+def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the_same_journey_and_a_new_destination_is_not(monkeypatch):
+    """A/A run 44946411675: the browser's own connections and its second lookup of a name (the answer lives 30 s) were written under the step that was current, a different one in
+    each run; 40 leaves differed that way on Linux and 60 on Windows. The CONNECTs and the DNS questions are one summary of the whole journey; the requests stay in their step."""
+    doh = "192.0.2.53:443"
+    first = _journey_run(monkeypatch, {1: [doh, "<A>", doh], 3: ["<A>"]}, {1: ["journey-a.test"], 3: ["journey-a.test"]})
+    second = _journey_run(monkeypatch, {1: [doh], 2: ["<A>", "<A>"], 3: [doh, doh]}, {1: ["journey-a.test"], 2: ["journey-a.test"]})
+    assert "order" not in first and set(first) == {"steps", "connects", "dns"}
+    assert all(set(step) >= {"requests", "udp"} and "connects" not in step and "dns" not in step for step in first["steps"].values())
+    assert first["connects"]["order"] == second["connects"]["order"] == [doh, "127.0.0.1:A"]
+    assert first["dns"] == second["dns"] == {"order": ["journey-a.test"], "types": {"journey-a.test": [1]}}
+    assert first["connects"]["counts"] != second["connects"]["counts"], "the pool's counts do differ, and the volatile list says so"
+    a, b = transcript(), transcript("b")
+    a["seeds"]["11"]["journey"], b["seeds"]["11"]["journey"] = first, second
+    volatile = [{"pattern": "seeds/*/journey/connects/counts/*", "reason": "the pool", "aa_run": "x"}]
+    report = compare(a, b, volatile)
+    assert report["verdict"] == "green" and report["differences"] == [] and report["excused"] == 4
+    third = _journey_run(monkeypatch, {1: [doh, "<A>", "192.0.2.77:443"]}, {1: ["journey-a.test"]})
+    c = transcript("c")
+    c["seeds"]["11"]["journey"] = third
+    red = compare(a, c, volatile)
+    assert red["verdict"] == "red"
+    assert {"path": "seeds/11/journey/connects/order/2", "a": ab.MISSING, "b": "192.0.2.77:443"} in red["differences"]
+
+
+def _h3_run(visits):
+    """``ab.walk_h3`` with a page that answers h2 until the last visit and h3 on it, and a QUIC server that has seen a connection; ``visits`` is the datagrams the relay carries
+    in each visit's stage (the last ones of one visit arrive in the next one's, which is what the A/A showed)."""
+    from types import SimpleNamespace
+
+    rec = ab.Recorder()
+    rec.attach("doh", [])
+    lab = SimpleNamespace(rec=rec, norm=ab.Normalizer({}), h3=SimpleNamespace(port=5, quic=[object()]))
+    state = {"visit": 0}
+
+    class Page:
+        def goto(self, url, **options):
+            state["visit"] += 1
+            for _ in range(visits[state["visit"] - 1]):
+                rec.event("udp", target="127.0.0.1:5", message="quic-short")
+
+        def evaluate(self, script):
+            return "h3" if state["visit"] == len(visits) else "h2"
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            pass
+
+    browser = SimpleNamespace(new_context=lambda **kw: Context())
+    original = ab.wire_summary
+    ab.wire_summary = lambda server, phase, norm: {"connections": [], "quic": []}
+    try:
+        return ab.walk_h3(browser, lab)
+    finally:
+        ab.wire_summary = original
+
+
+def test_the_datagrams_of_the_http3_walk_are_summarised_over_the_walk_because_a_visit_leaves_packets_in_flight_for_the_next():
+    one, two = _h3_run([12, 8]), _h3_run([13, 7])
+    assert one == two and one["udp"]["counts"] == {"127.0.0.1:5": 20} and one["visits"] == ["h2", "h3"]
+    assert all("udp" not in one[v] for v in ("v1", "v2"))
+    assert _h3_run([13, 8])["udp"]["counts"] == {"127.0.0.1:5": 21} != one["udp"]["counts"], "a datagram more in the walk is a difference"
 
 
 def test_an_ice_candidate_loses_what_it_draws_at_random_and_keeps_what_the_client_decides():
@@ -453,7 +612,7 @@ def minimal_run():
     headers = [["Host", "journey-a.test:7000"], ["User-Agent", "Mozilla/5.0"], ["Accept", "text/html"], ["Accept-Language", "en-US,en;q=0.5"], ["Accept-Encoding", "gzip, deflate"],
                ["Connection", "keep-alive"], ["Upgrade-Insecure-Requests", "1"], ["Cookie", "theme=dark"]]
     request = {"role": "A", "method": "GET", "target": "/", "headers": headers, "body_length": 0}
-    step = {"connects": ab.connect_summary(["127.0.0.1:7000"], norm), "dns": ab.dns_summary([("journey-a.test", 1, "lab")]), "udp": ab.udp_summary([], norm),
+    step = {"udp": ab.udp_summary([], norm),
             "requests": ab.request_summary([request] * 3, norm), "name": "n", "ok": True, "idle": True, "url": "A/", "title": "t", "marker": "m", "cookies": [], "history_length": 2,
             "pages": 1, "extra": {}}
     tls = wc.parse_client_hello(build_hello())
@@ -462,7 +621,8 @@ def minimal_run():
           "frames_after_the_first_request": 3, "settings_ack_sent_by_client": True,
           "requests": [{"stream": 1, "pseudo_order": [":method", ":path", ":authority", ":scheme"], "header_names": ["user-agent", "accept"], "headers": [[":method", "GET"], ["user-agent", "x"]],
                         "end_stream": True}]}
-    body = {"journey": {"steps": {"%02d" % i: step for i in range(17)}, "order": ["127.0.0.1:A"]}, "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": tls, "h2": h2}]}}},
+    body = {"journey": {"steps": {"%02d" % i: step for i in range(17)}, "connects": ab.connect_summary(["127.0.0.1:7000"], norm),
+                        "dns": ab.dns_summary([("journey-a.test", 1, "lab")])}, "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": tls, "h2": h2}]}}},
             "webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "gathering": "complete"}, "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
             "lab": {"direct": {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}}}
     leaves = ab.flatten({"11": body})
@@ -477,7 +637,7 @@ def test_a_whole_synthetic_transcript_of_a_plausible_run_holds_the_leaves_the_fl
     assert set(by_category) == {"journey", "https", "webrtc", "idle", "lab"}
     assert by_category["https"] > 100, "the ClientHello alone is a hundred leaves or more"
     assert by_category["journey"] > 17 * 30
-    assert total > 700
+    assert total > 600
 
 
 def test_the_script_names_the_categories_the_run_writes_and_the_e2e_floor_is_below_a_minimal_run():
@@ -581,6 +741,25 @@ def _fake_run_engine(monkeypatch, make):
 
     monkeypatch.setattr(ab, "run_engine", run_engine)
     return calls
+
+
+def test_each_engine_run_of_the_network_oracle_has_a_cache_folder_of_its_own_that_is_gone_when_it_ends(tmp_path, monkeypatch):
+    import ci_ab_oracle as oracle
+
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    original = oracle.own_cache_env
+    monkeypatch.setattr(oracle, "own_cache_env", lambda env, folder: original(env, folder, platform="linux"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "user"))
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append((env["XDG_CACHE_HOME"], Path(env["XDG_CACHE_HOME"]).is_dir())) or Done())
+    assert ab.run_engine("ff", None, "firefox-68", (0,), tmp_path / "t.json") == 0
+    assert ab.run_engine("ff", None, "firefox-68-again", (0,), tmp_path / "t.json") == 0
+    (first, there1), (second, there2) = seen
+    assert there1 and there2 and first != second and str(tmp_path / "user") not in (first, second)
+    assert not Path(first).exists() and not Path(second).exists()
 
 
 def _ab_args(tmp_path, *extra):

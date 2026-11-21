@@ -17,8 +17,9 @@ datagram log are the transcript's hosts and UDP path), the fake DoH behind it (e
   * one WebRTC page (STUN and TURN by address through the relay): the candidates, normalised, the SDP, the datagrams the relay carried;
   * IDLE launches (no action): the destinations of a browser that does nothing, each up to an event the lab drives (see IDLE below).
 
-THE NORMALISATION. A port of the lab becomes the role of its server (``A``, ``O``, ``page``, ``h1``, ``h2``, ``h3``, ``witness``); the random token of a page of the journey
-and the values of a cookie are dropped. ci/ab-network-volatile.json lists the leaves that differ between two runs of ONE engine: each entry has the pattern of the leaf
+THE NORMALISATION. A port of the lab becomes the role of its server (``A``, ``O``, ``page``, ``h1``, ``h2``, ``h3``, ``witness``), written plainly (``:41039``) or inside a URL
+parameter (``%3A41039``); the random token of a page of the journey (``tok=``, the ids ``lp``, ``park``, ``kapark`` and ``sf``, which the page draws at every load) and the values of a
+cookie are dropped. ci/ab-network-volatile.json lists the leaves that differ between two runs of ONE engine: each entry has the pattern of the leaf
 path, the reason, and the A/A run that proved it. The list is born from the A/A (``ab --a-a``, ``compare --a-a``), never written ahead of it, and it may only shrink: an
 entry that matches no leaf of a run is red as stale.
 
@@ -233,6 +234,10 @@ def print_report(report: Dict[str, Any], control: bool) -> None:
 _PORT = re.compile(r":(\d{2,5})(?!\d)")
 _TOKEN = re.compile(r"(?P<p>[?&]tok=)[A-Za-z0-9]+")
 _PAGE_ID = re.compile(r"(?P<p>[?&]id=(?:lp|park|kapark))[a-z0-9]{4,8}")
+#: The id of the held requests of the slow frame is ``sf`` + the page's random token + the index of the request (tests/fakeweb/journey_site.py, JFRAME_JS "slow"): the token goes, the index stays.
+_FRAME_ID = re.compile(r"(?P<p>[?&]id=sf)[a-z0-9]{1,10}(?P<i>\d)(?![a-z0-9])")
+#: A port written inside a value that is itself a URL parameter: ``a=http%3A%2F%2Fjourney-a.test%3A41039`` (encodeURIComponent of the origin the ad frame is told to open).
+_ENCODED_PORT = re.compile(r"%3[Aa](\d{2,5})(?!\d)")
 
 
 class Normalizer:
@@ -247,8 +252,14 @@ class Normalizer:
             role = self.roles.get(int(m.group(1)))
             return ":" + role if role else m.group(0)
 
+        def encoded_port(m: "re.Match[str]") -> str:
+            role = self.roles.get(int(m.group(1)))
+            return "%3A" + role if role else m.group(0)
+
         value = _PORT.sub(port, value)
+        value = _ENCODED_PORT.sub(encoded_port, value)
         value = _TOKEN.sub(lambda m: m.group("p") + "<TOK>", value)
+        value = _FRAME_ID.sub(lambda m: m.group("p") + "<TOK>" + m.group("i"), value)
         return _PAGE_ID.sub(lambda m: m.group("p") + "<TOK>", value)
 
     def header(self, name: str, value: str) -> str:
@@ -390,6 +401,12 @@ def default_seeds() -> Tuple[int, ...]:
 
 def parse_seeds(text: Optional[str]) -> Tuple[int, ...]:
     return tuple(int(s) for s in text.split(",") if s.strip()) if text else default_seeds()
+
+
+def transcript_errors(seeds: Dict[str, Any]) -> List[str]:
+    """The paths where the run itself failed: a phase that raised (``guarded``), a journey step that did not complete, a connection that broke. The ``extra`` of a journey step is
+    what the PAGE answered (the sign-in step has an ``error`` field that holds the text "Wrong user or password.", on purpose): it is content, not a failure of the run."""
+    return sorted(p for p in flatten(seeds) if p.endswith("/error") and "/extra/" not in p)
 
 
 def write_json(path: Path, document: Any) -> None:
@@ -785,6 +802,23 @@ def phase_data(lab: Lab, phase: str) -> Dict[str, Any]:
             "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm), "requests": request_summary(lab.rec.of(phase, "http"), lab.norm)}
 
 
+def step_data(lab: Lab, phase: str) -> Dict[str, Any]:
+    """What the lab saw in ONE step of the journey: the HTTP requests of the tees and the datagrams. Not the CONNECTs and not the DNS questions: the lab cuts the journey into
+    steps at the moment the driver moves on, and what the browser does on its own (a connection it opens or closes, a name it asks again when the 30 s of an answer are over)
+    lands in the step that happens to be current, a different one in each run (A/A run 44946411675: the same CONNECT to ``journey-o.test`` in step 09 of one run and step 12
+    of the other). Those two are summarised over the whole journey instead (:func:`journey_data`). A request is the page's own act, driven by an event, and stays in its step."""
+    data = phase_data(lab, phase)
+    return {"requests": data["requests"], "udp": data["udp"]}
+
+
+def journey_data(lab: Lab) -> Dict[str, Any]:
+    """The CONNECTs and the DNS questions of the whole journey (every stage ``journey.*``): the destinations in the order they were first reached and the names in the order they
+    were first asked, which the engine orders (a name is resolved before its first connection), and how many connections each destination got (a count is the pool's, see
+    ci/ab-network-volatile.json)."""
+    queries = [(q.name, q.qtype, q.via) for q in lab.rec.slice("doh", "journey")]
+    return {"connects": connect_summary([e["target"] for e in lab.rec.of("journey", "connect")], lab.norm), "dns": dns_summary(queries)}
+
+
 def wire_summary(server: Any, phase: str, norm: Normalizer) -> Dict[str, Any]:
     """The connections one capture server saw in a stage: the ClientHello, the HTTP/2 frames or the HTTP/1.1 heads, the QUIC parameters and HTTP/3 settings."""
     snapshot = server.snapshot()
@@ -845,7 +879,7 @@ def walk_journey(browser: Any, lab: Lab) -> Dict[str, Any]:
     steps: Dict[str, Any] = {}
     stage = {"%02d" % r["n"]: r for r in records}
     for key in ["00"] + sorted(stage) + ["end"]:
-        step: Dict[str, Any] = phase_data(lab, "journey.%s" % key)
+        step: Dict[str, Any] = step_data(lab, "journey.%s" % key)
         record = stage.get(key)
         if record is not None:
             step.update(name=record["name"], ok=record["ok"], idle=record["idle"], url=record["url"], title=record.get("title"), marker=record.get("marker"),
@@ -854,8 +888,7 @@ def walk_journey(browser: Any, lab: Lab) -> Dict[str, Any]:
             if not record["ok"]:
                 step["error"] = re.sub(r"\d+", "N", record["error"] or "")[:200]
         steps[key] = step
-    order = list(dict.fromkeys(lab.norm.text(e["target"]) for e in lab.rec.events if e["kind"] == "connect" and e["phase"].startswith("journey.")))
-    return {"steps": steps, "order": order}
+    return dict(journey_data(lab), steps=steps)
 
 
 def walk_https(browser: Any, lab: Lab, which: str, server: Any, name: str) -> Dict[str, Any]:
@@ -891,10 +924,12 @@ def walk_h3(browser: Any, lab: Lab) -> Dict[str, Any]:
             out["quic_seen"] = bool(lab.h3.quic)
             protocol = page.evaluate(NAV_JS)
             out["visits"].append(protocol)
-            data = phase_data(lab, phase)
-            out["v%d" % visit] = dict(wire_summary(lab.h3, phase, lab.norm), dns=data["dns"], udp=data["udp"])
+            out["v%d" % visit] = dict(wire_summary(lab.h3, phase, lab.norm), dns=phase_data(lab, phase)["dns"])
             if protocol == "h3" or not out["quic_seen"]:
                 break
+        # The datagrams of the whole walk, not of each visit: the packets a visit leaves in flight (an acknowledgement, a close) arrive in the next visit's stage
+        # (A/A run 44946411675, Linux: 12 and 8 datagrams in one run, 13 and 7 in the other, 20 in both).
+        out["udp"] = phase_data(lab, "h3")["udp"]
         return out
     finally:
         context.close()
@@ -1033,7 +1068,7 @@ def run(binary: str, label: str, seeds: Tuple[int, ...], out: Path) -> int:
             sys.stdout.flush()
             transcript["seeds"][str(seed)] = walk_seed(binary, seed, index == 0, patch)
         write_json(out, transcript)
-        for path in sorted(p for p in flatten(transcript["seeds"]) if p.endswith("/error")):
+        for path in transcript_errors(transcript["seeds"]):
             print("ERROR in the transcript at %s" % path)
         print("transcript written: %s (%d leaves)" % (out, len(flatten(transcript["seeds"]))))
         return 0
@@ -1062,8 +1097,11 @@ def run_engine(binary: str, seal: Optional[str], label: str, seeds: Tuple[int, .
     command = [sys.executable, "-u", str(Path(__file__).resolve()), "run", "--binary", binary, "--label", label, "--seeds", ",".join(map(str, seeds)), "--out", str(out)]
     print("=== run %s: %s (seal %s)" % (label, binary, seal or "the one this process has"))
     sys.stdout.flush()
+    from ci_ab_oracle import own_cache_env
+
     try:
-        return subprocess.run(command, env=env, timeout=RUN_TIMEOUT_S).returncode
+        with tempfile.TemporaryDirectory(prefix="ab-network-cache-") as cache:
+            return subprocess.run(command, env=own_cache_env(env, cache), timeout=RUN_TIMEOUT_S).returncode
     except subprocess.TimeoutExpired:
         return 124
 

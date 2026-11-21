@@ -31,7 +31,7 @@ SCRIPT = ROOT / "scripts" / "ci_ab_network.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import ci_ab_network as oracle  # noqa: E402
 
-#: The fewest leaves a comparison holds, per system. A minimal but complete run of ONE seed (one request on each road, tests/test_ab_network.py) holds about 740; a real one holds several times that. A floor of
+#: The fewest leaves a comparison holds, per system. A minimal but complete run of ONE seed (one request on each road, tests/test_ab_network.py) holds about 670; a real one holds several times that. A floor of
 #: 500 says "the run saw something on every road" and nothing more: it is raised to a fraction of the measured count once the A/A has measured it.
 FLOOR = {"linux": 500, "win32": 500}
 TIMEOUT_S = 40 * 60

@@ -1,0 +1,31 @@
+{
+  "format": "ab-host-volatile/1",
+  "about": "The leaves of the host footprint that differ between two launches of ONE engine (the A/A of scripts/ci_ab_host.py). Each entry: `os`, `leaf` (fnmatch over the leaf names: proc.<kind>, mod.<kind>:<path>, spawn.<label>, short.*), `reason` (why that leaf is noise, with the numbers of the run), `aa_run` (the A/A run that proved it) and, only when the leaf may be missing on one side, `absent_ok`. It is applied in the A/A and in the A/B. Born from the evidence of the A/A, never written ahead of it. It may only shrink: an entry that matches no leaf of a run is red as stale.",
+  "entries": [
+    {
+      "os": "linux",
+      "leaf": "proc.tab/isForBrowser",
+      "reason": "How many content processes are alive when the tree is read follows timers of the engine (a process with no frame left is closed after a grace period, a spare is started after a delay), and the wait for a quiet tree (eight equal readings, two seconds) can end before or after one of them. Seed 6: 7 in the first run (the tree changed during the wait, 15 readings) and 8 in the second (9 readings); the other nine launches of the two runs read 8. The processes the tree ever made are compared by strace (spawn.*), and they were equal in all ten launches: 4 Web Content, 4 Isolated Web Co, 1 Privileged Cont, 1 WebExtensions.",
+      "aa_run": "44946411675 (linux)"
+    },
+    {
+      "os": "linux",
+      "leaf": "mod.parent:<app>/fonts/tahoma7_04.ttf",
+      "absent_ok": true,
+      "reason": "The parent maps the fonts of the bundle it is asked for: 8 files in nine of the ten launches and 7 in seed 6 of the first run, without tahoma7_04.ttf, which the tab processes of that launch did map. It is the same launch in which the tree read 7 tab processes (proc.tab/isForBrowser above): that launch took another path through the process allocation. The other seven fonts the parent maps stay compared.",
+      "aa_run": "44946411675 (linux)"
+    },
+    {
+      "os": "windows",
+      "leaf": "short.job_total_processes",
+      "reason": "The job has held 15 processes in eight of the ten launches and 16 in two (seed 6 of the first run, seed 63 of the second): one more content process started and was gone before the snapshot (the polling saw 11 tab processes in those launches, 10 in the others). ActiveProcesses is 13 in all ten, TotalTerminatedProcesses 0, and the kinds alive (proc.*) are equal. One short-lived process more or less in a launch is this noise; a different NAME of a short-lived child is not (it would be a new leaf).",
+      "aa_run": "44946411675 (windows)"
+    },
+    {
+      "os": "windows",
+      "leaf": "short.wmi.firefox.exe",
+      "reason": "The same fact read by the WMI trace of process starts: 16 in the same two launches and 15 in the others, equal to the job's TotalProcesses in all ten.",
+      "aa_run": "44946411675 (windows)"
+    }
+  ]
+}

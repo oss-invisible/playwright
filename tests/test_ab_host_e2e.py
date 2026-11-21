@@ -15,6 +15,9 @@ Two modes, chosen by the environment as the gate chooses it:
     (its seal and archive fetched the way the core fetches an engine), then the published engine against the candidate, with the declared differences of
     ci/ab-host-expected.json.
 
+What two launches of the SAME engine disagree on is listed in ci/ab-host-volatile.json (with the run that proved it, per system); it applies in the A/A and in the A/B, and an
+entry that matches no leaf is red as stale. The launches run with a cache folder of their own (XDG_CACHE_HOME on Linux), so they leave nothing for the fontconfig test's cold launch.
+
 The footprints, the diffs and the log are kept whatever the verdict: in AB_ORACLE_OUT/ab-host (the gate uploads that folder), else in
 $RUNNER_TEMP/invpw-evidence/ab-host (the e2e job uploads that one), else in tmp_path.
 
@@ -74,9 +77,9 @@ def test_the_engine_leaves_the_same_footprint_on_the_host_after_the_same_journey
                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
     (out / "ab-host.log").write_text(done.stdout + "\n--- stderr\n" + done.stderr, encoding="utf-8")
     verdict = [line for line in done.stdout.splitlines()
-               if line.startswith(("DIFF ", "FAIL ", "DECLARED ", "AB HOST", "BROKEN CONTROL", "seed ", "---"))]
+               if line.startswith(("DIFF ", "FAIL ", "DECLARED ", "VOLATILE ", "AB HOST", "BROKEN CONTROL", "seed ", "---"))]
     control = json.loads((out / "diff-a-a.json").read_text(encoding="utf-8")) if (out / "diff-a-a.json").exists() else {}
-    assert done.returncode != 2, "the control is broken: the engine differs from itself, what is compared is not stable\n" + "\n".join(verdict[:80])
+    assert done.returncode != 2, "the control is broken: the engine differs from itself, what is compared is not stable (what may differ is listed in ci/ab-host-volatile.json)\n" + "\n".join(verdict[:80])
     assert done.returncode == 0, "the host footprint differs:\n" + "\n".join(verdict[:80]) + "\n" + done.stderr[-1500:]
     assert control.get("verdict") == "green" and control.get("differences") == [] and control.get("problems") == []
     names = sorted(p.name for p in out.glob("footprint-*.json"))
