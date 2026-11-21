@@ -18,7 +18,7 @@ Two modes of one file.
 Scenarios (`--scenarios`):
 
   direct    `InvisiblePlaywright(seed=...)`: no proxy, the exit asked of the internet (what a user without a proxy pays), the engine on the surface of the system.
-  proxy     the same behind a SOCKS5 gateway of this machine (`tests/_socks_servers.py`, the fake web's: no real proxy): the TCP exit is asked THROUGH the proxy and the
+  proxy     the same behind a SOCKS5 gateway of this machine (`tests/_socks_servers.py`, the fake web's: no real proxy; it forwards the question of the exit for real): the TCP exit is asked THROUGH the proxy and the
             UDP exit is measured beside it, on a thread (the product's decision: they stay parallel).
   headless  `headless=True`: the hidden surface (an Xvfb on Linux, a Win32 desktop on Windows) is made by the launch.
 
@@ -587,7 +587,8 @@ def _scenario_md(title: str, sc: Dict[str, Any]) -> List[str]:
     for s in visible:
         parallel = ", ".join(p.split("/")[-1] for p in s["in_parallel_with"])
         name = ("&nbsp;&nbsp;" * s["depth"]) + "`" + s["path"].split("/")[-1] + "`"
-        thread = s["thread"] if s["thread"] != "MainThread" else ""
+        names = s["thread"].split(",")
+        thread = "" if names == ["MainThread"] else ", ".join(names[:2]) + (" +%d" % (len(names) - 2) if len(names) > 2 else "")
         out.append("| %s | %s | %.1f | %.1f | %.1f | %.1f | %s | %s |" % (
             name, describe(s["label"]), s["median_ms"], s["p90_ms"], s["pct_total"], s["self_median_ms"], parallel, thread))
         extra = hidden.get(s["path"])
@@ -641,6 +642,9 @@ def driver(args: argparse.Namespace) -> int:
     if "proxy" in scenarios:
         sys.path.insert(0, str(ROOT / "tests"))
         import _socks_servers
+        # The gateway of the tests refuses the question "what is my exit" (the lab declares it instead of asking the internet). Here the question is the step that
+        # is measured, so the gateway forwards it for real: the TCP discovery goes through it to the services, as it does through a real proxy.
+        _socks_servers.asks_the_world = lambda server, host, port: False
         try:
             from invisible_core._geo import discover_egress_ip
             exit_ip = discover_egress_ip(None)
