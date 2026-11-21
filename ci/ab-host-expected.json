@@ -1,0 +1,14 @@
+{
+  "format": "ab-host-expected/1",
+  "differences": [
+    {
+      "id": "glxtest-69",
+      "os": "linux",
+      "category": "spawn",
+      "name": "glxtest",
+      "published": "present",
+      "candidate": "absent",
+      "reason": "the 69 no longer spawns glxtest (commit 0e896e4ee1, glxtest never reads the host)"
+    }
+  ]
+}
