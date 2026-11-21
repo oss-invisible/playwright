@@ -4,7 +4,7 @@
     {
       "id": "glxtest-69",
       "os": "linux",
-      "category": "spawn",
+      "category": "proc",
       "name": "glxtest",
       "published": "present",
       "candidate": "absent",

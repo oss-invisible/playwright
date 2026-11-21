@@ -19,12 +19,13 @@ _SYSCALLS = ("execve,clone,clone3,fork,vfork,open,openat,stat,lstat,"
              "newfstatat,statx,access,faccessat,faccessat2,readlink")
 
 
-def _strace_options() -> str:
+def _strace_options(fd_paths: bool = False) -> str:
     """strace's own flags: quiet, follow forks, and die with the traced process
-    when this build knows --kill-on-exit."""
+    when this build knows --kill-on-exit; ``fd_paths`` adds ``-y``, which prints the path of every file descriptor
+    (``3</usr/share/fonts>``), so that a path relative to a directory descriptor is known."""
     help_text = subprocess.run([shutil.which("strace"), "-h"], capture_output=True,
                                text=True).stdout
-    return "-f -qq -s 4096" + (" --kill-on-exit" if "--kill-on-exit" in help_text else "")
+    return "-f -qq -s 4096" + (" -y" if fd_paths else "") + (" --kill-on-exit" if "--kill-on-exit" in help_text else "")
 
 
 def _require_strace_can_trace(tmp: Path) -> None:
@@ -38,7 +39,7 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
-              timestamps: bool = False) -> str:
+              timestamps: bool = False, fd_paths: bool = False) -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -53,7 +54,8 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
 
     ``syscalls`` is what strace traces; ``timestamps`` adds ``-ttt`` (the epoch
     seconds after each pid), which ``_LINE`` does not read: a caller that asks
-    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``)."""
+    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``);
+    ``fd_paths`` adds ``-y`` (scripts/ci_ab_host.py reads the paths the tree touched)."""
     real = Path(os.path.realpath(binary))
     tree.mkdir()
     for entry in real.parent.iterdir():
@@ -64,7 +66,7 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
         "#!/bin/sh\n"
         "echo $$ > %s\n"
         'exec %s %s -o %s -e trace=%s %s "$@"\n'
-        % (pidfile, shutil.which("strace"), _strace_options() + (" -ttt" if timestamps else ""), log, syscalls, real))
+        % (pidfile, shutil.which("strace"), _strace_options(fd_paths) + (" -ttt" if timestamps else ""), log, syscalls, real))
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 

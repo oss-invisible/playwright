@@ -1,45 +1,47 @@
 #!/usr/bin/env python3
-"""Host-footprint A/B oracle: after the same short journey, what the engine leaves on the machine is the same.
+"""Host-footprint A/B oracle: what the engine does to the HOST, over the whole of a closed run.
 
-scripts/ci_ab_oracle.py compares what a PAGE reads. This compares what the engine does to the HOST, which a page cannot
-read but a release can change (a helper that is no longer spawned, a library the parent maps that it did not map before):
+scripts/ci_ab_oracle.py compares what a PAGE reads. This compares what the engine does to the host, which a page cannot read but a release can
+change (a helper that is no longer spawned, a path of the machine it did not touch before). It is not a photograph of one instant: it is the
+TRACE of the run, from the launch to the exit of the browser (the quiet point is the exit of the process, not a wait), after the same short
+journey (the first steps of the fake web's P4 walk, tests/fakeweb/profile_p4.py, no internet, driven by the stock Playwright client).
 
-  * the process tree: the multiset of process KINDS (the parent, or the last argument of `-contentproc` with its
-    `-sandboxingKind N` and `-isForBrowser` / `-notForBrowser`);
-  * the modules: for each kind, the union of the files its processes have mapped (Windows `memory_maps()`, Linux
-    /proc/<pid>/maps), normalized so that the install dir, the system dirs and the temporary paths of the run are the
-    same strings on every engine and every run;
-  * the children that live and die before the snapshot: Linux, `strace` (execve, clone, fork, prctl: every process
-    the tree ever made, named by what it ran); Windows, the job object's TotalProcesses plus the names the polling and
-    a WMI trace (Win32_ProcessStartTrace through PowerShell) saw, see `windows_short_lived`.
+Two things are compared, over the whole trace:
 
-The journey is the first steps of the fake web's P4 walk (tests/fakeweb/profile_p4.py, no internet) driven by the stock
-Playwright client: home, a teaser, the next article, the category (the ad frames of the other origin are out of
-process). The snapshot is taken after the journey, once the tree is quiet, before the browser is closed.
+  * the processes, by KIND, from the command lines of the launch: the parent, `-contentproc` with its type, `-sandboxingKind N` and
+    `-isForBrowser` / `-notForBrowser`, and the helpers (glxtest, pingsender, ...) by what they ran. Every kind and its COUNT must be identical,
+    with one exception: for the content processes of type `tab` only the presence of the kind counts, because how many are alive follows the idle
+    time (a spare process is prelaunched after a delay and closed after a grace period);
+  * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. The SET of host
+    paths must be identical, no exception. `ours` leaves the comparison as a class (OURS below: reading its own package is not touching the host).
+
+How the trace is taken:
+
+  * Linux: `strace -f -y` of the whole tree (the stand-in of tests/_strace_stand_in.py), calls execve, clone, fork, prctl and the file calls
+    (open, openat, stat, access, readlink, ...). The tree is named by what each process ran, or called itself when it forked without exec
+    (the forkserver's children), and the log is read after the tree has exited.
+  * Windows: the process starts WITH their command lines come from the Security log, event 4688 (the process-creation audit with the command
+    line, switched on for the run and put back after it): the kernel writes one per process, so a short-lived child cannot be missed, which a
+    poll of the job's pids can. The files come from an ETW session on Microsoft-Windows-Kernel-File (the Create events: every path a process
+    opens, a library included) taken with `logman` and read with `tracerpt`, both part of Windows. It needs an administrator (the hosted runners
+    are). Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
+    see them is red, not empty.
 
     python ci_ab_host.py run <firefox> [--seal SEAL] --leg linux-x86_64 --out footprint.json [--seeds 11,12,13]
     python ci_ab_host.py compare A.json B.json --out diff.json [--a-a]
     python ci_ab_host.py ab [<candidate> --candidate-seal SEAL] --leg L --out DIR [--published-binary B [--published-seal S]]
 
-`ab` without a candidate is the A/A control (the published engine twice). With a candidate: the A/A first, then the
-published engine against the candidate. Exit 0 green, 1 red, 2 the control is broken (A/A differs: what is compared is not
-stable, the A/B says nothing).
+`ab` without a candidate is the A/A control (the published engine twice). With a candidate: the A/A first, then the published engine against the
+candidate. Exit 0 green, 1 red, 2 the control is broken (A/A differs: what is compared is not stable, the A/B says nothing). Nothing here reads
+the clock for a verdict, and nothing excuses a difference: the A/A is green or the comparison is not stable.
 
-Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, and one that does not show
-is red as stale. Nothing here reads the clock for a verdict.
-
-The leaves that differ between two launches of ONE engine are the noise (ci/ab-host-volatile.json), and they are born from
-the A/A: each entry names the leaf, the system, the reason and the run that proved it. A volatile leaf is excused in the A/A
-and in the A/B alike (it is noise of the engine, not of the candidate), only for the system it is declared for; unless the
-entry says `absent_ok`, the leaf must still be present on both sides, so that a kind or a counter that vanishes is not noise.
-An entry that matches no leaf of the run is red as stale.
+Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, by kind, and one that does not show is red as stale.
 """
 from __future__ import annotations
 
 import argparse
 import codecs
 import collections
-import fnmatch
 import json
 import os
 import re
@@ -47,8 +49,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -58,30 +60,38 @@ sys.path.insert(0, str(ROOT / "tests"))
 import ci_ab_oracle as oracle  # noqa: E402  (fetch_published, ENGINE_TAG)
 import ci_host_gate as gate  # noqa: E402  (SEEDS)
 
-FORMAT = "ab-host/1"
+FORMAT = "ab-host/2"
 EXPECTED_FORMAT = "ab-host-expected/1"
 EXPECTED_FILE = ROOT / "ci" / "ab-host-expected.json"
-VOLATILE_FORMAT = "ab-host-volatile/1"
-VOLATILE_FILE = ROOT / "ci" / "ab-host-volatile.json"
 SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
 #: The steps of the journey (tests/fakeweb/profile_p4.py STEPS, by method name).
 JOURNEY = (("open home", "s1_open_home"),
            ("hover and click a teaser", "s2_hover_click_teaser"),
            ("scroll to the bottom, next article", "s3_scroll_next"),
            ("nav Category", "s7_nav_category"))
-#: What a seed's footprint must hold at least, per category of leaf: a footprint that holds less did not see the tree.
+#: What a seed's footprint must hold at least, per category of leaf: a footprint that holds less did not see the run.
 #: Provisional: the first A/A on both systems gives the real numbers (they are in diff.json, "leaves").
-FLOORS = {"proc": 3, "mod": 100}
+FLOORS = {"proc": 3, "file": 100}
 #: The categories of leaf a footprint has.
-CATEGORIES = ("proc", "mod", "spawn", "short")
-#: Of what a Windows run says about short-lived children, what is COMPARED (the exact count of the job, the names of the WMI
-#: trace). The polling is kept as evidence only: it sees a process only if it lives longer than its period.
+CATEGORIES = ("proc", "file")
 MISSING = "<missing>"
-#: Seconds the tree is polled while it settles, and how many equal polls in a row make it quiet; the wait ends at LIMIT (an
-#: acquisition limit: the verdict never reads it, `quiet.reached` says whether it was reached).
-QUIET_PERIOD_S, QUIET_POLLS, QUIET_LIMIT_S = 0.25, 8, 60.0
+#: Seconds a closed run is given to exit (an acquisition limit, never read by a verdict: `trace.exited` says whether the tree had gone).
+EXIT_LIMIT_S, EXIT_PERIOD_S = 120.0, 0.25
 RUN_TIMEOUT_S = 30 * 60
 CLIP = 400
+
+#: What is `ours` and why it leaves the comparison as a class. The reason is written here once; the report and the footprints name the class.
+OURS = {
+    "package": "reading its own package is not touching the host",
+    "profile": "its own profile and the temp folders of the launch are made by the launch: the run's temp root belongs to the run, not to the host",
+    "cache": "the cache folder the oracle gives every run is the run's own",
+    "ipc": "the shared memory and pipes it opens between its own processes are named after its own pids",
+}
+#: The content processes of type `tab`: `-contentproc ... tab` on Windows and, where they fork from the forkserver and name themselves
+#: (prctl PR_SET_NAME, 15 characters), the names of the remote types. Only the PRESENCE of one of these kinds counts, not how many.
+TAB_NAMES = frozenset({"web content", "isolated web co", "privileged cont", "webextensions", "file content", "isolated servic"})
+TAB_REASON = ("the number of content processes of type tab follows the idle time (a spare is prelaunched after a delay, a process with no frame "
+              "left is closed after a grace period): only the presence of the kind is compared")
 
 
 # -
@@ -104,20 +114,44 @@ def kind_of(cmdline) -> str:
     return "/".join(parts)
 
 
+def is_tab(label: str) -> bool:
+    """A process of type `tab`: its kind says so (`tab/isForBrowser`), or, forked from the forkserver, it named itself after a remote type."""
+    low = label.lower()
+    return low == "tab" or low.startswith("tab/") or low in TAB_NAMES
+
+
+def _base(path: str) -> str:
+    """The file name of a path of either system."""
+    return re.split(r"[\\/]", path)[-1]
+
+
+def label_of_exec(path: str, argv: list, real: str) -> str:
+    """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), else the
+    program's name (lower case)."""
+    if "-contentproc" in argv:
+        return kind_of(argv)  # whatever path it was started by (the binary, /proc/self/exe)
+    if any(a.lstrip("-") == "glxtest" for a in argv[1:]) or _base(argv[0] if argv else "").lower() == "glxtest":
+        return "glxtest"
+    if path == real or _base(path).lower() == _base(real).lower():
+        return "parent"
+    return _base(path).lower() or path
+
+
 # -
-# Normalization of a mapped path: the same string for the same file on every engine, run and runner.
+# The path of a touched file: ours, or the host's.
 
 class Context:
-    """What the normalizer needs to know about the machine and the run: `platform` ("win32" or "linux"), `app` (the engine's
-    install folders: the link and the real one), `drops` (folders whose files are the run's own: profile, temp, home) and, on
-    Windows, `sysroot` (%SystemRoot%)."""
+    """What the classifier needs to know about the machine and the run: `platform` ("win32" or "linux"), `app` (the engine's package
+    folders: the link and the real one), `temp` (the run's temp root and the work folders under it: the profile and the temp dirs of the
+    launch), `cache` (the folders the oracle made the cache of the run in) and, on Windows, `devices` ({`\\device\\harddiskvolume3`: `c:`})."""
 
-    def __init__(self, platform: str, app=(), drops=(), sysroot: str = "C:\\Windows") -> None:
+    def __init__(self, platform: str, app=(), temp=(), cache=(), devices: dict | None = None) -> None:
         self.platform = platform
         self.windows = platform == "win32"
         self.app = [self._key(p) for p in app if p]
-        self.drops = [self._key(p) for p in drops if p]
-        self.sysroot = self._key(sysroot)
+        self.temp = [self._key(p) for p in temp if p]
+        self.cache = [self._key(p) for p in cache if p]
+        self.devices = {k.lower(): v.lower() for k, v in (devices or {}).items()}
 
     def _key(self, path: str) -> str:
         if self.windows:
@@ -133,91 +167,79 @@ class Context:
             return path[len(root) + 1:].replace("\\", "/")
         return None
 
+    def own(self, path: str) -> tuple | None:
+        """(class, name) when `path` is under one of the run's own folders, else None."""
+        for cls, roots in (("package", self.app), ("profile", self.temp), ("cache", self.cache)):
+            for root in roots:
+                rel = self.under(path, root)
+                if rel is not None:
+                    return cls, rel
+        return None
 
-_DIGITS = re.compile(r"\d+")
+
 _NT_VOLUME = re.compile(r"^\\device\\harddiskvolume\d+", re.I)
-_DELETED = " (deleted)"
-#: Folders no run shares with another: where a temporary file or a profile is (any system).
-_PRIVATE_WINDOWS = re.compile(r"\\(appdata|temp|pytest-of-[^\\]*|invisible-[^\\]*|playwright[^\\]*)\\")
+_NT_PIPE = re.compile(r"^\\(device\\namedpipe|\\\.\\pipe|pipe)\\", re.I)
+_OWN_PIPE = re.compile(r"(gecko|mozilla|firefox|chrome\.\d)", re.I)
+_PROC_NUMBER = re.compile(r"(?<=/)\d+(?=/|$)")
 
 
-def _no_numbers(text: str) -> str:
-    return _DIGITS.sub("N", text)
-
-
-def normalize_module(path: str, ctx: Context) -> str | None:
-    """One mapped path as the footprint spells it, or None when it is not a file (an anonymous mapping)."""
+def classify(path: str, ctx: Context) -> tuple | None:
+    """`(class, name)` of one touched path: class is a key of OURS or `host`; `name` is the path as the footprint spells it (host: the same
+    string for the same file on every run: the numbers of /proc/<pid> and /run/user/<uid> are N, a Windows path is lower case with its volume
+    named). None when it is not a path (empty)."""
     if not path:
         return None
-    if ctx.windows:
-        return _normalize_windows(path, ctx)
-    return _normalize_posix(path, ctx)
+    return _classify_windows(path, ctx) if ctx.windows else _classify_posix(path, ctx)
 
 
-def _normalize_windows(path: str, ctx: Context) -> str | None:
+def _classify_posix(path: str, ctx: Context):
+    if path.startswith("/memfd:"):
+        return "ipc", path
+    own = ctx.own(path)
+    if own:
+        return own
+    if path.startswith("/dev/shm/org.mozilla."):
+        return "ipc", path
+    if path == "/proc" or path.startswith("/proc/"):
+        path = _PROC_NUMBER.sub("N", path)
+    path = re.sub(r"^/run/user/\d+", "/run/user/N", path)
+    return "host", path
+
+
+def _classify_windows(path: str, ctx: Context):
     p = path.replace("/", "\\")
-    p = _NT_VOLUME.sub("c:", p) if p.lower().startswith("\\device\\") else p
     low = p.lower()
-    for root in ctx.app:
-        rel = ctx.under(low, root)
-        if rel is not None:
-            return "<app>/" + rel
-    for root in ctx.drops:
-        if ctx.under(low, root) is not None:
-            return "<profile>"
-    sysroot = ctx.sysroot
-    rel = ctx.under(low, sysroot)
-    if rel is not None:
-        parts = rel.split("/")
-        if parts[0] == "system32" and len(parts) == 2:
-            return "<sys>/" + parts[1]
-        if parts[0] == "syswow64" and len(parts) == 2:
-            return "<syswow>/" + parts[1]
-        if parts[0] == "winsxs" and len(parts) >= 3:
-            return "<winsxs>/" + parts[-1]
-        if parts[0] == "temp":
-            return "<profile>"
-        return "<win>/" + rel
-    if re.match(r"^[a-z]:\\users\\", low) or _PRIVATE_WINDOWS.search(low + "\\"):
-        return "<profile>"
-    return low
+    for prefix in ("\\??\\", "\\\\?\\"):
+        if low.startswith(prefix):
+            low = low[len(prefix):]
+    vol = _NT_VOLUME.match(low)
+    if vol and vol.group(0) in ctx.devices:
+        low = ctx.devices[vol.group(0)] + low[len(vol.group(0)):]
+    pipe = _NT_PIPE.match(low)
+    if pipe:
+        return ("ipc", low) if _OWN_PIPE.search(low) else ("host", low)
+    own = ctx.own(low)
+    if own:
+        return own
+    return "host", low.rstrip("\\") or low
 
 
-def _normalize_posix(path: str, ctx: Context) -> str | None:
-    if not path.startswith("/"):
-        return None  # [heap], [stack], [vdso], [anon:...]: not a file
-    p, deleted = path, ""
-    if p.endswith(_DELETED):
-        p, deleted = p[:-len(_DELETED)], " (deleted)"
-    if p.startswith("/memfd:"):
-        return "<memfd:%s>" % _no_numbers(p[len("/memfd:"):])
-    if p.startswith("/dev/shm/"):
-        return "<shm:%s>" % _no_numbers(p[len("/dev/shm/"):])
-    for root in ctx.app:
-        rel = ctx.under(p, root)
-        if rel is not None:
-            return "<app>/" + rel + deleted
-    for root in ctx.drops:
-        if ctx.under(p, root) is not None:
-            return "<profile>"
-    if p.startswith(("/tmp/", "/var/tmp/")):
-        return "<profile>"
-    p = re.sub(r"^/proc/\d+/", "/proc/N/", p)
-    p = re.sub(r"^/run/user/\d+", "/run/user/N", p)
-    return p + deleted
-
-
-def normalize_modules(paths, ctx: Context) -> list:
-    out = set()
+def classify_paths(paths, ctx: Context) -> tuple:
+    """`(host paths, {class: how many})` of the touched paths: the host's as a sorted list, ours counted by class."""
+    host, ours = set(), collections.Counter()
     for path in paths:
-        n = normalize_module(path, ctx)
-        if n:
-            out.add(n)
-    return sorted(out)
+        got = classify(path, ctx)
+        if got is None:
+            continue
+        if got[0] == "host":
+            host.add(got[1])
+        else:
+            ours[got[0]] += 1
+    return sorted(host), dict(sorted(ours.items()))
 
 
 # -
-# Linux: the processes the tree ever made, from the strace log.
+# Linux: the processes and the files of the tree, from the strace log.
 
 _LINE = re.compile(r"^(\d+)\s+(\w+)\((.*)$")
 _RESUMED = re.compile(r"^(\d+)\s+<\.\.\. (\w+) resumed>(.*)$")
@@ -226,24 +248,48 @@ _STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 _EXEC = re.compile(r'"((?:[^"\\]|\\.)*)",\s*\[(.*?)\],\s*(?:0x[0-9a-fA-F]+|NULL|\[)')
 _FLAGS = re.compile(r"flags=([A-Za-z0-9_|]+)")
 _SET_NAME = re.compile(r'PR_SET_NAME,\s*"((?:[^"\\]|\\.)*)"')
-#: What strace traces for this: the processes the tree makes and what they run, nothing else.
-STRACE_CALLS = "execve,clone,clone3,fork,vfork,prctl"
+_FIRST_STR = re.compile(r'^"((?:[^"\\]|\\.)*)"')
+_DIRFD_STR = re.compile(r'^(AT_FDCWD|\d+(?:<([^>]*)>)?),\s*"((?:[^"\\]|\\.)*)"')
+#: The calls that name a path as their first argument, and those that name it after a directory descriptor (`-y` spells the descriptor
+#: `3</usr/share>`, so a path relative to it is known).
+PATH_CALLS = ("execve", "open", "creat", "stat", "lstat", "access", "readlink", "statfs")
+PATH_AT_CALLS = ("openat", "openat2", "newfstatat", "statx", "faccessat", "faccessat2", "readlinkat")
+#: What strace traces here: the processes the tree makes and what they run, and every path they touch.
+STRACE_CALLS = "clone,clone3,fork,vfork,prctl," + ",".join(PATH_CALLS + PATH_AT_CALLS)
+#: A path relative to the working directory, which the strace log does not carry: the same text on every run, so the same on both sides.
+CWD = "<cwd>"
 
 
 def _unescape(text: str) -> str:
     return codecs.escape_decode(text.encode("latin-1", errors="replace"))[0].decode("utf-8", errors="replace")
 
 
-def label_of_exec(path: str, argv: list, real: str) -> str:
-    """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), else the
-    program's name."""
-    if "-contentproc" in argv:
-        return kind_of(argv)  # whatever path it was started by (the binary, /proc/self/exe)
-    if any(a.lstrip("-") == "glxtest" for a in argv[1:]) or os.path.basename(argv[0] if argv else "") == "glxtest":
-        return "glxtest"
-    if path == real or os.path.basename(path) == os.path.basename(real):
-        return "parent"
-    return os.path.basename(path) or path
+def touched_paths(lines) -> set:
+    """Every path a strace log (read as lines) says a process of the tree touched, failed attempts included: opening, stat, access, readlink,
+    execve. A path relative to a directory descriptor is joined to the path `-y` printed for it, one relative to the working directory is
+    spelled `<cwd>/...`, an empty path (the descriptor itself) is not a path."""
+    found = set()
+    for line in lines:
+        m = _LINE.match(line)
+        if not m:
+            continue
+        call, rest = m.group(2), m.group(3)
+        if call in PATH_CALLS:
+            s = _FIRST_STR.match(rest)
+            base, raw = CWD, s.group(1) if s else None
+        elif call in PATH_AT_CALLS:
+            s = _DIRFD_STR.match(rest)
+            base = (s.group(2) or "<fd>") if s and s.group(1) != "AT_FDCWD" else CWD
+            raw = s.group(3) if s else None
+        else:
+            continue
+        if raw:
+            found.add((base, raw))
+    out = set()
+    for base, raw in found:
+        path = _unescape(raw)
+        out.add(path if path.startswith("/") else _unescape(base).rstrip("/") + "/" + path)
+    return out
 
 
 def spawned_processes(lines, real: str) -> dict:
@@ -326,278 +372,288 @@ def spawned_counts(procs: dict) -> dict:
     return dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
 
 
+def _read_lines(log: Path):
+    with open(log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            yield line.rstrip("\n")
+
+
 # -
-# Windows: the children that are gone before the snapshot.
+# Windows: the processes with their command lines (the audit, event 4688) and the files (an ETW session on Kernel-File).
 
-def accounting_of(job) -> dict:
-    """JOBOBJECT_BASIC_ACCOUNTING_INFORMATION of the launch's job: how many processes the job has EVER held (TotalProcesses, the
-    exact count of every child of the tree, short-lived or not), how many are alive and how many were terminated.
-
-    The way to the handle: `RemoteServer.process` (invisible_playwright/_juggler/remote.py `process`) is the core's
-    `_WindowsProcess` (invisible_core/juggler/connection.py:1014), whose `.job` (:1044, set at :1313) is the launch's `EngineJob`
-    (invisible_core/process.py:547) and `EngineJob.handle` (:574) is the Windows job handle, valid in this process. The core
-    itself reads only ActiveProcesses (`EngineJob.active`, process.py:657-684: the struct has TotalProcesses at :668 and
-    discards it), so this makes the same QueryInformationJobObject call, information class 1, and keeps the field."""
-    if job is None:
-        return {"reachable": False, "why": "the launch has no job (invisible_core/juggler/connection.py `_spawn_windows`: "
-                                           "EngineJob.create() answered None, or the process is not a _WindowsProcess)"}
-    if not getattr(job, "handle", None):
-        return {"reachable": False, "why": "the job's handle is closed (invisible_core/process.py EngineJob.close; read it before the close)"}
-    import ctypes
-    from ctypes import wintypes
-
-    class Accounting(ctypes.Structure):
-        _fields_ = [("TotalUserTime", ctypes.c_longlong), ("TotalKernelTime", ctypes.c_longlong),
-                    ("ThisPeriodTotalUserTime", ctypes.c_longlong), ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
-                    ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
-                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
-
-    k = ctypes.WinDLL("kernel32", use_last_error=True)
-    k.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
-    info = Accounting()
-    if not k.QueryInformationJobObject(job.handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
-        return {"reachable": False, "why": "QueryInformationJobObject failed: error %d" % ctypes.get_last_error()}
-    return {"reachable": True, "total_processes": int(info.TotalProcesses), "active_processes": int(info.ActiveProcesses),
-            "terminated_processes": int(info.TotalTerminatedProcesses)}
+AUDIT_GUID = "{0CCE922B-69AE-11D9-BED3-505054503030}"  # the subcategory "Process Creation"
+AUDIT_KEY = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit"
+AUDIT_VALUE = "ProcessCreationIncludeCmdLine_Enabled"
+FILE_PROVIDER, FILE_CREATE_KEYWORD = "Microsoft-Windows-Kernel-File", "0x80"  # KERNEL_FILE_KEYWORD_CREATE
 
 
-WMI_SCRIPT = r"""
-param([string]$out, [string]$stop)
-$ErrorActionPreference = 'Stop'
-Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier abhost | Out-Null
-Set-Content -Path "$out.ready" -Value 'ready'
-while (-not (Test-Path $stop)) {
-  $e = Wait-Event -SourceIdentifier abhost -Timeout 1
-  if ($e) {
-    $n = $e.SourceEventArgs.NewEvent
-    Add-Content -Path $out -Value ("{0}`t{1}`t{2}" -f $n.ProcessID, $n.ParentProcessID, $n.ProcessName)
-    Remove-Event -EventIdentifier $e.EventIdentifier
-  }
-}
-Unregister-Event -SourceIdentifier abhost
-"""
+class TraceError(RuntimeError):
+    """The trace of a Windows run could not be taken (not an administrator, no audit, no session): said as such, never an empty trace."""
 
 
-def descendants_of(events, roots) -> list:
-    """The (pid, ppid, name) of `events` that are a root or come from one, by the parent pid each start event says."""
-    wanted = set(roots)
-    out, changed = [], True
-    chosen = set()
-    while changed:
-        changed = False
-        for i, (pid, ppid, name) in enumerate(events):
-            if i not in chosen and (pid in wanted or ppid in wanted):
-                chosen.add(i)
-                wanted.add(pid)
-                changed = True
-    for i in sorted(chosen):
-        out.append(events[i])
+def split_command_line(text: str) -> list:
+    """The arguments of a Windows command line, by the rules of CommandLineToArgvW (quotes, and backslashes before a quote)."""
+    args, cur, quoted, started, i, n = [], [], False, False, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            j = i
+            while j < n and text[j] == "\\":
+                j += 1
+            slashes = j - i
+            if j < n and text[j] == '"':
+                cur.append("\\" * (slashes // 2))
+                started = True
+                if slashes % 2:
+                    cur.append('"')
+                    j += 1
+                i = j
+                continue
+            cur.append("\\" * slashes)
+            started, i = True, j
+            continue
+        if c == '"':
+            quoted, started, i = not quoted, True, i + 1
+            continue
+        if c in " \t" and not quoted:
+            if started:
+                args.append("".join(cur))
+                cur, started = [], False
+            i += 1
+            continue
+        cur.append(c)
+        started, i = True, i + 1
+    if started:
+        args.append("".join(cur))
+    return args
+
+
+def _number(text: str) -> int:
+    text = (text or "").strip()
+    return int(text, 16) if text.lower().startswith("0x") else int(text or 0)
+
+
+def parse_audit_events(xml_text: str) -> list:
+    """The process creations of what `wevtutil qe Security /f:xml` printed (event 4688, one `<Event>` after the other):
+    `[{"rid", "pid", "ppid", "image", "cmd"}]`, `ppid` being the creator's pid."""
+    body = re.sub(r"<\?xml[^>]*\?>", "", xml_text)
+    root = ET.fromstring("<Events>%s</Events>" % body)
+    out = []
+    for ev in root:
+        data = {d.get("Name"): (d.text or "") for d in ev.iter() if d.tag.rsplit("}", 1)[-1] == "Data"}
+        rid = next((int(e.text) for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "EventRecordID" and e.text), 0)
+        if "NewProcessId" not in data:
+            continue
+        out.append({"rid": rid, "pid": _number(data["NewProcessId"]), "ppid": _number(data.get("ProcessId", "")),
+                    "image": data.get("NewProcessName", ""), "cmd": data.get("CommandLine", "")})
     return out
 
 
-def wmi_names(events, roots) -> dict:
-    """{process name (lower case): how many started} among the descendants of `roots`, the roots themselves included."""
-    return dict(sorted(collections.Counter(name.lower() for _p, _pp, name in descendants_of(events, roots)).items()))
+def process_tree(events, roots) -> list:
+    """The events of `parse_audit_events` that are a root or come from a process of the tree, by the creator's pid each says, in their order."""
+    wanted, chosen, changed = set(roots), set(), True
+    while changed:
+        changed = False
+        for i, e in enumerate(events):
+            if i not in chosen and (e["pid"] in wanted or e["ppid"] in wanted):
+                chosen.add(i)
+                wanted.add(e["pid"])
+                changed = True
+    return [events[i] for i in sorted(chosen)]
 
 
-class WmiTrace:
-    """Method 2 for the short-lived children on Windows: a PowerShell subprocess subscribed to Win32_ProcessStartTrace (needs the
-    rights to register a WMI event: an administrator, as the hosted runners are). Started BEFORE the launch, stopped after the
-    snapshot. `result(roots)` is {"available": bool, "why": ..., "names": {...}, "events": n}."""
+def windows_processes(tree, real: str) -> dict:
+    """{pid: {"label", "image", "cmd"}} of a tree of 4688 events, each named by what it ran with its command line (`label_of_exec`)."""
+    out = {}
+    for e in tree:
+        argv = split_command_line(e["cmd"])
+        out[e["pid"]] = {"label": label_of_exec(e["image"], argv, real), "image": e["image"], "cmd": e["cmd"]}
+    return out
+
+
+def etw_files(path, pids) -> tuple:
+    """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids`. Read as a stream: the file
+    has every open of the machine for the length of the run."""
+    seen, events = set(), 0
+    for _ev, el in ET.iterparse(path, events=("end",)):
+        if el.tag.rsplit("}", 1)[-1] != "Event":
+            continue
+        events += 1
+        pid, name = None, None
+        for child in el.iter():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "Execution":
+                raw = child.get("ProcessID") or child.get("ProcessId")
+                pid = _number(raw) if raw else None
+            elif tag == "Data" and child.get("Name") == "FileName":
+                name = child.text
+        if name and pid in pids:
+            seen.add((pid, name))
+        el.clear()
+    return seen, events
+
+
+def parse_audit_setting(csv_text: str) -> str:
+    """The inclusion setting of the subcategory in `auditpol /get /subcategory:{GUID} /r` ("No Auditing", "Success", ...), '' when unreadable."""
+    lines = [l for l in csv_text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return ""
+    head, row = [h.strip() for h in lines[0].split(",")], [c.strip() for c in lines[1].split(",")]
+    return row[head.index("Inclusion Setting")] if "Inclusion Setting" in head and len(row) == len(head) else ""
+
+
+def _tool(argv, timeout: float = 300.0) -> str:
+    """A Windows tool's output, or a TraceError that says what failed."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise TraceError("%s: %s" % (argv[0], e))
+    if done.returncode != 0:
+        raise TraceError("%s %s failed with %d: %s" % (argv[0], argv[1] if len(argv) > 1 else "", done.returncode,
+                                                       (done.stdout + done.stderr).strip()[:300]))
+    return done.stdout
+
+
+class WindowsTrace:
+    """The trace of one Windows run. `start()` BEFORE the launch (the audit on, the session open, the first canary), `finish(roots, alive)` after
+    the browser was closed: it waits for the tree to be gone, stops the session, and returns what the tree did. Raises TraceError when a part of
+    the trace cannot be taken (the run is then red and says why)."""
 
     def __init__(self, work: Path) -> None:
-        self.out, self.stop = work / "wmi-events.tsv", work / "wmi.stop"
-        self.script = work / "wmi.ps1"
-        self.proc = None
-        self.error = None
+        self.work = Path(work)
+        self.name = "abhost-%d-%d" % (os.getpid(), time.time_ns() % 10 ** 9)
+        self.etl, self.xml = self.work / "files.etl", self.work / "files.xml"
+        self.first_record = 0
+        self.before = None
+        self.session = False
 
-    def start(self, timeout_s: float = 60.0) -> None:
-        if sys.platform != "win32":
-            self.error = "WMI is Windows only"
-            return
-        self.script.write_text(WMI_SCRIPT, encoding="utf-8")
-        exe = shutil.which("powershell") or shutil.which("pwsh")
-        if not exe:
-            self.error = "no powershell on this machine"
-            return
-        self.proc = subprocess.Popen([exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.script),
-                                      str(self.out), str(self.stop)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        ready = Path(str(self.out) + ".ready")
-        end = time.monotonic() + timeout_s
-        while time.monotonic() < end and not ready.exists():
-            if self.proc.poll() is not None:
-                break
-            time.sleep(0.2)
-        if not ready.exists():
-            _o, err = self._finish()
-            self.error = "the WMI subscription did not start: %s" % ((err or "").strip()[:400] or "no message")
+    def _canary(self, which: str) -> str:
+        path = self.work / ("canary-%s-%s" % (which, self.name))
+        path.write_text(which, encoding="utf-8")
+        path.read_text(encoding="utf-8")
+        return str(path)
 
-    def _finish(self):
-        if self.proc is None:
-            return "", ""
-        self.stop.write_text("stop", encoding="utf-8")
+    def start(self) -> None:
+        self.before = {"setting": parse_audit_setting(_tool(["auditpol", "/get", "/subcategory:" + AUDIT_GUID, "/r"])),
+                       "value": self._registry_value()}
+        _tool(["auditpol", "/set", "/subcategory:" + AUDIT_GUID, "/success:enable"])
+        _tool(["reg", "add", AUDIT_KEY, "/v", AUDIT_VALUE, "/t", "REG_DWORD", "/d", "1", "/f"])
+        newest = _tool(["wevtutil", "qe", "Security", "/c:1", "/rd:true", "/f:xml"])
+        m = re.search(r"<EventRecordID>(\d+)</EventRecordID>", newest)
+        self.first_record = int(m.group(1)) if m else 0
+        _tool(["logman", "create", "trace", self.name, "-p", FILE_PROVIDER, FILE_CREATE_KEYWORD, "0xff", "-o", str(self.etl), "-ets",
+               "-bs", "1024", "-nb", "64", "256"])
+        self.session = True
+        self._start_canary = self._canary("start")
+
+    def _registry_value(self):
         try:
-            return self.proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            return self.proc.communicate()
+            out = _tool(["reg", "query", AUDIT_KEY, "/v", AUDIT_VALUE])
+        except TraceError:
+            return None
+        m = re.search(r"REG_DWORD\s+(0x[0-9a-fA-F]+)", out)
+        return int(m.group(1), 16) if m else None
 
-    def result(self, roots) -> dict:
-        if self.error:
-            return {"available": False, "why": self.error}
-        time.sleep(2.0)  # the events are delivered to the subscriber a moment after the start; read what has come, then stop
-        _o, err = self._finish()
-        events = []
-        if self.out.exists():
-            for line in self.out.read_text(encoding="utf-8", errors="replace").splitlines():
-                parts = line.split("\t")
-                if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-                    events.append((int(parts[0]), int(parts[1]), parts[2].strip()))
-        if self.proc is not None and self.proc.returncode not in (0, None) and not events:
-            return {"available": False, "why": "powershell ended with %s: %s" % (self.proc.returncode, (err or "").strip()[:400])}
-        return {"available": True, "events_seen": len(events), "names": wmi_names(events, roots)}
+    def tree(self, roots) -> list:
+        xml = _tool(["wevtutil", "qe", "Security", "/q:*[System[(EventID=4688) and (EventRecordID>%d)]]" % self.first_record, "/f:xml"])
+        return process_tree(parse_audit_events(xml), roots)
 
+    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic) -> dict:
+        """`{"tree": [4688 events], "files": {(pid, name)}, "exited": {...}, "events": n}`: what the tree did from its first process to its last."""
+        if alive is None:
+            import psutil
 
-class Poller:
-    """Names, by polling, the engine processes that exist at some moment (evidence for the Windows run: a process that lives
-    less than the period is not seen, and the job's count says how many were missed). `pids` gives the pids to look at."""
+            alive = psutil.pid_exists
+        tree, exited = wait_exited(lambda: self.tree(roots), alive, sleep=sleep, now=now)
+        end_canary = self._canary("end")
+        _tool(["logman", "stop", self.name, "-ets"])
+        self.session = False
+        summary = self.work / "files.txt"
+        _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
+        pids = {e["pid"] for e in tree} | {os.getpid()}
+        seen, events = etw_files(self.xml, pids)
+        problems = []
+        mine = {name for pid, name in seen if pid == os.getpid()}
+        for label, canary in (("first", self._start_canary), ("last", end_canary)):
+            if not any(m.lower().endswith(os.path.basename(canary).lower()) for m in mine):
+                problems.append("the file trace did not see the %s canary file of the oracle (%s): the session was not recording" % (label, os.path.basename(canary)))
+        lost = re.search(r"(?i)events?\s+lost\D{0,20}(\d+)", summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else "")
+        if lost and int(lost.group(1)):
+            problems.append("the file trace lost %s events" % lost.group(1))
+        tree_pids = {e["pid"] for e in tree}
+        missing = sorted(tree_pids - {pid for pid, _n in seen})
+        if missing:
+            problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
+        return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "exited": exited, "events": events, "problems": problems}
 
-    def __init__(self, pids, period: float = 0.02) -> None:
-        self.pids, self.period = pids, period
-        self.seen: dict = {}
-        self._halt = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="ab-host-poller", daemon=True)
-
-    def start(self):
-        self._thread.start()
-
-    def _run(self):
-        import psutil
-
-        while not self._halt.is_set():
+    def cleanup(self) -> None:
+        """Put the machine back: the session closed, the audit as it was."""
+        if self.session:
             try:
-                for pid in self.pids():
-                    try:
-                        p = psutil.Process(pid)
-                        key = (pid, p.create_time())
-                        if key not in self.seen:
-                            self.seen[key] = kind_of(p.cmdline()) if is_engine_name(p.name()) else p.name().lower()
-                    except Exception:
-                        continue
-            except Exception:
+                _tool(["logman", "stop", self.name, "-ets"])
+            except TraceError:
                 pass
-            self._halt.wait(self.period)
+            self.session = False
+        if self.before is None:
+            return
+        flags = {"Success": ("enable", "disable"), "Failure": ("disable", "enable"), "Success and Failure": ("enable", "enable")}
+        success, failure = flags.get(self.before["setting"], ("disable", "disable"))
+        try:
+            _tool(["auditpol", "/set", "/subcategory:" + AUDIT_GUID, "/success:" + success, "/failure:" + failure])
+            if self.before["value"] is None:
+                _tool(["reg", "delete", AUDIT_KEY, "/v", AUDIT_VALUE, "/f"])
+            else:
+                _tool(["reg", "add", AUDIT_KEY, "/v", AUDIT_VALUE, "/t", "REG_DWORD", "/d", str(self.before["value"]), "/f"])
+        except TraceError:
+            pass
+        self.before = None
 
-    def stop(self) -> dict:
-        self._halt.set()
-        self._thread.join(timeout=10)
-        return dict(sorted(collections.Counter(self.seen.values()).items()))
 
+def windows_device_map() -> dict:
+    """{`\\device\\harddiskvolume3`: `c:`} of this machine, from QueryDosDeviceW (Windows only)."""
+    import ctypes
+    import string
 
-def is_engine_name(name: str) -> bool:
-    return (name or "").lower().startswith("firefox")
+    out = {}
+    buf = ctypes.create_unicode_buffer(1024)
+    for letter in string.ascii_uppercase:
+        if ctypes.windll.kernel32.QueryDosDeviceW("%s:" % letter, buf, 1024):
+            out[buf.value.lower()] = "%s:" % letter.lower()
+    return out
 
 
 # -
-# The snapshot of the tree.
+# The exit of a closed run: the quiet point is the process exit, not a wait.
 
-def engine_processes(root_pid: int, job=None) -> list:
-    """The living engine processes of the tree: `[(psutil.Process, cmdline)]`. Windows: the job's own list; else the descendants of
-    `root_pid` (and `root_pid` itself when it is the engine)."""
-    import psutil
-    from _cpu_by_type import is_engine
-
-    found = []
-    pids = []
-    if job is not None and getattr(job, "handle", None):
-        pids = list(job.pids())
-    else:
-        try:
-            root = psutil.Process(root_pid)
-            pids = [root.pid] + [c.pid for c in root.children(recursive=True)]
-        except psutil.Error:
-            pids = []
-    for pid in pids:
-        try:
-            p = psutil.Process(pid)
-            if is_engine(p):
-                found.append((p, p.cmdline()))
-        except (psutil.Error, OSError):
-            continue
-    return found
-
-
-def wait_quiet(read, period=QUIET_PERIOD_S, polls=QUIET_POLLS, limit_s=QUIET_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> tuple:
-    """Reads the tree (`read()` returns the set of its pids) until it has not changed for `polls` reads in a row, or `limit_s`.
-    Returns (last set, {"reached": bool, "reads": n})."""
+def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> tuple:
+    """Reads the tree of the run (`read_tree()` returns the events of its processes, in their order) until every process of it is gone (`alive(pid)`)
+    and two reads in a row say the same thing, or until `limit_s`. Returns (the last tree, {"exited": bool, "reads": n}): a tree that was
+    still running at the limit says so, it is not made to look quiet."""
     end = now() + limit_s
-    last, same, reads = None, 0, 0
+    previous, reads = None, 0
     while True:
-        current = frozenset(read())
+        tree = read_tree()
         reads += 1
-        same = same + 1 if current == last else 1
-        last = current
-        if same >= polls:
-            return set(current), {"reached": True, "reads": reads}
+        pids = tuple(e["pid"] for e in tree)
+        if not any(alive(p) for p in pids) and pids == previous:
+            return tree, {"exited": True, "reads": reads}
+        previous = pids
         if now() >= end:
-            return set(current), {"reached": False, "reads": reads}
+            return tree, {"exited": False, "reads": reads}
         sleep(period)
-
-
-def modules_of(proc, windows: bool):
-    """The files `proc` has mapped: Windows `memory_maps()` (path), Linux /proc/<pid>/maps. Raises OSError / psutil errors."""
-    if windows:
-        return [m.path for m in proc.memory_maps()]
-    paths = set()
-    with open("/proc/%d/maps" % proc.pid, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            fields = line.rstrip("\n").split(None, 5)
-            if len(fields) == 6:
-                paths.add(fields[5])
-    return sorted(paths)
-
-
-def take_footprint(processes, ctx: Context) -> dict:
-    """{"kinds", "modules", "unreadable", "processes"} of `processes` ([(psutil.Process, cmdline)])."""
-    kinds = collections.Counter()
-    mods: dict = {}
-    unreadable: list = []
-    listing = []
-    for proc, cmd in processes:
-        kind = kind_of(cmd)
-        kinds[kind] += 1
-        listing.append({"pid": proc.pid, "kind": kind})
-        try:
-            mods.setdefault(kind, set()).update(modules_of(proc, ctx.windows))
-        except Exception as e:  # noqa: BLE001 - a process that cannot be read is said, never skipped
-            unreadable.append("%s (pid %d): %s: %s" % (kind, proc.pid, type(e).__name__, str(e)[:120]))
-    return {"kinds": dict(sorted(kinds.items())),
-            "modules": {k: normalize_modules(v, ctx) for k, v in sorted(mods.items())},
-            "unreadable": unreadable, "processes": listing}
 
 
 # -
 # The comparison.
 
 def leaves_of(seed_footprint: dict) -> dict:
-    """{leaf: value} of one seed: proc.<kind> = count; mod.<kind>:<path> = 1; spawn.<label> = count (Linux strace);
-    short.job_total_processes and short.wmi.<name> = count (Windows)."""
+    """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence) and
+    file.<path> = 1 for every HOST path the tree touched."""
     out = {}
     for kind, n in seed_footprint.get("kinds", {}).items():
-        out["proc." + kind] = n
-    for kind, paths in seed_footprint.get("modules", {}).items():
-        for path in paths:
-            out["mod.%s:%s" % (kind, path)] = 1
-    for label, n in seed_footprint.get("spawned", {}).items():
-        out["spawn." + label] = n
-    short = seed_footprint.get("short_lived") or {}
-    job = short.get("job") or {}
-    if job.get("reachable"):
-        out["short.job_total_processes"] = job["total_processes"]
-    wmi = short.get("wmi") or {}
-    if wmi.get("available"):
-        for name, n in wmi.get("names", {}).items():
-            out["short.wmi." + name] = n
+        out["proc." + kind] = 1 if is_tab(kind) and n else n
+    for path in seed_footprint.get("files", []):
+        out["file." + path] = 1
     return out
 
 
@@ -617,62 +673,35 @@ def load_expected(path: Path = EXPECTED_FILE) -> list:
     return document["differences"]
 
 
-def load_volatile(path: Path = VOLATILE_FILE) -> list:
-    """The entries of the volatile list: each `{"os", "leaf", "reason", "aa_run"}` and, when the leaf may be absent on one side, `"absent_ok": true`. `leaf` is a
-    pattern (`fnmatch`) over the leaf names of `leaves_of`. A malformed list is an error, not an empty one."""
-    document = json.loads(Path(path).read_text(encoding="utf-8"))
-    if document.get("format") != VOLATILE_FORMAT:
-        raise SystemExit("%s: format %r, not %r" % (path, document.get("format"), VOLATILE_FORMAT))
-    entries = document.get("entries")
-    if not isinstance(entries, list):
-        raise SystemExit("%s: `entries` is not a list" % path)
-    seen = set()
-    for entry in entries:
-        if entry.get("os") not in ("linux", "windows"):
-            raise SystemExit("%s: every entry needs an os, linux or windows (%r)" % (path, entry))
-        for field in ("leaf", "reason", "aa_run"):
-            if not isinstance(entry.get(field), str) or not entry[field].strip():
-                raise SystemExit("%s: every entry needs a non-empty %s (%r)" % (path, field, entry))
-        if not isinstance(entry.get("absent_ok", False), bool):
-            raise SystemExit("%s: absent_ok is true or false (%r)" % (path, entry))
-        if (entry["os"], entry["leaf"]) in seen:
-            raise SystemExit("%s: the leaf %r is listed twice for %s" % (path, entry["leaf"], entry["os"]))
-        seen.add((entry["os"], entry["leaf"]))
-    return entries
-
-
 def _declared_covers(entry: dict, diff: dict) -> bool:
-    """A declared difference covers a difference of `spawn.<name>` that is the published engine having it (count >= 1) and the
-    candidate not having it."""
-    if entry.get("category") != "spawn" or diff["leaf"] != "spawn." + entry["name"]:
+    """A declared difference covers a difference of `proc.<name>` that is the published engine having it (count >= 1) and the candidate not
+    having it: by kind."""
+    if entry.get("category") != "proc" or diff["leaf"] != "proc." + entry["name"]:
         return False
     published, candidate = diff["a"], diff["b"]
     return (published != MISSING and published >= 1) and candidate == MISSING
 
 
 def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, platform: str | None = None,
-          floors: dict | None = None, volatile: list | None = None) -> dict:
-    """The verdict on two footprints (the document `run` writes). `expected` is the declared differences, applied only when `a_a`
-    is false; `volatile` is the noise of the engine (`load_volatile`), applied in both modes. Returns {"verdict", "problems",
-    "differences", "declared", "excused", "volatile", "leaves": {seed: {category: n}}, "mode"}."""
+          floors: dict | None = None) -> dict:
+    """The verdict on two footprints (the document `run` writes). `expected` is the declared differences, applied only when `a_a` is false.
+    Returns {"verdict", "problems", "differences", "declared", "ours", "tab", "leaves": {seed: {category: n}}, "mode"}: nothing is excused."""
     floors = FLOORS if floors is None else floors
     platform = platform or a.get("platform") or sys.platform
     os_name = "windows" if platform == "win32" else "linux"
     seeds_a = {s["seed"]: s for s in a.get("seeds", [])}
     seeds_b = {s["seed"]: s for s in b.get("seeds", [])}
     problems, differences, declared, counts = [], [], [], {}
-    every_leaf: set = set()
-    for side, fp, seeds in (("A", a, seeds_a), ("B", b, seeds_b)):
+    for side, fp in (("A", a), ("B", b)):
         for message in fp.get("problems", []):
             problems.append("side %s: %s" % (side, message))
     if sorted(seeds_a) != sorted(seeds_b):
         problems.append("the two footprints have different seeds: A %s, B %s" % (sorted(seeds_a), sorted(seeds_b)))
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         la, lb = leaves_of(seeds_a[seed]), leaves_of(seeds_b[seed])
-        every_leaf |= set(la) | set(lb)
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
-            for u in fp.get("unreadable", []):
-                problems.append("seed %s side %s: the modules of a process cannot be read: %s" % (seed, side, u))
+            for message in fp.get("problems", []):
+                problems.append("seed %s side %s: %s" % (seed, side, message))
         per = {c: 0 for c in CATEGORIES}
         for leaf in set(la) | set(lb):
             per[category_of(leaf)] = per.get(category_of(leaf), 0) + 1
@@ -681,7 +710,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             have = {c: sum(1 for k in leaves if category_of(k) == c) for c in floors}
             for c, floor in floors.items():
                 if have[c] < floor:
-                    problems.append("seed %s side %s has %d %s leaves, fewer than the floor of %d: the tree was not seen"
+                    problems.append("seed %s side %s has %d %s leaves, fewer than the floor of %d: the run was not seen"
                                     % (seed, side, have[c], c, floor))
         for leaf in sorted(set(la) | set(lb)):
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
@@ -700,24 +729,14 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             for d in hit:
                 differences.remove(d)
                 declared.append(dict(d, id=entry.get("id")))
-    excused, used = [], []
-    for entry in (e for e in volatile or [] if e["os"] == os_name):
-        matching = sorted(leaf for leaf in every_leaf if fnmatch.fnmatchcase(leaf, entry["leaf"]))
-        if not matching:
-            stale.append({"id": entry["leaf"]})
-            problems.append("the volatile entry %r (%s) matches no leaf of either footprint: it is stale, remove it" % (entry["leaf"], entry["aa_run"]))
-            continue
-        covered = [d for d in differences if fnmatch.fnmatchcase(d["leaf"], entry["leaf"])
-                   and (entry.get("absent_ok") or (d["a"] != MISSING and d["b"] != MISSING))]
-        for d in covered:
-            differences.remove(d)
-            excused.append(dict(d, aa_run=entry["aa_run"]))
-        used.append({"leaf": entry["leaf"], "leaves": len(matching), "differing": len(covered)})
     for d in differences:
         problems.append("seed %s %s: A %s | B %s" % (d["seed"], d["leaf"], json.dumps(d["a"], sort_keys=True)[:160],
                                                      json.dumps(d["b"], sort_keys=True)[:160]))
+    tab = {str(seed): {"A": {k: n for k, n in seeds_a[seed].get("kinds", {}).items() if is_tab(k)},
+                       "B": {k: n for k, n in seeds_b[seed].get("kinds", {}).items() if is_tab(k)}}
+           for seed in sorted(set(seeds_a) & set(seeds_b))}
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
-            "differences": differences, "declared": declared, "excused": excused, "volatile": used,
+            "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
             "stale": [e.get("id") for e in stale], "leaves": counts}
 
 
@@ -729,9 +748,7 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
                                                   b_name, json.dumps(d["b"], sort_keys=True)[:160]))
     for d in report["declared"]:
         print("DECLARED seed %s %s (%s)" % (d["seed"], d["leaf"], d["id"]))
-    for d in report.get("excused", []):
-        print("VOLATILE seed %s %s: %s %s | %s %s (run %s)" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160], b_name,
-                                                              json.dumps(d["b"], sort_keys=True)[:160], d["aa_run"]))
+    print("OURS (not compared): " + "; ".join("%s: %s" % kv for kv in sorted(report.get("ours", OURS).items())))
     n = len(report["differences"])
     for p in report["problems"][:len(report["problems"]) - n]:
         print("FAIL " + p)
@@ -740,7 +757,7 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
 
 
 # -
-# One engine: the journey, the snapshot, the footprint.
+# One engine: the journey, the close, the trace, the footprint.
 
 def default_seeds() -> list:
     """ci/persona-seeds.json key "candidate" when it is there, else the seeds of the A/B oracle (the host gate's)."""
@@ -754,19 +771,19 @@ def default_seeds() -> list:
     return list(gate.SEEDS)
 
 
-def _context(binary: str, windows: bool, profile_dirs=()) -> Context:
+def _context(binary: str, windows: bool, work: Path) -> Context:
+    """The run's own folders: the package (the link and the real folder), the temp root of this process (the oracle's subprocess runs with a
+    TMPDIR / TEMP of its own, `run_subprocess`) and the folder of the work of the seed, and the cache folder of the run."""
     real = os.path.realpath(binary)
     app = {os.path.dirname(real), os.path.dirname(os.path.abspath(binary))}
-    drops = {tempfile.gettempdir(), os.environ.get("RUNNER_TEMP", ""), os.path.expanduser("~"), *profile_dirs}
+    temp = {tempfile.gettempdir(), str(work)}
     if windows:
-        drops |= {os.environ.get("LOCALAPPDATA", ""), os.environ.get("APPDATA", ""), os.environ.get("TEMP", "")}
-        # the engine folder may sit under the temp dir or the home: the app wins (Context checks it first)
-        return Context("win32", app=app, drops=drops, sysroot=os.environ.get("SystemRoot", "C:\\Windows"))
-    return Context("linux", app=app, drops=drops)
+        return Context("win32", app=app, temp=temp, devices=windows_device_map())
+    return Context("linux", app=app, temp=temp, cache={os.environ.get("XDG_CACHE_HOME", "")})
 
 
-def run_seed(binary: str, seed: int, use_strace: bool, work: Path) -> dict:
-    """One browser, one journey, one snapshot. Returns the seed's footprint."""
+def run_seed(binary: str, seed: int, work: Path) -> dict:
+    """One browser, one journey, one close, one trace. Returns the seed's footprint."""
     from playwright.sync_api import sync_playwright
 
     from fakeweb import journey_site, profile_p4
@@ -775,25 +792,31 @@ def run_seed(binary: str, seed: int, use_strace: bool, work: Path) -> dict:
     windows = sys.platform == "win32"
     seed_work = work / ("seed%d" % seed)
     seed_work.mkdir(parents=True)
-    exe, log, pidfile = binary, seed_work / "strace.log", seed_work / "stand-in.pid"
-    if use_strace:
+    exe, log, pidfile, pgid = binary, seed_work / "strace.log", seed_work / "stand-in.pid", None
+    trace = None
+    problems = []
+    if windows:
+        trace = WindowsTrace(seed_work)
+        try:
+            trace.start()
+        except TraceError as e:
+            trace.cleanup()
+            return {"seed": seed, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False},
+                    "problems": ["the trace of a Windows run could not be started (it needs an administrator): %s" % e]}
+    else:
         from _strace_stand_in import _stand_in
 
-        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS)
+        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
-    holder = {"job": None}
-    poller = wmi = None
-    if windows:
-        wmi = WmiTrace(seed_work)
-        wmi.start()
-        poller = Poller(lambda: _poll_pids(holder))
-        poller.start()
-    server, steps, footprint, short = None, [], {}, {}
+    server, steps, root_pid = None, [], None
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
                                launch_timeout_ms=180_000)
-        root = server.process
-        holder["job"] = getattr(root, "job", None)
+        root_pid = server.process.pid
+        if not windows:
+            from _strace_stand_in import _group_of
+
+            pgid = _group_of(pidfile)
         with sync_playwright() as p:
             browser = p.firefox.connect(server.ws_endpoint)
             context = browser.new_context()
@@ -811,72 +834,88 @@ def run_seed(binary: str, seed: int, use_strace: bool, work: Path) -> dict:
                     steps.append({"n": n, "name": name, "ok": True})
                 except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
                     steps.append({"n": n, "name": name, "ok": False, "error": str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc)})
-            # The snapshot: after the journey, once the tree is quiet, before anything is closed.
-            _pids, quiet = wait_quiet(lambda: {q.pid for q, _c in engine_processes(root.pid, holder["job"])})
-            ctx = _context(binary, windows)
-            footprint = take_footprint(engine_processes(root.pid, holder["job"]), ctx)
-            footprint["quiet"] = quiet
-            if windows:
-                short["job"] = accounting_of(holder["job"])
-                short["polled"] = poller.stop()
-                short["wmi"] = wmi.result({root.pid})
             context.close()
             browser.close()
+        # The close: the run ends with the exit of the browser, and the trace is read after it.
+        server.close()
+        server = None
+        exited = _wait_for_tree_exit(pgid)
+        if exited is not None and not exited:
+            problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
+        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows)
+    except TraceError as e:
+        result = {"seed": seed, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
+                  "problems": ["the trace of the run could not be taken: %s" % e]}
     finally:
         stop_site()
-        if poller is not None:
-            poller.stop()
         if server is not None:
             try:
                 server.close()
             except Exception:  # noqa: BLE001
                 pass
-        if use_strace:
+        if not windows:
             from _strace_stand_in import _kill_group
 
             _kill_group(pidfile)
-    result = {"seed": seed, "steps": steps}
-    result.update(footprint)
-    if windows:
-        result["short_lived"] = short
-    if use_strace and log.exists():
-        procs = spawned_processes(log.read_text(encoding="utf-8", errors="replace").splitlines(), os.path.realpath(binary))
-        result["spawned"] = spawned_counts(procs)
-        result["spawned_detail"] = sorted(
-            ({"label": p["label"], "exec": (" ".join([os.path.basename(p["exec"][0])] + p["exec"][1][1:6]) if p["exec"] else None),
-              "name": p["name"]} for p in procs.values()), key=lambda d: (d["label"], d["exec"] or ""))
+        elif trace is not None:
+            trace.cleanup()
+    result["problems"] = result.get("problems", []) + problems
     return result
 
 
-def _poll_pids(holder) -> list:
-    job = holder["job"]
-    if job is not None and getattr(job, "handle", None):
-        return job.pids()
-    import psutil
+def _wait_for_tree_exit(pgid):
+    """Linux: whether the process group of the run is empty (strace follows every process of the tree, so it ends with its last one); None on
+    Windows, where `WindowsTrace.finish` waits for its own tree."""
+    if pgid is None:
+        return None
+    from _strace_stand_in import _wait_for_exit
 
-    return [c.pid for c in psutil.Process().children(recursive=True)]
+    return not _wait_for_exit(pgid, EXIT_LIMIT_S)
 
 
-def run_engine(binary: str, leg: str, seeds: list, label: str, use_strace: bool) -> dict:
+def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool) -> dict:
+    real = os.path.realpath(binary)
+    ctx = _context(binary, windows, seed_work)
+    if windows:
+        got = trace.finish({root_pid})
+        procs = windows_processes(got["tree"], real)
+        raw = {name for _pid, name in got["files"]}
+        info = {"source": "etw+audit", "events": got["events"], "exited": got["exited"]["exited"], "reads": got["exited"]["reads"]}
+        problems = list(got["problems"])
+        if not got["exited"]["exited"]:
+            problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
+        detail = sorted(({"label": p["label"], "cmd": p["cmd"][:300]} for p in procs.values()), key=lambda d: (d["label"], d["cmd"]))
+    else:
+        procs = spawned_processes(_read_lines(log), real)
+        raw = touched_paths(_read_lines(log))
+        info, problems = {"source": "strace", "exited": True}, []
+        detail = sorted(({"label": p["label"], "exec": (" ".join([os.path.basename(p["exec"][0])] + p["exec"][1][1:6]) if p["exec"] else None),
+                          "name": p["name"]} for p in procs.values()), key=lambda d: (d["label"], d["exec"] or ""))
+    host, ours = classify_paths(raw, ctx)
+    kinds = dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
+    info.update({"processes": len(procs), "paths": len(raw)})
+    return {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems,
+            "processes": detail}
+
+
+def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
     """The footprint document of one engine: every seed's journey, one browser at a time."""
     work = Path(tempfile.mkdtemp(prefix="ab-host-"))
     problems, out_seeds = [], []
     try:
         for seed in seeds:
-            fp = run_seed(binary, seed, use_strace, work)
+            fp = run_seed(binary, seed, work)
             out_seeds.append(fp)
             for step in fp["steps"]:
                 if not step["ok"]:
                     problems.append("seed %d: step %d (%s) failed: %s" % (seed, step["n"], step["name"], step.get("error")))
-            if not fp["quiet"]["reached"]:
-                print("seed %d: the tree did not settle within %d s; the last reading is the footprint" % (seed, QUIET_LIMIT_S))
-            print("seed %d: %s; %d module leaves" % (seed, json.dumps(fp["kinds"], sort_keys=True),
-                                                      sum(len(v) for v in fp["modules"].values())))
+            print("seed %d: %s; %d host paths, %s" % (seed, json.dumps(fp["kinds"], sort_keys=True), len(fp["files"]),
+                                                      json.dumps(fp.get("ours", {}), sort_keys=True)))
             sys.stdout.flush()
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "strace": use_strace,
-            "binary": os.path.basename(os.path.dirname(os.path.realpath(binary))), "seeds": out_seeds, "problems": problems}
+    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "problems": problems,
+            "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
 
 
 def write_json(path: Path, document) -> None:
@@ -893,23 +932,27 @@ def read_json(path: Path) -> dict:
 # -
 # The run of an engine as a subprocess (the seal a process runs under is read at import), and the orchestration.
 
-def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: str, seeds: list, strace: str) -> int:
+def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: str, seeds: list) -> int:
+    """`run` in a process of its own, with a cache folder and a temp root of its own: they are the run's, so what the engine does in them is `ours`
+    (the cache of the bundle's fonts, the profile and the temp dirs of the launch) and the rest of the machine is the host's."""
     env = dict(os.environ, INVISIBLE_CORE_AUTOFIX="off", INVISIBLE_CORE_PIN="allow")
     if seal:
         env["INVISIBLE_SEAL_FILE"] = str(seal)
     for name in ("MOZ_LOG", "MOZ_LOG_FILE"):
         env.pop(name, None)
     cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "run", binary, "--leg", leg, "--out", str(out), "--label", label,
-           "--seeds", ",".join(str(s) for s in seeds), "--strace", strace]
+           "--seeds", ",".join(str(s) for s in seeds)]
     try:
-        with tempfile.TemporaryDirectory(prefix="ab-host-cache-") as cache:
-            return subprocess.run(cmd, env=oracle.own_cache_env(env, cache), timeout=RUN_TIMEOUT_S).returncode
+        with tempfile.TemporaryDirectory(prefix="ab-host-cache-") as cache, tempfile.TemporaryDirectory(prefix="ab-host-tmp-") as temp:
+            env = oracle.own_cache_env(env, cache)
+            env.update(TMPDIR=temp, TEMP=temp, TMP=temp)
+            return subprocess.run(cmd, env=env, timeout=RUN_TIMEOUT_S).returncode
     except subprocess.TimeoutExpired:
         return 124
 
 
-def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, engine_tag: str, seeds: list, strace: str,
-       published: tuple | None = None, expected_file: Path = EXPECTED_FILE, volatile_file: Path = VOLATILE_FILE) -> int:
+def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, engine_tag: str, seeds: list,
+       published: tuple | None = None, expected_file: Path = EXPECTED_FILE) -> int:
     """A/A first (the published engine twice), then, with a candidate, the published engine against it. 0 green, 1 the A/B is red,
     2 the control is broken."""
     out.mkdir(parents=True, exist_ok=True)
@@ -924,7 +967,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
         for label, name, exe, seal_file in runs:
             print("=== footprint with %s: %s" % (label, exe))
             sys.stdout.flush()
-            rc = run_subprocess(exe, Path(seal_file) if seal_file else None, leg, out / name, label, seeds, strace)
+            rc = run_subprocess(exe, Path(seal_file) if seal_file else None, leg, out / name, label, seeds)
             if rc != 0 or not (out / name).exists():
                 failed.append("the run with %s ended with %s" % (label, rc))
         if failed:
@@ -933,8 +976,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             print("\n".join("FAIL " + f for f in failed))
             return 2
         first, again = (read_json(out / runs[0][1]), read_json(out / runs[1][1]))
-        volatile = load_volatile(volatile_file)
-        control = judge(first, again, a_a=True, volatile=volatile)
+        control = judge(first, again, a_a=True)
         write_json(out / "diff-a-a.json", control)
         print("--- A/A: %s against itself" % engine_tag)
         print_report(control, engine_tag, engine_tag + " again")
@@ -944,7 +986,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
         if not candidate:
             return 0
         expected = load_expected(expected_file)
-        report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False, volatile=volatile)
+        report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False)
         write_json(out / "diff.json", report)
         print("--- A/B: %s against the candidate" % engine_tag)
         print_report(report, engine_tag, oracle.CANDIDATE)
@@ -962,14 +1004,12 @@ def main(argv=None) -> int:
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--label", default="engine")
     r.add_argument("--seeds", default=None, help="comma separated (default: ci/persona-seeds.json 'candidate', else the host gate's)")
-    r.add_argument("--strace", choices=("auto", "on", "off"), default="auto", help="Linux: trace the children (auto = on)")
     c = sub.add_parser("compare", help="two footprints: the diff and the verdict")
     c.add_argument("a", type=Path)
     c.add_argument("b", type=Path)
     c.add_argument("--out", type=Path)
     c.add_argument("--a-a", action="store_true", help="the control: no declared difference is applied; a difference is a broken control (exit 2)")
     c.add_argument("--expected", type=Path, default=EXPECTED_FILE)
-    c.add_argument("--volatile", type=Path, default=VOLATILE_FILE)
     x = sub.add_parser("ab", help="A/A, then with a candidate the published engine against it")
     x.add_argument("candidate", nargs="?")
     x.add_argument("--candidate-seal", type=Path, default=os.environ.get("INVISIBLE_SEAL_FILE"))
@@ -977,13 +1017,12 @@ def main(argv=None) -> int:
     x.add_argument("--out", type=Path, required=True)
     x.add_argument("--engine-tag", default=oracle.ENGINE_TAG)
     x.add_argument("--seeds", default=None)
-    x.add_argument("--strace", choices=("auto", "on", "off"), default="auto")
     x.add_argument("--published-binary", type=Path, help="use this binary for the published engine instead of fetching it")
     x.add_argument("--published-seal", type=Path, help="its seal (default: the environment's)")
     args = ap.parse_args(argv)
     if args.cmd == "compare":
         a, b = read_json(args.a), read_json(args.b)
-        report = judge(a, b, expected=None if args.a_a else load_expected(args.expected), a_a=args.a_a, volatile=load_volatile(args.volatile))
+        report = judge(a, b, expected=None if args.a_a else load_expected(args.expected), a_a=args.a_a)
         if args.out:
             write_json(args.out, report)
         print_report(report, a.get("engine", "A"), b.get("engine", "B"))
@@ -992,11 +1031,10 @@ def main(argv=None) -> int:
         return 2 if args.a_a else 1
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else default_seeds()
     if args.cmd == "run":
-        use_strace = sys.platform.startswith("linux") and args.strace != "off"
-        if use_strace and not shutil.which("strace"):
-            print("needs strace (apt install strace): without it the short-lived children are not seen; --strace off to go without")
+        if sys.platform.startswith("linux") and not shutil.which("strace"):
+            print("needs strace (apt install strace): without it the processes and the files of the run are not seen")
             return 3
-        document = run_engine(args.binary, args.leg, seeds, args.label, use_strace)
+        document = run_engine(args.binary, args.leg, seeds, args.label)
         write_json(args.out, document)
         return 0
     if args.candidate and not args.candidate_seal:
@@ -1004,8 +1042,7 @@ def main(argv=None) -> int:
     given = None
     if args.published_binary:
         given = (str(args.published_binary), args.published_seal)
-    return ab(args.candidate, Path(args.candidate_seal) if args.candidate_seal else None, args.leg, args.out, args.engine_tag, seeds,
-              args.strace, given)
+    return ab(args.candidate, Path(args.candidate_seal) if args.candidate_seal else None, args.leg, args.out, args.engine_tag, seeds, given)
 
 
 if __name__ == "__main__":
