@@ -199,14 +199,14 @@ def test_the_kind_of_a_process_is_the_last_argument_with_its_sandbox_and_browser
 # -
 # The normalizer.
 
-WIN = host.Context("win32", app=["C:\\Users\\runneradmin\\AppData\\Local\\invisible\\engines\\firefox-68\\firefox"],
-                   drops=["C:\\Users\\runneradmin\\AppData\\Local\\Temp"], sysroot="C:\\Windows")
-LIN = host.Context("linux", app=["/home/runner/.cache/invisible/engines/firefox-68/firefox"], drops=["/home/runner", "/tmp"])
+WIN = host.Context("win32", app=["D:\\lab\\runner\\AppData\\Local\\invisible\\engines\\firefox-68\\firefox"],
+                   drops=["D:\\lab\\runner\\AppData\\Local\\Temp"], sysroot="C:\\Windows")
+LIN = host.Context("linux", app=["/srv/lab/runner/.cache/invisible/engines/firefox-68/firefox"], drops=["/srv/lab/runner", "/tmp"])
 
 
 @pytest.mark.parametrize("path,out", [
-    ("C:\\Users\\runneradmin\\AppData\\Local\\invisible\\engines\\firefox-68\\firefox\\xul.dll", "<app>/xul.dll"),
-    ("c:\\users\\runneradmin\\appdata\\local\\invisible\\engines\\firefox-68\\firefox\\gmp-clearkey\\0.1\\clearkey.dll",
+    ("D:\\lab\\runner\\AppData\\Local\\invisible\\engines\\firefox-68\\firefox\\xul.dll", "<app>/xul.dll"),
+    ("d:\\lab\\runner\\appdata\\local\\invisible\\engines\\firefox-68\\firefox\\gmp-clearkey\\0.1\\clearkey.dll",
      "<app>/gmp-clearkey/0.1/clearkey.dll"),
     ("C:\\Windows\\System32\\KERNEL32.DLL", "<sys>/kernel32.dll"),
     ("C:\\WINDOWS\\system32\\ntdll.dll", "<sys>/ntdll.dll"),
@@ -215,8 +215,8 @@ LIN = host.Context("linux", app=["/home/runner/.cache/invisible/engines/firefox-
      "<winsxs>/comctl32.dll"),
     ("C:\\Windows\\Fonts\\arial.ttf", "<win>/fonts/arial.ttf"),
     ("C:\\Windows\\Globalization\\Sorting\\sortdefault.nls", "<win>/globalization/sorting/sortdefault.nls"),
-    ("C:\\Users\\runneradmin\\AppData\\Local\\Temp\\tmpab12cd\\profile\\cache2\\x", "<profile>"),
-    ("C:\\Users\\runneradmin\\AppData\\Roaming\\Mozilla\\x.dat", "<profile>"),
+    ("D:\\lab\\runner\\AppData\\Local\\Temp\\tmpab12cd\\profile\\cache2\\x", "<profile>"),
+    ("D:\\lab\\runner\\AppData\\Roaming\\Mozilla\\x.dat", "<profile>"),
     ("\\Device\\HarddiskVolume3\\Windows\\System32\\bcrypt.dll", "<sys>/bcrypt.dll"),
     ("C:\\Program Files\\Some Vendor\\hook.dll", "c:\\program files\\some vendor\\hook.dll"),
 ])
@@ -225,15 +225,15 @@ def test_a_windows_path_is_spelled_the_same_on_every_machine(path, out):
 
 
 @pytest.mark.parametrize("path,out", [
-    ("/home/runner/.cache/invisible/engines/firefox-68/firefox/libxul.so", "<app>/libxul.so"),
-    ("/home/runner/.cache/invisible/engines/firefox-68/firefox/gmp-clearkey/0.1/libclearkey.so", "<app>/gmp-clearkey/0.1/libclearkey.so"),
+    ("/srv/lab/runner/.cache/invisible/engines/firefox-68/firefox/libxul.so", "<app>/libxul.so"),
+    ("/srv/lab/runner/.cache/invisible/engines/firefox-68/firefox/gmp-clearkey/0.1/libclearkey.so", "<app>/gmp-clearkey/0.1/libclearkey.so"),
     ("/usr/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libc.so.6"),
     ("/memfd:mozilla-ipc (deleted)", "<memfd:mozilla-ipc>"),
     ("/memfd:mozilla-ipc-4321 (deleted)", "<memfd:mozilla-ipc-N>"),
     ("/dev/shm/org.mozilla.ipc.1234.5 (deleted)", "<shm:org.mozilla.ipc.N.N>"),
     ("/dev/shm/org.mozilla.ipc.77.8", "<shm:org.mozilla.ipc.N.N>"),
     ("/tmp/tmpabc123/profile/startupCache/scriptCache.bin", "<profile>"),
-    ("/home/runner/work/_temp/p/cache2/entries/AB", "<profile>"),
+    ("/srv/lab/runner/work/_temp/p/cache2/entries/AB", "<profile>"),
     ("/usr/share/fonts/x.ttf (deleted)", "/usr/share/fonts/x.ttf (deleted)"),
     ("[heap]", None),
     ("[vdso]", None),
