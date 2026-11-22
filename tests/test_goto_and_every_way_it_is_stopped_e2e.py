@@ -193,10 +193,7 @@ def test_a_goto_stopped_on_its_way_raises_or_lands_and_never_lies(firefox_binary
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary, headless=True) as browser:
         for site, target_base in (("same", same), ("cross", cross)):
             for i in range(2):
-                # One page per iteration: a refresh the engine queued while an
-                # earlier goto was on its way is replayed on the page that goto
-                # landed on, at any later moment, and on a shared page it can fall
-                # on the next iteration's setup goto.
+                # A page per iteration: a refresh queued by an earlier iteration (replayed late on its landed page) cannot reach this setup goto.
                 page = browser.new_page()
                 try:
                     page.goto(same + "/start?k=%s&i=%d" % (kind, i))
