@@ -1,39 +1,39 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# intermittent-68-suite-cores-hunt.yml - a HUNT for the intermittent e2e of firefox-68, in the context that reproduces them: the WHOLE e2e suite, on the load
-# of the whole suite, with the cores of any crash read by gdb. It is NOT a gate, it is never merged to main (it lives on the branch
-# `hunt/intermittent-68-suite-cores` and is deleted with it), and no result of it counts as green for anything: a green hunt proves nothing about a release,
-# a red one is evidence to read.
+# intermittent-69-secstate-binary-hunt.yml - the proof, red then green, of the fix of the exit by SIGSEGV (-11) of the engine in the generate mode of the
+# security state: the SAME loaded leg as the one that found it on the published engine, run on the ENGINE BUILT BY A RUN OF THE SERIES. It is NOT a gate, it
+# is never merged to main (it lives on the branch `hunt/intermittent-69-secstate-binary` and is deleted with it), and no result of it counts as green for
+# anything: a green hunt proves nothing about a release, a red one is evidence to read.
 #
-# What it runs. The Linux job of .github/workflows/e2e.yml on this branch, as that file runs it, ROUNDS (3) times in sequence per job, and it never stops at a
-# red: three identical copies (the whole suite under xvfb-run without the root and the sandbox files, then the root step and the sandbox step, as e2e.yml
-# runs them). No Windows, no one-file security-state job. Left out on purpose: the gate that waits for the core on the index. Same runner, same install, same
-# security state, same fetch, same GeoIP database, same scripts/run_e2e.py with its own width (-n), its own deadline and no rerun of any kind.
-# The job linux-3-loaded also runs, DURING the main run of every round, 4 background loops of tests/test_security_state_engine_e2e.py::
-# test_the_engine_generates_the_security_state_it_is_given (see "THE BACKGROUND LOOPS" in the step): the -11 of the generation did not happen alone, only
-# inside the suite. A red iteration, or a core of a background engine, makes the job red; the summary lists node, iteration and engine exit code.
-# What this branch adds to the tests: tests/conftest.py raises RLIMIT_CORE and, after a test that fails, tests/_crash_cores.py has gdb read every core in
-# $INVPW_CORE_DIR (gdb, kernel.core_pattern and INVPW_CORE_DIR are set in the system-deps step, as in e2e.yml); the gdb texts are in
-# invpw-evidence/cores/<test>/, which moves with invpw-evidence into round-N.
+# What it runs. ONE job: the Linux job of .github/workflows/e2e.yml on this branch, as that file runs it (the whole suite under xvfb-run without the root and
+# the sandbox files, then the root step and the sandbox step), 3 rounds in sequence, and DURING the main run of every round 4 background loops of
+# tests/test_security_state_engine_e2e.py::test_the_engine_generates_the_security_state_it_is_given (see "THE BACKGROUND LOOPS" in the step). Expected on the
+# engine of the fix: no engine exit at -11 in the background generations, and no datareporting/glean folder in the profile of a generation (the test asserts
+# it on firefox-69 and asserts the opposite on firefox-68).
+#
+# The engine. NOT the published one: the asset `asset-linux-x86_64` of the run of oss-invisible/firefox_antidetect_patch whose id is in
+# hunt/build_run_id.txt, unpacked and sealed as the series' gate does (gate.yml: Download asset, Extract + locate firefox binary, The core under test,
+# Seal of the binary under test), with the core at the ref of hunt/core_ref.txt and the seal tag of hunt/seal_tag.txt. While hunt/build_run_id.txt holds
+# anything but a number the job is red at its first step. An artifact of a run lives 7 days.
 #
 # Each round leaves, in $RUNNER_TEMP/hunt/round-N/: the junit of the round, the evidence the tests save on failure (invpw-evidence, with the gdb texts of
-# the cores), the watchdog file, the log of the round and the junit of the root and sandbox steps. The browsers left over are closed between rounds.
-# hunt-summary.md (also in the job summary) has one line per round (passed, failed, errors, skipped) and the failed node ids with the first line of each
-# message. A job is red when any round has a failure or an error, when a round produced no junit, or when the shell broke.
+# the cores), the watchdog file, the log of the round, the junit of the root and sandbox steps and the files of the background loops. hunt-summary.md (also
+# in the job summary) has one line per round, the lines of the loops (iterations, reds by engine exit code, cores with gMozCrashReason, generate profiles with a
+# glean folder) and a total. A job is red when any round has a failure or an error, when a background generation is red or leaves a core, or when the shell broke.
 #
-# Triggered ONLY by a push to `hunt/intermittent-68-suite-cores`: no schedule, no dispatch, no pull request.
+# Triggered ONLY by a push to `hunt/intermittent-69-secstate-binary`: no schedule, no dispatch, no pull request.
 # ─────────────────────────────────────────────────────────────────────────────
-name: intermittent 68 suite cores hunt
+name: intermittent 69 secstate binary hunt
 
 on:
   push:
-    branches: [hunt/intermittent-68-suite-cores]
+    branches: [hunt/intermittent-69-secstate-binary]
 
 permissions:
   contents: read
 
 # A newer push to the hunt branch replaces the run it supersedes.
 concurrency:
-  group: intermittent-68-suite-cores-hunt-${{ github.ref }}
+  group: intermittent-69-secstate-binary-hunt-${{ github.ref }}
   cancel-in-progress: true
 
 # Engine and GeoIP downloads go through the release API with this token (as every workflow that runs tests).
@@ -42,19 +42,15 @@ env:
 
 jobs:
   hunt:
-    name: suite cores hunt ${{ matrix.label }}
+    name: secstate binary hunt ${{ matrix.label }}
     runs-on: ubuntu-24.04
-    # Up to 6 rounds of the whole suite plus the install: the ceiling is the longest a hosted job may run.
+    # 3 rounds of the whole suite under the load of 4 generations, plus the install.
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 1
       matrix:
         include:
-          - label: linux-1
-            temp: /tmp
-          - label: linux-2
-            temp: /tmp
           - label: linux-3-loaded
             temp: /tmp
             load: secstate-x4
@@ -67,6 +63,19 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # RED AT ONCE while hunt/build_run_id.txt is not the id of a run: nothing is installed or run on an engine nobody named.
+      - name: The build to hunt on (hunt/build_run_id.txt), the core ref and the seal tag
+        id: build
+        run: |
+          set -e
+          run_id="$(tr -d '[:space:]' < hunt/build_run_id.txt)"
+          case "$run_id" in ''|*[!0-9]*) echo "::error::hunt/build_run_id.txt holds '$run_id', not the id of a run of the series: put the id of the run that built the engine"; exit 1;; esac
+          core_ref="$(tr -d '[:space:]' < hunt/core_ref.txt 2>/dev/null || true)"
+          if [ -z "$core_ref" ]; then core_ref=main; fi
+          seal_tag="$(tr -d '[:space:]' < hunt/seal_tag.txt)"
+          case "$seal_tag" in firefox-[0-9]*) ;; *) echo "::error::hunt/seal_tag.txt holds '$seal_tag', not firefox-N or firefox-N-candidate"; exit 1;; esac
+          { echo "run_id=$run_id"; echo "core_ref=$core_ref"; echo "seal_tag=$seal_tag"; } >> "$GITHUB_OUTPUT"
+          echo "engine of run $run_id, core at $core_ref, seal tag $seal_tag"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
@@ -93,8 +102,75 @@ jobs:
       # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
       - name: The security state (a fixed directory of the repository)
         run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
-      - name: Fetch the published firefox binary
-        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      # The steps that follow are the ones of the series' gate (.github/workflows/gate.yml of oss-invisible/firefox_antidetect_patch, jobs.gate.steps), copied: the
+      # asset of the build is downloaded from the run, unpacked, and the core at core_ref is installed and asserted before the binary is sealed. The series
+      # repository is public: the token of this repository reads its artifacts (download-artifact with `repository` takes the token of the job).
+      - name: Download asset (the build of the series)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: asset-linux-x86_64
+          path: art
+          repository: oss-invisible/firefox_antidetect_patch
+          run-id: ${{ steps.build.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Extract + locate firefox binary
+        run: |
+          set -e
+          mkdir -p ff
+          set -- art/firefox-*-stealth-linux-x86_64.*
+          [ "$#" -eq 1 ] && [ -e "$1" ] || { echo "ERROR: expected one firefox-*-stealth-linux-x86_64 archive in art/, found: $*"; exit 1; }
+          A="$1"
+          sha256sum "$A"
+          tar xzf "$A" -C ff
+          EXE="ff/firefox"
+          [ -e "$EXE" ] || { echo "ERROR: firefox binary not found at $EXE"; exit 1; }
+          chmod +x "$EXE" 2>/dev/null || true
+          echo "FF_EXE=$PWD/$EXE" >> "$GITHUB_ENV"
+      - name: The core under test (core_ref, from git) and the wrapper with its dev extra
+        env:
+          CORE_REF: ${{ steps.build.outputs.core_ref }}
+        run: |
+          export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
+          CORE_GIT="git+https://github.com/oss-invisible/core@$CORE_REF"
+          python -m pip install --quiet "$CORE_GIT"
+          python -m pip install --quiet ".[dev]"
+          python -m pip install --quiet --force-reinstall "$CORE_GIT"
+          python - <<'PY'
+          import json, os, re, subprocess, sys
+          from importlib.metadata import distribution, version
+          ref = os.environ["CORE_REF"]
+          if re.fullmatch(r"[0-9a-f]{40}", ref):
+              want = ref
+          else:
+              rows = [line.split() for line in subprocess.run(
+                  ["git", "ls-remote", "https://github.com/oss-invisible/core", ref, ref + "^{}"],
+                  capture_output=True, text=True, check=True).stdout.splitlines() if line.strip()]
+              peeled = [s for s, r in rows if r.endswith("^{}")]
+              want = (peeled or [s for s, _ in rows] or [""])[0]
+          import invisible_playwright  # noqa: F401
+          raw = distribution("invisible-core").read_text("direct_url.json")
+          got = (json.loads(raw).get("vcs_info") or {}).get("commit_id") if raw else None
+          print("core under test: %s from %s" % (version("invisible-core"), got or "the index"))
+          if not want or got != want:
+              sys.exit("THE CORE UNDER TEST IS NOT core_ref: installed %s from %s, core_ref %r is %s"
+                       % (version("invisible-core"), got or "the index", ref, want or "not a ref of invisible_core"))
+          PY
+      # The seal of the binary: INVISIBLE_SEAL_FILE makes the wrapper accept it ("substituted seal in effect"), and the switches keep the core at core_ref. FF, the
+      # binary of the main run, is the one the gate calls FF_EXE; every later step of the job reads these four.
+      - name: Seal of the binary under test
+        env:
+          SEAL_TAG: ${{ steps.build.outputs.seal_tag }}
+        run: |
+          export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
+          python -m invisible_core seal --binary "$FF_EXE" --tag "$SEAL_TAG" -o gate.seal.json
+          {
+            echo "INVISIBLE_CORE_AUTOFIX=off"
+            echo "INVISIBLE_CORE_PIN=allow"
+            echo "INVISIBLE_SEAL_FILE=$PWD/gate.seal.json"
+            echo "FF=$FF_EXE"
+            echo "INVPW_BINARY_PATH=$FF_EXE"
+            echo "STEALTHFOX_E2E_BINARY=$FF_EXE"
+          } >> "$GITHUB_ENV"
       # The GeoIP database made by the repository, as in e2e.yml (no download, the same bytes every run).
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
@@ -246,7 +322,10 @@ jobs:
             if [ "$ncores" -gt 0 ]; then state=RED; fi
             engine=$(grep -o 'exit code -\?[0-9]*' "$it/read.txt" | head -1)
             case "$engine" in *" -11") engine="$engine (SIGSEGV)";; esac
-            printf '%s\t%s\tpytest exit %s\t%s s\t%s\t%s cores\n' "$n" "$state" "$code" "$secs" "${engine:-no engine exit code in the message}" "$ncores" >> "$d/bg.tsv"
+            # Is there a datareporting/glean folder in the profile of the generation (the work dir of the test is under the basetemp of the iteration)?
+            glean=no-glean
+            for g in "$it"/base/generate*/profile/datareporting/glean; do if [ -d "$g" ]; then glean=glean; fi; done
+            printf '%s\t%s\tpytest exit %s\t%s s\t%s\t%s cores\t%s\n' "$n" "$state" "$code" "$secs" "${engine:-no engine exit code in the message}" "$ncores" "$glean" >> "$d/bg.tsv"
             if [ "$state" = RED ]; then
               echo "bg-$k iteration $n: RED, pytest exit $code, ${engine:-no engine exit code in the message}, $ncores core(s), $secs s, $node | $(grep -m1 '^FAIL\|^PROBLEM' "$it/read.txt" | cut -c1-300)" >> "$d/red.txt"
             else
@@ -317,6 +396,17 @@ jobs:
               bg_red=$((bg_red + 1)); sed 's/^/  RED leftover /' "$rd/bg-leftover-cores.txt" >> "$rd/bg-summary.txt"
             fi
             if [ "$bg_iters" -eq 0 ]; then bg_red=$((bg_red + 1)); echo "  RED no iteration of any loop ended in the round: not measured" >> "$rd/bg-summary.txt"; fi
+            # The line of the round: iterations, reds by engine exit code, cores with their gMozCrashReason, generate profiles with a glean folder.
+            local gl=0 codes crash
+            cat "$rd"/secstate-bg-*/bg.tsv 2>/dev/null | awk -F'\t' '$7=="glean"{n++} END{print n+0}' > "$rd/bg-glean.txt" || true
+            gl=$(cat "$rd/bg-glean.txt")
+            codes=$(cat "$rd"/secstate-bg-*/bg.tsv 2>/dev/null | awk -F'\t' '$2=="RED"{c[$5]++} END{for (k in c) printf "%s x%d; ", k, c[k]}' || true)
+            crash=$(find "$rd" -name '*.gdb.txt' 2>/dev/null | while read -r f; do printf '%s: ' "$(basename "$f")"; (grep -h -m2 -i 'MozCrashReason\|MOZ_CRASH\|RELEASE_ASSERT' "$f" | tr '\n' ' ' | cut -c1-200); echo; done || true)
+            {
+              echo "background generations: $bg_iters iterations, $bg_red red; reds by engine exit code: ${codes:-none}"
+              echo "cores of the round with their gMozCrashReason text: ${crash:-none}"
+              echo "glean folder present in $gl generate profiles"
+            } >> "$rd/bg-summary.txt"
           }
           # The run of the runner user, as e2e.yml runs it: Linux, the whole suite without the root and the sandbox files; Windows, the files of the part.
           run_main() {
@@ -430,6 +520,12 @@ jobs:
             tail -n +2 "$rd/round-read.txt"
             cat "$rd/bg-summary.txt"
           done
+          if [ "$bg_n" -gt 0 ]; then
+            {
+              echo ""
+              cat "$hunt"/round-*/secstate-bg-*/bg.tsv 2>/dev/null | awk -F'\t' '{n++; if ($2=="RED") {r++; c[$5]++}; if ($7=="glean") g++} END {printf "TOTAL background generations: %d, red %d (by engine exit code: ", n, r; for (k in c) printf "%s x%d; ", k, c[k]; printf "), glean folder present in %d generate profiles\n", g}' || true
+            } >> "$hunt/hunt-summary.md"
+          fi
           cat "$hunt/hunt-summary.md"
           # Red means FOUND, and also NOT MEASURED: a red round, or no round at all.
           finished=1
