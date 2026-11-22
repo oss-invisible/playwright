@@ -17,7 +17,7 @@ answers WHO, without changing what any test sees:
 
 THE RULE OF THIS MODULE: it never changes the outcome of a test. Every error is caught and becomes a line (a folder that cannot be read, a file that vanishes between its
 listing and its ``stat``, a system that is not Linux, a log that cannot be written); the fixture yields exactly once whatever happens; no folder is created, nothing is
-written but the log, fontconfig is not touched and ``HOME`` is not isolated (that would hide the read it is looking for).
+written but the log, fontconfig is not touched and this module does not isolate ``HOME`` (the fontconfig cache test does, for its own launches, and lists the runner's real home).
 """
 from __future__ import annotations
 

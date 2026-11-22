@@ -4,7 +4,7 @@ Why it exists. On a Linux e2e run the cold launch of ``test_the_warm_parent_read
 ``~/.fontconfig/`` of the runner's home (written by an earlier launch on that runner, which one is unknown) and wrote none under its own ``XDG_CACHE_HOME``. To know WHO writes
 ``~/.fontconfig`` and ``~/.cache/fontconfig``, ``tests/_fontconfig_caches.py`` writes, after each e2e module on Linux, one greppable line per cache file that is new or changed
 (``[fontconfig-caches] after <module>: new <path> mtime=<ISO, nanoseconds> size=<bytes>``), and the failure of that test carries the same listing. It never lists the folders
-by creating them, never touches fontconfig and never isolates ``HOME`` (that would hide the read it is looking for).
+by creating them, never touches fontconfig and does not isolate ``HOME`` (the fontconfig cache test does, for its own launches, and lists the runner's real home).
 
 What these tests hold. The helper is made to FAIL on purpose, and the test it wraps comes out the same:
 

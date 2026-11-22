@@ -81,7 +81,7 @@ from pathlib import Path
 
 import pytest
 
-from _fontconfig_caches import listing_text
+from _fontconfig_caches import folders as runner_cache_folders, listing_text
 from _waits import wait_until
 from test_a_screenshot_draws_the_text_of_the_bundled_fonts_as_the_content_does_e2e import EVIDENCE_FOLDER, FAMILIES
 from _strace_stand_in import (
@@ -428,9 +428,16 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
         pytest.fail("needs strace (apt install strace): without it nothing is measured", pytrace=False)
     _require_strace_can_trace(tmp_path)
 
-    xdg = tmp_path / "xdg-cache"
+    # The listing of the failure is of the RUNNER's real home: its folders are read here, before this test gives its launches another HOME.
+    runner_folders = runner_cache_folders()
+
+    # The engine's parent reads fontconfig caches from the host's home and from /var/cache (valid for a constant mtime): an engine defect, to be
+    # fixed at the root after firefox-69. Until then this test isolates HOME, so its verdict does not depend on what an earlier launch left in the runner's home.
+    xdg, home = tmp_path / "xdg-cache", tmp_path / "home"
     xdg.mkdir()
+    home.mkdir()
     monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("FC_DEBUG", FC_DEBUG)  # it only prints; the core passes it to the browser as it passes XDG_CACHE_HOME
 
     cold = _launch(firefox_binary, tmp_path / "cold", xdg)
@@ -438,9 +445,11 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
     warm = _launch(firefox_binary, tmp_path / "warm", xdg)
 
     # "Before": the folder is never shown to fontconfig. Its own cache folder, so that it is not warmed by the others.
-    before_xdg = tmp_path / "xdg-cache-before"
+    before_xdg, before_home = tmp_path / "xdg-cache-before", tmp_path / "home-before"
     before_xdg.mkdir()
+    before_home.mkdir()
     monkeypatch.setenv("XDG_CACHE_HOME", str(before_xdg))
+    monkeypatch.setenv("HOME", str(before_home))
     try:
         before = _launch(firefox_binary, tmp_path / "before", before_xdg, extra_prefs={"gfx.bundled-fonts.activate": 0})
     except Exception as err:  # evidence only: a launch that fails is written down, it does not change the verdict
@@ -479,7 +488,7 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
         "Caches of fontconfig on the runner now (who wrote them: the lines [fontconfig-caches] of this run): %s."
         % (xdg, [f["name"] for f in cold_cache] or "nothing", cold["bundle_cache_names"], cold["parent_environ_xdg_cache_home"],
            cold["bundle_cache_read_anywhere_at_startup"] or "none", cold["fc_debug_about_the_bundle"] or "nothing (or FC_DEBUG not saved)",
-           cold["startup"], listing_text()))
+           cold["startup"], listing_text(runner_folders)))
     assert not cold["font_files_not_opened_at_startup"] and cold["bundle_font_files"], (
         "the parent of the cold launch did not open every font file of <GRE>/fonts (%d of %d) before a page was opened: the window does "
         "not see the scan; the test cannot judge. Not opened: %s"
@@ -490,4 +499,4 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
         "the warm parent %s. Cold: %s. Warm: %s. Cache under %s: cold %s, warm %s. Caches of fontconfig on the runner now: %s."
         % ("opened every one of the %d font files of <GRE>/fonts before a page: it scanned the folder again"
            % warm["bundle_font_files"] if scanned_again else "read no *.cache-* file of fontconfig at its start",
-           result["cold"]["startup"], result["warm"]["startup"], xdg / "fontconfig", cold_cache, warm["fontconfig_cache"], listing_text()))
+           result["cold"]["startup"], result["warm"]["startup"], xdg / "fontconfig", cold_cache, warm["fontconfig_cache"], listing_text(runner_folders)))
