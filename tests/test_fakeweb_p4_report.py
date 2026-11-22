@@ -231,6 +231,89 @@ def test_the_site_records_what_the_report_reads_and_the_tracer_keeps_what_the_cl
     assert profile_p4.Tracer(Context()).events is None      # without --trace nothing is kept
 
 
+# the pages the walk left before their noise was done (journey_site.pages_left_before_their_noise) --------------------------------------
+A, O = "http://127.0.0.1:1", "http://localhost:2"
+
+
+def _request(m, site, method, path, referer=None, status=200, ctype=None, step=1):
+    if ctype is None:
+        ctype = "text/html; charset=utf-8" if not path.startswith("/r?") else "text/css"
+    return {"ev": "request", "m_arrive": m, "site": site, "method": method, "path": path, "referer": referer, "status": status,
+            "ctype": ctype, "step": step}
+
+
+def _noise(m, site, path):
+    """The last stage of a page and its five woff2, from moment `m` on."""
+    referrer = (A + path) if site == 0 else (O + "/")
+    return [_request(m, 0, "GET", "/r?kind=css&id=ld3", referrer)] + [
+        _request(m + 0.01 * (k + 1), 1, "GET", "/r?kind=woff2&id=font", O + "/r?kind=fontcss&id=fc", ctype="font/woff2") for k in range(5)]
+
+
+def test_a_walk_that_leaves_every_page_after_its_noise_has_no_problem():
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/")] + _noise(2, 0, "/") + [_request(3, 0, "GET", "/account", status=302, ctype=None)]
+               + [_request(4, 0, "GET", "/signin?x=1")] + _noise(5, 0, "/signin?x=1")
+               + [_request(6, 1, "GET", "/partner/1")] + _noise(7, 1, "/partner/1")
+               + [_request(7.5, 0, "GET", "/download/1.txt", ctype="text/plain; charset=utf-8")]
+               + [_request(8, 0, "POST", "/signin")] + _noise(9, 0, "/signin"))
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == []
+
+
+def test_a_page_left_before_its_late_stylesheet_and_its_fonts_is_found():
+    """Step 15 of the walk as the network oracle saw it: the home page is left (the request of /account) before its last stage."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/", step=15), _request(1.1, 0, "GET", "/account", step=15)] + _noise(1.2, 0, "/")
+               + _noise(2, 0, "/account"))
+    left = journey_site.pages_left_before_their_noise(records, [A, O])
+    assert len(left) == 2 and all("GET A/ (step 15)" in line for line in left)
+    assert "ld3" in left[0] and "0 woff2" in left[1]
+
+
+def test_a_late_stylesheet_of_another_page_does_not_count_for_the_page():
+    """The referrer tells the pages apart: the stylesheet of the page left behind arrives while the next page is open."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/article/2")] + _noise(2, 0, "/article/2")[1:] + [_request(3, 0, "GET", "/article/3")]
+               + _noise(4, 0, "/article/3") + [_request(4.5, 0, "GET", "/r?kind=css&id=ld3", A + "/article/2")])
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == [
+        "GET A/article/2 (step 1): its stylesheet ld3 (referrer %s/article/2) had not arrived when the walk left the page" % A]
+
+
+def test_the_page_of_the_other_origin_counts_its_fonts_with_the_page_open_beside_it():
+    """The partner tab opens while the article is open: the stretch until the next navigation holds both pages, so ten woff2."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/article/2")] + _noise(2, 0, "/article/2") + [_request(3, 1, "GET", "/partner/2")]
+               + _noise(4, 1, "/partner/2")[:3] + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search"))
+    left = journey_site.pages_left_before_their_noise(records, [A, O])
+    assert left == ["GET A/article/2 (step 1), GET O/partner/2 (step 1): 7 woff2 had arrived when the walk left, 10 expected "
+                    "(5 @font-face per page)"]
+
+
+def test_the_site_keeps_the_referrer_and_the_type_of_every_answer_and_the_lab_can_make_the_last_stage_long():
+    import urllib.request
+
+    from fakeweb import journey_site
+
+    a, _o, stop = journey_site.start((0, 0), last_stage_ms=3000)
+    try:
+        page = urllib.request.urlopen(urllib.request.Request(a + "/", headers={"Referer": a + "/article/1"})).read().decode()
+        urllib.request.urlopen(a + "/r?kind=css&id=ld3").read()
+    finally:
+        stop()
+    home, css = [r for r in stop.state.records if r["ev"] == "request"]
+    assert (home["referer"], home["ctype"], css["referer"], css["ctype"]) == (a + "/article/1", "text/html; charset=utf-8", None, "text/css")
+    assert "LAST_MS=3000;" in page and "afterLoad(LAST_MS, () => {" in page and "/r?kind=css&id=ld3" in page
+    a, _o, stop = journey_site.start((0, 0))
+    try:
+        page = urllib.request.urlopen(a + "/").read().decode()
+    finally:
+        stop()
+    assert "LAST_MS=%d;" % journey_site.LAST_STAGE_MS in page and journey_site.LAST_STAGE_MS == 600
+
+
 # the workflow ------------------------------------------------------------------------------------------------------------
 WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb.yml").read_text(encoding="utf-8")
 

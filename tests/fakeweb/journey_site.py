@@ -19,8 +19,10 @@ Pages (A): /  /category/<name>[?sort=new|top]  /article/<id>  /search[?q=..]
 Both origins also serve /r?kind=.. (finite resources), /hold, /release, /stream, /jf/<kind> and POST /beacon.
 User: alice / secret.
 """
+import bisect
 import html
 import json
+import re
 import secrets
 import select
 import socket
@@ -42,6 +44,11 @@ CATEGORIES = ["world", "tech", "sport", "travel", "science", "culture"]
 WORDS = ["Harbour", "Orchard", "Signal", "Lantern", "Meadow", "Circuit", "Glacier", "Market",
          "Village", "Satellite", "Garden", "Bridge", "Compass", "Library", "Station"]
 PRELUDE = sites.PRELUDE
+#: When the last stage of the noise starts, in ms after `load` (the late DOM resources, the stylesheet `ld3` among them). A lab can make it
+#: longer (`start(last_stage_ms=...)`): a page the walk passes through is then left before that stage unless the walk waits for it.
+LAST_STAGE_MS = 600
+#: The weights of the five @font-face rules of the noise (the font stylesheet), one woff2 request each.
+FONT_WEIGHTS = (400, 500, 600, 700, 800)
 
 CSS = """
 body{font:16px/1.5 sans-serif;margin:0 auto;max-width:900px;padding:0 16px}
@@ -127,7 +134,7 @@ for (let i = 0; i < 3; i++) {
   document.body.appendChild(f);
 }
 // 8. late DOM resources
-afterLoad(600, () => {
+afterLoad(LAST_MS, () => {
   const im = document.createElement('img');
   im.src = O + '/r?kind=svg&id=ld1';
   document.body.appendChild(im);
@@ -173,8 +180,8 @@ def noise_script(ctx, park_until=None, park_keepalive_until=None):
         js += ("\nafterLoad(0, () => fetch(A + '/hold?id=kapark' + tok + '&until=%d', {keepalive: true}).catch(noop));\n"
                % park_keepalive_until)
     # Own <script> element: a failure in the noise cannot break the page's script.
-    return "<script>(function(){const A=%s,O=%s;\n%s\ntry{\n%s\n}catch(e){}\n})();</script>" % (
-        json.dumps(ctx.own), json.dumps(ctx.other), PRELUDE, js)
+    return "<script>(function(){const A=%s,O=%s,LAST_MS=%d;\n%s\ntry{\n%s\n}catch(e){}\n})();</script>" % (
+        json.dumps(ctx.own), json.dumps(ctx.other), ctx.last_ms, PRELUDE, js)
 
 
 JFRAME_JS = {
@@ -373,10 +380,12 @@ class State:
         self.walk = 0
         self.cond = threading.Condition()
         self.released = set()
+        self.last_stage_ms = LAST_STAGE_MS
         #: What the server itself saw, in order, for a test that saves it when it fails (`start(...)[2].state.records`; nothing else reads
         #: it): one `accept` per TCP connection and one `request` per request, with `time.perf_counter()` of this process as `m_*` (the
         #: scale of the client's log) and `time.time()` as `t_*`; for a held request (`/hold`) also when the hold began and ended, why
-        #: it ended, and when the server first saw the browser's end of the connection closed.
+        #: it ended, and when the server first saw the browser's end of the connection closed. Each request also keeps its `referer` and the
+        #: `ctype` of its answer (what `pages_left_before_their_noise` reads).
         self.records = []
 
     def note(self, record):
@@ -482,6 +491,7 @@ class Handler(BaseHTTPRequestHandler):
         rec = getattr(self, "_rec", None)
         if rec is not None:
             rec["status"] = code
+            rec["ctype"] = ctype
             rec["t_answer"] = round(time.time(), 4)
             rec["m_answer"] = round(time.perf_counter(), 6)
 
@@ -497,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
         rec = self._rec = state.note({
             "ev": "request", "t_arrive": round(time.time(), 4), "m_arrive": round(time.perf_counter(), 6), "site": self.server.idx,
             "peer": self.client_address[1], "method": self.command, "path": self.path, "walk": state.walk, "step": state.step,
-            "status": None, "t_answer": None, "m_answer": None, "t_done": None, "m_done": None, "error": None})
+            "referer": self.headers.get("Referer"), "ctype": None, "status": None, "t_answer": None, "m_answer": None, "t_done": None, "m_done": None, "error": None})
         try:
             fn()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
@@ -535,7 +545,8 @@ class Handler(BaseHTTPRequestHandler):
     def _ctx(self, q):
         st = self.server.state
         idx = self.server.idx
-        return SimpleNamespace(own=st.origins[idx], other=st.origins[1 - idx], noise=q.get("noise", ["1"])[0] != "0")
+        return SimpleNamespace(own=st.origins[idx], other=st.origins[1 - idx], noise=q.get("noise", ["1"])[0] != "0",
+                               last_ms=st.last_stage_ms)
 
     def _session_user(self):
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -688,9 +699,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(400, "text/plain", b"bad kind")
 
 
-def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_host="localhost"):
-    """Start both origins on daemon threads. Returns (origin_a, origin_o, stop)."""
+def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_host="localhost", last_stage_ms=LAST_STAGE_MS):
+    """Start both origins on daemon threads. Returns (origin_a, origin_o, stop). `last_stage_ms`: when the last stage of the noise
+    starts after `load` (LAST_STAGE_MS; a lab that tests the walk makes it longer)."""
     state = State()
+    state.last_stage_ms = int(last_stage_ms)
     servers = [Site((bind, p), Handler, i, state) for i, p in enumerate(ports)]
     state.origins = ["http://%s:%d" % (host, s.server_address[1]) for host, s in zip((public_host, other_host), servers)]
     for s in servers:
@@ -705,3 +718,50 @@ def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_h
     global STATE
     STATE = state
     return state.origins[0], state.origins[1], stop
+
+
+# The server's record read back: did the walk leave a page before the noise of the page was done? ------------------------------------
+#: A navigation of a tab: a page, or a route that answers a form with a redirect. Not /download/ (the page stays where it is).
+NAVIGATION = re.compile(r"^/(?:$|\?|category/|article/|partner/|(?:search|signin|account|signout)(?:$|\?))")
+
+
+def _query(path):
+    return {k: v[0] for k, v in parse_qs(urlsplit(path).query).items()}
+
+
+def _name(page):
+    return "%s %s%s (step %s)" % (page["method"], "AO"[page["site"]], page["path"], page["step"])
+
+
+def pages_left_before_their_noise(records, origins):
+    """The pages of a walk whose noise had not reached the server when the walk left them, from the server's own record (`State.records`,
+    `origins` = `State.origins`). Returns one line per problem (none: every page was left after its noise).
+
+    A page is an HTML answer to a navigation. The walk leaves a page of the site's tab (origin A) at its next navigation request to A; the
+    one page of the other origin (the partner tab) is closed before the walk's next navigation of A; the last page is left when the walk
+    ends. Before that moment the last stage of the page must have arrived: its stylesheet `ld3` with the page as its referrer (the whole URL
+    from a page of A; from the page of O only its origin, as a request to another origin carries), and the woff2 of its five @font-face
+    rules. Those all have the font stylesheet as their referrer, so they are counted per stretch that ends where the walk leaves: every
+    page that starts in a stretch brings five."""
+    requests = sorted((r for r in records if r.get("ev") == "request"), key=lambda r: r["m_arrive"])
+    navigations = [r for r in requests if NAVIGATION.match(r["path"])]
+    pages = [r for r in navigations if r.get("status") == 200 and (r.get("ctype") or "").startswith("text/html")]
+    leaves = [r["m_arrive"] for r in navigations if r["site"] == 0]
+    resources = [(r, _query(r["path"])) for r in requests if r["path"].startswith("/r?")]
+    late_css = [r for r, q in resources if q.get("kind") == "css" and q.get("id") == "ld3"]
+    fonts = [r["m_arrive"] for r, q in resources if q.get("kind") == "woff2"]
+    problems, stretches = [], {}
+    for page in pages:
+        i = bisect.bisect_right(leaves, page["m_arrive"])
+        left_at = leaves[i] if i < len(leaves) else float("inf")
+        referrer = origins[0] + page["path"] if page["site"] == 0 else origins[1] + "/"
+        if not any(r.get("referer") == referrer and page["m_arrive"] < r["m_arrive"] < left_at for r in late_css):
+            problems.append("%s: its stylesheet ld3 (referrer %s) had not arrived when the walk left the page" % (_name(page), referrer))
+        stretches.setdefault(left_at, []).append(page)
+    for left_at, group in stretches.items():
+        expected = len(FONT_WEIGHTS) * len(group)
+        arrived = sum(1 for m in fonts if group[0]["m_arrive"] < m < left_at)
+        if arrived < expected:
+            problems.append("%s: %d woff2 had arrived when the walk left, %d expected (%d @font-face per page)" % (
+                ", ".join(_name(p) for p in group), arrived, expected, len(FONT_WEIGHTS)))
+    return problems

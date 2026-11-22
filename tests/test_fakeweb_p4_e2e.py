@@ -6,6 +6,11 @@ succeed, and `networkidle` must come where stock Firefox has it: on every step e
 on purpose (declared in tests/fakeweb/pages.json under journey_p4; one of them holds a keepalive fetch, which the client must
 count as in flight). Stock Firefox itself is held to that declaration by scripts/run_fakeweb.py --profile p4, which also
 compares our engine with it field by field, step by step.
+
+The walk leaves a page (a click or a key that navigates, back or forward, closing a tab, the end of the walk) only once the page says
+its noise is done: the noise runs on timers after `load`, and a page left before its last stage sends a different set of requests in
+every run. The second test makes that last stage long (LONG_LAST_STAGE_MS after `load`) and reads the site's own record: every page's
+late stylesheet and its five woff2 must reach the site before the walk's next navigation.
 """
 from __future__ import annotations
 
@@ -21,6 +26,9 @@ from fakeweb import journey_site, profile_p4
 pytestmark = pytest.mark.e2e
 
 HERE = pathlib.Path(__file__).resolve().parent / "fakeweb"
+#: The last stage of the noise in the second test, in ms after `load`: far longer than the walk spends on a page it passes through
+#: (step 15 clicks Account as soon as the home page has loaded), so a walk that does not wait for the page leaves before that stage.
+LONG_LAST_STAGE_MS = 3000
 
 
 def _stock_client():
@@ -54,3 +62,29 @@ def test_the_journey_succeeds_on_every_step_and_idles_where_stock_does(firefox_b
         wrong = ["step %d (%s): %s" % (s["n"], s["name"], "idle, stock holds a request here" if s["idle"] else
                  "not idle, open: %s" % s["open_at_idle_end"]) for s in steps if s["idle"] != (s["n"] not in not_idle)]
         assert not wrong, "networkidle differs from the declared outcome of stock Firefox:\n  " + "\n  ".join(wrong)
+
+
+def test_the_journey_leaves_every_page_only_once_its_noise_is_done(firefox_binary):
+    """The last stage of every page's noise starts LONG_LAST_STAGE_MS after `load`. The site's own record must show, for every page of
+    the walk, its stylesheet `ld3` (with the page as its referrer) and the woff2 of its five @font-face rules arriving before the
+    walk's next navigation (journey_site.pages_left_before_their_noise). When it fails it saves, under
+    `invpw-evidence/fakeweb-journey-leaves-a-page-when-its-noise-is-done/`, `fakeweb-server-record.jsonl` (every request with its
+    referrer and the moment it arrived), `client-request-log.jsonl` and `cells.json` (each step's moments)."""
+    with FailureEvidence("fakeweb-journey-leaves-a-page-when-its-noise-is-done") as evidence:
+        origin_a, origin_o, stop = journey_site.start((0, 0), last_stage_ms=LONG_LAST_STAGE_MS)
+        evidence.watch_server(stop)
+        step_log = []
+        evidence.note_cells(step_log)
+        try:
+            evidence.arm()
+            steps = profile_p4.run_on_candidate(_stock_client(), firefox_binary, origin_a, origin_o, 1,
+                                                client_log=evidence.client_log, step_log=step_log)
+        finally:
+            stop()
+        failed = ["step %d (%s): %s" % (s["n"], s["name"], s["error"]) for s in steps if not s["ok"]]
+        assert not failed, "steps that did not succeed:\n  " + "\n  ".join(failed)
+        with stop.state.lock:
+            records = list(stop.state.records)
+        assert any(r.get("ev") == "request" and r["path"] == "/" for r in records), "the site saw no walk"
+        left = journey_site.pages_left_before_their_noise(records, stop.state.origins)
+        assert not left, "pages the walk left before their noise was done:\n  " + "\n  ".join(left)
