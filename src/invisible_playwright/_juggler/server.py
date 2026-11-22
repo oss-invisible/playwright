@@ -47,7 +47,7 @@ from invisible_core.juggler import PageActs, popup_number
 from invisible_core.juggler import connection as juggler
 from invisible_core.juggler.actions import Actions
 from invisible_core.juggler.deadline import Deadline
-from . import _bindings, dialogs
+from . import _bindings, dialogs, perimeter
 from ._reaped import SessionRemoval
 from ._threads import ThreadStarterLease
 from .pointer import Pointer
@@ -674,6 +674,14 @@ def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
         return remote
     finally:
         argument.release()
+
+
+def _refuse_parameter(operation: str, parameter: str):
+    """Refuse one parameter of a served operation with the sentence `perimeter.REFUSED_PARAMETERS` holds for it.
+
+    ⛔ THE ONLY WAY A PARAMETER IS REFUSED, so that the inventory and the code cannot drift: the test of the refusals reads
+    every call of this function in the file and holds it to that table, both ways."""
+    raise ProtocolException(perimeter.parameter_refusal(operation, parameter))
 
 
 def _round_px(value: float) -> int:
@@ -4477,6 +4485,21 @@ class PageDispatcher(Dispatcher):
         # A clip the CALLER supplied is passed through untouched. Playwright
         # documents it in page coordinates, which is what the engine wants, so
         # there is nothing to translate.
+        # ⛔ WHAT STOCK DOES BY MODIFYING THE PAGE IS REFUSED, NOT IGNORED. `mask`, `style` and `animations="disabled"` change the
+        # page before the picture in Playwright; this server took them without reading them, and the picture came back as if they
+        # had not been written. `caret="initial"` asks for the text caret to be drawn, which the engine never does. `omitBackground`
+        # with png is Firefox's own `Not implemented` (stock reaches it only for png). The element's screenshot comes through here
+        # with the caller's parameters, so this is the one place; the sentences are `perimeter.REFUSED_PARAMETERS`'.
+        if params.get("mask"):
+            _refuse_parameter("screenshot", "mask")
+        if params.get("style"):
+            _refuse_parameter("screenshot", "style")
+        if params.get("animations") == "disabled":
+            _refuse_parameter("screenshot", "animations")
+        if params.get("caret") == "initial":
+            _refuse_parameter("screenshot", "caret")
+        if params.get("omitBackground") and params.get("type") != "jpeg":
+            _refuse_parameter("screenshot", "omitBackground")
         clip = params.get("clip")
         if not clip:
             box = self.injected.evaluate(
