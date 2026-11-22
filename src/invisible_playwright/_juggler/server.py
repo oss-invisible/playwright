@@ -66,6 +66,7 @@ from invisible_core.juggler.lifecycle import Lifecycle
 # from HERE, and a move that breaks its callers to tidy a file is not a
 # tidy-up. One definition, two names to reach it. (The profile helpers and the
 # `user.js` writer are the core's since 0.30.0, and their tests are there.)
+from ._arguments import Argument, refuse_handles
 from ._marshal import (_js_number, _as_script, _button, _caller_timeout,
                        _console_text,
                        _deserialize, _guid_of,
@@ -463,14 +464,21 @@ _READ = "o => o"
 _ARRAY = "(...a) => a"
 
 
+def _object_lookup(dispatcher):
+    """The server's registry as a function of a guid, for the handles an argument names; None where there is no server to ask."""
+    return getattr(getattr(dispatcher, "server", None), "object", None)
+
+
 def _call_callers_function(injected: InjectedScript, context: str, function: str,
-                           receivers, params: Dict, *, by_value: bool) -> Dict:
+                           receivers, argument: Argument, *, by_value: bool) -> Dict:
     """`function(...receivers, arg)` in the caller's world: the argument goes
-    as a protocol value, never into a text."""
+    as a protocol value (or as the object the decoder made of it, see
+    `_arguments`), never into a text. `_CALL` is the same text whatever the
+    argument is: it is what the caller's code sees in `new Error().stack`."""
     return injected.call_raw(
         context, _CALL,
         [{"objectId": function}] + [{"objectId": r} for r in receivers]
-        + [{"value": _deserialize(params.get("arg"))}],
+        + [argument.call_argument()],
         by_value=by_value)
 
 
@@ -483,12 +491,18 @@ class _Predicate:
     each turn. A world that goes takes the function with it, and the next turn
     evaluates the script in the new one."""
 
-    def __init__(self, injected: InjectedScript, frame_id: str, params: Dict) -> None:
+    def __init__(self, injected: InjectedScript, frame_id: str, params: Dict, *,
+                 objects=None) -> None:
         self.injected = injected
         self.frame_id = frame_id
         self.params = params
+        self.objects = objects
         #: (context, objectId) of the function, in the world that made it.
         self.function: Optional[tuple] = None
+        #: The argument, decoded ONCE for the world the function lives in and
+        #: kept across the turns (stock parses its arguments once, too); a new
+        #: world has new objects, so a new one.
+        self.argument: Optional[Argument] = None
 
     def turn(self) -> Optional[Dict]:
         """The value as a RemoteObject when JavaScript judges it truthy, None
@@ -499,13 +513,17 @@ class _Predicate:
         try:
             if self.function is None or self.function[0] != context:
                 self.function = None
+                self._drop_argument()
                 remote = injected.evaluate_raw(
                     context, _as_script(self.params["expression"]))
                 if remote.get("type") != "function":
                     return self._judged(context, remote)
                 self.function = (context, remote["objectId"])
+            if self.argument is None:
+                self.argument = Argument(injected, context, self.frame_id,
+                                         self.params.get("arg"), self.objects)
             return self._judged(context, _call_callers_function(
-                injected, context, self.function[1], (), self.params,
+                injected, context, self.function[1], (), self.argument,
                 by_value=False))
         except ContextDestroyed:
             self.function = None
@@ -521,7 +539,13 @@ class _Predicate:
             self.injected.release(context, remote["objectId"])
         return None
 
+    def _drop_argument(self) -> None:
+        argument, self.argument = self.argument, None
+        if argument is not None:
+            argument.release()
+
     def release(self) -> None:
+        self._drop_argument()
         if self.function is not None:
             context, object_id = self.function
             self.function = None
@@ -529,7 +553,7 @@ class _Predicate:
 
 
 def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
-                      receivers=(), *, by_value: bool) -> Dict:
+                      receivers=(), *, by_value: bool, objects=None) -> Dict:
     """THE ONE PLACE the caller's code runs ([B340]), the way Playwright's
     utility script runs it: the caller's text is evaluated as a script in the
     caller's world (`_as_script`), and when what it produced is a function,
@@ -546,23 +570,32 @@ def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
     Sent once ([B285]): a world that goes under it is `ContextDestroyed`. The
     function's reference is released after its call, and an object read by
     value after the read, so a call leaves nothing behind in the page.
+
+    THE ARGUMENT IS READ BEFORE THE CODE RUNS, as Playwright's node side reads
+    it (`_arguments.Argument`): a handle that cannot be used is refused with
+    Playwright's own text and the caller's code never starts. `objects` is the
+    registry the handles are looked up in.
     """
     context = injected.caller_context(frame_id)
-    remote = injected.evaluate_raw(context, _as_script(params["expression"]))
-    if remote.get("type") == "function":
-        try:
-            return _call_callers_function(injected, context, remote["objectId"],
-                                          receivers, params, by_value=by_value)
-        finally:
-            injected.release(context, remote["objectId"])
-    if by_value and "objectId" in remote:
-        try:
-            return injected.call_raw(context, _READ,
-                                     [{"objectId": remote["objectId"]}],
-                                     by_value=True)
-        finally:
-            injected.release(context, remote["objectId"])
-    return remote
+    argument = Argument(injected, context, frame_id, params.get("arg"), objects)
+    try:
+        remote = injected.evaluate_raw(context, _as_script(params["expression"]))
+        if remote.get("type") == "function":
+            try:
+                return _call_callers_function(injected, context, remote["objectId"],
+                                              receivers, argument, by_value=by_value)
+            finally:
+                injected.release(context, remote["objectId"])
+        if by_value and "objectId" in remote:
+            try:
+                return injected.call_raw(context, _READ,
+                                         [{"objectId": remote["objectId"]}],
+                                         by_value=True)
+            finally:
+                injected.release(context, remote["objectId"])
+        return remote
+    finally:
+        argument.release()
 
 
 def _round_px(value: float) -> int:
@@ -607,9 +640,18 @@ class ElementHandleDispatcher(Dispatcher):
 
     def __init__(self, server, frame: "FrameDispatcher", object_id: str,
                  preview: str = "", *, world: str = "utility",
-                 remote: Optional[Dict] = None) -> None:
+                 remote: Optional[Dict] = None, node: bool = True,
+                 context: Optional[str] = None) -> None:
         self.frame = frame
         self.object_id = object_id
+        # ⛔ WHETHER THE UTILITY-WORLD OBJECT IS A NODE, and what a handle can
+        # be handed to the caller's code as. A node crosses worlds (`Page.
+        # adoptNode`); any other object of the utility world cannot, and the
+        # properties `get_property` and `get_property_list` make are of it.
+        # `context` is the caller's world a "caller" handle was born in: a
+        # handle of a world that has gone is not the caller's to use any more.
+        self.node = node
+        self.context = context
         # A caller-world PRIMITIVE has no objectId: its value is the engine's
         # RemoteObject, kept here so `json_value` can answer it [B324].
         self.remote = remote or {}
@@ -727,7 +769,7 @@ class ElementHandleDispatcher(Dispatcher):
         if self.world == "caller":
             return {"value": _serialize(_remote_value(_run_callers_code(
                 self.injected, self.frame.frame_id, params, [self.object_id],
-                by_value=True)))}
+                by_value=True, objects=_object_lookup(self))))}
         return {"value": _serialize(self.frame._call_on_elements(
             self.frame.frame_id, [self.object_id], params))}
 
@@ -760,7 +802,8 @@ class ElementHandleDispatcher(Dispatcher):
             self.frame.frame_id,
             "(injected, o, n) => o[n]",
             {"objectId": self.object_id}, params["name"], by_value=False)
-        handle = ElementHandleDispatcher(self.server, self.frame, object_id)
+        handle = ElementHandleDispatcher(self.server, self.frame, object_id,
+                                         node=False)
         return {"handle": handle.channel}
 
     def op_get_property_list(self, params: Dict) -> Any:
@@ -786,7 +829,8 @@ class ElementHandleDispatcher(Dispatcher):
             object_id = self.injected.call(
                 self.frame.frame_id, "(injected, o, n) => o[n]",
                 {"objectId": self.object_id}, name, by_value=False)
-            handle = ElementHandleDispatcher(self.server, self.frame, object_id)
+            handle = ElementHandleDispatcher(self.server, self.frame, object_id,
+                                             node=False)
             out.append({"name": name, "value": handle.channel})
         return {"properties": out}
 
@@ -1330,7 +1374,8 @@ class FrameDispatcher(Dispatcher):
         # sent once ([B285]).
         def attempt(deadline=None):
             return _remote_value(_run_callers_code(
-                self.injected, self.frame_id, params, by_value=True))
+                self.injected, self.frame_id, params, by_value=True,
+                objects=_object_lookup(self)))
         if params.get("repeatable") is True:
             return {"value": _serialize(self.injected.in_current_world(
                 attempt, timeout=30.0))}
@@ -1636,6 +1681,11 @@ class FrameDispatcher(Dispatcher):
         # and the message names a field the caller never wrote. Nothing to do
         # with frames: it failed on the main frame too, and only an iframe test
         # happened to exercise it.
+        # ⛔ A HANDLE IN THE INIT IS REFUSED, NOT SENT AS null: the event is built
+        # in the utility world by the core, where the handle's object does not
+        # exist (stock takes it to the page's own world).
+        refuse_handles(params.get("eventInit"), "dispatch_event's eventInit",
+                       "the utility world, through the core")
         self.actions.dispatch_event(
             selector, params["type"],
             _deserialize(params.get("eventInit")) or {},
@@ -1741,7 +1791,8 @@ class FrameDispatcher(Dispatcher):
                     by_value=False)["objectId"]
                 receivers = [array]
             return _remote_value(_run_callers_code(
-                self.injected, frame_id, params, receivers, by_value=True))
+                self.injected, frame_id, params, receivers, by_value=True,
+                objects=_object_lookup(self)))
         finally:
             if array:
                 self.injected.release(context, array)
@@ -1768,8 +1819,9 @@ class FrameDispatcher(Dispatcher):
                     "the node the expression returned could not be handed back")
             self.injected.release(self.injected.caller_context(self.frame_id), object_id)
             return ElementHandleDispatcher(self.server, self, adopted)
-        return ElementHandleDispatcher(self.server, self, object_id or "",
-                                       world="caller", remote=remote)
+        return ElementHandleDispatcher(
+            self.server, self, object_id or "", world="caller", remote=remote,
+            context=self.injected.caller_context(self.frame_id) if object_id else None)
 
     def op_wait_for_function(self, params: Dict) -> Any:
         """Poll the CALLER'S expression until it is truthy.
@@ -1794,7 +1846,8 @@ class FrameDispatcher(Dispatcher):
         """
         deadline = Deadline(self._timeout(params))
         expression = params["expression"]
-        predicate = _Predicate(self.injected, self.frame_id, params)
+        predicate = _Predicate(self.injected, self.frame_id, params,
+                               objects=_object_lookup(self))
         while True:
             # ⛔ A NAVIGATION DOES NOT END THE POLL. Each turn is one command
             # (the caller's code is never sent twice, [B285]), and a world that
@@ -2005,6 +2058,8 @@ class FrameDispatcher(Dispatcher):
             frame_id, sel = self.frame_id, None
         options = {k: params[k] for k in self._EXPECT_OPTIONS if k in params}
         if params.get("expectedValue") is not None:
+            refuse_handles(params["expectedValue"], "expect's expectedValue",
+                           "the utility world, through the core")
             options["expectedValue"] = _deserialize(params["expectedValue"])
         return self.injected.call(frame_id, self._EXPECT, sel, options) or {
             "matches": False, "missingReceived": True}
@@ -2239,7 +2294,7 @@ class FrameDispatcher(Dispatcher):
 
     def op_evaluate_handle(self, params: Dict) -> Any:
         remote = _run_callers_code(self.injected, self.frame_id, params,
-                                   by_value=False)
+                                   by_value=False, objects=_object_lookup(self))
         return {"handle": self._handle_from_caller(remote).channel}
 
 
@@ -2774,18 +2829,39 @@ class BindingCallDispatcher(Dispatcher):
 
     @staticmethod
     def _deliver(page: "PageDispatcher", context_id: str, native: str, seq: int, ok: bool, value: Any) -> None:
+        """`value` is a plain JSON value, or the `Argument` of an answer."""
         end = page._binding_ends.get((context_id, native))
         if end is None:
             return          # the document left (or never handed its end over): nobody is waiting
         try:
+            answer = value.call_argument() if isinstance(value, Argument) else {"value": value}
             page.injected.call_raw(context_id, _bindings.DELIVER,
-                                   [{"objectId": end}, {"value": seq}, {"value": ok}, {"value": value}],
+                                   [{"objectId": end}, {"value": seq}, {"value": ok}, answer],
                                    by_value=True, timeout=10.0)
         except Exception:
             pass            # the document left: nobody is waiting for the answer
 
     def op_resolve(self, params: Dict) -> Any:
-        self._deliver(self.page, self.context_id, self.native, self.seq, True, _deserialize(params.get("result")))
+        """The answer goes to the page the way Playwright's goes: through `parseEvaluationResultValue`, so a Date is a Date and a NaN is a NaN
+        (`_arguments.Argument`), in the context the call came from.
+
+        ⛔ AN ANSWER THIS CANNOT DELIVER REJECTS THE PAGE'S PROMISE WITH THE REASON, and does not leave it waiting for ever: a JSHandle (its
+        object lives in the caller's world, the answer is read in the page's own) or a BigInt that is the whole answer."""
+        argument = None
+        try:
+            argument = Argument(self.page.injected, self.context_id, None, params.get("result"),
+                                what="result", handles_allowed=False)
+            argument.call_argument()
+        except Exception as failure:
+            if argument is not None:
+                argument.release()
+            self._deliver(self.page, self.context_id, self.native, self.seq, False, str(failure) or "binding failed")
+            self.dispose()
+            return None
+        try:
+            self._deliver(self.page, self.context_id, self.native, self.seq, True, argument)
+        finally:
+            argument.release()
         self.dispose()
         return None
 
