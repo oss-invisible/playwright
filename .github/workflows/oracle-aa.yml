@@ -1,0 +1,164 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# oracle-aa.yml - the A/A of the page A/B oracle on the PUBLISHED engine, on a POISONED host, on this branch only.
+#
+# A measurement, not a gate: before the poisoned host (scripts/ci_poison_host.py) and the ab. leaves (the extra visit of every realm a page can make, on seeds 0 and 63) enter a
+# candidate, the published engine must repeat itself on them with ZERO differences, on GitHub, on Linux and on Windows, and must read none of the poison. There is no candidate here:
+# INVISIBLE_SEAL_FILE is not set, so tests/test_ab_oracle_e2e.py runs its A/A mode, and its verdict is the pytest result: the same test the gate's leg runs (it reads
+# AB_ORACLE_POISON and holds the dumps to the identity the core declares), the same file, the same assertions.
+#
+# Runs on a push to the branch below and nowhere else (not a pull request, not main): the file leaves with the branch, and e2e.yml is not touched.
+#
+# One run per system, the two at once (`max-parallel: 2`), in the order the gate's leg has them:
+#   1. the CLEAN dump of the published engine on the runner as it is (ci_ab_oracle.py clean: poison-clean-68.json), the by-product the test compares with the poisoned dump
+#      (poison-host-dependence-68.json: a finding about the published engine, never a verdict);
+#   2. the poison goes on (ci_poison_host.py apply: time zone of Lima, ja-JP, dark scheme, the canary font ZZHostCanary and, on Linux, the null sink at 96 kHz with 6 channels
+#      as the default, H10) and is verified;
+#   3. the NEGATIVE CONTROL: Playwright's own Firefox on the same runner reads the poison (poison-control.json), or the test is red on a broken control;
+#   4. the test, on the five seeds of the candidate set (AB_ORACLE_PR_SEEDS=5, so seed 63 and its ab. leaves are visited: the default of a pull request is two), under xvfb on Linux;
+#   5. the poison comes off (always), before everything that reads the result.
+# The ab. leaves are in the dumps of every run (ab-control.json is the test's own count of them), so Linux covers them and the null sink, and Windows the rest.
+#
+# Time: the test's own guard (tests/test_ab_oracle_e2e.py, TIMEOUT_S) is 40 minutes, plus 2 of thread guard. The test step ends at 45, the clean dump at 20 (one engine run of five
+# seeds), the control at 8, the job at 100 (setup is 5 to 10 minutes). Expected: about 35 to 45 minutes a run, the two at the same time.
+#
+# No cache is written (no cache action, no setup-python cache): every run installs and fetches from scratch, as the e2e jobs do.
+# ─────────────────────────────────────────────────────────────────────────────
+name: oracle-aa
+
+on:
+  push:
+    branches: [tests/ab-page-h2h3]
+
+permissions:
+  contents: read
+
+# A push while a run is going waits for it (a measurement is not cancelled half way); of the ones waiting only the newest stays.
+concurrency:
+  group: oracle-aa-${{ github.ref }}
+  cancel-in-progress: false
+
+# Engine and GeoIP downloads go through the release API with this token (the same reason as e2e.yml).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  # The install below resolves `invisible-core==N.M.0` from the package index: the same gate as e2e.yml, so that a core that is not on the index yet skips the runs with the reason
+  # in the summary instead of failing them.
+  core-on-index:
+    uses: ./.github/workflows/core-on-index.yml
+
+  page-aa-poisoned:
+    name: page oracle A/A, poisoned host (${{ matrix.system }})
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - { system: linux, runs_on: ubuntu-24.04 }
+          - { system: windows, runs_on: windows-2022 }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      # Where the oracle's files go (the test's own default on a runner): the clean dump, the state of the poison and its control are kept beside them, so that the one
+      # directory is uploaded. (`runner.temp` is not a context of a job's `env`, so the variable is made here.)
+      - name: Where the oracle's files go
+        run: echo "OUT=$RUNNER_TEMP/invpw-evidence/ab-oracle" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: System deps (xvfb, Firefox runtime libs, and the poison's locale, fontconfig and PulseAudio)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb locales fontconfig pulseaudio pulseaudio-utils
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+          else
+            echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+          fi
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      # The negative control is Playwright's own Firefox (the pin of the wrapper): the libraries it loads are already installed on Linux by the step above.
+      - name: Playwright's own Firefox (the control of the poison)
+        run: python -m playwright install firefox
+      # The CLEAN dump, before the poison: the published engine on this runner as it is, on the seeds of the test's own run. A finding, never a verdict: a clean dump that fails does
+      # not stop the run, the summary says it is missing.
+      - name: The clean dump of the published engine (before the poison)
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mkdir -p "$OUT"
+          LEG=linux-x86_64; if [ "$RUNNER_OS" = Windows ]; then LEG=win-x86_64; fi
+          python -u scripts/ci_ab_oracle.py clean --leg "$LEG" --out "$OUT" --limit 5
+      - name: The poisoned host
+        run: python scripts/ci_poison_host.py apply --state "$OUT/poison-state.json"
+      - name: The negative control (stock Firefox of Playwright reads the poison)
+        if: env.AB_ORACLE_POISON == '1'
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          PREFIX=""
+          if [ "$RUNNER_OS" = Linux ]; then PREFIX="xvfb-run -a"; fi
+          $PREFIX python -u scripts/ci_poison_host.py control --out "$OUT/poison-control.json"
+      - name: Run the page oracle A/A on the poisoned host
+        timeout-minutes: 45
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_ORACLE_PR_SEEDS: "5"
+        run: |
+          PREFIX=""
+          if [ "$RUNNER_OS" = Linux ]; then PREFIX="xvfb-run -a"; fi
+          $PREFIX env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-aa-e2e.xml"
+          python - "$RUNNER_TEMP/page-aa-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      # The poison comes off right after the test and before everything that reads its result: those steps run on the host as it was.
+      - name: Take the poison off
+        if: always() && env.AB_ORACLE_POISON_STATE != ''
+        run: python scripts/ci_poison_host.py undo --state "$AB_ORACLE_POISON_STATE"
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      # The evidence whatever the verdict, under invpw-evidence/ab-oracle: both dumps of the engine, the clean one, the diff of the control, ab-control.json,
+      # poison-control.json, poison-host-dependence-68.json, the state of the poison and the oracle's log; and the junit of the run.
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oracle-aa-poisoned-${{ matrix.system }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-aa-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
