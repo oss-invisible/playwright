@@ -15,6 +15,7 @@ import inspect
 import json
 import shutil
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -2591,3 +2592,264 @@ def test_another_alternate_stream_is_a_path_of_its_own(tmp_path):
     xml = tmp_path / "other.xml"
     xml.write_text(etw(*[(100, n) for n in names]), encoding="utf-8")
     assert host.etw_files(xml, {100})[0] == {(100, n) for n in names}
+
+
+# -
+# The real lines of run 45060573559 (engine candidate, built with a wrapper without the fixes above), as data: the Windows A/A (job 137346793388) and the Linux A/B (job 137346793511).
+
+def bs(paths):
+    """The paths of the data below, written with `/`, as Windows spells them."""
+    return [p.replace("/", chr(92)) for p in paths]
+
+
+#: The 13 paths of the red of the Windows A/A "the system modules only run A has in its measured launches are 13, more than 5": every one is `<file>:wofcompresseddata`, only in the
+#: warm-up of the first run of the 68 (7 of a resource file or a catalog, 6 of a library).
+WIN_STREAMS = bs([
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package011~31bf3856ad364e35~amd64~~10.0.26100.1742.cat:wofcompresseddata",
+    "c:/windows/system32/en-us/avrt.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/networkexplorer.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/powrprof.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/windows.applicationmodel.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/windows.system.launcher.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/wpnapps.dll.mui:wofcompresseddata",
+    "c:/windows/system32/evr.dll:wofcompresseddata",
+    "c:/windows/system32/mfperfhelper.dll:wofcompresseddata",
+    "c:/windows/system32/mp3dmod.dll:wofcompresseddata",
+    "c:/windows/system32/msauddecmft.dll:wofcompresseddata",
+    "c:/windows/system32/msdmo.dll:wofcompresseddata",
+    "c:/windows/system32/msmpeg2vdec.dll:wofcompresseddata",
+])
+#: The plain paths that same warm-up has and the second run does not: the files of 7 of the 13 above, and 10 more (13 resource files and 4 catalogs in all).
+WIN_ONLY_A = bs([
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package011~31bf3856ad364e35~amd64~~10.0.26100.1742.cat",
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package012~31bf3856ad364e35~amd64~~10.0.26100.33828.cat",
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package013~31bf3856ad364e35~amd64~~10.0.26100.33828.cat",
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package03~31bf3856ad364e35~amd64~~10.0.26100.33828.cat",
+    "c:/windows/system32/en-us/avrt.dll.mui",
+    "c:/windows/system32/en-us/explorerframe.dll.mui",
+    "c:/windows/system32/en-us/fwpuclnt.dll.mui",
+    "c:/windows/system32/en-us/iertutil.dll.mui",
+    "c:/windows/system32/en-us/mmdevapi.dll.mui",
+    "c:/windows/system32/en-us/mscms.dll.mui",
+    "c:/windows/system32/en-us/networkexplorer.dll.mui",
+    "c:/windows/system32/en-us/powrprof.dll.mui",
+    "c:/windows/system32/en-us/setupapi.dll.mui",
+    "c:/windows/system32/en-us/urlmon.dll.mui",
+    "c:/windows/system32/en-us/windows.applicationmodel.dll.mui",
+    "c:/windows/system32/en-us/windows.system.launcher.dll.mui",
+    "c:/windows/system32/en-us/wpnapps.dll.mui",
+])
+#: The libraries of those resource files (in both runs, but networkexplorer.dll, which only the first has; three of them are in a long launch) and the 6 libraries the streams belong to.
+WIN_LIBS = bs([
+    "c:/windows/system32/avrt.dll",
+    "c:/windows/system32/explorerframe.dll",
+    "c:/windows/system32/fwpuclnt.dll",
+    "c:/windows/system32/iertutil.dll",
+    "c:/windows/system32/mmdevapi.dll",
+    "c:/windows/system32/mscms.dll",
+    "c:/windows/system32/networkexplorer.dll",
+    "c:/windows/system32/powrprof.dll",
+    "c:/windows/system32/setupapi.dll",
+    "c:/windows/system32/urlmon.dll",
+    "c:/windows/system32/windows.applicationmodel.dll",
+    "c:/windows/system32/windows.system.launcher.dll",
+    "c:/windows/system32/wpnapps.dll",
+])
+WIN_LIBS_LATE = bs(["c:/windows/system32/networkexplorer.dll", "c:/windows/system32/iertutil.dll", "c:/windows/system32/urlmon.dll"])
+WIN_STREAM_LIBS = bs([
+    "c:/windows/system32/evr.dll",
+    "c:/windows/system32/mfperfhelper.dll",
+    "c:/windows/system32/mp3dmod.dll",
+    "c:/windows/system32/msauddecmft.dll",
+    "c:/windows/system32/msdmo.dll",
+    "c:/windows/system32/msmpeg2vdec.dll",
+])
+
+
+def etw_names(tmp_path, name, names):
+    """What the oracle reads of one launch: the names of the file events of an ETW export, through `etw_files` (where a WOF stream becomes its file), sorted."""
+    xml = tmp_path / name
+    xml.write_text(etw(*[(100, n) for n in names]), encoding="utf-8")
+    return sorted({n for _pid, n in host.etw_files(xml, {100})[0]})
+
+
+def real_win_runs(tmp_path):
+    """The two runs of the 68 of the A/A as the oracle reads them (the footprint of each launch is what `etw_files` returns): run A has the stream variants and the plain paths in its
+    warm-up, run B the plain libraries only. Returns the run A, the run B and the warm-up of A."""
+    first = [p for p in WIN_LIBS if p not in WIN_LIBS_LATE]
+    a_warm = etw_names(tmp_path, "a_warm.xml", WIN_STREAMS + WIN_ONLY_A + first + WIN_STREAM_LIBS)
+    a_idle = etw_names(tmp_path, "a_idle.xml", WIN_LIBS_LATE)
+    b_warm = etw_names(tmp_path, "b_warm.xml", first + WIN_STREAM_LIBS)
+    b_idle = etw_names(tmp_path, "b_idle.xml", [p for p in WIN_LIBS_LATE if not p.endswith("networkexplorer.dll")])
+    return with_system(win(), {"warmup": a_warm, "idle": a_idle}), with_system(win("again"), {"warmup": b_warm, "idle": b_idle}), a_warm
+
+
+def test_the_13_wof_streams_of_run_45060573559_are_their_files_and_the_a_a_has_no_problem(tmp_path):
+    a, b, a_warm = real_win_runs(tmp_path)
+    assert len(WIN_STREAMS) == 13 and not any(p.endswith(host.WOF_STREAM) for p in a_warm), "no stream is left in the footprint of the run"
+    assert all(host.wof_base(p) in a_warm for p in WIN_STREAMS), "each of the 13 is a file the run has"
+    report = judge(a, b, a_a=True)
+    assert report["problems"] == [] and report["verdict"] == "green" and report["differences"] == []
+    counts = report["system_modules"]["counts"]["measured"]
+    assert counts["A"] == {"counted": 0, "mui_excused": 13, "cat_excused": 4, "orphans": 0} and counts["B"]["counted"] == 0
+    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": []}, "none of the 13 is rare: the 6 libraries are in both runs, the 7 others are the excused files"
+
+
+def test_the_same_13_streams_are_red_without_the_mapping_of_a_stream_to_its_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(host, "wof_base", lambda name: name)
+    a, b, a_warm = real_win_runs(tmp_path)
+    assert [p for p in a_warm if p.endswith(host.WOF_STREAM)] == sorted(WIN_STREAMS)
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "red" and report["system_modules"]["rare"]["measured"]["A"] == sorted(WIN_STREAMS), "the real 13"
+    assert len(report["problems"]) == 1 and "the system modules only run A has in its measured launches are 13, more than 5: the class is growing" in report["problems"][0]
+
+
+# -
+# Linux: the 45 differences of the A/B (5 seeds, 9 each): 15 of the probe gfxtest, 30 of where the two engines were installed.
+
+#: The DIFF lines of the job as the oracle printed them. The root of the runner's checkout is a neutral one here (the structure is kept: `/home` is `/srv`, `/home/<user>/work` is
+#: `/srv/ci/work`), because the disclosure scanner refuses local paths.
+REAL_AB_LINES = """
+seed 0 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 0 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 0 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 0 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 0 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 2 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 2 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 2 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 2 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 2 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 4 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 4 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 4 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 4 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 4 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 6 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 6 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 6 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 6 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 6 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 63 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 63 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 63 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 63 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 63 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+""".strip().splitlines()
+
+REAL_LINE = re.compile(r'^seed (\d+) ((?:file|proc)\.\S+): firefox-68 ("<missing>"|\d+) \| candidate ("<missing>"|\d+) \(by A: (.*?) \| B: (.*?)(?:, via (\w+))?\)$')
+NO_PROBE = {k: n for k, n in KINDS.items() if k != "gfxtest"}
+
+
+def real_ab_entries():
+    """The 45 lines as {seed, leaf, a, b, by: {A, B}, via}."""
+    out = []
+    for line in REAL_AB_LINES:
+        m = REAL_LINE.match(line)
+        assert m, line
+        seed, leaf, a, b, by_a, by_b, via = m.groups()
+        value = lambda v: host.MISSING if v == '"<missing>"' else int(v)
+        names = lambda text: [] if text == "-" else text.split(", ")
+        out.append({"seed": int(seed), "leaf": leaf, "a": value(a), "b": value(b), "by": {"A": names(by_a), "B": names(by_b)}, "via": via})
+    return out
+
+
+def is_gfx(entry):
+    return entry["leaf"] in ("proc.gfxtest", "file./sys/bus/pci", "file./sys/bus/pci/")
+
+
+def real_ab_footprints(entries):
+    """The footprints of the 68 and of the candidate: the seeds of `entries`, the same base in both, and where a line says one side has a leaf, that side has it (with who touched it
+    and the call, or who spawned it)."""
+    seeds = sorted({e["seed"] for e in entries})
+    a = {"format": host.FORMAT, "engine": "firefox-68", "platform": "linux", "problems": [], "seeds": [seed_footprint(s, kinds=KINDS) for s in seeds]}
+    b = {"format": host.FORMAT, "engine": "candidate", "platform": "linux", "problems": [], "seeds": [seed_footprint(s, kinds=NO_PROBE) for s in seeds]}
+    for e in entries:
+        for side, fp, value in (("A", a, e["a"]), ("B", b, e["b"])):
+            if value == host.MISSING:
+                continue
+            seed = next(s for s in fp["seeds"] if s["seed"] == e["seed"])
+            category, _dot, name = e["leaf"].partition(".")
+            if category == "proc":
+                seed["spawned_by"] = dict(seed.get("spawned_by", {}), **{name: e["by"][side]})
+            else:
+                seed["files"] = seed["files"] + [name]
+                seed["touched_by"] = dict(seed.get("touched_by", {}), **{name: e["by"][side]})
+                seed["touched_calls"] = dict(seed.get("touched_calls", {}), **{name: [e["via"]]})
+    return a, b
+
+
+LOOSE = {"proc": 1, "file": 1}
+
+
+def test_the_45_real_lines_are_5_seeds_by_15_of_the_probe_and_30_of_the_install_and_the_footprints_built_from_them_give_them_back():
+    entries = real_ab_entries()
+    assert len(entries) == 45 and {e["seed"] for e in entries} == {0, 2, 4, 6, 63}
+    assert sum(is_gfx(e) for e in entries) == 15 and sum(not is_gfx(e) for e in entries) == 30
+    a, b = real_ab_footprints(entries)
+    report = judge(a, b, expected=[], floors=LOOSE)
+    got = sorted((d["seed"], d["leaf"], d["a"], d["b"], d["by"]["A"], d["by"]["B"]) for d in report["differences"])
+    assert got == sorted((e["seed"], e["leaf"], e["a"], e["b"], e["by"]["A"], e["by"]["B"]) for e in entries), "the same 45, nothing is normalised"
+
+
+def test_the_15_real_gfxtest_lines_are_covered_by_the_declared_entry_and_the_entry_is_not_stale():
+    entries = [e for e in real_ab_entries() if is_gfx(e)]
+    assert len(entries) == 15 and sorted({e["leaf"] for e in entries}) == ["file./sys/bus/pci", "file./sys/bus/pci/", "proc.gfxtest"]
+    assert all(e["by"] == {"A": ["gfxtest"], "B": []} for e in entries if e["leaf"].startswith("file.")) and all(e["a"] == 1 and e["b"] == host.MISSING for e in entries)
+    a, b = real_ab_footprints(entries)
+    report = judge(a, b, expected=expected(), floors=LOOSE)
+    assert report["verdict"] == "green", report["problems"]
+    assert report["differences"] == [] and report["stale"] == [] and {d["id"] for d in report["declared"]} == {"gfxtest-69"}
+    assert sorted((d["seed"], d["leaf"]) for d in report["declared"]) == sorted((e["seed"], e["leaf"]) for e in entries), "all 15, none more"
+    assert len(judge(a, b, expected=[], floors=LOOSE)["differences"]) == 15, "without the entry they are red"
+
+
+def test_the_30_real_install_lines_are_red_from_two_roots_and_gone_when_both_engines_run_from_the_staged_folder(monkeypatch):
+    """The fix is at the source: every engine is run from `stage_dir()`, so the links read of its ancestors are the same leaves in both runs. The comparison is as strict as it was: the
+    footprints of two different roots still give the 30; each engine run from the staged folder is the footprint of the same ancestors in both, and nothing is left."""
+    monkeypatch.setenv("RUNNER_TEMP", "/srv/ci/work/_temp")
+    entries = [e for e in real_ab_entries() if not is_gfx(e)]
+    assert len(entries) == 30
+    a, b = real_ab_footprints(entries)
+    red = judge(a, b, expected=expected(), floors=LOOSE)
+    assert red["verdict"] == "red" and len(red["differences"]) == 30 and len(red["declared"]) == 5, "from two roots they are still red (the probe is declared, the 5 seeds of it)"
+    stage = Path(host.stage_dir().as_posix())
+    ancestors = [p.as_posix() for p in stage.parents if p.as_posix() not in ("/", ".")]
+    assert ancestors == ["/srv/ci/work/_temp/ab-host/engine", "/srv/ci/work/_temp/ab-host", "/srv/ci/work/_temp", "/srv/ci/work", "/srv/ci", "/srv"]
+    install = {e["leaf"][len("file."):] for e in entries}
+    for side, fp in (("A", a), ("B", b)):
+        for seed in fp["seeds"]:
+            by = next(e["by"][side] for e in entries if e["seed"] == seed["seed"] and e["by"][side])
+            seed["files"] = [p for p in seed["files"] if p not in install] + ancestors
+            seed["touched_by"] = dict({p: v for p, v in seed.get("touched_by", {}).items() if p not in install}, **{p: by for p in ancestors})
+            seed["touched_calls"] = dict({p: v for p, v in seed.get("touched_calls", {}).items() if p not in install}, **{p: ["readlink"] for p in ancestors})
+    staged = judge(a, b, expected=expected(), floors=LOOSE)
+    assert staged["verdict"] == "green" and staged["differences"] == [] and staged["problems"] == [], "no difference left"
+    assert len(entries) + sum(is_gfx(e) for e in real_ab_entries()) == len(real_ab_entries()) == 45
+
+
+def test_a_staged_ancestor_that_only_one_run_read_is_still_a_difference(monkeypatch):
+    monkeypatch.setenv("RUNNER_TEMP", "/srv/ci/work/_temp")
+    a = with_files(footprint(), ["/srv/ci/work/_temp"], {"/srv/ci/work/_temp": ["forkserver"]}, {"/srv/ci/work/_temp": ["readlink"]})
+    report = judge(a, footprint("candidate"), expected=[])
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./srv/ci/work/_temp"}

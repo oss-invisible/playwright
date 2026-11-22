@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.1] - 2026-11-22
+
+### Fixed
+- A read that waits for its element (`inner_text`, `text_content`, `get_attribute` and the others) and runs out of time now always fails with
+  Playwright's own `Timeout Nms exceeded`. On Windows it could fail with the engine connection's `no response in 0s` instead, when the last
+  probe ran out of the caller's time a moment before the clock said so.
+
 ## [0.58.0] - 2026-11-21
 
 ### Changed

@@ -33,11 +33,23 @@ answer as the service; the plain-HTTP endpoint ``api.ipify.org:80`` is still
 answered here for the tests that ask it), and the UDP exit is what the fake STUN server puts in its XOR-MAPPED-ADDRESS.
 Both are chosen by the test (``tcp_exit`` and ``udp_exit`` arguments).
 
-Any other CONNECT is really forwarded, and any other UDP datagram is really
-forwarded to its destination and the reply wrapped back, so a page, or an echo
-server on 127.0.0.1, can be reached through the gateway and the test can
-observe which road its bytes took (:attr:`Gateway.connects`,
-:attr:`Gateway.datagrams`).
+HERMETIC: a gateway of this module carries a CONNECT or a datagram only to the LAB (:func:`is_lab_destination`: loopback, the
+documentation ranges of RFC 5737 and RFC 3849 the tests use as lab exits and servers, the addresses of this host's own interfaces, where a server
+of a test may stand, and the name ``localhost``). These tests run in the gate of the candidate, where no test may depend on a real service, and the
+browser behind a gateway makes background requests of its own (a name of the vendor, a captive-portal check, a telemetry endpoint): such a
+destination is REFUSED, never forwarded (a CONNECT is answered with reply 2, "not allowed"; a datagram is dropped), and RECORDED
+(:class:`LabGuard`: the time since the gateway started, the SOCKS5 address type, the destination as it was received - the NAME for type 3 -, the
+port, the protocol, ``tcp`` or ``udp``, and the REASON: which rule refused it, the lab's or the narrower one of a subclass). The interfaces of this
+host are read ONCE, when the guard is made (``psutil.net_if_addrs``, written once in the record with how they were read), and every decision of that
+guard is taken against that reading: a browser that retries a refused destination hundreds of times costs a list append each, not a reading of the
+host; a reading that fails RAISES (``_witness.HostInterfacesUnreadable``), it is never an empty list. The record is always written, when the gateway is closed, under
+``$RUNNER_TEMP/invpw-evidence/<gateway>/<pid>-<ms>/refused-destinations.json`` (the folder the e2e jobs upload; off a runner nothing is
+written), so that a reader sees what the browser asked for besides what the test drives. There is no option that reopens it. A subclass can only
+narrow it (:meth:`Gateway._admits`); the destinations it serves itself (the fake STUN server, the page of ``WEB_NAME``, the exit questions) are
+answered before it, and a name mapped to a local server by :meth:`Gateway._target` is judged by the server it maps to. What a test sees of the
+road is :attr:`Gateway.connects`, :attr:`Gateway.datagrams` (every datagram the relay read, carried or dropped) and
+:attr:`Gateway.guard`. :class:`Socks5TcpOnly` and the SOCKS5 server of ``test_proxy_socks_auth_e2e.py`` are hermetic the same way (same rule,
+same record).
 
 This is the ONE SOCKS5 gateway of the test suite. A road that needs more than the three above (a TURN server, a resolver,
 a page, by NAME: ``tests/_turn_chain.py``) subclasses :class:`Gateway` and overrides the small hooks (:meth:`Gateway._route`,
@@ -46,7 +58,10 @@ ASSOCIATE, the relay or the round trip.
 """
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
+import pathlib
 import select
 import socket
 import struct
@@ -55,7 +70,7 @@ import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 #: The name the product's STUN probe sends through the relay. The relay maps it
-#: to the fake STUN server; every other destination is forwarded for real.
+#: to the fake STUN server; every other destination is the lab's to carry or is refused (``LabGuard``).
 STUN_NAME = "stun.l.google.com"
 STUN_PORT = 19302
 #: The same STUN server by NUMBER. A page cannot resolve a name behind the session (the engine forbids local
@@ -79,19 +94,18 @@ _MAGIC = b"\x21\x12\xa4\x42"
 
 
 # ----------------------------------------------------------------------------------------------------------------
-#  The exit of a proxy that forwards for real. The question "where do I leave from" is HTTPS (api.ipify.org:443), and no gateway
-#  of the tests can answer a TLS request as the service: a proxy that FORWARDS (a CONNECT to anything outside loopback goes out for
-#  real) would carry it to the internet, and the answer would be the address of whatever machine runs the test (a GitHub runner
-#  that changes NAT in the middle of a session: ``ProxyEgressDrifted``). So such a proxy DECLARES its exit (``declare_exit``) and
-#  ``tests/_lab_egress.DeclaredExit`` answers the question with it; and as a backstop each of them refuses to forward the question
-#  (``asks_the_world``), which records it and makes the test fail (``nobody_asked_the_world``), so that a proxy that forgot to declare
-#  is a red with its name and not a flaky green.
+#  The exit of a proxy that relays CONNECTs. The question "where do I leave from" is HTTPS (api.ipify.org:443), and no gateway
+#  of the tests can answer a TLS request as the service. A gateway of this module is hermetic (a CONNECT outside the lab is refused, see
+#  ``LabGuard``), so the question could not reach the internet through it anyway; but the product would then be told no exit at all. So such a
+#  proxy DECLARES its exit (``declare_exit``) and ``tests/_lab_egress.DeclaredExit`` answers the question with it; and as a backstop each of
+#  them refuses the question itself (``asks_the_world``), which records it and makes the test fail (``nobody_asked_the_world``), so that a
+#  proxy that forgot to declare is a red with its name and not a flaky green.
 # ----------------------------------------------------------------------------------------------------------------
 #: The hosts of the services of the core that tell a caller its address (``invisible_core._geo._IP_ECHO_ENDPOINTS`` and
 #: ``_IPV6_ECHO_ENDPOINTS``; ``tests/test_a_launch_asks_nobody_on_the_internet_where_it_leaves_from.py`` checks that this list covers them).
 EXIT_SERVICES = ("api.ipify.org", "api6.ipify.org", "icanhazip.com", "ipv6.icanhazip.com", "checkip.amazonaws.com", "ifconfig.me")
 
-#: ``host:port`` of a proxy of the tests that forwards for real -> the exit it declares. Filled by the proxies themselves.
+#: ``host:port`` of a proxy of the tests that relays CONNECTs -> the exit it declares. Filled by the proxies themselves.
 _DECLARED_EXITS: Dict[str, str] = {}
 #: The questions of the exit that reached a forwarding proxy and were refused there: one sentence each, until a test reads them.
 _WORLD_QUESTIONS: List[str] = []
@@ -103,7 +117,7 @@ def _endpoint(server: str) -> str:
 
 
 def declare_exit(server: str, exit_ip: str) -> None:
-    """The proxy at ``server`` forwards for real and says its exit is ``exit_ip``."""
+    """The proxy at ``server`` relays CONNECTs and says its exit is ``exit_ip``."""
     _DECLARED_EXITS[_endpoint(server)] = exit_ip
 
 
@@ -117,10 +131,10 @@ def declared_exit_of(server: Optional[str]) -> Optional[str]:
 
 
 def asks_the_world(server: str, host: str, port: int) -> bool:
-    """True, and the question is recorded, when a CONNECT to ``host:port`` is the question of the exit: the proxy must refuse it, not forward it."""
+    """True, and the question is recorded, when a CONNECT to ``host:port`` is the question of the exit: the proxy must refuse it (the lab answers it with the declared exit)."""
     if host.lower() not in EXIT_SERVICES:
         return False
-    _WORLD_QUESTIONS.append("%s was asked %s:%d: the question of the exit reached a proxy that would have forwarded it to the internet" % (
+    _WORLD_QUESTIONS.append("%s was asked %s:%d: the question of the exit reached a proxy of the lab, which refuses it (its exit is declared, not asked of the internet)" % (
         server, host, port))
     return True
 
@@ -147,6 +161,140 @@ def _recv_exact(s: socket.socket, n: int) -> bytes:
             raise ConnectionError("closed")
         data += chunk
     return data
+
+
+# ----------------------------------------------------------------------------------------------------------------
+#  The lab. A gateway of the tests forwards nothing that is not the lab's: the destination is refused and recorded.
+# ----------------------------------------------------------------------------------------------------------------
+#: The networks that are the lab's whatever the host: loopback, and the documentation ranges (RFC 5737 TEST-NET-1/2/3, RFC 3849) that the tests use
+#: for their exits and their servers (nothing routes them: a test holds the ones a server stands at on ``lo``).
+LAB_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
+    "127.0.0.0/8", "::1/128", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32"))
+#: The folder under ``$RUNNER_TEMP`` the e2e workflows upload (``invpw-evidence-*``).
+EVIDENCE_FOLDER = "invpw-evidence"
+
+
+def _own_interfaces() -> Dict[str, List[str]]:
+    """The addresses assigned to each interface of this host (a server of a test stands at one of them), by interface name. It RAISES when they
+    cannot be listed (``_witness.HostInterfacesUnreadable``, or the ImportError of ``_witness``): never an empty list in place of an unreadable one."""
+    from _witness import read_host_interfaces
+
+    return read_host_interfaces()
+
+
+def _own_addresses() -> Set[str]:
+    """Every address of :func:`_own_interfaces` (raises as it does)."""
+    return {address for addresses in _own_interfaces().values() for address in addresses}
+
+
+def _how_own_interfaces_are_read() -> str:
+    from _witness import how_host_interfaces_are_read
+
+    return how_host_interfaces_are_read()
+
+
+def lab_refusal(host: str, own: Optional[Set[str]] = None) -> Optional[str]:
+    """None when ``host`` (an address, or a name as a SOCKS5 client sent it) is the lab's: loopback, a documentation range, an address of one of this host's
+    own interfaces, or ``localhost``; otherwise WHY it is not, one sentence. Any other NAME is not the lab's: nothing here resolves a name for the internet's
+    sake, and the question would leave the machine. ``own`` is the addresses of this host's interfaces as a guard read them when it was made; None: they
+    are read now (:func:`_own_addresses`), only for an address outside loopback and the documentation ranges, and a reading that fails raises."""
+    text = host.strip().strip("[]").split("%", 1)[0].rstrip(".").lower()
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        if text == "localhost" or text.endswith(".localhost"):
+            return None
+        return "a name that is not localhost: a gateway of the tests resolves no name, the question would leave the machine"
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    if any(address in network for network in LAB_NETWORKS):
+        return None
+    read_at = "read at the decision" if own is None else "read when the gateway was made"
+    own = _own_addresses() if own is None else own
+    if address.compressed in own:
+        return None
+    return ("%s is not loopback, not in a documentation range and not one of the %d addresses of this host's interfaces %s"
+            % (address.compressed, len(own), read_at))
+
+
+def is_lab_destination(host: str) -> bool:
+    """Whether ``host`` is the lab's (:func:`lab_refusal` has no reason to refuse it)."""
+    return lab_refusal(host) is None
+
+
+#: The address type of the SOCKS request the current thread last read (:meth:`Gateway._read_address`).
+_REQUEST = threading.local()
+
+
+class LabGuard:
+    """What refuses a destination that is not the lab's and writes it down: one per gateway.
+
+    :meth:`admits` is asked with the destination as RECEIVED (``atyp`` is the SOCKS5 address type: 1 IPv4, 3 a name, 4 IPv6; ``protocol`` is ``"tcp"`` or
+    ``"udp"``); ``target`` is where it would really go, as (host, port), when that is not the destination itself (a name a gateway maps to a local server): the lab's
+    decision is about the target. A refusal is recorded in :attr:`records` as a dict with ``t`` (seconds since ``t0``, the start of the gateway), ``atyp``,
+    ``destination`` (as received), ``port``, ``protocol`` and ``reason`` (the rule that refused it). :meth:`write_evidence` leaves them, always, under
+    ``$RUNNER_TEMP/invpw-evidence/<name>/``, with the interfaces of this host as the guard read them when it was made (:attr:`host_interfaces`) and how.
+
+    The interfaces are read ONCE, when the guard is made (a reading that fails raises there: the gateway is not made), and every decision is taken against
+    that reading: a refusal is a list append, synchronous, with no reading of the host."""
+
+    def __init__(self, name: str, t0: Optional[float] = None):
+        self.name = name
+        self.t0 = time.monotonic() if t0 is None else t0
+        #: Every refusal, in order.
+        self.records: List[dict] = []
+        #: The addresses of each interface of this host, read when the guard was made (raises if they cannot be read), and how they were read.
+        self.host_interfaces: Dict[str, List[str]] = _own_interfaces()
+        self.host_interfaces_read_by = _how_own_interfaces_are_read()
+        #: The same addresses as one set: what every decision of this guard is judged against.
+        self._own = {address for addresses in self.host_interfaces.values() for address in addresses}
+        self._lock = threading.Lock()
+        self._written = False
+
+    def admits(self, host: str, port: int, atyp: int, protocol: str, target: Optional[Tuple[str, int]] = None) -> bool:
+        reason = lab_refusal(host if target is None else target[0], self._own)
+        if reason is None:
+            return True
+        if target is not None and (target[0], target[1]) != (host, port):
+            reason = "mapped to %s:%d, and %s" % (target[0], target[1], reason)
+        self.refuse(host, port, atyp, protocol, reason=reason)
+        return False
+
+    def refuse(self, host: str, port: int, atyp: int, protocol: str, *, reason: str) -> None:
+        """Write down a destination that was refused (by this guard's rule, or by the narrower rule of a subclass), with the ``reason``: which rule, one sentence."""
+        record = {"t": round(time.monotonic() - self.t0, 3), "atyp": atyp, "destination": host, "port": port, "protocol": protocol,
+                  "reason": reason}
+        with self._lock:
+            self.records.append(record)
+
+    def refused(self, protocol: Optional[str] = None) -> List[Tuple[str, int]]:
+        """Every refused destination as (destination as received, port), in order; of one protocol when asked."""
+        with self._lock:
+            return [(r["destination"], r["port"]) for r in self.records if protocol is None or r["protocol"] == protocol]
+
+    def evidence(self, extra: Optional[dict] = None) -> dict:
+        """The record as it is written: the refusals, the interfaces of this host as read when the guard was made and how."""
+        with self._lock:
+            records = list(self.records)
+        return dict({"gateway": self.name, "refused": records,
+                     "host_interfaces": {"read_by": self.host_interfaces_read_by, "read_at": "when the gateway was made",
+                                         "interfaces": self.host_interfaces}}, **(extra or {}))
+
+    def write_evidence(self, extra: Optional[dict] = None) -> Optional[pathlib.Path]:
+        """Write the record, once (a gateway may be closed twice): the file written, or None off a runner (no ``$RUNNER_TEMP``) or when already written."""
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        with self._lock:
+            if self._written:
+                return None
+            self._written = True
+        path = None
+        if runner_temp:
+            folder = pathlib.Path(runner_temp) / EVIDENCE_FOLDER / self.name / ("%d-%d" % (os.getpid(), int(time.time() * 1000)))
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / "refused-destinations.json"
+            path.write_text(json.dumps(self.evidence(extra), indent=2), encoding="utf-8")
+        return path
 
 
 class FakeStun:
@@ -215,10 +363,12 @@ class FakeStun:
 class Gateway:
     """A SOCKS5 server. ``udp`` is ``"relay"`` or ``"refuse"`` (reply code 7)."""
 
-    #: Whether a CONNECT that is not special is forwarded for real, past loopback: such a gateway declares ``tcp_exit`` as its exit
+    #: Whether this gateway relays the CONNECTs that are not special (to the lab: it is hermetic): such a gateway declares ``tcp_exit`` as its exit
     #: (``declare_exit``). A subclass that refuses everything but loopback (``tests/_doh_servers.DohGateway``) sets False: it cannot carry the
     #: question of the exit anywhere, and the question is left to what answers it.
     forwards_for_real = True
+    #: The name of the folder of the record of what this gateway refused under ``$RUNNER_TEMP/invpw-evidence/`` (a subclass may name its own).
+    evidence_name = "socks5-gateway"
 
     def __init__(self, *, udp: str, tcp_exit: str, udp_exit: str,
                  user: Optional[str] = None, password: Optional[str] = None,
@@ -269,6 +419,9 @@ class Gateway:
         self.associates = 0
         #: When the gateway started: the origin of the times below.
         self.t0 = time.monotonic()
+        #: What refuses (and records, and writes under ``$RUNNER_TEMP/invpw-evidence/<evidence_name>/`` when the gateway is closed) every destination that is
+        #: not the lab's, CONNECT or datagram: ``guard.records``, ``guard.refused()``.
+        self.guard = LabGuard(self.evidence_name, self.t0)
         #: The same instant on the wall clock (seconds since the epoch), to compare with what a page reads from Date.now().
         self.wall0 = time.time()
         #: Every TCP connection the gateway accepted (a SOCKS handshake starts with one), as seconds from t0.
@@ -289,8 +442,8 @@ class Gateway:
         self.exit_ports: List[int] = []
         #: A datagram the relay could not send (a socket that raised): said here and in the report of a test, never mute.
         self.send_errors: List[str] = []
-        #: The hosts the relay forwards a datagram to (the fake STUN server aside); None: any host. A test that sends from an
-        #: address of this host keeps its lab closed: the browser's own background QUIC does not leave the machine.
+        #: The hosts the relay forwards a datagram to (the fake STUN server aside), among the lab's; None: any host of the lab. It only narrows: a host
+        #: that is not the lab's is never forwarded (``guard``).
         self.forward_only_to: Optional[Set[str]] = None
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -332,6 +485,11 @@ class Gateway:
             except OSError:
                 pass
         self.stun.close()
+        self.guard.write_evidence(self._evidence())
+
+    def _evidence(self) -> dict:
+        """What a subclass adds to the record of the refusals written at the close (a dict of JSON values)."""
+        return {}
 
     def __enter__(self) -> "Gateway":
         return self
@@ -401,7 +559,10 @@ class Gateway:
 
     @staticmethod
     def _read_address(c: socket.socket) -> Tuple[str, int]:
+        """The destination of a request, as received (the NAME for address type 3); its address type is left in :data:`_REQUEST` ``.atyp`` of the
+        thread that read it. A static method, as on main: a test that wraps it calls ``type(gateway)._read_address(c)``."""
         atyp = _recv_exact(c, 1)[0]
+        _REQUEST.atyp = atyp
         if atyp == 1:
             host = socket.inet_ntoa(_recv_exact(c, 4))
         elif atyp == 3:
@@ -444,6 +605,12 @@ class Gateway:
         """Where a CONNECT that is not a special one really goes. A subclass maps a name to a local server."""
         return host, port
 
+    def _admits(self, host: str, port: int, atyp: int, protocol: str, target: Optional[Tuple[str, int]] = None) -> bool:
+        """Whether the gateway carries a CONNECT (``protocol`` ``"tcp"``) or a datagram (``"udp"``) to ``host``:``port`` (as received; ``atyp`` is its SOCKS5
+        address type), or to ``target`` (host, port) when it is mapped elsewhere: only the lab's, and the rest is refused and recorded (``guard``). A subclass may narrow
+        it (never widen it: call this one first)."""
+        return self.guard.admits(host, port, atyp, protocol, target)
+
     def _open_upstream(self, target: Tuple[str, int]) -> socket.socket:
         """The TCP connection of a CONNECT: from ``exit_host`` when ``tcp_from_exit``, else from wherever the system chooses."""
         if not self.tcp_from_exit:
@@ -480,8 +647,12 @@ class Gateway:
         if self.forwards_for_real and asks_the_world(self.server, host, port):
             self._send(c, self._reply(2))      # not allowed: the exit of this gateway is declared, it is not asked of the internet
             return
+        target = self._target(host, port)
+        if not self._admits(host, port, getattr(_REQUEST, "atyp", 3), "tcp", target):
+            self._send(c, self._reply(2))      # not allowed: the gateway carries nothing outside the lab
+            return
         try:
-            up = self._open_upstream(self._target(host, port))
+            up = self._open_upstream(target)
         except OSError:
             self._send(c, self._reply(5))
             return
@@ -538,13 +709,15 @@ class Gateway:
         ``target`` is the real address the datagram is sent to from the exit socket (``out_port`` is that socket's port);
         ``reported_as`` is the address the client is told the reply came from (None: the real source). A subclass may also
         answer by itself with ``answer(host, port, data)``. By default the fake STUN server, by name or by number, is
-        mapped and everything else is forwarded for real."""
+        mapped and everything else is forwarded when it is the lab's (``_admits``); a datagram to any other destination is dropped and recorded."""
         if (host, dport) in ((STUN_NAME, STUN_PORT), (STUN_NUMBER, STUN_PORT), (MEASURE_NUMBER, STUN_PORT)):
             if not self.stun_answers:
                 return None
             # A real server answers from the address it was asked at; the fake STUN server is mapped, so its reply is
             # reported as from the asked address (only when that was a literal: a name has no address to report).
             return self.stun.address, ((host, dport) if atyp == 1 else None)
+        if not self._admits(host, dport, atyp, "udp"):
+            return None                        # not the lab's: dropped, and recorded
         if self.forward_only_to is not None and host not in self.forward_only_to:
             return None
         return (host, dport), None
@@ -688,12 +861,15 @@ def silent_udp(*, exit_ip: str = EXIT, user: Optional[str] = None, password: Opt
 #  A tiny TCP-only SOCKS5 server for the e2e tests (the fixture `socks5_tcp_only` of conftest.py makes one).
 # ----------------------------------------------------------------------------------------------------------------
 class Socks5TcpOnly:
-    """Minimal SOCKS5: no-auth, CONNECT (TCP) relayed, UDP ASSOCIATE refused.
+    """Minimal SOCKS5: no-auth, CONNECT (TCP) relayed to the lab, UDP ASSOCIATE refused.
 
     Reproduces a residential TCP-only proxy: pages load over TCP, but WebRTC's
     UDP path is dead - which (for a no-camera page in default_address_only mode)
     is exactly what made the default-route probe fail and ICE return zero
     candidates before Fix C.
+
+    Hermetic like :class:`Gateway`: a CONNECT to a destination that is not the lab's (:func:`is_lab_destination`) is refused with reply 2 and
+    recorded in :attr:`guard` (written under ``$RUNNER_TEMP/invpw-evidence/socks5-tcp-only/`` when the server is closed).
     """
 
     def __init__(self, exit_ip: Optional[str] = None):
@@ -702,10 +878,12 @@ class Socks5TcpOnly:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(16)
         self.port = self._srv.getsockname()[1]
-        #: It relays a CONNECT for real, so it declares its exit (what a launch behind it is told: the lab's, unless a test gives another).
+        #: It relays a CONNECT (to the lab), so it declares its exit (what a launch behind it is told: the lab's, unless a test gives another).
         self.exit_ip = exit_ip or _lab_exit()
         declare_exit(self.server, self.exit_ip)
         self.udp_associate_attempts = 0
+        #: What refuses (and records) every CONNECT that is not the lab's.
+        self.guard = LabGuard("socks5-tcp-only")
         self._stop = False
         self._t = threading.Thread(target=self._serve, daemon=True)
         self._t.start()
@@ -765,6 +943,10 @@ class Socks5TcpOnly:
                 conn.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # not allowed: the exit is declared, not asked of the internet
                 conn.close()
                 return
+            if not self.guard.admits(addr, port, atyp, "tcp"):
+                conn.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # not allowed: nothing outside the lab is carried
+                conn.close()
+                return
             try:
                 upstream = socket.create_connection((addr, port), timeout=30)
             except OSError:
@@ -804,3 +986,4 @@ class Socks5TcpOnly:
             self._srv.close()
         except Exception:
             pass
+        self.guard.write_evidence()

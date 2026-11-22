@@ -26,16 +26,52 @@ from unittest import mock
 
 
 
-def marionette_port() -> int:
-    """A port for ONE browser's Marionette, free when it is asked for.
+def marionette_active_port(profile: Optional[Path] = None, timeout: float = 120.0) -> int:
+    """The port ONE browser's Marionette got, read from the browser itself: launch it with ``"marionette.port": 0`` and ask here.
 
-    ⛔ NEVER A FIXED PORT. Three e2e files used 28431 and xdist runs them on different workers at once: the second browser could
-    not bind it while the first held it, its Marionette never listened, and once the first closed every connection was refused
-    (ConnectionRefusedError 10061 for 120 s, e2e Windows part 2, run 43704738537: the font test on gw2 while the iframe-crash test
-    held the port on gw1). The OS picks the port; it is released just before the browser binds it."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    ⛔ NEVER A FIXED PORT, AND NEVER A PORT FREED FOR THE BROWSER TO TAKE. Three e2e files used 28431 and xdist runs them on different
+    workers at once: the second browser could not bind it while the first held it, its Marionette never listened, and once the first
+    closed every connection was refused (ConnectionRefusedError 10061 for 120 s, e2e Windows part 2, run 43704738537: the font test on
+    gw2 while the iframe-crash test held the port on gw1). A port that was free when it was asked for and released just before the
+    browser binds it has the same race with a neighbour that binds first. With port 0 the browser binds first and the OS chooses; the
+    engine writes `<profile>/MarionetteActivePort` once Marionette listens, and this is what reads it.
+
+    `profile` is the profile directory of the browser; None finds it in the command line (`-profile`) of the engine process below this
+    one (a test runs one browser). It waits on the condition "the file holds a port", up to `timeout`."""
+    import re
+
+    end = time.time() + timeout
+    while True:
+        folder = profile if profile is not None else _profile_of_the_engine()
+        if folder is not None:
+            try:
+                found = re.search(r"\d+", (Path(folder) / "MarionetteActivePort").read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                found = None
+            if found is not None and int(found.group()) > 0:
+                return int(found.group())
+        if time.time() > end:
+            raise OSError("Marionette never wrote MarionetteActivePort in %.0f s (profile %s). %s"
+                          % (timeout, folder if folder is not None else "not found", marionette_diagnosis(0)))
+        time.sleep(0.2)
+
+
+def _profile_of_the_engine() -> Optional[Path]:
+    """The `-profile` of the parent process of the engine below this process, or None while it is not there."""
+    import psutil
+
+    try:
+        below = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        return None
+    for proc in below:
+        try:
+            cmd = proc.cmdline()
+            if _runs_firefox(proc) and "-contentproc" not in cmd and "-profile" in cmd:
+                return Path(cmd[cmd.index("-profile") + 1])
+        except (psutil.Error, OSError, ValueError, IndexError):
+            continue
+    return None
 
 FONTS_REPORTER = "explicit/gfx/webrender/resource-cache/fonts"
 
@@ -246,16 +282,15 @@ def run(binary: str, contexts: int = 20, open_at_once: int = 3) -> Dict[str, flo
     folder = tempfile.mkdtemp(prefix="webfont_probe_")
     result: Dict[str, float] = {"contexts": contexts}
     marionette = None
-    port = marionette_port()
     try:
         # the engine reads the variable from the environment it inherits (the launcher takes none): set for this launch only, undone after it
         with mock.patch.dict(os.environ, {"MOZ_REMOTE_ALLOW_SYSTEM_ACCESS": "1"}), InvisiblePlaywright(
                 binary_path=binary, headless=True, humanize=False, extra_args=["-marionette"],
-                extra_prefs={"marionette.port": port}) as browser:
+                extra_prefs={"marionette.port": 0}) as browser:
             keep = browser.new_context()
             keep_page = keep.new_page()
             keep_page.goto(root + "/blank.html")
-            marionette = _Marionette(port)
+            marionette = _Marionette(marionette_active_port())
             marionette.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {}}})
             marionette.call("WebDriver:SetTimeouts", {"script": 240000})
             result["before_mb"] = fonts_mb(marionette, folder, "before")

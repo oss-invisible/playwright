@@ -1243,9 +1243,12 @@ class FrameDispatcher(Dispatcher):
                     frame_id, selector, what, *args, strict=strict,
                     timeout=deadline.left())
             except juggler.ReplyTimeout as exc:
-                # The caller's time ran out while a probe was in flight: that
-                # is this read's timeout, not the probe's.
-                if deadline.passed():
+                # The probe's bound is what was left of the caller's time, so
+                # its running out IS the caller's time running out: this
+                # read's timeout, not the probe's. Not asked of the clock
+                # again: on Windows a wait can end before it says so. With no
+                # limit the probe had no bound, and this is something else.
+                if deadline.seconds is not None:
                     raise expired() from exc
                 raise
             if found:

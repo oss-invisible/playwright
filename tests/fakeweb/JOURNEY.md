@@ -17,7 +17,8 @@ step), never by a timer; nothing is aborted or removed while its request is in f
 use timers. Stock Firefox then gives the same `networkidle` vector on every run. Two pages stay "not idle" on purpose, and
 pages.json (`journey_p4.not_idle_steps`) declares which steps: the category page holds a fetch until step 9 (steps 7, 8), the
 search results hold a KEEPALIVE fetch until step 13 (step 12): a client that does not count a keepalive request as in flight
-is red there.
+is red there. The page starts that fetch from a task after `load`, never while it is parsed (the commit of a document can be
+told after a request started during parsing, on the reference Juggler too): the step tests the rule, not that race.
 
 ## Known difference in our favour
 

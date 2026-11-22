@@ -27,13 +27,16 @@ ask for the processes of one site and never compare two counts. Counting was wro
 processes of its own: in every run, a second isolated process (remote type `webIsolated=https://mozgcp.net`) is
 born about a second after the process of the New Tab page, with any page, and under load it arrived between the
 two reads (red in 14 of 30 runs of the whole e2e suite, `[P] -> [P, P2]`). A cross-site frame gives a process
-for the frame's site; a same-site one leaves the page's site in its single process. Off Linux the two tests
-skip: no other system names the process.
+for the frame's site; a same-site one leaves the page's site in its single process. Windows names no process, so there
+the same two questions are answered by the engine's own log, which says the remote type of every process it creates
+(`webIsolated=http://a.test^userContextId=N` for the process of a site): the browser is started with `LOG_ENV` and a file
+base, and a process counts when it is alive in the tree and its logged type is that of the site (tests/_processes.py).
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
@@ -42,7 +45,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from _processes import NAMED_BY_SITE, site_processes_below
+from _processes import LOG_ENV, NAMED_BY_SITE, remote_types, site_processes_below
 from _servers import LocalServer
 
 SITE_A = "http://a.test"
@@ -135,13 +138,26 @@ def engine_dir(firefox_binary):
     return str(Path(firefox_binary).resolve().parent)
 
 
-def processes_of(site, engine_dir):
-    """The pids of the engine's processes below this test that host `site` (named by it, tests/_processes.py)."""
-    return site_processes_below(os.getpid(), site, engine_dir)
+@pytest.fixture
+def engine_log(monkeypatch, tmp_path):
+    """Windows only: the engine logs the remote type of each process it creates, to files that start with the returned
+    base (Linux names the process by its site instead, and the environment stays as it is there)."""
+    base = tmp_path / "process-types"
+    if sys.platform == "win32":
+        monkeypatch.setenv("MOZ_LOG", LOG_ENV["MOZ_LOG"])
+        monkeypatch.setenv("MOZ_LOG_FILE", str(base))
+    return base
 
 
 @pytest.fixture
-def browser(firefox_binary):
+def processes_of(engine_dir, engine_log):
+    """`processes_of(site)`: the pids of the engine's processes below this test that host `site` (tests/_processes.py:
+    by the name of the process on Linux, by the type the engine logged on Windows)."""
+    return lambda site: site_processes_below(os.getpid(), site, engine_dir, types=lambda: remote_types(engine_log))
+
+
+@pytest.fixture
+def browser(firefox_binary, engine_log):
     from invisible_playwright import InvisiblePlaywright
 
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary, humanize=False, headless=True,
@@ -195,7 +211,7 @@ def frame_with_origin(page, origin):
 # ── 1, 2: the bench itself ─────────────────────────────────────────────────────
 
 @pytest.mark.e2e
-def test_cross_site_iframe_gets_its_own_process(page, cross_site_loop, engine_dir):
+def test_cross_site_iframe_gets_its_own_process(page, cross_site_loop, processes_of):
     """Green today: it says the bench separates sites. A frame of b.test in a page of a.test has a process of its own.
 
     The processes are asked for by the name of their site, never counted between two reads (tests/_processes.py): the
@@ -204,20 +220,20 @@ def test_cross_site_iframe_gets_its_own_process(page, cross_site_loop, engine_di
     the navigation: a top-level navigation may land in another process of the same site (`mReplaceBrowsingContext`,
     dom/ipc/ProcessIsolation.cpp, see the control below)."""
     page.goto(cross_site_loop["plain"])
-    here = processes_of(SITE_A, engine_dir)
+    here = processes_of(SITE_A)
     assert len(here) == 1, "the page of a.test must have one process of its site: %s" % sorted(here)
-    assert not processes_of(SITE_B, engine_dir), "a process for b.test before any page of it"
+    assert not processes_of(SITE_B), "a process for b.test before any page of it"
     page.goto(cross_site_loop["top"], wait_until="load")
     assert wait_for(page, lambda: any(r["path"] == "/report/loaded" and r["host"] == "a.test" and
                                 r["query"]["path"] == ["/leaf"] for r in cross_site_loop["reports"]))
-    framed = processes_of(SITE_B, engine_dir)
+    framed = processes_of(SITE_B)
     assert len(framed) >= 1, "no process for the site of the frame (b.test)"
-    tops = processes_of(SITE_A, engine_dir)
+    tops = processes_of(SITE_A)
     assert len(tops) == 1, "the processes of a.test must still be one: %s" % sorted(tops)
 
 
 @pytest.mark.e2e
-def test_same_site_other_port_stays_in_process(page, cross_site_loop, engine_dir):
+def test_same_site_other_port_stays_in_process(page, cross_site_loop, processes_of):
     """Green today, the control: a frame of the page's own site gets no process, and none for another site.
 
     The processes of a.test are asked for by name before and after the frame is added: one pid, the same pid. Nothing
@@ -233,15 +249,15 @@ def test_same_site_other_port_stays_in_process(page, cross_site_loop, engine_dir
     the same site (`dom.ipc.processCount.webIsolated` is 4). That is the top's process, not the frame's; a frame of
     the page's site stays in the page's process."""
     page.goto(cross_site_loop["plain"])
-    before = processes_of(SITE_A, engine_dir)
+    before = processes_of(SITE_A)
     assert len(before) == 1, "the page of a.test must have one process of its site: %s" % sorted(before)
     page.evaluate("(u) => { const f = document.createElement('iframe'); f.id = 's'; f.src = u;"
                   " document.body.appendChild(f); }", cross_site_loop["leaf"])
     assert wait_for(page, lambda: any(r["path"] == "/report/loaded" and r["query"]["path"] == ["/leaf"]
                                       for r in cross_site_loop["reports"]))
-    after = processes_of(SITE_A, engine_dir)
+    after = processes_of(SITE_A)
     assert after == before, "a same-site frame changed the processes of a.test: %s -> %s" % (sorted(before), sorted(after))
-    assert not processes_of(SITE_B, engine_dir), "a process for b.test, which no page here belongs to"
+    assert not processes_of(SITE_B), "a process for b.test, which no page here belongs to"
 
 
 # ── 3 .. 10: what the product does not do yet ──────────────────────────────────

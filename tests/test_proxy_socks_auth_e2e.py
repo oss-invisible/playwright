@@ -9,6 +9,10 @@ handshake and relays traffic.
 Fully hermetic - a local SOCKS5 server + a local HTTP target, with the localhost
 target forced through the proxy via ``allow_hijacking_localhost`` - so it runs
 identically on a dev box and on a GitHub runner (no external site, no secrets).
+The SOCKS5 server carries only the lab's (``_socks_servers.is_lab_destination``: loopback, the documentation ranges, the addresses of this host): the
+browser behind it also makes background requests of its own, and a CONNECT to any other destination is refused (reply 2) and recorded
+(``_socks_servers.LabGuard``: time since the server started, address type, destination as received, port, protocol), the record written when the server is
+closed under ``$RUNNER_TEMP/invpw-evidence/socks5-auth-recorder/`` (the folder the e2e jobs upload; off a runner nothing is written).
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ import pytest
 from invisible_playwright import InvisiblePlaywright
 
 from _servers import LocalServer
-from _socks_servers import asks_the_world, declare_exit, forget_exit
+from _socks_servers import LabGuard, asks_the_world, declare_exit, forget_exit
 
 _USER = "ferd_socks_user"
 _PASS = "ferd_socks_pw_42"
@@ -30,7 +34,8 @@ _PASS = "ferd_socks_pw_42"
 
 class _Socks5AuthRecorder:
     """SOCKS5 that REQUIRES RFC1929 user/pass auth, records the creds it saw,
-    then relays CONNECT to the requested target."""
+    then relays CONNECT to the requested target when it is the lab's (loopback, the documentation ranges, this host); any other CONNECT is refused and
+    recorded in :attr:`guard`."""
 
     def __init__(self):
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -44,6 +49,8 @@ class _Socks5AuthRecorder:
 
         declare_exit(self.server, LAB_EGRESS_IP)
         self.seen_creds: list[tuple[str, str]] = []
+        #: What refuses (and records) every CONNECT that is not the lab's.
+        self.guard = LabGuard("socks5-auth-recorder")
         self._stop = False
         threading.Thread(target=self._serve, daemon=True).start()
 
@@ -102,6 +109,8 @@ class _Socks5AuthRecorder:
                 conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00"); conn.close(); return
             if asks_the_world(self.server, addr, port):   # the exit is declared above, not asked of the internet
                 conn.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00"); conn.close(); return
+            if not self.guard.admits(addr, port, atyp, "tcp"):   # nothing outside the lab is carried
+                conn.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00"); conn.close(); return
             try:
                 up = socket.create_connection((addr, port), timeout=30)
             except OSError:
@@ -140,6 +149,7 @@ class _Socks5AuthRecorder:
             self._srv.close()
         except OSError:
             pass
+        self.guard.write_evidence()
 
 
 class _LocalHTTP:

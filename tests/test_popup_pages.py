@@ -363,10 +363,13 @@ def test_window_open_features_headed_humanized(firefox_binary, harness):
     """Headed + `humanize=True` (the real-user shape): a `window.open` WITH a
     feature string is captured, usable and closable like any page."""
     import os
+    import sys
 
     import pytest
 
-    if not os.environ.get("DISPLAY"):
+    # A headed run needs a display: on Linux that is X11 (DISPLAY, which the runner's xvfb sets); Windows has no DISPLAY
+    # and does not need one, it always has a desktop (the runner's own, or the hidden one the wrapper creates).
+    if sys.platform != "win32" and not os.environ.get("DISPLAY"):
         pytest.skip("headed test needs a display")
     from invisible_playwright import InvisiblePlaywright
 

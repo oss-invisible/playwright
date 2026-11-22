@@ -657,7 +657,14 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     host_file = "tests/test_ab_host_e2e.py"
     page_file = "tests/test_ab_oracle_e2e.py"
     assert "OWN_JOB_FILES: %s %s %s" % (network, host_file, page_file) in shared_linux
-    assert 'own_job = ["%s", "%s", "%s"]' % (network, host_file, page_file) in shared_windows and "f not in left_out and f not in own_job" in shared_windows
+    # The Windows parts take their files from the rows wrapper.e2e.suite.windows.N of ci/required-suites.json (one partition with the candidate's
+    # gate); the oracles' files are in none of those rows (tests/test_the_e2e_suite_is_accounted_for.py names them as excluded: their own jobs).
+    assert 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
+    import json
+
+    rows = json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))
+    suite_entries = [t for r in rows if r["id"].startswith("wrapper.e2e.suite.") for t in r["tests"]]
+    assert not [t for t in suite_entries if t.split("::")[0] in (network, host_file, page_file, "tests/test_ab_host_crash_linux_e2e.py")]
     assert network not in _job(text, "e2e-windows-control-a")
     # the budget of the test itself fits the job: 5 seeds, two engine runs, with its own setup
     import test_ab_network_e2e as network_e2e
@@ -727,7 +734,11 @@ def test_the_page_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs
         assert "      - name: Run the page oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
     assert "xvfb-run -a" in linux
     shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
-    assert page in shared_linux.split("OWN_JOB_FILES: ")[1].splitlines()[0] and '"%s"]  # ' % page in shared_windows and "f not in left_out and f not in own_job" in shared_windows
+    assert page in shared_linux.split("OWN_JOB_FILES: ")[1].splitlines()[0] and 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
+    import json
+
+    rows = json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))
+    assert not [t for r in rows if r["id"].startswith("wrapper.e2e.suite.") for t in r["tests"] if t.split("::")[0] == page], "the page oracle's file is in no row of the shared suite"
     assert page not in _job(text, "e2e-windows-control-a")
     import test_ab_oracle_e2e as page_e2e
 

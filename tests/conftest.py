@@ -71,6 +71,10 @@ def _watchdog_open():
 
 
 def pytest_configure(config):
+    # TEMPORARY, with tests/_crash_cores.py (the -11 at the exit of the security state's generate): on Linux every engine of the run, the core's launches
+    # included, inherits a core limit equal to the hard one, so a crash leaves a core in $INVPW_CORE_DIR (kernel.core_pattern on the e2e jobs).
+    import _crash_cores
+    _crash_cores.lift_the_core_limit_of_the_session()
     # The run stops at the first refusal of the engine (tests/engine_refusal.py).
     from engine_refusal import StopAtTheFirstRefusal
     config.pluginmanager.register(StopAtTheFirstRefusal(config), "engine-refusal-stop")
@@ -94,6 +98,16 @@ def pytest_runtest_setup(item):
 def pytest_runtest_teardown(item, nextitem):
     if _watchdog_handle is not None:
         faulthandler.cancel_dump_traceback_later()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    """TEMPORARY, with tests/_crash_cores.py: after a phase that failed, gdb's text of every core in $INVPW_CORE_DIR is saved in the evidence and the core deleted;
+    the cores left after a test that passed are deleted and listed."""
+    report = yield
+    import _crash_cores
+    _crash_cores.after_the_report(item.nodeid, report.when, report.failed)
+    return report
 
 
 def pytest_collection_modifyitems(config, items):

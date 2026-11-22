@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pytest
 
+from _generation_evidence import evidence_folder, save_what_the_failed_generation_left, the_core_s_generation_keeps_its_evidence
 from _servers import LocalServer
 
 pytestmark = pytest.mark.e2e
@@ -116,17 +117,29 @@ def _engine_env(work: Path) -> dict:
     return env
 
 
-def _run_to_the_end(argv, env, cwd, timeout_s):
-    """Runs `argv` with nothing on stdout and stderr; (exit code, None) or (None, "timed out ...") with its whole tree ended."""
+def _run_to_the_end(argv, env, cwd, timeout_s, *, output_to=None):
+    """Runs `argv` with nothing on stdout and stderr (or, with `output_to`, with both written to files `<output_to>.stdout` and `<output_to>.stderr`, which is all
+    that changes); (exit code, None) or (None, "timed out ...") with its whole tree ended. A crash leaves a core where `kernel.core_pattern` says: the process
+    inherits the core limit of the session (TEMPORARY, tests/_crash_cores.py, which reads it after the test fails)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, cwd=str(cwd), creationflags=flags)
+    sinks = [subprocess.DEVNULL, subprocess.DEVNULL]
+    opened = []
+    if output_to is not None:
+        for index, suffix in enumerate((".stdout", ".stderr")):
+            opened.append(open(str(output_to) + suffix, "wb"))
+            sinks[index] = opened[-1]
     try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=sinks[0], stderr=sinks[1], env=env, cwd=str(cwd), creationflags=flags)
         try:
-            return proc.wait(timeout=timeout_s), None
-        except subprocess.TimeoutExpired:
-            return None, "did not finish within %s s" % timeout_s
+            try:
+                return proc.wait(timeout=timeout_s), None
+            except subprocess.TimeoutExpired:
+                return None, "did not finish within %s s" % timeout_s
+        finally:
+            _kill_tree(proc)
     finally:
-        _kill_tree(proc)
+        for sink in opened:
+            sink.close()
 
 
 # --- the files the core would write ----------------------------------------------------------------------------------------------------------------------------
@@ -223,13 +236,16 @@ _READY = {}
 
 
 def _ready(ff, inputs, root):
-    """The ready directory the CORE makes from the inputs with the engine (its validation included), made once for the module; a failure is kept and said again."""
+    """The ready directory the CORE makes from the inputs with the engine (its validation included), made once for the module and SHARED by every test that needs
+    one: a failure is kept and said again, so one failed generation is the failure of each of those tests."""
     from invisible_core._security_state_generate import default_argv, engine_id_of, generate
 
     if "state" not in _READY:
         out = Path(root) / "ready"
         try:
-            generate(default_argv(ff), inputs, engine_id_of(ff), out)
+            # TEMPORARY, with tests/_generation_evidence.py: the core's own launch keeps the engine's output, the profile's files and a core when it fails.
+            with the_core_s_generation_keeps_its_evidence(Path(root) / "core-generation", "security-state-generate-core"):
+                generate(default_argv(ff), inputs, engine_id_of(ff), out)
             _READY["state"] = (out, None)
         except Exception as exc:
             _READY["state"] = (None, exc)
@@ -249,15 +265,25 @@ def _a_ready_directory_with(root, name, *, state):
     return directory
 
 
-def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_path_factory):
+def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_path_factory, engine_reaches):
     files = inputs
     work = tmp_path_factory.mktemp("generate")
     profile = work / "profile"
     profile.mkdir()
     (profile / "user.js").write_bytes(_user_js(files))
-    code, why = _run_to_the_end([ff, "-headless", "-no-remote", "-profile", str(profile)], _engine_env(work), work, GENERATE_TIMEOUT_S)
+    output = work / "engine-output"
+    code, why = _run_to_the_end([ff, "-headless", "-no-remote", "-profile", str(profile)], _engine_env(work), work, GENERATE_TIMEOUT_S, output_to=output)
+    if code != 0:  # TEMPORARY, with tests/_generation_evidence.py
+        save_what_the_failed_generation_left(profile, output, code, why, evidence_folder("security-state-generate", work))
     said = (profile / RESULT_NAME).read_bytes().decode("utf-8") if (profile / RESULT_NAME).is_file() else "no %s" % RESULT_NAME
     assert code == 0, "the engine in generate mode %s (exit code %r); its result: %s" % (why or "exited", code, said)
+
+    # Glean started inside the shutdown raced Mozilla's own close of its database (exit -11): firefox-69 never starts it in this mode, so its profile has no glean folder.
+    glean = profile / "datareporting" / "glean"
+    if engine_reaches("firefox-69"):
+        assert not glean.exists(), "generate mode started Glean: %s is in the profile (%s)" % (glean, sorted(p.relative_to(glean).as_posix() for p in glean.rglob("*") if p.is_file()))
+    else:
+        assert glean.is_dir(), "firefox-68 starts Glean at the shutdown of generate mode: %s is not in the profile" % glean
 
     result = json.loads((profile / RESULT_NAME).read_bytes().decode("utf-8"))
     assert set(result) == {"format", "ok", "error", "engine", "collections", "crlite_filter_hashes"}, sorted(result)

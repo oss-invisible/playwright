@@ -10,10 +10,26 @@ of its token field from an evaluate got the clearance refused on the reload,
 native one, every other name is the page's. These tests hold both halves on
 a page that counts every call to the APIs it wrapped, and the one change the
 rule declares.
+
+Two more tests hold the ends of the rule (hooks `StealthHybridXray*` in
+`js/xpconnect/src` of the engine, folder `automation/hybrid-xrays` of the engine
+series):
+
+* the control of the probe: the same lookups made from the PAGE's realm
+  (`add_script_tag`) are counted, each one, so the zeros above are the caller's
+  world and not a probe that cannot count;
+* what the caller hands the page from a cross-origin iframe (its window and its
+  location, and from inside that iframe the `top` that is cross-origin to it)
+  stays what the page would get for itself: a cross-origin object, whose
+  properties throw `SecurityError` for what is not allowed and answer for what
+  is (`CrossOriginObjectWrapper`), not a transparent wrapper that opens the
+  other site to the page.
 """
 from __future__ import annotations
 
 import pytest
+
+from _fission_frames import Sites, launch, new_page, wait_frame
 
 PAGE = """<!doctype html><html><head><script>
 window.__calls = 0;
@@ -132,3 +148,90 @@ def test_what_the_caller_hands_the_page_has_the_pages_own_prototypes(page):
                                   f.constructor === Function,
                                   f.constructor('return globalThis')() === window];""")
     assert page.evaluate("() => probe([1, 2], () => 1)") == [True, True, True, True]
+
+
+@pytest.mark.e2e
+def test_the_same_lookups_from_the_pages_realm_are_counted(page):
+    """The control of the probe: what the caller's world does not make the page count, the page's own realm does.
+
+    Each lookup the first test makes through `evaluate` (and its siblings) is made here by a script of the page
+    (`add_script_tag` runs in the page's realm), one script each, and the counter must rise after every one: a
+    counter that only ever read 0 would also pass the tests above."""
+    assert _calls(page) == 0
+    # the tag itself costs the page no counted call, so what rises below is the lookup
+    page.add_script_tag(content=";")
+    assert _calls(page) == 0
+    lookups = [
+        "document.querySelector('input[name=\"cf-turnstile-response\"]')",
+        "document.querySelectorAll('input')",
+        "document.getElementById('x')",
+        "document.body.querySelector('#x')",
+        "[1, 2].map(n => n)",
+        "JSON.stringify({a: 1})",
+    ]
+    seen = 0
+    for code in lookups:
+        page.add_script_tag(content=code + ";")
+        now = _calls(page)
+        assert now > seen, "the page's own %s was not counted (%d before, %d after)" % (code, seen, now)
+        seen = now
+    assert seen > 0
+
+
+#: The page's function that touches what it is handed, and says for each property whether it answered or what it threw.
+#: Defined by the page (in both documents), so a caller can only HAND it objects.
+CROSS_ORIGIN_PROBE = """
+window.crossProbe = (w, loc) => {
+  const attempt = (f) => { try { f(); return 'ok'; } catch (e) { return 'throws ' + e.name; } };
+  return {
+    document: attempt(() => w.document),
+    href: attempt(() => loc.href),
+    closed: attempt(() => w.closed),
+    top: attempt(() => w.top),
+    frames: attempt(() => w.frames),
+    replace: attempt(() => typeof loc.replace),
+  };
+};
+"""
+
+#: What a page gets from a cross-origin window and its location: the contents are refused, the few names the web
+#: platform allows across origins answer.
+CROSS_ORIGIN_ANSWERS = {"document": "throws SecurityError", "href": "throws SecurityError",
+                        "closed": "ok", "top": "ok", "frames": "ok", "replace": "ok"}
+
+
+@pytest.mark.e2e
+def test_what_the_caller_hands_the_page_from_a_cross_origin_frame_stays_cross_origin(firefox_binary):
+    """A caller that holds the window and the location of a cross-origin iframe, and hands them to the page, gives it
+    what the page would get for itself: `CrossOriginObjectWrapper`'s answers, from the page's side and from the frame's
+    (where the cross-origin one is `window.top`)."""
+    with Sites() as sites:
+        sites.route("B", "/inner", "<!doctype html><script>%s</script><body>inner</body>" % CROSS_ORIGIN_PROBE)
+        sites.route("A", "/", "<!doctype html><script>%s</script><iframe id=\"f\" src=\"%s\"></iframe>"
+                    % (CROSS_ORIGIN_PROBE, sites.url("B", "/inner")))
+        with launch(firefox_binary) as browser:
+            _context, page = new_page(browser)
+            page.goto(sites.url("A", "/"))
+            frame = wait_frame(page, sites.origin["B"], "/inner", seconds=30)
+
+            # from the page: what the page's own script gets for the cross-origin iframe is the control
+            page.add_script_tag(content="""
+                (() => {
+                    const w = document.getElementById('f').contentWindow;
+                    window.__own = crossProbe(w, w.location);
+                })();""")
+            own = page.evaluate("() => window.__own")
+            assert own == CROSS_ORIGIN_ANSWERS, own
+            # and the caller hands the page the same two objects
+            handed = page.evaluate("""() => {
+                const w = document.getElementById('f').contentWindow;
+                return crossProbe(w, w.location);
+            }""")
+            assert handed == own, (handed, own)
+
+            # from inside the iframe: its `top` is the cross-origin one
+            frame.add_script_tag(content="window.__own = crossProbe(window.top, window.top.location);")
+            own_top = frame.evaluate("() => window.__own")
+            assert own_top == CROSS_ORIGIN_ANSWERS, own_top
+            handed_top = frame.evaluate("() => crossProbe(window.top, window.top.location)")
+            assert handed_top == own_top, (handed_top, own_top)
