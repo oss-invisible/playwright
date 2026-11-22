@@ -1868,6 +1868,10 @@ class FrameDispatcher(Dispatcher):
         return None
 
     def op_tap(self, params: Dict) -> Any:
+        # Stock's `Frame.tap` opens with this refusal (the handle's `tap` has none): without touch the page has no `ontouchstart` to hear it, so a tap that went on would answer success and do nothing.
+        if not self.page.context.options.get("hasTouch"):
+            raise ProtocolException(
+                "The page does not support tap. Use hasTouch context option to enable touch support.")
         frame_id, selector = self.enter_frames(params["selector"])
         self._by_hand(params, frame_id, selector,
                       lambda position, timeout: self.actions.tap(

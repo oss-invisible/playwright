@@ -138,7 +138,15 @@ def test_is_checked_reads_this_element(page):
 def test_is_editable_reads_this_element(page):
     assert page.query_selector("#txt").is_editable() is True
     assert page.query_selector("#ro").is_editable() is False
-    assert page.query_selector("#off").is_editable() is False
+
+
+def test_is_editable_of_an_element_that_cannot_be_edited_is_stocks_error(page):
+    # stock (injected `elementState`, "editable"): `getReadonly` answers "error" for a node that is not an <input>, <textarea>, <select> or
+    # [contenteditable] with a role that allows [aria-readonly], a disabled <button> among them, and that is thrown, not answered `false`.
+    from invisible_playwright.sync_api import Error
+
+    with pytest.raises(Error, match=r"Element is not an <input>, <textarea>, <select> or \[contenteditable\] and does not have a role allowing \[aria-readonly\]"):
+        page.query_selector("#off").is_editable()
 
 
 def test_a_node_that_left_the_document_is_hidden_and_has_no_other_state(page):
@@ -203,6 +211,15 @@ def test_dblclick_double_clicks_this_element(page):
 def test_tap_taps_this_element(touch_page):
     touch_page.query_selector("#go").tap()
     assert touch_page.evaluate("window.seen.touchstart") == 1
+
+
+def test_a_page_tap_of_a_context_without_touch_is_stocks_error(page):
+    # stock's `Frame.tap` (not the handle's) refuses first, whatever the selector
+    from invisible_playwright.sync_api import Error
+
+    with pytest.raises(Error, match="The page does not support tap. Use hasTouch context option to enable touch support."):
+        page.tap("#go")
+    assert page.evaluate("window.seen.touchstart") == 0
 
 
 def test_select_text_selects_the_text_of_this_element(page):
