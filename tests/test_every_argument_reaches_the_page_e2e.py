@@ -12,6 +12,7 @@ object) and, node side, `evaluateExpression` with `adoptIfNeeded` (an element of
 from __future__ import annotations
 
 import datetime
+import json
 from urllib.parse import urlparse
 
 import pytest
@@ -174,3 +175,63 @@ def test_an_exposed_function_answering_a_date_hands_the_page_a_date(page):
     page.expose_function("whenIsIt", lambda: WHEN)
     assert page.evaluate("async () => { const r = await window.whenIsIt(); return [r instanceof Date, r.toISOString()]; }") == [
         True, "2021-07-28T20:26:32.123Z"]
+
+
+COUNTING = """<!doctype html><button id="touch" onclick="window.__touch()">touch</button>
+<script>
+(() => {
+  const calls = {Date: 0, URL: 0, Map: 0, RegExp: 0, Error: 0, defineProperty: 0};
+  const publish = () => document.documentElement.setAttribute("data-calls", JSON.stringify(calls));
+  for (const name of ["Date", "URL", "Map", "RegExp", "Error"]) {
+    const Native = window[name];
+    const Wrapper = new Proxy(Native, {
+      construct(target, args, newTarget) { calls[name]++; publish(); return Reflect.construct(target, args, newTarget === Wrapper ? target : newTarget); },
+      apply(target, self, args) { calls[name]++; publish(); return Reflect.apply(target, self, args); },
+    });
+    window[name] = Wrapper;
+  }
+  Object.defineProperty = new Proxy(Object.defineProperty, {
+    apply(target, self, args) { calls.defineProperty++; publish(); return Reflect.apply(target, self, args); },
+  });
+  window.__touch = () => {
+    new Date(0); new URL("https://a.test/"); new Map(); new RegExp("a"); new Error("x"); Object.defineProperty({}, "k", {value: 1});
+  };
+  publish();
+})();
+</script>"""
+
+ZERO = {"Date": 0, "URL": 0, "Map": 0, "RegExp": 0, "Error": 0, "defineProperty": 0}
+
+
+def _page_saw(page):
+    """What the page's own world counted, read from the DOM (every world shares it, so it does not depend on what the caller's world sees of the page's globals)."""
+    return json.loads(page.get_attribute("html", "data-calls"))
+
+
+@pytest.fixture
+def counting_page(browser):
+    page = browser.new_context().new_page()
+    page.set_default_timeout(30000)
+    page.set_content(COUNTING)
+    yield page
+    page.context.close()
+
+
+def test_the_counters_of_the_page_do_see_a_call_made_in_the_page(counting_page):
+    # the control of the next test: a click runs the page's own function, in the page's own world, and every wrapper counts
+    assert _page_saw(counting_page) == ZERO
+    counting_page.click("#touch")
+    assert _page_saw(counting_page) == {"Date": 1, "URL": 1, "Map": 1, "RegExp": 1, "Error": 1, "defineProperty": 1}
+
+
+def test_decoding_an_argument_makes_no_call_the_page_can_see(counting_page):
+    # the decoder runs in the caller's world (`__ctx_caller__`), not in the page's: a page that replaced `Date`, `URL`, `Map`, `RegExp`, `Error` and
+    # `Object.defineProperty` with wrappers that count sees none of the objects made for the argument, and the function gets the right values
+    shared = {"k": 1}
+    got = counting_page.evaluate(
+        "d => [d.date instanceof Date, d.date.toISOString(), d.url instanceof URL, d.url.href, d.err instanceof Error, d.err.message,"
+        " d.x === d.y, Object.is(d.zero, -0), Number.isNaN(d.nan)]",
+        {"date": WHEN, "url": urlparse("https://page.test/a?b=1"), "err": ValueError("boom"), "x": shared, "y": shared, "zero": 0.0,
+         "nan": float("nan")})
+    assert got == [True, "2021-07-28T20:26:32.123Z", True, "https://page.test/a?b=1", True, "boom", True, True, True]
+    assert _page_saw(counting_page) == ZERO

@@ -711,3 +711,116 @@ def test_every_tag_the_protocol_validator_accepts_is_a_tag_this_module_handles()
     page_side = {"ab"} if '"ab" in value' in _installed_bundle() else set()
     assert page_side == {"ab"}, "the page side of the driver no longer decodes `ab`"
     assert set(_arguments.VALUE_TAGS) == (validator - {"id"}) | page_side
+
+
+# --- the divergences from stock, each pinned by the TEXT it answers with -------------------------------------------------------------------
+
+REFUSED_HANDLE = ("%s cannot carry a JSHandle: it is read in the utility world, through the core, where the handle's object does not exist, and used to "
+                  "arrive as null. Pass the handle's value (json_value) or its properties instead")
+
+
+def test_a_utility_world_value_that_is_not_a_node_is_refused_with_the_exact_context_text(page, engine):
+    """(1) What `get_property` hands back cannot cross to the caller's world; stock's own text, word for word, is the answer (the same test as above pins
+    it through `_refused`, which compares the whole text; this one names the divergence and holds the literal)."""
+    made = handle(page, "main", "u-7", node=False)
+    with pytest.raises(ProtocolException) as refused:
+        evaluate(page, arg({"h": 0}, made.guid))
+    assert str(refused.value) == "JSHandles can be evaluated only in the context they were created!"
+
+
+def test_a_handle_in_an_event_init_is_refused_with_the_exact_text(page):
+    """(2) `dispatch_event`'s `eventInit`."""
+    with pytest.raises(ProtocolException) as refused:
+        page.frame.call("dispatchEvent", {"selector": "#a", "type": "click",
+                                          "eventInit": arg({"o": [{"k": "relatedTarget", "v": {"h": 0}}], "id": 1}, "elementhandle@1")})
+    assert str(refused.value) == REFUSED_HANDLE % "dispatch_event's eventInit"
+
+
+def test_a_handle_in_an_expected_value_is_refused_with_the_exact_text(page):
+    """(2) `expect`'s `expectedValue`."""
+    page.injected = Mock()
+    with pytest.raises(ProtocolException) as refused:
+        page.frame._expect_probe("to.have.js.property", "#a", {
+            "expression": "to.have.js.property", "expressionArg": "a", "expectedValue": arg({"h": 0}, "elementhandle@1")})
+    assert str(refused.value) == REFUSED_HANDLE % "expect's expectedValue"
+
+
+def test_a_bigint_as_the_whole_argument_is_refused_with_the_exact_text(page, engine):
+    """(3) The protocol's JSON has no BigInt; inside an array or an object it goes."""
+    with pytest.raises(ProtocolException) as refused:
+        evaluate(page, arg({"bi": "12"}))
+    assert str(refused.value) == ("a BigInt as the whole argument cannot be handed to the page: the engine's protocol carries no BigInt. Put it in an "
+                                  "array or an object, or pass it as a string")
+
+
+def test_a_handle_in_the_result_of_an_exposed_function_rejects_the_promise_with_the_exact_reason(engine):
+    """(4) The reason the page's promise is rejected with, word for word."""
+    _binding(engine).op_resolve({"result": arg({"h": 0}, "elementhandle@1")})
+    assert _delivered(engine)[3][2:] == [
+        {"value": False},
+        {"value": "result carries a JSHandle, which cannot be delivered here: its object lives in the caller's world, and this answer is read in the "
+                  "page's own"}]
+    assert not engine.decoders()
+
+
+# --- where the decoder runs ---------------------------------------------------------------------------------------------------------------
+
+THE_CALLERS_WORLD = "the-callers-world"
+
+
+class _OnlyTheCallersWorld(_Engine):
+    """An engine whose caller's world has a name nothing else has, and which has NO other way to ask for a world: a call that reached for the page's
+    main world (or the utility one) would not find the method."""
+
+    def __init__(self):
+        super().__init__()
+        self.context = THE_CALLERS_WORLD
+
+    def __getattr__(self, name):
+        raise AssertionError("the argument asked the injected script for %r: only `caller_context` names the world the decoder runs in" % name)
+
+
+def _entry_points(page):
+    element = handle(page, "main", "u-1")
+    return {
+        "evaluate": lambda: evaluate(page, arg(DATE)),
+        "evaluate_handle": lambda: page.frame.call("evaluateExpressionHandle", {"expression": "f", "arg": arg(DATE)}),
+        "element_evaluate": lambda: element.call("evaluateExpression", {"expression": "f", "arg": arg(DATE)}),
+        "eval_on_selector": lambda: page.frame.call("evalOnSelector", {"selector": "#a", "expression": "f", "arg": arg(DATE)}),
+        "eval_on_selector_all": lambda: page.frame.call("evalOnSelectorAll", {"selector": "li", "expression": "f", "arg": arg(DATE)}),
+        "wait_for_function": lambda: page.frame.call("waitForFunction", {"expression": "f", "arg": arg(DATE), "timeout": 5000}),
+    }
+
+
+@pytest.mark.parametrize("entry", ["evaluate", "evaluate_handle", "element_evaluate", "eval_on_selector", "eval_on_selector_all", "wait_for_function"])
+def test_the_decoder_runs_in_the_callers_world_and_leaves_no_global(page, entry):
+    """(a) The decoder is called in the context `injected.caller_context(...)` names, the one the caller's own code runs in, and never in the page's
+    main-world context: every command of the call (the decoder, the caller's function, the releases) is aimed at that one context. It is a function
+    declaration called with the spec: it writes nothing on `window`, `globalThis`, `self` or `this`."""
+    engine = _OnlyTheCallersWorld()
+    page.injected = engine
+    _entry_points(page)[entry]()
+    assert len(engine.decoders()) == 1
+    assert engine.decoders()[0][1] == THE_CALLERS_WORLD
+    assert {e[1] for e in engine.log if e[0] in ("call", "evaluate", "release")} == {THE_CALLERS_WORLD}, engine.log
+    assert [e for e in engine.log if e[0] == "evaluate" and "parseEvaluationResultValue" in e[2]] == [], "no script is evaluated to define the decoder"
+    declaration = engine.decoders()[0][2]
+    assert re.search(r"\b(window|globalThis|self|top|this)\b\s*(\.|\[)[^;\n]*=(?!=)", declaration) is None, "the decoder writes a global"
+    assert not re.search(r"\b(globalThis|window\.|self\.)", declaration)
+    assert ("release", THE_CALLERS_WORLD, "decoded") in engine.log
+
+
+def test_a_plain_result_of_an_exposed_function_is_one_call_the_delivery_and_nothing_else(engine):
+    """(b) Plain JSON goes as `{"value": ...}` in the very call that delivers it: no decoder, no other command."""
+    engine.__class__ = _OnlyTheCallersWorld
+    _binding(engine).op_resolve({"result": arg({"o": [{"k": "a", "v": {"n": 1}}, {"k": "l", "v": {"a": [{"s": "x"}], "id": 2}}], "id": 1})})
+    assert [e[:3] for e in engine.log] == [("call", "ctx", server._bindings.DELIVER)]
+    assert engine.log[0][3] == [{"objectId": "end-1"}, {"value": 3}, {"value": True}, {"value": {"a": 1, "l": ["x"]}}]
+
+
+def test_a_result_that_is_not_plain_is_decoded_in_the_binding_s_context_then_delivered_there_then_released(engine):
+    """(b) Only a value that is not plain JSON asks the decoder, in the context of the binding (the page's), before the delivery in the same one."""
+    engine.__class__ = _OnlyTheCallersWorld
+    _binding(engine).op_resolve({"result": arg(DATE)})
+    assert [e[:3] if e[0] == "call" else e for e in engine.log] == [
+        ("call", "ctx", engine.decoders()[0][2]), ("call", "ctx", server._bindings.DELIVER), ("release", "ctx", "decoded")]
