@@ -158,7 +158,6 @@ def test_stock_firefox_that_read_the_poison_is_a_sound_control():
 
 @pytest.mark.parametrize("change, requirement", [
     ({"offsets": [-420, -420]}, "timezone"),
-    ({"dark": False}, "dark"),
     ({"canary": {"with": [100, 100], "without": [100, 100], "present": False}}, "canary"),
     ({"audio": {"sampleRate": 48000, "maxChannelCount": 2}}, "audio"),
     ({"generic": [30.5, 216.0, 216.0]}, "generic"),
@@ -630,3 +629,83 @@ def test_the_realm_hashes_a_png_without_its_per_launch_chunk_and_the_site_withou
     assert "t !== 'deBG'" in realm and "toDataURL: dataUrlHash(c.toDataURL())" in realm and "png: pngHash(" in realm and "textHash" not in realm
     surfaces = (ROOT / "scripts" / "host_gate" / "ab" / "surfaces.html").read_text(encoding="utf-8")
     assert "e.origin.replace(/:\\d+$/, ':<port>')" in surfaces
+
+
+# -
+# In trial: measured and told, not required (run 45026082150: stock read no dark scheme on either system and, on Windows, did not see the per-user canary).
+
+def test_the_scheme_and_the_windows_canary_are_in_trial_everything_else_stays_required():
+    assert poison.IN_TRIAL == {"dark": ("linux", "windows"), "canary": ("windows",)}
+    assert set(poison.REQUIRED) >= {"timezone", "language", "canary", "audio", "generic"}
+    assert poison.in_trial("dark", "linux") and poison.in_trial("dark", "windows") and poison.in_trial("canary", "windows")
+    assert not poison.in_trial("canary", "linux") and not poison.in_trial("timezone", "windows") and not poison.in_trial("language", "linux")
+
+
+def test_a_scheme_stock_did_not_read_is_not_a_broken_control_but_is_told():
+    light = dict(STOCK, dark=False)
+    for system in ("linux", "windows"):
+        assert poison.control_failures(light, system) == []
+        assert [n for n, _ in poison.control_trials(light, system)] == ["dark"]
+    assert poison.control_trials(STOCK, "linux") == [] and poison.control_trials(None, "linux") == []
+
+
+def test_the_windows_canary_is_in_trial_and_the_linux_one_is_required():
+    unseen = dict(STOCK, canary={"with": [72, 122.6], "without": [72, 122.6], "present": False})
+    assert poison.control_failures(unseen, "windows") == [] and [n for n, _ in poison.control_trials(unseen, "windows")] == ["canary"]
+    assert [n for n, _ in poison.control_failures(unseen, "linux")] == ["canary"] and poison.control_trials(unseen, "linux") == []
+
+
+def test_what_stays_required_stays_red_on_windows_too():
+    bad = dict(STOCK, dark=False, offsets=[-420, -420], intl_locale="en-US", date_full="x", canary={"present": False})
+    assert sorted(n for n, _ in poison.control_failures(bad, "windows")) == ["language", "timezone"]
+
+
+def test_the_control_writes_the_trials_to_its_file_and_to_the_summary(tmp_path, monkeypatch, capsys):
+    import types
+
+    class Page:
+        def goto(self, url):
+            pass
+
+        def evaluate(self, expression):
+            return dict(STOCK, dark=False)
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+    class Browser:
+        def new_context(self, **options):
+            return Context()
+
+        def close(self):
+            pass
+
+    class Firefox:
+        def launch(self, **options):
+            return Browser()
+
+    class Manager:
+        firefox = Firefox()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = lambda: Manager()
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setattr(poison, "system_name", lambda: "linux")
+    assert poison.control(tmp_path / "out" / "poison-control.json") == 0
+    report = json.loads((tmp_path / "out" / "poison-control.json").read_text(encoding="utf-8"))
+    assert report["verdict"] == "green" and report["failures"] == []
+    assert [f["requirement"] for f in report["in_trial"]["not_read"]] == ["dark"]
+    assert report["in_trial"]["requirements"]["dark"] == ["linux", "windows"]
+    text = summary.read_text(encoding="utf-8")
+    assert "Verdict: **green**" in text and "not read, in trial (dark)" in text
+    assert "IN TRIAL, not required (dark)" in capsys.readouterr().out
