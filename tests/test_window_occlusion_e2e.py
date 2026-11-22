@@ -42,6 +42,14 @@ system kept that order and whether the foreground window belongs to one of the t
 ``$RUNNER_TEMP/invpw-evidence/test_window_occlusion/`` on every run, green or red, and every message carries one line per half
 ("order without topmost: kept / not kept, foreground: pid X (engine yes/no)").
 
+Also on Windows and also as evidence only, for the covered window that comes back above the cover in the product half: each half records the system's
+window events (``_win_events.ForegroundRecorder``: ``SetWinEventHook(EVENT_SYSTEM_FOREGROUND .. EVENT_OBJECT_FOCUS, WINEVENT_OUTOFCONTEXT)`` from a thread of
+its own, from before the first engine starts until the read-back without topmost, every event with ``time.perf_counter()``, its window and the window's
+process and thread) and ``GetForegroundWindow`` right before and right after the insert; both engines of the half write their focus log
+(``MOZ_LOG=Focus:5,timestamp``, ``MOZ_LOG_FILE`` in the evidence, ``moz-log/<half>/``, set with ``monkeypatch``). The events are saved as
+``win-events.jsonl``, and the line of each half goes on with who had the foreground at the insert, which engine had it before, who took it after and when
+(relative to the insert), and the focus events after it; a record that cannot be trusted says "NOT RECORDED" and why.
+
 A page reads it from ``document.visibilityState`` and the ``visibilitychange`` event.
 """
 from __future__ import annotations
@@ -55,6 +63,7 @@ import pytest
 from _evidence_on_failure import FailureEvidence
 from _os_focus import a_display_of_its_own
 from _waits import watch
+from _win_events import ForegroundRecorder
 from _window_sessions import DEADLINE_S, in_a_thread_of_its_own, launch, wait_for_condition
 from _x_visibility import XVisibility
 
@@ -76,6 +85,9 @@ TWO_FRAMES = "() => new Promise(done => requestAnimationFrame(() => requestAnima
 #: Names the page, so that on Windows its top-level window is found by its title.
 NAME = "(name) => { document.title = name; return document.title; }"
 COVERED_TITLE, COVER_TITLE = "occlusion-covered-window", "occlusion-covering-window"
+
+#: The engine's focus log of every Windows half (evidence only, a diagnostic no page reads).
+FOCUS_LOG = "Focus:5,timestamp"
 
 #: How far inside the covering window's rectangle the covered one is put, in device pixels.
 INSET = 32
@@ -314,19 +326,25 @@ class CoveringOnWindows:
         self.calls = None
         self.after_arrangement = None
 
-    def record_without_topmost(self, answered):
+    def record_without_topmost(self, answered, recorder):
         """The arrangement without topmost, then ``answered()`` (the page's answer the half waits for), then the Z-order and the foreground read
-        back: EVIDENCE only, nothing asserted. Whether the system kept the order, and whether the foreground is one of the two engines."""
+        back: EVIDENCE only, nothing asserted. Whether the system kept the order, and whether the foreground is one of the two engines; then the
+        ``recorder`` of the window events is stopped and says who had the foreground at the insert and who took it after."""
+        before = recorder.snapshot("right before the insert")
         calls = self.win.insert_under(self.first, self.cover)
+        after = recorder.snapshot("right after the insert")
         page = answered()
         seen = self.read()
+        recorder.stop()
         foreground = seen["foreground"]
         pid = foreground[1] if foreground else None
-        engine = {self.win.pid(self.first): "the covered session's engine", self.win.pid(self.cover): "the covering session's engine"}.get(pid)
+        roles = {self.win.pid(self.first): "the covered session's engine", self.win.pid(self.cover): "the covering session's engine"}
+        engine = roles.get(pid)
         self.without_topmost = {"calls": calls, "page": page, "read back": seen,
-                                "line": "order without topmost: %s, foreground: pid %s %s (engine %s)" % (
+                                "foreground record": dict(recorder.as_dict(), before=before, after=after),
+                                "line": "order without topmost: %s, foreground: pid %s %s (engine %s); %s" % (
                                     "kept" if seen["cover above"] else "not kept", pid, self.win.process_name(pid) if pid else "",
-                                    "yes, %s" % engine if engine else "no")}
+                                    "yes, %s" % engine if engine else "no", recorder.line(before, after, roles, self.win.process_name))}
 
     def arrange(self):
         """The arrangement the precondition rests on: the cover topmost, then the covered window inside it, read back once right after."""
@@ -406,15 +424,42 @@ class Record:
             self.records.append(record)
 
 
-def second_window_over_the_first(firefox_binary, tracking, record, x):
+class ForegroundEvidence:
+    """Windows only, evidence only: per half, the focus log of both engines and the recorder of the system's window events (``win-events.jsonl``)."""
+
+    def __init__(self, monkeypatch, evidence) -> None:
+        self.monkeypatch = monkeypatch
+        self.folder = evidence.moz_log_dir
+        self.events = Record()
+        evidence.note_records("win-events", self.events)
+
+    @contextlib.contextmanager
+    def recording(self, half):
+        """Before the half's two engines start: their ``MOZ_LOG`` into ``moz-log/<half>/`` and a started recorder; at the end its events are kept."""
+        folder = self.folder / half.split()[0]
+        folder.mkdir(parents=True, exist_ok=True)
+        self.monkeypatch.setenv("MOZ_LOG", FOCUS_LOG)
+        self.monkeypatch.setenv("MOZ_LOG_FILE", str(folder / "engine-%PID.log"))
+        recorder = ForegroundRecorder()
+        try:
+            with recorder:
+                yield recorder
+        finally:
+            self.events.add({"half": half, "record": recorder.as_dict()})
+            for event in recorder.recorded():
+                self.events.add({"half": half, **event})
+
+
+def second_window_over_the_first(firefox_binary, tracking, record, x, foreground=None):
     """(state, changes, windows) of the first session's page after a second session's window is up over it; ``windows`` is the evidence of the
     covering (Windows: the tracker's view, Linux: X's), also added to ``record`` for the evidence file.
 
     ``tracking`` is None for the product as it launches, or the value both tracking prefs are given; ``x`` is the test's own connection to the private
-    display on Linux, None on Windows."""
+    display on Linux, None on Windows; ``foreground`` the ``ForegroundEvidence`` of the test on Windows, None on Linux."""
     half = "control (tracking enabled)" if tracking else "product"
     extra = None if tracking is None else {name: tracking for name in TRACKING_PREFS}
-    with launch(firefox_binary, extra_prefs=extra) as first, in_a_thread_of_its_own(firefox_binary) as second:
+    recording = foreground.recording(half) if foreground else contextlib.nullcontext()
+    with recording as recorder, launch(firefox_binary, extra_prefs=extra) as first, in_a_thread_of_its_own(firefox_binary) as second:
         covered = first.new_page()
         covered.goto("about:blank")
         covered.evaluate(NAME, COVERED_TITLE)
@@ -434,7 +479,7 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
             second.run(opens_the_covering_window)
             if sys.platform == "win32":
                 covering = CoveringOnWindows(covered)
-                covering.record_without_topmost(answered)
+                covering.record_without_topmost(answered, recorder)
                 covering.arrange()
             if on_x:
                 on_x.raise_the_cover_and_read_back(covered)
@@ -484,12 +529,13 @@ def test_a_covered_window_stays_visible_unless_occlusion_tracking_is_enabled(fir
     record = Record()
     with FailureEvidence("test_window_occlusion") as evidence, the_display(monkeypatch) as x:
         evidence.note_records("windows", record)
-        tracked_state, tracked_changes, tracked_windows = second_window_over_the_first(firefox_binary, True, record, x)
+        foreground = ForegroundEvidence(monkeypatch, evidence) if sys.platform == "win32" else None
+        tracked_state, tracked_changes, tracked_windows = second_window_over_the_first(firefox_binary, True, record, x, foreground)
         assert tracked_state == "hidden" and tracked_changes == ["visible", "hidden"], (
             "control: with tracking enabled the covered page reads %r, changes %r; %s; windows: %r" % (
                 tracked_state, tracked_changes, lines(record), tracked_windows))
 
-        state, changes, windows = second_window_over_the_first(firefox_binary, None, record, x)
+        state, changes, windows = second_window_over_the_first(firefox_binary, None, record, x, foreground)
         assert state == "visible" and changes == ["visible"], (
             "the product's covered page reads %r, changes %r: it must stay visible, with no visibilitychange; %s; windows: %r" % (
                 state, changes, lines(record), windows))
