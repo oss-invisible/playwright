@@ -95,6 +95,12 @@ EVIDENCE_SECONDS = 30
 #: (TRR.cpp / DNSPacket.cpp: ``aAllowRFC1918 || !addr.IsIPAddrLocal()``), so the name would resolve to nothing and the probe would never connect
 #: (the first run on a runner, 10.1.0.150: the DoH was asked, the gateway never got a CONNECT). The lab declares it; no egress assertion depends on it.
 LAB_PREFS = {"network.trr.allow-rfc1918": True, "media.peerconnection.ice.obfuscate_host_addresses": True}
+#: The popup cases make their window by a click, and a popup of a click is allowed only while the transient activation of the press lasts (5 s from ``pointerdown``,
+#: ``dom.user_activation.transient.timeout``): after it the popup blocker answers null. What they measure is the exit of a dead window, not the blocker, so the precondition
+#: (a popup to close) must not depend on that timer against the speed of the runner. They declare "Block pop-up windows" unchecked, as a user does (diagnosis of the popup not made, run 45064266867).
+POPUP_BLOCKER_OFF = {"dom.disable_open_during_load": False}
+#: How long the press of the held-press test is held, in seconds: more than the 5 s of the activation, so the click comes after it has expired.
+PRESS_HELD_S = 5.5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -375,10 +381,15 @@ def engine_log(tmp_path, monkeypatch):
     return directory
 
 
-def _launch(binary, proxy=None):
-    """The session of the lab: NO proxy unless given (the default context is the machine's own network), the DoH provider of the FakeDoh."""
+def _launch(binary, proxy=None, prefs=None):
+    """The session of the lab: NO proxy unless given (the default context is the machine's own network), the DoH provider of the FakeDoh. ``prefs``: what a case adds."""
     return EndingPlaywright(seed=42, binary_path=binary, proxy=proxy, headless=True,
-                            extra_prefs={**PREFS, **LAB_PREFS})
+                            extra_prefs={**PREFS, **LAB_PREFS, **(prefs or {})})
+
+
+def _window_case_prefs(case: "WindowCase") -> Dict[str, object]:
+    """The prefs a window case adds to the launch: the popup cases, the popup blocker off (their window must not hang on the 5 s activation of a click)."""
+    return dict(POPUP_BLOCKER_OFF) if case.window == "popup" else {}
 
 
 def _the_proxy_of(case: Case, doh, gateway):
@@ -491,7 +502,7 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
     proxy = HttpProxy("http1", doh) if case.proxy == "http" else gateway("gw-context")
     stun_host, turn_host, port = lab.ice_host(case, "stun"), lab.ice_host(case, "turn"), lab.witness.port
     reached = None
-    with _launch(firefox_binary) as browser:
+    with _launch(firefox_binary, prefs=_window_case_prefs(case)) as browser:
         context, page = _page_in(browser, proxy=proxy.proxy)
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
         click_s = None
@@ -595,6 +606,31 @@ def test_the_same_peerconnection_of_an_attached_iframe_leaves_only_through_the_p
     the context (green on firefox-63 and on firefox-64): the lab sees the PeerConnection of a sub-window."""
     proxy, outcome, reached = _run_window_case(case, firefox_binary, lab, doh, pages, gateway, watcher)
     _check_window_case(case, outcome, proxy, reached, lab, doh, trap, watcher, engine_log, record_property)
+
+
+def test_the_popup_of_a_press_held_past_the_activation_is_made(firefox_binary, doh, pages, gateway):
+    """The precondition of the popup cases does not depend on the 5 s of the activation of a click. The press is held 5.5 s (``mouse.down()``, a hold, ``mouse.up()``)
+    on the button of the popup cases, so the ``click`` that ends it comes after the transient activation of its ``pointerdown`` has expired (``probe.isActive`` false,
+    the click at least 5000 ms after the pointer went down). With the popup blocker on, ``window.open`` answers null and ``made`` is false (the hunt of run 45064266867);
+    the launch of the popup cases declares it off, and the popup is made."""
+    case = WindowCase("popup", "socks5")
+    proxy = gateway("gw-context")
+    with _launch(firefox_binary, prefs=_window_case_prefs(case)) as browser:
+        context, page = _page_in(browser, proxy=proxy.proxy)
+        page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
+        page.evaluate(_POPUP_BUTTON_JS)
+        box = page.locator("#open-dead").bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.down()
+        ds.wait_until(lambda: False, PRESS_HELD_S)      # the press is held on purpose: this is the stimulus
+        page.mouse.up()
+        outcome = page.evaluate("() => ({made: !!window.__popup, popupIs: window.__popup === null ? 'null' : typeof window.__popup, probe: window.__probe || null})")
+        context.close()
+    probe = outcome.get("probe") or {}
+    gap = (probe["clickAt"] - probe["down"]) if "clickAt" in probe and "down" in probe else None
+    said = "outcome: %s, clickAt-down: %s" % (outcome, gap)
+    assert probe.get("isActive") is False and gap is not None and gap >= 5000, "the press did not outlive the activation, so the test proves nothing: " + said
+    assert outcome["made"], "the popup was not made after a press held past the activation, with the popup blocker declared off: " + said
 
 
 # ------------------------------------------------------------------------------------- two contexts alive at once, a TURN name each
