@@ -1027,3 +1027,234 @@ def test_the_stand_in_traces_the_network_only_when_the_host_oracle_asks(tmp_path
     assert "-e trace=%s " % stand_in._SYSCALLS in font and "socket" not in font, "the font tests' default is unchanged"
     assert "-e trace=%s,%s " % (host.STRACE_CALLS, stand_in._NET_SYSCALLS) in oracle and " -y" in oracle
     assert set(stand_in._NET_SYSCALLS.split(",")) == set(host.NET_CALLS)
+
+
+# -
+# The geolocation step: the candidate starts no Windows location utility process and loads no location module; stock Firefox, the control, must start it.
+
+LOCATION_CMD = '"%s" -contentproc --channel="100.7.8" -sandboxingKind 3 -notForBrowser utility' % FIREFOX
+WIN_FILES = ["c:\\windows\\system32\\kernel32.dll", "c:\\windows\\system32\\ntdll.dll", "c:\\windows\\system32\\user32.dll"]
+WIN_KINDS = {"parent": 1, "tab/isForBrowser": 2, "utility/sandboxingKind=1/notForBrowser": 1}
+LOCATION_KIND = "utility/sandboxingKind=3/notForBrowser"
+
+
+def windows_footprints(candidate_kinds=None, candidate_files=None, engine="candidate"):
+    published = footprint(platform="win32", kinds=WIN_KINDS, files=WIN_FILES)
+    return published, footprint(engine, platform="win32", kinds=candidate_kinds or WIN_KINDS, files=candidate_files or WIN_FILES)
+
+
+def test_the_location_utility_process_is_the_kind_3_of_a_real_windows_command_line():
+    events = host.parse_audit_events(audit(18, 108, 100, FIREFOX, LOCATION_CMD))
+    label = host.windows_processes(events, FIREFOX)[108]["label"]
+    assert label == LOCATION_KIND
+    assert host.location_utility_kinds({"parent": 1, label: 1, "utility/sandboxingKind=1/notForBrowser": 1, "utility/sandboxingKind=30/notForBrowser": 1}) == [LOCATION_KIND]
+    assert host.LOCATION_UTILITY_KIND == "3"
+
+
+def test_a_candidate_that_starts_the_location_utility_process_is_red_on_windows_and_says_so():
+    published, candidate = windows_footprints(candidate_kinds=dict(WIN_KINDS, **{LOCATION_KIND: 1}))
+    report = judge(published, candidate, expected=[])
+    assert report["verdict"] == "red"
+    messages = [p for p in report["problems"] if "location utility process (-sandboxingKind 3)" in p]
+    assert len(messages) == len(SEEDS) and all("side B" in m and LOCATION_KIND in m for m in messages)
+
+
+def test_the_rule_is_absolute_the_published_engine_having_the_process_too_does_not_excuse_the_candidate():
+    both = dict(WIN_KINDS, **{LOCATION_KIND: 1})
+    report = judge(footprint(platform="win32", kinds=both, files=WIN_FILES), footprint("candidate", platform="win32", kinds=both, files=WIN_FILES), expected=[])
+    assert report["differences"] == [] and report["verdict"] == "red"
+
+
+def test_a_candidate_that_loads_a_location_module_is_red_whatever_the_spelling_of_the_path():
+    for path in ("C:\\Windows\\System32\\GeoLocation.dll", "c:\\windows\\system32\\locationframeworkps.dll", "C:\\Windows\\System32\\wlanapi.dll",
+                 "c:\\windows\\system32\\capabilityaccessmanagerclient.dll", "c:\\windows\\system32\\locationapi.dll",
+                 "c:\\windows\\system32\\windows.devices.geolocation.dll", "c:\\windows\\system32\\Windows.Devices.GeolocationExt.dll"):
+        published, candidate = windows_footprints(candidate_files=WIN_FILES + [path])
+        published["seeds"] = [dict(s, files=WIN_FILES + [path]) for s in published["seeds"]]
+        report = judge(published, candidate, expected=[])
+        assert report["verdict"] == "red" and any("loaded location modules" in p and path.rsplit("\\", 1)[-1] in p for p in report["problems"]), path
+
+
+def test_a_neighbour_of_the_location_modules_is_not_one():
+    assert host.location_modules(["c:\\windows\\system32\\geolocation.dll.mui", "c:\\windows\\system32\\location.dll", "c:\\lab\\geolocation.json"]) == []
+
+
+def test_the_utility_process_of_the_media_decoder_is_not_the_location_one():
+    published, candidate = windows_footprints()
+    assert judge(published, candidate, expected=[])["verdict"] == "green"
+
+
+def test_the_warm_up_launch_of_the_candidate_is_checked_too():
+    published, candidate = windows_footprints()
+    candidate["warmup"] = dict(seed_footprint(11, kinds=dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=WIN_FILES), seed=11)
+    report = judge(published, candidate, expected=[])
+    assert report["verdict"] == "red" and any(p.startswith("warm-up side B: the engine started the Windows location utility process") for p in report["problems"])
+
+
+def test_the_rule_is_for_the_candidate_on_windows_not_for_the_a_a_nor_for_linux():
+    published, candidate = windows_footprints(candidate_kinds=dict(WIN_KINDS, **{LOCATION_KIND: 1}))
+    a_a = judge(candidate, copy.deepcopy(candidate), a_a=True)
+    assert not any("location" in p for p in a_a["problems"])
+    side_a = judge(candidate, published, expected=[])
+    assert not any("side B: the engine started" in p for p in side_a["problems"])
+    on_linux = judge(footprint(), footprint("candidate", kinds=dict(KINDS, **{LOCATION_KIND: 1})), expected=[])
+    assert not any("location" in p for p in on_linux["problems"])
+
+
+def a_stock(kinds, files=(), steps=None, problems=()):
+    return {"format": host.FORMAT, "engine": "stock", "platform": "win32",
+            "stock": {"seed": 0, "steps": steps if steps is not None else [{"n": 5, "name": host.GEO_STEP, "ok": True}], "kinds": kinds, "files": list(files),
+                      "problems": list(problems)}}
+
+
+def test_stock_that_starts_the_location_utility_process_is_a_working_control():
+    stock = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=["c:\\windows\\system32\\geolocation.dll"])
+    assert host.stock_control_problems(stock) == []
+
+
+def test_stock_that_does_not_start_it_is_a_broken_control_and_says_the_step_does_not_reach_the_provider():
+    problems = host.stock_control_problems(a_stock(WIN_KINDS))
+    assert len(problems) == 1 and "did not start the Windows location utility process (-sandboxingKind 3)" in problems[0]
+    assert "does not reach the platform provider" in problems[0]
+
+
+def test_a_stock_run_that_failed_or_was_not_traced_is_a_broken_control_too():
+    kinds = dict(WIN_KINDS, **{LOCATION_KIND: 1})
+    assert host.stock_control_problems(a_stock(kinds, steps=[{"n": 5, "name": host.GEO_STEP, "ok": False, "error": "timeout"}])) == [
+        "stock control: step 5 (%s) failed: timeout" % host.GEO_STEP]
+    assert host.stock_control_problems(a_stock(kinds, problems=["the file trace lost 3 events"])) == ["stock control: the file trace lost 3 events"]
+    assert host.stock_control_problems({"stock": {}}) == ["stock control: the run made no footprint"]
+
+
+class FakePage:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def goto(self, url):
+        self.calls.append(("goto", url))
+
+    def evaluate(self, script):
+        self.calls.append(("evaluate", script))
+        return {"answer": "error", "code": 2}
+
+
+class FakeContext:
+    def __init__(self, calls, options):
+        self.calls = calls
+        calls.append(("new_context", options))
+
+    def grant_permissions(self, permissions, origin=None):
+        self.calls.append(("grant_permissions", list(permissions), origin))
+
+    def new_page(self):
+        self.calls.append(("new_page",))
+        return FakePage(self.calls)
+
+    def close(self):
+        self.calls.append(("close",))
+
+
+class FakeBrowser:
+    def __init__(self):
+        self.calls = []
+
+    def new_context(self, **options):
+        return FakeContext(self.calls, options)
+
+
+def test_the_step_grants_the_permission_to_the_lab_page_then_opens_it_then_asks_and_awaits_the_answer():
+    browser = FakeBrowser()
+    step = host.geolocation_step(browser, "http://127.0.0.1:9", host.GEO_DECLARED, 5)
+    assert [c[0] for c in browser.calls] == ["new_context", "grant_permissions", "new_page", "goto", "evaluate", "close"]
+    assert browser.calls[0][1] == {"geolocation": host.GEO_DECLARED}
+    assert browser.calls[1][1:] == (["geolocation"], "http://127.0.0.1:9")
+    assert browser.calls[3][1] == "http://127.0.0.1:9/geo"
+    assert step == {"n": 5, "name": host.GEO_STEP, "ok": True, "geo": {"answer": "error", "code": 2}}
+
+
+def test_the_stock_control_declares_no_position_so_that_it_has_to_ask_the_platform():
+    browser = FakeBrowser()
+    host.geolocation_step(browser, "http://127.0.0.1:9", None, 5)
+    assert browser.calls[0] == ("new_context", {})
+
+
+def test_the_request_ends_with_the_callback_or_the_error_and_no_timer_of_the_page_decides():
+    assert "getCurrentPosition" in host.GEO_READ and "position =>" in host.GEO_READ and "error =>" in host.GEO_READ
+    assert "setTimeout" not in host.GEO_READ and "sleep" not in host.GEO_READ.lower()
+
+
+def test_a_step_that_threw_is_recorded_as_failed_and_closes_its_context():
+    class Throws(FakePage):
+        def evaluate(self, script):
+            raise RuntimeError("page crashed\nmore")
+
+    class B(FakeBrowser):
+        def new_context(self, **options):
+            context = FakeContext(self.calls, options)
+            context.new_page = lambda: Throws(self.calls)
+            return context
+
+    browser = B()
+    step = host.geolocation_step(browser, "http://127.0.0.1:9", None, 5)
+    assert step["ok"] is False and step["error"] == "page crashed" and browser.calls[-1] == ("close",)
+
+
+def test_the_journey_has_the_geolocation_step_after_its_own_steps_in_a_run():
+    source = Path(host.__file__).read_text(encoding="utf-8")
+    run_seed = source[source.index("def run_seed("):source.index("def _wait_for_tree_exit(")]
+    assert run_seed.index("for n, (name, method) in enumerate(JOURNEY, 1)") < run_seed.index("geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1)")
+    assert run_seed.index("geolocation_step(") < run_seed.index("browser.close()")
+
+
+def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
+    import urllib.request
+
+    origin, stop = host.start_geo_lab()
+    try:
+        assert origin.startswith("http://127.0.0.1:")
+        with urllib.request.urlopen(origin + host.GEO_PATH, timeout=5) as response:
+            assert response.status == 200 and b"<title>geo</title>" in response.read()
+    finally:
+        stop()
+
+
+def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_verdict_and_a_broken_one_is_exit_2(tmp_path, monkeypatch):
+    order = []
+    monkeypatch.setattr(host, "_windows", lambda: True)
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub-binary", "pub-seal"))
+    monkeypatch.setattr(host, "print_report", lambda *a, **k: None)
+    monkeypatch.setattr(host, "load_expected", lambda path: [])
+    stock = {"doc": a_stock(WIN_KINDS)}
+
+    def fake_run(exe, seal, leg, out, label, seeds):
+        order.append(("run", label))
+        host.write_json(out, footprint(label, platform="win32"))
+        return 0
+
+    def fake_stock(leg, out):
+        order.append(("stock", leg))
+        host.write_json(out, stock["doc"])
+        return 0
+
+    def fake_judge(a, b, **kw):
+        order.append(("judge", "a-a" if kw.get("a_a") else "a-b"))
+        return {"verdict": "green", "problems": []}
+
+    monkeypatch.setattr(host, "run_subprocess", fake_run)
+    monkeypatch.setattr(host, "run_stock_subprocess", fake_stock)
+    monkeypatch.setattr(host, "judge", fake_judge)
+    assert host.ab("cand", Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
+    assert order == [("run", "firefox-68"), ("run", "firefox-68 again"), ("run", "candidate"), ("judge", "a-a"), ("stock", "windows-x86_64")]
+    order.clear()
+    stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}))
+    assert host.ab("cand", Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
+    assert order[-2:] == [("stock", "windows-x86_64"), ("judge", "a-b")]
+    order.clear()
+    assert host.ab(None, None, "windows-x86_64", tmp_path / "o3", "firefox-68", [11]) == 0
+    assert ("stock", "windows-x86_64") not in order, "the A/A has no candidate: no control of the geolocation step"
+
+
+def test_the_stock_command_is_for_windows_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(host, "_windows", lambda: False)
+    assert host.main(["stock", "--leg", "linux-x86_64", "--out", str(tmp_path / "s.json")]) == 3
+    assert "Linux has no Windows location provider" in capsys.readouterr().out

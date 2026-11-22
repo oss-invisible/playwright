@@ -6,6 +6,12 @@ change (a helper that is no longer spawned, a path of the machine it did not tou
 TRACE of the run, from the launch to the exit of the browser (the quiet point is the exit of the process, not a wait), after the same short
 journey (the first steps of the fake web's P4 walk, tests/fakeweb/profile_p4.py, no internet, driven by the stock Playwright client).
 
+After the four steps of the journey comes a fifth: the geolocation permission is granted to a page of the oracle's own and `getCurrentPosition` is called and awaited
+(the callback or the error, an event). On Windows the candidate must start NO utility process of the kind WINDOWS_UTILS (`-sandboxingKind 3`) and load none of the modules of
+the platform's location provider (an absolute rule, `geolocation_problems`); the NEGATIVE CONTROL is Playwright's own Firefox on the same runner with the same step
+(`run_stock`, command `stock`), which MUST start that process: if it does not the step does not reach the provider and the leg is a broken control (exit 2).
+On Linux the same step runs and its footprint is compared like the rest.
+
 Three things are compared, over the whole trace:
 
   * the processes, by KIND, from the command lines of the launch: the parent, `-contentproc` with its type, `-sandboxingKind N` and
@@ -66,7 +72,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -85,6 +93,29 @@ JOURNEY = (("open home", "s1_open_home"),
            ("hover and click a teaser", "s2_hover_click_teaser"),
            ("scroll to the bottom, next article", "s3_scroll_next"),
            ("nav Category", "s7_nav_category"))
+#: The step that follows the journey (not a method of the fake web's journey: it has a page of the oracle's own, `start_geo_lab`): the geolocation
+#: permission is granted to that page and `navigator.geolocation.getCurrentPosition` is called. It ends with the callback or the error, whichever the
+#: engine gives (an event, never a clock): what the page is answered is recorded (`geo`) and never judged, the host is what is judged.
+GEO_STEP = "geolocation granted, getCurrentPosition"
+GEO_PATH = "/geo"
+#: The position the core declares to our engine, made up (the engine's own contract test, juggler/tests/geolocation_windows_provider_never_selected.test.mjs, uses
+#: the same); the stock control is given none, so that it has to ask the platform.
+GEO_DECLARED = {"latitude": 45.0, "longitude": 9.0, "accuracy": 1500}
+#: The page asks once and ends with a position or an error. `timeout` is the acquisition limit of the request (a stock Firefox with no answer from its
+#: provider would wait for ever): it is never read by a verdict, the answer is recorded and not judged.
+GEO_READ = """() => new Promise(resolve => navigator.geolocation.getCurrentPosition(
+  position => resolve({answer: 'position'}),
+  error => resolve({answer: 'error', code: error.code}),
+  {timeout: %d, maximumAge: 0}))""" % 20000
+#: The Windows location provider of Firefox runs in the utility process of the kind WINDOWS_UTILS: `-sandboxingKind 3` (the enum of
+#: ipc/glue/UtilityProcessSandboxing.h: GENERIC_UTILITY 0, UTILITY_AUDIO_DECODING_WMF 1, MF_MEDIA_ENGINE_CDM 2, WINDOWS_UTILS 3, WINDOWS_FILE_DIALOG 4).
+#: Our engine has no caller of it left (acceptance contract, item 4, of the engine's geolocation_windows_provider_never_selected.test.mjs).
+LOCATION_UTILITY_KIND = "3"
+#: The modules the provider loads (a Windows trace sees a library as a file opened): the engine's contract names the first four as ABSENT (item 3 of the
+#: same test); the WinRT geolocation modules are matched by their prefix.
+LOCATION_MODULES = frozenset({"geolocation.dll", "locationframeworkps.dll", "locationapi.dll", "wlanapi.dll", "capabilityaccessmanagerclient.dll"})
+LOCATION_MODULE_PREFIXES = ("windows.devices.geolocation",)
+
 #: What a seed's footprint must hold at least, per category of leaf: a footprint that holds less did not see the run.
 #: Provisional: the first A/A on both systems gives the real numbers (they are in diff.json, "leaves").
 #: There is no floor for `net`: a run that opens no netlink socket and sends nothing to a public address is a run that can exist.
@@ -1019,6 +1050,54 @@ def _by(seed_footprint: dict, leaf: str) -> list:
     return list(seed_footprint.get("touched_by" if category == "file" else "spawned_by", {}).get(name, []))
 
 
+def _windows() -> bool:
+    return sys.platform == "win32"
+
+
+def location_utility_kinds(kinds) -> list:
+    """The kinds of process (`utility/sandboxingKind=3/notForBrowser`) that are the utility process of the Windows location provider."""
+    return sorted(k for k in kinds if "sandboxingKind=%s" % LOCATION_UTILITY_KIND in k.split("/"))
+
+
+def location_modules(paths) -> list:
+    """The paths (host paths of a footprint, either separator) of a module the Windows location provider loads."""
+    out = []
+    for path in paths:
+        name = _base(path).lower()
+        if name in LOCATION_MODULES or name.startswith(LOCATION_MODULE_PREFIXES):
+            out.append(path)
+    return sorted(out)
+
+
+def geolocation_problems(seed_footprint: dict, where: str) -> list:
+    """What a candidate's launch did to the host that only the platform's location provider does: a process of the kind `-sandboxingKind 3` and
+    the modules it loads. Absolute (it does not read the published engine): the candidate answers from the core's declaration and asks nobody."""
+    problems = []
+    kinds = location_utility_kinds(seed_footprint.get("kinds", {}))
+    if kinds:
+        problems.append("%s side B: the engine started the Windows location utility process (-sandboxingKind %s): %s"
+                        % (where, LOCATION_UTILITY_KIND, ", ".join(kinds)))
+    modules = location_modules(seed_footprint.get("files", []))
+    if modules:
+        problems.append("%s side B: the engine loaded location modules: %s" % (where, ", ".join(modules[:10])))
+    return problems
+
+
+def stock_control_problems(stock: dict) -> list:
+    """What makes the stock control BROKEN (exit 2, the A/B says nothing): its own trace or step failed, or stock Firefox, given the permission and the
+    same request, did not start the Windows location utility process, so the step does not reach the platform provider."""
+    seed = stock.get("stock") or {}
+    problems = ["stock control: %s" % p for p in seed.get("problems", [])]
+    problems += ["stock control: step %s (%s) failed: %s" % (st.get("n"), st.get("name"), st.get("error")) for st in seed.get("steps", []) if not st.get("ok")]
+    if not seed:
+        problems.append("stock control: the run made no footprint")
+    elif not location_utility_kinds(seed.get("kinds", {})):
+        problems.append("stock control: stock Firefox did not start the Windows location utility process (-sandboxingKind %s) after getCurrentPosition with the "
+                        "permission granted: the step does not reach the platform provider, so a candidate without that process proves nothing"
+                        % LOCATION_UTILITY_KIND)
+    return problems
+
+
 def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, platform: str | None = None,
           floors: dict | None = None) -> dict:
     """The verdict on two footprints (the document `run` writes). `expected` is the declared differences, applied only when `a_a` is false.
@@ -1054,6 +1133,9 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             if va != vb:
                 differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)}})
+    if os_name == "windows" and not a_a:
+        for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
+            problems += geolocation_problems(fp, where)
     stale = []
     if not a_a:
         for entry in expected or []:
@@ -1153,6 +1235,58 @@ def _context(binary: str, windows: bool, work: Path) -> Context:
     return Context("linux", app=app, temp=temp, cache={os.environ.get("XDG_CACHE_HOME", "")})
 
 
+def start_geo_lab():
+    """The oracle's own lab page of the geolocation step: one static page on 127.0.0.1 (a secure context). Returns (origin, stop)."""
+    body = b"<!doctype html><meta charset=utf-8><title>geo</title><p>geo"
+
+    class Handler(BaseHTTPRequestHandler):
+        timeout = 5
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def stop():
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    return "http://127.0.0.1:%d" % server.server_address[1], stop
+
+
+def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dict:
+    """The step after the journey: a context (with the declared position, or none for the stock control), the permission granted to the lab page,
+    the page opened, `getCurrentPosition` called and awaited. Returns the step as the journey's are recorded, with `geo` (what the page was answered)."""
+    step = {"n": n, "name": GEO_STEP}
+    context = None
+    try:
+        context = browser.new_context(geolocation=dict(declared)) if declared else browser.new_context()
+        context.grant_permissions(["geolocation"], origin=origin)
+        page = context.new_page()
+        page.goto(origin + GEO_PATH)
+        step["geo"] = page.evaluate(GEO_READ)
+        step["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
+        step.update(ok=False, error=str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc))
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return step
+
+
 def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dict:
     """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own)."""
     from playwright.sync_api import sync_playwright
@@ -1179,6 +1313,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
 
         exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
+    geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
@@ -1205,6 +1340,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
                     steps.append({"n": n, "name": name, "ok": True})
                 except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
                     steps.append({"n": n, "name": name, "ok": False, "error": str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc)})
+            steps.append(geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1))
             context.close()
             browser.close()
         # The close: the run ends with the exit of the browser, and the trace is read after it.
@@ -1219,6 +1355,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
                   "problems": ["the trace of the run could not be taken: %s" % e]}
     finally:
         stop_site()
+        stop_geo()
         if server is not None:
             try:
                 server.close()
@@ -1315,6 +1452,46 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
             "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
 
 
+def run_stock(leg: str) -> dict:
+    """The negative control of the geolocation step, Windows only: Playwright's own Firefox (`p.firefox.launch()`, as the fake web's stock control), with
+    no declared position, the same step, the same trace. It must start the Windows location utility process (`stock_control_problems`). The tree is the
+    one of this process (the driver and the browser it launches): only the kinds and the modules of the run are read."""
+    from playwright.sync_api import sync_playwright
+
+    work = Path(tempfile.mkdtemp(prefix="ab-host-stock-"))
+    trace = WindowsTrace(work)
+    stop_geo = None
+    steps = []
+
+    def document(result):
+        return {"format": FORMAT, "engine": "stock", "leg": leg, "platform": sys.platform, "stock": result}
+
+    try:
+        try:
+            trace.start()
+        except TraceError as e:
+            return document({"seed": 0, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False},
+                             "problems": ["the trace of a Windows run could not be started (it needs an administrator): %s" % e]})
+        geo_origin, stop_geo = start_geo_lab()
+        try:
+            with sync_playwright() as p:
+                exe = p.firefox.executable_path
+                browser = p.firefox.launch(headless=True)
+                try:
+                    steps.append(geolocation_step(browser, geo_origin, None, len(JOURNEY) + 1))
+                finally:
+                    browser.close()
+            return document(_seed_result(exe, 0, work, steps, work / "none.log", trace, os.getpid(), True))
+        except TraceError as e:
+            return document({"seed": 0, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
+                             "problems": ["the trace of the run could not be taken: %s" % e]})
+    finally:
+        if stop_geo is not None:
+            stop_geo()
+        trace.cleanup()
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def write_json(path: Path, document) -> None:
     Path(path).write_text(json.dumps(document, sort_keys=True, indent=1), encoding="utf-8")
 
@@ -1346,6 +1523,39 @@ def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: s
             return subprocess.run(cmd, env=env, timeout=RUN_TIMEOUT_S).returncode
     except subprocess.TimeoutExpired:
         return 124
+
+
+def run_stock_subprocess(leg: str, out: Path) -> int:
+    """`stock` in a process of its own (its tree is the one of that process), with a temp root of its own."""
+    env = dict(os.environ)
+    for name in ("MOZ_LOG", "MOZ_LOG_FILE"):
+        env.pop(name, None)
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "stock", "--leg", leg, "--out", str(out)]
+    try:
+        with tempfile.TemporaryDirectory(prefix="ab-host-tmp-") as temp:
+            env.update(TMPDIR=temp, TEMP=temp, TMP=temp)
+            return subprocess.run(cmd, env=env, timeout=RUN_TIMEOUT_S).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+def run_stock_control(leg: str, out: Path) -> dict | None:
+    """The stock run of the geolocation step and its verdict: the footprint, or None when the control is broken (said on the output)."""
+    print("=== negative control of the geolocation step: Playwright's own Firefox")
+    sys.stdout.flush()
+    rc = run_stock_subprocess(leg, out / "footprint-stock.json")
+    broken = ["the run of the stock control ended with %s" % rc] if rc != 0 or not (out / "footprint-stock.json").exists() else []
+    stock = None
+    if not broken:
+        stock = read_json(out / "footprint-stock.json")
+        broken = stock_control_problems(stock)
+    if broken:
+        print("\n".join("FAIL " + b for b in broken))
+        print("BROKEN CONTROL: the geolocation step does not reach the platform provider on stock Firefox; the A/B says nothing")
+        return None
+    print("GEOLOCATION CONTROL: stock Firefox started %s; modules: %s" % (
+        ", ".join(location_utility_kinds(stock["stock"]["kinds"])), ", ".join(location_modules(stock["stock"]["files"])) or "-"))
+    return stock
 
 
 def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, engine_tag: str, seeds: list,
@@ -1382,6 +1592,10 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             return 2
         if not candidate:
             return 0
+        if _windows():
+            stock = run_stock_control(leg, out)
+            if stock is None:
+                return 2
         expected = load_expected(expected_file)
         report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False)
         write_json(out / "diff.json", report)
@@ -1401,6 +1615,9 @@ def main(argv=None) -> int:
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--label", default="engine")
     r.add_argument("--seeds", default=None, help="comma separated (default: ci/persona-seeds.json 'candidate', else the host gate's)")
+    k = sub.add_parser("stock", help="the negative control of the geolocation step (Windows): Playwright's own Firefox")
+    k.add_argument("--leg", required=True)
+    k.add_argument("--out", type=Path, required=True)
     c = sub.add_parser("compare", help="two footprints: the diff and the verdict")
     c.add_argument("a", type=Path)
     c.add_argument("b", type=Path)
@@ -1426,6 +1643,12 @@ def main(argv=None) -> int:
         if report["verdict"] == "green":
             return 0
         return 2 if args.a_a else 1
+    if args.cmd == "stock":
+        if not _windows():
+            print("the stock control is for Windows: Linux has no Windows location provider to reach")
+            return 3
+        write_json(args.out, run_stock(args.leg))
+        return 0
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else default_seeds()
     if args.cmd == "run":
         if sys.platform.startswith("linux") and not shutil.which("strace"):
