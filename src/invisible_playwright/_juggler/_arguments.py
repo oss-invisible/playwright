@@ -131,6 +131,12 @@ function parseEvaluationResultValue(value, handles = [], refs = /* @__PURE__ */ 
 #: i-th). Run in the caller's context, by reference.
 DECODER = "(spec, ...handles) => {\n" + _STOCK + "\nreturn parseEvaluationResultValue(spec, handles);\n}"
 
+#: THE VALUE TAGS THIS MODULE HANDLES, each one a node `_to_spec` knows. They are the keys of the driver's protocol validator for a serialized value (`scheme.SerializedValue`
+#: in `coreBundle.js`: `n b s v d u bi ta e r a o h ref`; `id` only marks an array or an object and is no value) and one more, `ab` (an ArrayBuffer): the validator
+#: does not list it, the page side of stock (`parseEvaluationResultValue`, embedded above) decodes it, so it is passed to the decoder as it came. A test reads the
+#: validator from the installed driver and compares it with this set.
+VALUE_TAGS = ("n", "b", "s", "v", "d", "u", "bi", "ab", "ta", "e", "r", "a", "o", "h", "ref")
+
 _SPECIAL_NUMBERS = ("NaN", "Infinity", "-Infinity", "-0")
 _ISO_MILLISECONDS = re.compile(r"^(\d{4,6}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$")
 _BIGINT_REMOTE = re.compile(r"^-?\d+n$")
@@ -283,6 +289,8 @@ class Argument:
             return {"r": {"p": node["r"].get("p"), "f": node["r"].get("f")}}
         if "ta" in node:
             return {"ta": {"b": node["ta"]["b"], "k": node["ta"]["k"]}}
+        if "ab" in node:
+            return {"ab": node["ab"]}
         if "a" in node:
             spec = {"a": [self._to_spec(x) for x in node["a"]]}
             if "id" in node:
