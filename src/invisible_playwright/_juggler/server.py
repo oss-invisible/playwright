@@ -4098,7 +4098,13 @@ class PageDispatcher(Dispatcher):
                         else "image/png",
             "clip": clip,
             "quality": params.get("quality"),
-            "omitDeviceScaleFactor": False,
+            # ⛔ THE SCALE IS THE CALLER'S, and it is the engine that applies it: `"css"` is a picture in CSS pixels
+            # (1280x720 for a 1280x720 viewport at any ratio), `"device"` and no `scale` a picture in device pixels
+            # (1600x900 at 1.25). Stock Playwright's Firefox sends `omitDeviceScaleFactor: scale === "css"`; this sent
+            # False for everything and ignored `scale`, so `scale="css"` gave device pixels at any ratio but 1. The
+            # element's screenshot ends here too (`ElementHandleDispatcher.op_screenshot` hands its rectangle to this
+            # call with the caller's params), so the page, the full page, a clip and an element all agree.
+            "omitDeviceScaleFactor": params.get("scale") == "css",
         }), timeout=self.frame._timeout(params)) or {}
         # ⛔ BASE64 IN, BASE64 OUT. The client decodes it; decoding here and
         # handing back bytes puts a str() of a bytes object in the answer.
