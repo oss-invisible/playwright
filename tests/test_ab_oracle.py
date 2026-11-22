@@ -1187,3 +1187,368 @@ def test_the_dump_of_an_oracle_run_is_given_its_own_folder_for_the_probe_and_the
     monkeypatch.setattr(ab, "run_dump", lambda *a: (_ for _ in ()).throw(ab.subprocess.TimeoutExpired("x", 1)))
     rc, problems = ab.dump_with_exits("firefox-68", "pub", None, "linux-x86_64", [(1.0, 0)], tmp_path / "t", tmp_path / "out")
     assert rc == "timeout" and problems == [], "a dump that timed out is red already (the dump ended with timeout); its missing record is not said twice"
+
+
+# --- what every launch leaves, a tab that died, a core with a parent that ended with 0 (scripts/ci_crash_evidence.py, scripts/ci_host_gate.py) ---------------------------------
+
+class ProcessOf:
+    pid = 4242
+
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+    def terminate(self):
+        pass
+
+
+class Tools:
+    """`subprocess.run` that answers `gdb` with a backtrace and keeps what it was asked; every other tool of the evidence is not installed."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+
+        class Done:
+            stdout, stderr = "#0 0x00007f in mozilla::dom::ContentChild::Crash ()\n", ""
+
+        return Done()
+
+    which = staticmethod(lambda name: "/usr/bin/gdb" if name == "gdb" else None)
+
+
+def a_launch(probe, code, label, text=b"", during=None):
+    """A launch as `launch` makes it: the reader of the browser's output first (`ProcessOutput`, over a pipe the browser writes on), then the `Connection`, closed as the wrapper closes it."""
+    from invisible_core.juggler.connection import Connection, ProcessOutput
+
+    probe.set_label(**label)
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
+    out_r, out_w = os.pipe()
+    output = ProcessOutput(os.fdopen(out_r, "rb"))
+    conn = Connection(to_w, from_r, ProcessOf(code))
+    conn.output = output
+    os.write(out_w, text)
+    os.close(out_w)
+    output.settle()
+    if during:
+        during()
+    conn.close()
+    os.close(from_w)
+    os.close(to_r)
+
+
+@pytest.fixture()
+def probe_of(tmp_path):
+    made = []
+
+    def make(**kw):
+        tools = Tools()
+        probe = crash.LaunchProbe("/e/firefox", tmp_path / "out" / "crash", windows=False, folders=[], core_folders=[tmp_path / "cores"], run=tools, which=tools.which, **kw)
+        (tmp_path / "cores").mkdir(exist_ok=True)
+        probe.tools = tools
+        made.append(probe.install())
+        return probe
+
+    yield make
+    for probe in made:
+        probe.uninstall()
+
+
+def test_what_the_browser_wrote_is_saved_for_every_launch_even_when_all_of_them_end_with_0(tmp_path, probe_of):
+    probe = probe_of()
+    lines = b"".join(b"line %d of the browser\n" % n for n in range(1, 301))  # the core's own reader keeps the last 200
+    a_launch(probe, 0, {"seed": 11, "dpr": 1.0, "launch": "visit"}, lines)
+    a_launch(probe, 0, {"seed": 12, "dpr": 1.5, "launch": "visit"}, b"[GFX1-]: a warning on stderr\n")
+    exits = probe.write()
+    folder = tmp_path / "out" / "crash"
+    assert sorted(p.name for p in (folder / "stderr").iterdir()) == ["01-11-1.0-visit.txt", "02-12-1.5-visit.txt"]
+    first = (folder / "stderr" / "01-11-1.0-visit.txt").read_text(encoding="utf-8")
+    assert "line 1 of the browser\n" in first and "line 300 of the browser\n" in first
+    assert "[GFX1-]: a warning on stderr" in (folder / "stderr" / "02-12-1.5-visit.txt").read_text(encoding="utf-8")
+    document = crash.read_exits(exits)
+    assert [x["returncode"] for x in document["launches"]] == [0, 0] and all(x["stderr"].startswith("crash/stderr/") for x in document["launches"])
+    assert not [p for p in folder.iterdir() if p.is_dir() and p.name != "stderr"], "a green launch leaves no evidence folder: only its output"
+    assert crash.exits_of_run(folder, "firefox-68", False) == [], "green stays green"
+
+
+def test_the_tee_gives_the_reader_the_same_lines_and_the_probe_a_copy():
+    from invisible_core.juggler.connection import ProcessOutput
+
+    class Stream:
+        def __init__(self):
+            self.lines = iter([b"one\n", b"two\n", b""])
+
+        def readline(self):
+            return next(self.lines)
+
+    record = crash.OutputRecord(1, {}, 0.0)
+    output = ProcessOutput(crash.OutputTee(Stream(), record))
+    output.settle()
+    assert output.tail() == ["one", "two"] and record.text() == "one\ntwo\n"
+
+
+def test_a_launch_whose_output_the_probe_could_not_keep_is_red_not_silent(tmp_path):
+    from invisible_core.juggler.connection import Connection
+
+    probe = crash.LaunchProbe("/e/firefox", tmp_path / "out" / "crash", windows=False, folders=[], core_folders=[tmp_path / "cores"]).install(Connection, output=None)
+    try:
+        a_launch(probe, 0, {"seed": 1, "launch": "visit"}, b"said something\n")
+    finally:
+        probe.uninstall()
+    probe.write()
+    lines = crash.exits_of_run(tmp_path / "out" / "crash", "candidate", False)
+    assert len(lines) == 2 and "could not save what its browsers wrote" in lines[0] and "did not save what the browser of launch 1 wrote" in lines[1]
+    assert not (tmp_path / "out" / "crash" / "stderr").exists()
+
+
+def test_a_launch_that_ended_while_starting_still_has_its_output_in_the_artifact(tmp_path, probe_of):
+    from invisible_core.juggler.connection import ProcessOutput
+
+    probe = probe_of()
+    probe.set_label(seed=3, dpr=1.0, launch="visit")
+    out_r, out_w = os.pipe()
+    output = ProcessOutput(os.fdopen(out_r, "rb"))  # `launch` raised after this: no Connection was made over it
+    os.write(out_w, b"Gtk-WARNING: cannot open display\n")
+    os.close(out_w)
+    output.settle()
+    probe.write()
+    document = crash.read_exits(tmp_path / "out" / "crash" / "exits.json")
+    assert document["launches"] == [] and [x["label"]["seed"] for x in document["launches_without_connection"]] == [3]
+    assert "cannot open display" in (tmp_path / "out" / "crash" / "stderr" / "01-3-1.0-visit-no-connection.txt").read_text(encoding="utf-8")
+
+
+def test_the_core_of_a_content_process_goes_through_gdb_though_the_parent_ended_with_0_and_is_red(tmp_path, probe_of):
+    probe = probe_of()
+    cores = tmp_path / "cores"
+    a_launch(probe, 0, {"seed": 11, "dpr": 1.0, "launch": "visit"}, b"fine\n")
+    a_launch(probe, 0, {"seed": 12, "dpr": 1.5, "launch": "visit"}, b"[Child 77] ###!!! ABORT: tab\n", during=lambda: (cores / "core.Web Content.77.1700000000").write_bytes(b"\x7fELF"))
+    a_launch(probe, 0, {"seed": 13, "dpr": 1.0, "launch": "visit"}, b"fine\n")
+    probe.write()
+    launches = crash.read_exits(tmp_path / "out" / "crash" / "exits.json")["launches"]
+    assert [x["cores"] for x in launches] == [[], ["core.Web Content.77.1700000000"], []], "a core is one launch's: the next launch does not get it again"
+    gdb = [c for c in probe.tools.calls if c[0].endswith("gdb")]
+    assert len(gdb) == 1 and all(command in gdb[0] for command in crash.GDB_COMMANDS)
+    saved = tmp_path / "out" / launches[1]["evidence"] / "gdb-core.Web_Content.77.1700000000.txt"
+    assert "ContentChild::Crash" in saved.read_text(encoding="utf-8")
+    lines = crash.exits_of_run(tmp_path / "out" / "crash", "candidate", False)
+    assert len(lines) == 1 and "a process of the browser crashed while the parent ended with 0" in lines[0] and "seed 12" in lines[0] and "core core.Web Content.77" in lines[0]
+    assert "(evidence: crash/02-12-1.5-visit)" in lines[0] and "run candidate" in lines[0]
+
+
+def test_a_missing_core_is_said_where_it_was_looked_for_and_never_left_silent(tmp_path, probe_of, monkeypatch):
+    monkeypatch.setenv(crash.CORE_DIR_ENV, str(tmp_path / "cores"))
+    probe = probe_of()
+    a_launch(probe, 0, {"seed": 11, "dpr": 1.0, "launch": "visit"})
+    a_launch(probe, -11, {"seed": 12, "dpr": 1.0, "launch": "visit"})
+    probe.write()
+    green, died = crash.read_exits(tmp_path / "out" / "crash" / "exits.json")["launches"]
+    assert "no core file written since the launch began, in %s" % (tmp_path / "cores") in green["core_said"]
+    assert "no core file written since the launch began" in " | ".join(died["said"]), "and the launch that died says it too, in its evidence"
+    monkeypatch.setenv(crash.CORE_DIR_ENV, "/job/cores")
+    assert "the kernel does not write into INVPW_CORE_DIR, so a core would not have been seen there" in crash.core_said([Path("/job/cores")], "|/usr/share/apport/apport %p", False)
+    assert "no core folder to look in" in crash.core_said([], "core", False) and "not seen" in crash.core_said([], "core", False)
+    assert "Windows" in crash.core_said([], None, True)
+
+
+# the tab that died: a visit whose session was lost is a leaf of its own, and the comparison is red with that line first
+
+def a_browser(monkeypatch, fail_on=None, error="Page.evaluate: cannot find session"):
+    """`invisible_playwright.InvisiblePlaywright` as a fake whose page answers the host gate's page and the states, and raises `error` at the call whose text contains `fail_on`."""
+    import types
+
+    answers = {"window.__hostGate": {"format": gate.FORMAT, "items": {"surface": {"x": 1}}}, "__hostGateStates.prepare()": {"x": 5, "y": 6},
+               "[innerWidth, innerHeight]": [100, 80], "__hostGateStates.measure()": {"innerWidth": 100}}
+
+    class Mouse:
+        def move(self, *a):
+            pass
+
+        def click(self, *a):
+            pass
+
+    class Page:
+        mouse = Mouse()
+
+        def goto(self, url, timeout=None):
+            if fail_on == "goto":
+                raise RuntimeError("Page.goto: Target page, context or browser has been closed")
+
+        def wait_for_function(self, expression, timeout=None):
+            pass
+
+        def evaluate(self, expression):
+            if fail_on and fail_on in expression:
+                raise RuntimeError(error)
+            return json.loads(json.dumps(answers.get(expression)))
+
+    class Browser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def new_context(self):
+            return self
+
+        def new_page(self):
+            return Page()
+
+    module = types.ModuleType("invisible_playwright")
+    module.InvisiblePlaywright = lambda **options: Browser()
+    monkeypatch.setitem(sys.modules, "invisible_playwright", module)
+
+
+def test_a_session_lost_during_the_states_is_the_leaf_crash_tab_with_the_error_and_the_step(monkeypatch):
+    a_browser(monkeypatch, fail_on="__hostGateStates.measure()")
+    gate._LAUNCH[0] = "visit"
+    result = gate.read_page({"seed": 12}, 1, 1.5, 1000)
+    leaf = result["items"]["crash.tab.visit"]
+    assert result["format"] == gate.FORMAT and "cannot find session" in leaf["error"] and leaf["step"] == "states: evaluate __hostGateStates.measure()"
+    assert result["items"]["surface"] == {"x": 1}, "what the page had read before the tab died is kept"
+    assert gate.tab_crash_lines("leg dpr 1.5 seed 12", result["items"]) == ["TAB CRASH leg dpr 1.5 seed 12 crash.tab.visit: %s, at the step states: evaluate __hostGateStates.measure()" % leaf["error"]]
+
+
+def test_a_tab_that_died_before_the_page_answered_is_the_leaf_alone_and_the_dump_goes_on(monkeypatch):
+    a_browser(monkeypatch, fail_on="goto")
+    gate._LAUNCH[0] = "relaunch-second"
+    try:
+        result = gate.read_page({"seed": 0}, 1, 1.0, 1000)
+    finally:
+        gate._LAUNCH[0] = "visit"
+    assert list(result["items"]) == ["crash.tab.relaunch-second"] and result["items"]["crash.tab.relaunch-second"]["step"] == "goto"
+
+
+def test_an_error_that_is_not_a_lost_tab_is_still_raised_as_it_always_was(monkeypatch):
+    a_browser(monkeypatch, fail_on="__hostGateStates.measure()", error="the page threw a TypeError")
+    gate._LAUNCH[0] = "visit"
+    result = gate.read_page({"seed": 12}, 1, 1.5, 1000)
+    assert "crash.tab.visit" not in result["items"] and "error" in result["items"]["state.normal"], "the states say it, as before"
+    a_browser(monkeypatch, fail_on="window.__hostGate", error="the page threw a TypeError")
+    with pytest.raises(RuntimeError, match="TypeError"):
+        gate.read_page({"seed": 12}, 1, 1.5, 1000)
+
+
+def test_the_second_launch_keeps_the_tab_that_died_in_the_first():
+    seen = iter([{"format": gate.FORMAT, "items": {"crash.tab.relaunch-first": {"error": "cannot find session", "step": "goto"}}}, {"format": gate.FORMAT, "items": {"surface": {"x": 1}}}])
+    got = gate.second_launch({"seed": 0}, 1, 1.0, 1000, read=lambda *a: next(seen))
+    assert got["items"]["crash.tab.relaunch-first"]["step"] == "goto" and got["items"]["surface"] == {"x": 1}
+
+
+def test_the_ab_visit_records_the_tab_that_died_and_goes_no_further(monkeypatch):
+    import types
+
+    log = []
+
+    class Page:
+        def goto(self, url, timeout=None):
+            pass
+
+        def go_back(self, timeout=None):
+            raise RuntimeError("Page.goBack: cannot find session")
+
+        def wait_for_function(self, expression, timeout=None):
+            pass
+
+        def evaluate(self, expression):
+            return {"top": 1} if expression == "window.__abResult" else {"n": 2, "persisted": False, "data": 1}
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            log.append("closed")
+            raise RuntimeError("Context.close: Target closed")  # closing the context of a dead tab says nothing more
+
+    class Browser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def new_context(self, **options):
+            return Context()
+
+    module = types.ModuleType("invisible_playwright")
+    module.InvisiblePlaywright = lambda **options: Browser()
+    monkeypatch.setitem(sys.modules, "invisible_playwright", module)
+    got = gate.ab_visit("ff", 0, "UTC", 1.0, timeout_ms=10)
+    assert list(got) == ["crash.tab.ab-visit"] and got["crash.tab.ab-visit"]["step"] == "go back (context launch)" and log == ["closed"]
+
+
+def a_visit_where_the_tab_died(error="Page.evaluate: cannot find session"):
+    """The visit as the dead side dumped it: what the page read before, the leaf of the crash, and the states the drive did not reach, each `{"error": ...}`."""
+    its = items(12)
+    its.update(crash.tab_crash_item("visit", "states: evaluate __hostGateStates.measure()", RuntimeError(error)))
+    for name in gate.STATES:
+        its[gate.STATE + name] = {"error": "RuntimeError: " + error}
+    return its
+
+
+def test_a_visit_whose_tab_died_is_red_with_the_tab_crash_first_and_no_cascade_of_missing_leaves():
+    a, b = visits(), visits()
+    for side in (a, b):
+        for key in side:
+            for name in gate.STATES:
+                side[key][gate.STATE + name] = {"innerWidth": 1920, "innerHeight": 1000, "screen": {"width": 1920}}
+    b[(1.5, 12)] = a_visit_where_the_tab_died()
+    report = run(a, b)
+    assert report["verdict"] == "red"
+    assert report["problems"][0].startswith("TAB CRASH side B seed 12 dpr 1.5 launch visit at step states: evaluate __hostGateStates.measure()")
+    assert "cannot find session" in report["problems"][0] and "are not compared" in report["problems"][0]
+    assert report["differences"] == [] and len(report["problems"]) == 1, "no leaf of the dead visit is listed: the cascade is one line"
+    assert "<missing>" not in json.dumps(report) and report["tab_crashes"][0]["launch"] == "visit"
+
+
+def test_the_leaf_alone_makes_the_comparison_red_though_every_other_leaf_is_equal():
+    a, b = visits(), visits()
+    b[(1.0, 11)].update(crash.tab_crash_item("visit", "goto", RuntimeError("Target page, context or browser has been closed")))
+    report = run(a, b)
+    assert report["verdict"] == "red" and report["differences"] == [] and len(report["problems"]) == 1
+    assert report["problems"][0] == "TAB CRASH side B seed 11 dpr 1.0 launch visit at step goto: RuntimeError: Target page, context or browser has been closed"
+    assert run(visits(), visits())["verdict"] == "green", "and without the leaf the same dumps are green"
+
+
+def test_a_tab_that_died_on_the_published_side_is_named_on_side_a_and_a_second_launch_that_died_is_named_by_its_launch():
+    a, b = {(1.0, 0): items(0)}, {(1.0, 0): items(0)}
+    a[(1.0, 0)].update(crash.tab_crash_item("visit", "goto", RuntimeError("cannot find session")))
+    b[(1.0, 0)].update({gate.RELAUNCH + k: v for k, v in crash.tab_crash_item("relaunch-second", "goto", RuntimeError("cannot find session")).items()})
+    problems = ab.compare_visits(a, b, [], SMALL, expected=((1.0, 0),))["problems"]
+    assert problems[0].startswith("TAB CRASH side A seed 0 dpr 1.0 launch visit") and problems[1].startswith("TAB CRASH side B seed 0 dpr 1.0 launch relaunch-second")
+
+
+def test_the_tab_crash_comes_before_the_exit_of_the_dump_it_left_and_before_the_leaves():
+    b = visits()
+    b[(1.5, 12)] = a_visit_where_the_tab_died()
+    b[(1.0, 13)]["surface"]["navigator"]["language"] = "it-IT"
+    report = ab.judge(visits(), b, [], extra_problems=["the dump with candidate ended with 1"], expected=VISITS)
+    assert report["verdict"] == "red"
+    assert report["problems"][0].startswith("TAB CRASH") and report["problems"][1] == "the dump with candidate ended with 1"
+    assert report["problems"][-1].startswith("seed 13 dpr 1.0 surface.navigator.language"), "the differences stay the last lines"
+
+
+def test_a_dump_prints_the_tab_crash_and_writes_the_visit_with_its_leaf(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv(crash.CRASH_DIR_ENV, raising=False)
+    monkeypatch.setattr(gate, "read_page", lambda *a: {"format": gate.FORMAT, "items": a_visit_where_the_tab_died()})
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    assert gate.dump("ff", "linux-x86_64", tmp_path / "dump", tmp_path / "reference", visits=[(1.5, 12)], pin_dpr=False) == 0
+    assert "TAB CRASH linux-x86_64 dpr 1.5 seed 12 crash.tab.visit: RuntimeError: Page.evaluate: cannot find session" in capsys.readouterr().out
+    written = json.loads((tmp_path / "dump" / "linux-x86_64_dpr1.5_seed12.json").read_text(encoding="utf-8"))
+    assert written["result"]["items"]["crash.tab.visit"]["step"].startswith("states:")
+
+
+def test_every_page_oracle_job_uploads_the_folder_where_the_oracle_keeps_what_each_launch_left_whatever_the_result():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    for name in ("e2e-page", "e2e-page-windows", "e2e-page-final", "e2e-page-final-windows"):
+        body = _job(text, name)
+        step = body[body.index("      - name: Upload what the test saved"):]
+        assert "if: always()" in step and "${{ runner.temp }}/invpw-evidence\n" in step, "%s: the evidence folder (ab-oracle/crash/<run>/stderr, exits.json, gdb files) is uploaded green or red" % name
+    assert "RUNNER_TEMP" in (root / "tests" / "test_ab_oracle_e2e.py").read_text(encoding="utf-8") and '"invpw-evidence" / "ab-oracle"' in (root / "tests" / "test_ab_oracle_e2e.py").read_text(encoding="utf-8")

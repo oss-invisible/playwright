@@ -55,6 +55,13 @@ process whose probe wrote nothing is red too. What the launch left is kept in `<
 names, `said.txt` for what the collectors did not find, and `exits.json` with how every launch ended. This oracle runs no strace (a trace would slow the browser and change the
 outcome it observes): the strace tail is the host oracle's.
 
+WHAT A LAUNCH LEAVES, ALWAYS. The probe also saves, for EVERY launch of both engines (and of the A/A), what the browser wrote on stdout and stderr (the core merges them on one pipe) in
+`<out>/crash/<run>/stderr/<launch>.txt`, green or not, and the cores written since the launch began (Linux) are run through gdb whatever code the parent ended with: a content process can
+die and the parent still end with 0, and then the launch is red and names the core. A launch without a core says where it looked (`core_said` in exits.json). A TAB THAT DIED, or a session lost
+during a visit (the core's `cannot find session`, a closed target), is the leaf `crash.tab.<launch>` of that visit, with the error and the step (`.error`, `.step`), and the comparison puts it FIRST:
+`TAB CRASH side B seed 12 dpr 1.5 launch visit at step ...`. That leaf alone makes the verdict red; the leaves the dead tab could not read (or that only the other side has) are not listed as a
+cascade of `<missing>`: they are counted in that line.
+
     python ci_ab_oracle.py touched BASE_SHA     (prints touched=true|false: does a pull request change a file of this oracle; e2e.yml's final-set job reads it)
 
 Writes, in --out: dump-<N>.json and dump-<N>-again.json (the published engine's items, twice), diff-a-a.json (the A/A),
@@ -100,6 +107,9 @@ CLIP = 400
 PRINT_LIMIT = 200
 #: What a leaf that is not in a visit reads as.
 MISSING = "<missing>"
+#: How the verdict names a tab that died (or a session that was lost) during a visit, first of all the lines: the dump records it as the leaf `crash.tab.<launch>`
+#: (scripts/ci_crash_evidence.py), and the leaves the dead tab could not read are consequences, not differences.
+TAB_CRASH = "TAB CRASH"
 #: Said by the run when no visit is dumped within this time (the host gate's own budget is 180 s per page).
 DUMP_TIMEOUT_S = 40 * 60
 
@@ -171,6 +181,17 @@ def split_launches(leaves: dict) -> tuple:
     return first, {k: v for k, v in leaves.items() if k.startswith(RELAUNCH)}
 
 
+def tab_crashes(leaves: dict) -> list:
+    """[(launch, error, step)] of the tab crashes one side's visit recorded: the leaves `crash.tab.<launch>.error` and `.step` (a second launch's keep their prefix)."""
+    found: dict = {}
+    for leaf, value in leaves.items():
+        bare = _bare(leaf)
+        if bare.startswith(crash.TAB_PREFIX):
+            launch, _, field = bare[len(crash.TAB_PREFIX):].partition(".")
+            found.setdefault((leaf.startswith(RELAUNCH), launch), {})[field or "error"] = value
+    return [(launch, f.get("error"), f.get("step")) for (_second, launch), f in sorted(found.items())]
+
+
 def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None,
                    expected: tuple | None = None, relaunch: tuple | None = None) -> dict:
     """a and b map (dpr, seed) to the items of that visit (as the dump returns them).
@@ -187,6 +208,7 @@ def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None
         expected = tuple((dpr, seed) for dpr in gate.DPRS for seed in gate.SEEDS)
     relaunch = relaunch_visits(expected) if relaunch is None else relaunch
     problems, differences, compared, excused, relaunched = [], [], {}, 0, {}
+    crashes, cascade = [], {}
     for side, visits in (("A", a), ("B", b)):
         gone = [visit_name(*k) for k in expected if k not in visits]
         if gone:
@@ -199,11 +221,20 @@ def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None
             continue
         dpr, seed = key
         la, lb = comparable(a[key]), comparable(b[key])
-        count, again = 0, 0
+        count, again, skipped = 0, 0, 0
         floor = min_leaves.get(dpr, min(min_leaves.values(), default=0))
+        died = {"A": tab_crashes(la), "B": tab_crashes(lb)}
+        crashed = bool(died["A"] or died["B"])
+        for side, found in died.items():
+            crashes += [{"side": side, "seed": seed, "dpr": dpr, "launch": launch, "error": error, "step": step} for launch, error, step in found]
         for leaf in sorted(set(la) | set(lb)):
             if gate.matching(noise, _bare(leaf)):
                 excused += 1
+                continue
+            if _bare(leaf).startswith(crash.TAB_PREFIX):
+                continue  # said as a TAB CRASH, once, with its error and its step: not a difference of values
+            if crashed and (leaf not in la or leaf not in lb):
+                skipped += 1  # what the dead tab could not read (or the other side read and this one never got to): a consequence, said once below
                 continue
             second = leaf.startswith(RELAUNCH)
             count, again = count + (not second), again + second
@@ -212,21 +243,28 @@ def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None
                 differences.append({"seed": seed, "dpr": dpr, "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "what": gate.describe(va, vb)})
         compared[visit_name(dpr, seed)] = count
-        if count < floor:
+        if skipped:
+            cascade[visit_name(dpr, seed)] = skipped
+        if count < floor and not crashed:
             problems.append("%s compared %d leaves, fewer than the %d of the host gate's reference: "
                             "the page dumped less than it should" % (visit_name(dpr, seed), count, floor))
         for side, leaves_of in (("A", la), ("B", lb)):
             has = len(split_launches(leaves_of)[1])
-            if key in relaunch and has < floor:
+            if key in relaunch and has < floor and not crashed:
                 problems.append("side %s: the second launch of %s on a reused profile has %d leaves under %s, fewer than the %d of the host gate's "
                                 "reference: it did not run, or the page dumped less than it should" % (side, visit_name(dpr, seed), has, RELAUNCH, floor))
-            if key not in relaunch and has:
+            if key not in relaunch and has and not crashed:
                 problems.append("side %s has the second launch of %s on a reused profile, which was not asked for" % (side, visit_name(dpr, seed)))
         if key in relaunch:
             relaunched[visit_name(dpr, seed)] = again
+    tab_lines = ["%s side %s seed %d dpr %s launch %s at step %s: %s%s" % (
+        TAB_CRASH, c["side"], c["seed"], c["dpr"], c["launch"], c["step"], c["error"],
+        " (the %d leaves of this visit that the tab could not read, or that only the other side has, are not compared)" % cascade[visit_name(c["dpr"], c["seed"])]
+        if visit_name(c["dpr"], c["seed"]) in cascade else "") for c in crashes]
+    problems = tab_lines + problems  # the tab crash is the first line of the verdict, before anything it caused
     for d in differences:
         problems.append("seed %d dpr %s %s: %s" % (d["seed"], d["dpr"], d["leaf"], d["what"]))
-    return {"verdict": "red" if problems else "green", "problems": problems, "differences": differences,
+    return {"verdict": "red" if problems else "green", "problems": problems, "differences": differences, "tab_crashes": crashes,
             "compared": compared, "relaunch": relaunched, "excused": excused}
 
 
@@ -257,7 +295,8 @@ def judge(published: dict, candidate: dict, noise: list, extra_problems=(), expe
           relaunch: tuple | None = None) -> dict:
     report = compare_visits(published, candidate, noise, expected=expected, relaunch=relaunch)
     if extra_problems:
-        report["problems"] = list(extra_problems) + report["problems"]
+        crashed = [x for x in report["problems"] if x.startswith(TAB_CRASH)]  # a tab that died is named before the exit code of the dump it left
+        report["problems"] = crashed + list(extra_problems) + report["problems"][len(crashed):]
         report["verdict"] = "red"
     return report
 

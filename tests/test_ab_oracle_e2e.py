@@ -37,6 +37,7 @@ pytestmark = pytest.mark.e2e
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_oracle.py"
 sys.path.insert(0, str(ROOT / "scripts"))
+import ci_crash_evidence as crash  # noqa: E402
 import ci_host_gate as gate  # noqa: E402
 import ci_poison_host as poison  # noqa: E402
 from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
@@ -116,6 +117,18 @@ def _check_ab_visit_and_poison(out: Path, candidate: bool) -> None:
     assert not read, "the engine read the poisoned host:\n" + "\n".join(read)
 
 
+def _check_what_every_launch_left(out: Path, candidate: bool) -> None:
+    """The artifact of a green run holds what each browser wrote: a file per launch of each engine run (`crash/<run>/stderr/`), whatever the launch's end was. A run that
+    saved none would leave the next crash to be inferred."""
+    runs = sorted(p.parent.name for p in (out / "crash").glob("*/exits.json"))
+    assert len(runs) == (3 if candidate else 2), "a record of how the browsers ended for each engine run: %s" % runs
+    for run in runs:
+        launches = crash.read_exits(out / "crash" / run / "exits.json")["launches"]
+        assert launches, "the run %s recorded no launch" % run
+        for launch in launches:
+            assert launch.get("stderr") and (out / "crash" / launch["stderr"]).is_file(), "the run %s did not save what the browser of launch %s wrote" % (run, launch.get("n"))
+
+
 def _out(tmp_path: Path) -> Path:
     explicit = os.environ.get("AB_ORACLE_OUT")
     if explicit:
@@ -156,6 +169,7 @@ def test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_by
     assert control["verdict"] == "green" and control["differences"] == [] and control["problems"] == [] and len(control["compared"]) == len(control["visits"]) >= 1
     assert len(control["visits"]) == len(visits), "every seed of the shard is visited: %s" % control["visits"]
     assert sorted(control["relaunch"]) == sorted(ab.visit_name(*key) for key in ab.relaunch_visits(visits)), "seed 0 is launched twice on one profile, whichever shard has it"
+    _check_what_every_launch_left(out, candidate)
     _check_ab_visit_and_poison(out, candidate)
     names = sorted(p.name for p in out.glob("*.json") if not p.name.startswith("poison-"))
     if candidate:

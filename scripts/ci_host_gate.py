@@ -424,21 +424,79 @@ def visit_options(firefox: str, seed: int, dpr: float | None, zone: str, profile
     return options
 
 
+#: Which launch of the dump is being made, for the name of the leaf a tab that died is recorded under (`crash.tab.<launch>`): the visit, the two launches of the pair on one profile,
+#: the ab visit. Set with the probe's own label (`_mark`), so that the leaf and the evidence of the launch have one name.
+_LAUNCH = ["visit"]
+
+
+def _mark(seed, dpr, launch: str) -> None:
+    _LAUNCH[0] = launch
+    crash.mark(seed=seed, dpr=dpr, launch=launch)
+
+
+class Steps:
+    """Which step of a launch is being made, so that a tab that dies says WHERE: `step` is the last one begun, and `failed` the (step, error) of the last call of `wrap` that raised."""
+
+    def __init__(self, step: str = "launch") -> None:
+        self.step, self.failed = step, None
+
+    def wrap(self, name: str, fn: Callable) -> Callable:
+        def run(*args, **kwargs):
+            self.step = "%s %s" % (name, ", ".join(str(a)[:60] for a in args))
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - noted, and raised again
+                self.failed = (self.step, e)
+                raise
+        return run
+
+
+def leaves_of_crash(items: dict) -> dict:
+    """{key: {"error", "step"}} of the items that record a tab that died or a session that was lost (also those of the second launch, under RELAUNCH)."""
+    out = {}
+    for key, value in items.items():
+        bare = key[len(RELAUNCH):] if key.startswith(RELAUNCH) else key
+        if bare.startswith(crash.TAB_PREFIX) and isinstance(value, dict):
+            out[key] = value
+    return out
+
+
+def tab_crash_lines(visit: str, items: dict) -> list:
+    """The tab crashes a visit's items hold, as the lines a dump prints."""
+    return ["TAB CRASH %s %s: %s, at the step %s" % (visit, k, v.get("error"), v.get("step")) for k, v in sorted(leaves_of_crash(items).items())]
+
+
 def read_page(options: dict, port: int, dpr: float, timeout_ms: int) -> dict:
     """One launch: the page's result (with the states driven when the page answered the format), the browser closed. With a profile_dir in
-    `options` the wrapper hands back a persistent context, not a browser, and the page is opened in it."""
+    `options` the wrapper hands back a persistent context, not a browser, and the page is opened in it.
+
+    A tab that died, or a session that was lost, while the page was read (the error says it: `crash.tab_lost`) is not an exception of the dump: it is the leaf
+    `crash.tab.<launch>` of this visit, with the error and the step, and the dump goes on. It used to be a `{"error": ...}` in each state the drive had not reached, which the
+    comparison read as a cascade of leaves that were missing (candidate run: «cannot find session» in every `state.*`)."""
     from invisible_playwright import InvisiblePlaywright
 
+    launch, trace, result = _LAUNCH[0], Steps("new page"), None
     with InvisiblePlaywright(**options) as browser:
-        page = browser.new_page() if "profile_dir" in options else browser.new_context().new_page()
-        # The same budget as the wait below: a cold Windows runner took
-        # more than goto's default 30 s to reach `load` on the first
-        # visit (candidate 42410156024), and passed locally 6/6.
-        page.goto("http://127.0.0.1:%d/?dpr%s" % (port, dpr), timeout=timeout_ms)
-        page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
-        result = page.evaluate("window.__hostGate")
-        if result.get("format") == FORMAT:
-            result["items"].update(drive_states(page.evaluate, page.mouse.move, page.mouse.click))
+        try:
+            page = browser.new_page() if "profile_dir" in options else browser.new_context().new_page()
+            # The same budget as the wait below: a cold Windows runner took
+            # more than goto's default 30 s to reach `load` on the first
+            # visit (candidate 42410156024), and passed locally 6/6.
+            trace.step = "goto"
+            page.goto("http://127.0.0.1:%d/?dpr%s" % (port, dpr), timeout=timeout_ms)
+            trace.step = "wait for the page's result"
+            page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
+            trace.step = "read the page's result"
+            result = page.evaluate("window.__hostGate")
+            if result.get("format") == FORMAT:
+                result["items"].update(drive_states(trace.wrap("evaluate", page.evaluate), trace.wrap("mouse move", page.mouse.move), trace.wrap("mouse click", page.mouse.click)))
+                if trace.failed is not None and crash.tab_lost(trace.failed[1]):
+                    result["items"].update(crash.tab_crash_item(launch, "states: " + trace.failed[0], trace.failed[1]))
+        except Exception as e:  # noqa: BLE001 - only a tab that died is recorded; anything else is raised as it always was
+            if not crash.tab_lost(e):
+                raise
+            result = {"format": FORMAT, "items": dict(result["items"]) if isinstance(result, dict) and isinstance(result.get("items"), dict) else {}}
+            result["items"].update(crash.tab_crash_item(launch, trace.step, e))
     return result
 
 
@@ -450,12 +508,15 @@ def second_launch(options: dict, port: int, dpr: float, timeout_ms: int, read=No
     profile = tempfile.mkdtemp(prefix="host-gate-profile-")
     try:
         with_profile = dict(options, profile_dir=profile)
-        crash.mark(seed=options.get("seed"), dpr=dpr, launch="relaunch-first")
+        _mark(options.get("seed"), dpr, "relaunch-first")
         first = read(with_profile, port, dpr, timeout_ms)
         if first.get("format") != FORMAT:
             return first
-        crash.mark(seed=options.get("seed"), dpr=dpr, launch="relaunch-second")
-        return read(with_profile, port, dpr, timeout_ms)
+        _mark(options.get("seed"), dpr, "relaunch-second")
+        again = read(with_profile, port, dpr, timeout_ms)
+        if again.get("format") == FORMAT:  # a tab that died in the first launch is not lost because the second one was read
+            again["items"].update(leaves_of_crash(first.get("items") or {}))
+        return again
     finally:
         shutil.rmtree(profile, ignore_errors=True)
 
@@ -481,7 +542,7 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     try:
         for dpr, seed in (visits if visits is not None else [(d, sd) for d in DPRS for sd in SEEDS]):
             options = visit_options(firefox, seed, dpr if pin_dpr else None, zone)
-            crash.mark(seed=seed, dpr=dpr, launch="visit")
+            _mark(seed, dpr, "visit")
             result = read_page(options, port, dpr, timeout_ms)
             if result.get("format") != FORMAT:
                 print("the page answered format %r, not %r" % (result.get("format"), FORMAT))
@@ -494,13 +555,15 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
                 result["items"].update(relaunch_items(again["items"]))
                 print("second launch of seed %d on a reused profile: %d items" % (seed, len(again["items"])))
             if ab and seed in AB_SEEDS:
-                crash.mark(seed=seed, dpr=dpr, launch="ab-visit")
+                _mark(seed, dpr, "ab-visit")
                 result["items"].update(ab_visit(firefox, seed, zone, dpr if pin_dpr else None))
             path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
             path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
                             encoding="utf-8")
             print("dumped %s: %d items" % (path.name, len(result["items"])))
             visit = "%s dpr %s seed %d" % (leg, dpr, seed)
+            for line in tab_crash_lines(visit, result["items"]):
+                print(line)
             for line in diag_report(visit, result["items"], first_diag):
                 print(line)
             # told here too, so the job log says it without the compare step
@@ -608,22 +671,44 @@ def ab_visit(firefox: str, seed: int, zone: str, dpr: float | None = None, timeo
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:%d/ab/" % server.server_address[1]
     items = {}
+    lost = None
     try:
         with InvisiblePlaywright(**ab_options(firefox, seed, dpr, zone)) as browser:
             for name, options in AB_CONTEXTS:
-                context = browser.new_context(**options)
+                context, step = None, "new context"
                 try:
+                    context = browser.new_context(**options)
+                    step = "new page"
                     page = context.new_page()
+                    step = "goto surfaces"
                     page.goto(base + "surfaces.html?ctx=" + name, timeout=timeout_ms)
+                    step = "wait for the page's result"
                     page.wait_for_function("document.title === 'ab-done'", timeout=timeout_ms)
+                    step = "read the page's result"
                     result = page.evaluate("window.__abResult")
                     # away and back: the page that comes back reads again (pageshow), restored from the cache or loaded anew
+                    step = "goto leave"
                     page.goto(base + "leave.html?ctx=" + name, timeout=timeout_ms)
+                    step = "go back"
                     page.go_back(timeout=timeout_ms)
+                    step = "wait for the page that came back"
                     page.wait_for_function("window.__abBf && window.__abBf.n >= 2", timeout=timeout_ms)
+                    step = "read the page that came back"
                     back = page.evaluate("window.__abBf")
+                except Exception as e:  # noqa: BLE001 - a tab that died is the leaf `crash.tab.ab-visit`; anything else is raised as it always was
+                    if not crash.tab_lost(e):
+                        raise
+                    lost = crash.tab_crash_item("ab-visit", "%s (context %s)" % (step, name), e)
                 finally:
-                    context.close()
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:  # noqa: BLE001 - closing a context whose tab died says nothing more
+                            if lost is None:
+                                raise
+                if lost is not None:
+                    items.update(lost)
+                    break
                 items.update(ab_items(name, result, back))
     finally:
         server.shutdown()

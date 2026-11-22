@@ -14,6 +14,14 @@ evidence: run 45030727459 had a firefox-68 parent die with -11 (SIGSEGV) in a no
     the probe wraps `Connection.__init__` and `Connection.close` (it reads the code after the close the launch already makes, and a watcher thread of the same
     crash folders the host oracle's bare launch reads), so nothing about the launch changes: same environment, same prefs, same durations, same launch count.
 
+Three more things the probe keeps, in EVERY launch and not only in a bad one:
+  * what the browser wrote (`stderr/<launch>.txt` in the crash folder): the core reads the browser's stdout and stderr (one pipe) through `ProcessOutput`, one reader for the whole life of
+    the process; the probe puts a tee in front of that reader, so the bytes are the ones the reader gets, the whole output and not the last 200 lines the core keeps, and the browser
+    cannot tell. A launch whose output could not be tee'd says so (`stderr_said`), and that is red;
+  * the cores written since the launch began (Linux): a core of a content process or of the parent goes through gdb whatever the code of the parent was (a tab can die and the parent
+    end with 0); a launch with a core, or with a minidump, whose parent ended with 0 is red, and a launch with none says where it looked (`core_said`);
+  * a tab that died is not here: it is the dump's leaf `crash.tab.<launch>` (`tab_lost`, `tab_crash_item`), which the page oracle's comparison puts first.
+
 A probe never changes the outcome it observes: nothing here sets an environment variable of the browser, a pref, a crash reporter option or a working directory.
 Cores are enabled the one way that cannot reach a launch that does not crash: the soft core limit of the oracle's own process is raised to the hard one (a child
 inherits it), and where the kernel writes the core is the job's `kernel.core_pattern` (`INVPW_CORE_DIR` names that folder).
@@ -37,6 +45,13 @@ FORMAT = "launch-exits/1"
 CORE_DIR_ENV = "INVPW_CORE_DIR"
 #: Where an oracle's launch probe writes what it saw (a folder of the oracle's artifact), named by the oracle that starts the run process.
 CRASH_DIR_ENV = "AB_CRASH_DIR"
+#: Where the probe saves what each browser wrote (a folder of the crash folder), and the most of it one launch keeps (the core's own reader keeps 200 lines; a launch writes a few KB).
+STDERR_DIR = "stderr"
+STDERR_LIMIT = 4 * 1024 * 1024
+#: The prefix of the leaf a dump records when the tab of a visit died or its session was lost, and what says it (the lowercased text of the error: the core's `cannot find session`,
+#: the client's `Target closed` / `has been closed`, a closed pipe, the page's own `crashed`).
+TAB_PREFIX = "crash.tab."
+TAB_LOST = ("cannot find session", "target closed", "targetclosederror", "session closed", "has been closed", "pipe is closed", "pipe closed", "page crashed", "tab crashed")
 STRACE_TAIL_LINES = 100
 SIGNAL_LINES = 20
 #: The gdb commands: every thread's stack, the reason MOZ_CRASH wrote, the libraries the core mapped.
@@ -71,6 +86,19 @@ def describe_exit(code, windows: bool | None = None) -> str:
     return str(code)
 
 
+def tab_lost(error) -> bool:
+    """Does this error (an exception, or its text) say that the tab died or the session was lost? The dump records that as a leaf of its own (`tab_crash_item`) and goes on."""
+    text = ("%s: %s" % (type(error).__name__, error)) if isinstance(error, BaseException) else str(error)
+    text = text.lower()
+    return any(word in text for word in TAB_LOST)
+
+
+def tab_crash_item(launch: str, step: str, error) -> dict:
+    """The item a dump adds to a visit whose tab died: `{"crash.tab.<launch>": {"error": ..., "step": ...}}`, the error text and the step of the visit it came in."""
+    text = ("%s: %s" % (type(error).__name__, error)) if isinstance(error, BaseException) else str(error)
+    return {TAB_PREFIX + launch: {"error": text[:300], "step": str(step)[:200]}}
+
+
 #: The order the parts of a launch's name are told in (a JSON file writes its keys sorted).
 LABEL_ORDER = ("seed", "dpr", "launch")
 
@@ -99,6 +127,14 @@ def exit_problems(launches, run: str, windows: bool | None = None, side: str | N
         who["launch number"] = launch.get("n")
         line = exit_problem(launch.get("returncode"), windows, **who)
         if line:
+            if launch.get("evidence"):
+                line += " (evidence: %s)" % launch["evidence"]
+            out.append(line)
+        elif launch.get("cores") or launch.get("dmp"):
+            # the parent ended with 0 and a process of the browser left a core or a minidump: a content process died (the parent does not say so)
+            line = "a process of the browser crashed while the parent ended with 0: %s left %s" % (
+                ", ".join("%s %s" % kv for kv in who.items() if kv[1] not in (None, "")),
+                " and ".join(x for x in ("core " + ", ".join(launch["cores"]) if launch.get("cores") else "", "minidump " + ", ".join(launch["dmp"]) if launch.get("dmp") else "") if x))
             if launch.get("evidence"):
                 line += " (evidence: %s)" % launch["evidence"]
             out.append(line)
@@ -310,8 +346,9 @@ def strace_signals(log, limit: int = SIGNAL_LINES) -> list:
 
 
 def collect(code, binary: str, *, strace_log=None, strace_said: str | None = None, watched: dict | None = None, core_folders=(), since=None, windows: bool | None = None,
-            run=subprocess.run, which=None) -> dict:
-    """Everything a launch that did not end with 0 left, and what could not be found, said: {"exit", "strace", "cores", "crash_files", "said"}."""
+            run=subprocess.run, which=None, cores=None) -> dict:
+    """Everything a launch that did not end with 0 (or that left a core or a minidump) left, and what could not be found, said: {"exit", "strace", "cores", "crash_files", "said"}.
+    `cores` is the list of cores this launch is given (the probe keeps a core for the first launch that finds it); None looks in `core_folders` for those written since `since`."""
     windows = (sys.platform == "win32") if windows is None else windows
     said: list = []
     out: dict = {"exit": {"code": code, "text": describe_exit(code, windows)}}
@@ -331,7 +368,7 @@ def collect(code, binary: str, *, strace_log=None, strace_said: str | None = Non
             except OSError as e:
                 out["strace"] = None
                 said.append("the strace log could not be read: %s" % e)
-        cores = find_cores(core_folders, since)
+        cores = find_cores(core_folders, since) if cores is None else list(cores)
         info = {"core_pattern": kernel_core_pattern(), "folders": [str(d) for d in core_folders], "cores": [c.name for c in cores], "backtraces": {}, "build_ids": {}}
         if not cores:
             said.append("no core file written since the launch began, in %s (core_pattern %s)" % (", ".join(str(d) for d in core_folders) or "no folder", info["core_pattern"]))
@@ -417,14 +454,71 @@ def raise_core_limit() -> str:
         return "RLIMIT_CORE could not be raised: %s" % e
 
 
+class OutputRecord:
+    """What one launch's browser wrote (stdout and stderr: the core merges them on one pipe), kept whole by the tee that sits in front of the core's own reader."""
+
+    def __init__(self, n: int, label: dict, started: float) -> None:
+        self.n, self.label, self.started = n, dict(label), started
+        self.output = None   # the core's ProcessOutput this belongs to (set once it exists)
+        self.size, self.truncated, self._chunks = 0, False, []
+        self._lock = threading.Lock()
+        self.written = None  # the file the probe saved it in, relative to the artifact
+
+    def add(self, line) -> None:
+        data = line if isinstance(line, bytes) else str(line).encode("utf-8", "replace")
+        with self._lock:
+            if self.size + len(data) > STDERR_LIMIT:
+                self.truncated = True
+                return
+            self._chunks.append(data)
+            self.size += len(data)
+
+    def text(self) -> str:
+        with self._lock:
+            return b"".join(self._chunks).decode("utf-8", "replace")
+
+
+class OutputTee:
+    """The stream the core's `ProcessOutput` reads, with every line it reads copied to a record: the same lines in the same order to the same reader, and nothing written to the browser."""
+
+    def __init__(self, stream, record: OutputRecord) -> None:
+        self._stream, self._record = stream, record
+
+    def readline(self, *args):
+        line = self._stream.readline(*args)
+        if line:
+            try:
+                self._record.add(line)
+            except Exception:  # noqa: BLE001 - a probe never breaks a launch
+                pass
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def core_said(folders, pattern, windows: bool) -> str | None:
+    """Where a launch looked for a core and found none (Linux), told so that a missing core is never silent: and, when the job's folder is not where the kernel writes, that a core would not have been seen."""
+    if windows:
+        return "Windows: no core (the minidumps and the `.extra` are what a crash leaves)"
+    where = ", ".join(str(f) for f in folders)
+    if not where:
+        return "no core folder to look in: INVPW_CORE_DIR is not set and core_pattern %r is not a path (a core, if one was written, was not seen)" % (pattern,)
+    said = "no core file written since the launch began, in %s (core_pattern %s)" % (where, pattern)
+    if os.environ.get(CORE_DIR_ENV) and not (pattern or "").startswith(str(Path(os.environ[CORE_DIR_ENV]))):
+        said += ": the kernel does not write into INVPW_CORE_DIR, so a core would not have been seen there"
+    return said
+
+
 class LaunchProbe:
     """Sees every browser this process launches through the core (`invisible_core.juggler.connection.Connection`): how its parent ended, and what a bad end left.
 
     `install` wraps `Connection.__init__` (the launch has begun: a crash watcher starts) and `Connection.close` (the launch is over: the exit code is read with `poll()`
     after the close the launch already makes). The oracle names the launch it is about to make with `set_label` (seed, launch ...)."""
 
-    def __init__(self, binary: str, crash_dir=None, windows: bool | None = None, run=subprocess.run, clock=time.time, which=None, folders=None) -> None:
+    def __init__(self, binary: str, crash_dir=None, windows: bool | None = None, run=subprocess.run, clock=time.time, which=None, folders=None, core_folders=None) -> None:
         self.binary = binary
+        self.core_folders = core_folders
         self.crash_dir = Path(crash_dir) if crash_dir else None
         self.windows = (sys.platform == "win32") if windows is None else windows
         self.run, self.clock, self.which = run, clock, which
@@ -434,15 +528,42 @@ class LaunchProbe:
         self._open: dict = {}
         self._lock = threading.Lock()
         self._patched = None
+        self._patched_output = None
         self.core_limit = None
+        #: what the browsers wrote, a record per launch, in the order of their birth; and why no output could be kept, when none could
+        self.records: list = []
+        self.stderr_said = None
+        self.unconnected: list = []
+        #: the cores a launch has been given: one core is one launch's
+        self._claimed: set = set()
 
     def set_label(self, **label) -> None:
         self.label = dict(label)
 
-    def install(self, connection=None) -> "LaunchProbe":
+    def install(self, connection=None, output=None) -> "LaunchProbe":
+        """Wraps `Connection.__init__` and `close`, and puts a tee in front of the reader of the browser's output (`ProcessOutput.__init__`). With a `connection` of the caller's (a
+        stand-in) the output class is the caller's too, or none."""
         if connection is None:
             from invisible_core.juggler.connection import Connection as connection
+            from invisible_core.juggler import connection as module
+
+            output = getattr(module, "ProcessOutput", None)
         probe, original_init, original_close = self, connection.__init__, connection.close
+        if output is None:
+            self.stderr_said = "the core has no `ProcessOutput` to put a tee in front of: what the browsers write is not saved"
+        else:
+            original_output = output.__init__
+
+            def output_init(out, stream, *args, **kwargs):
+                record = probe._born()
+                try:
+                    original_output(out, OutputTee(stream, record), *args, **kwargs)
+                finally:
+                    record.output = out
+
+            output_init.__wrapped__ = original_output
+            output.__init__ = output_init
+            self._patched_output = (output, original_output)
 
         def __init__(conn, *args, **kwargs):
             original_init(conn, *args, **kwargs)
@@ -461,7 +582,17 @@ class LaunchProbe:
             self.core_limit = raise_core_limit()
         return self
 
+    def _born(self) -> OutputRecord:
+        with self._lock:
+            record = OutputRecord(len(self.records) + 1, self.label, self.clock())
+            self.records.append(record)
+        return record
+
     def uninstall(self) -> None:
+        if self._patched_output:
+            output, original = self._patched_output
+            output.__init__ = original
+            self._patched_output = None
         if self._patched:
             connection, original_init, original_close = self._patched
             connection.__init__, connection.close = original_init, original_close
@@ -489,6 +620,11 @@ class LaunchProbe:
         except Exception:  # noqa: BLE001 - a probe never breaks a launch
             pass
 
+    def _core_folders(self) -> list:
+        if self.core_folders is not None:
+            return list(self.core_folders() if callable(self.core_folders) else self.core_folders)
+        return list(core_dirs())
+
     def _ended(self, conn) -> None:
         with self._lock:
             state = self._open.pop(id(conn), None)
@@ -501,29 +637,96 @@ class LaunchProbe:
             except Exception as e:  # noqa: BLE001
                 entry["probe_error"] = "poll failed: %s" % e
             watched = state["watcher"].stop()
-            if entry["returncode"] != 0:
-                folders = list(core_dirs()) if not self.windows else []
+            folders = [] if self.windows else self._core_folders()
+            cores = [] if self.windows else [c for c in find_cores(folders, state["started"]) if c.name not in self._claimed]
+            dmp = [f["name"] for f in watched.get("files", []) if f["name"].endswith(".dmp")]
+            self._claimed.update(c.name for c in cores)
+            # EVERY launch: what the browser wrote is saved, and the cores since it began (a content process can die and the parent still end with 0)
+            self._save_output(conn, entry)
+            entry["cores"], entry["dmp"] = [c.name for c in cores], dmp
+            if not cores:
+                entry["core_said"] = core_said(folders, kernel_core_pattern(), self.windows)
+            if entry["returncode"] != 0 or cores or dmp:
                 crash = collect(entry["returncode"], self.binary, watched=watched, core_folders=folders, since=state["started"], windows=self.windows,
-                                run=self.run, which=self.which, strace_said="this oracle runs no strace (a trace slows the browser and would change the outcome it observes)")
+                                run=self.run, which=self.which, cores=cores, strace_said="this oracle runs no strace (a trace slows the browser and would change the outcome it observes)")
                 if self.crash_dir is not None:
                     name = "%02d-%s" % (entry["n"], _safe("-".join(str(v) for v in state["label"].values()) or "launch"))
                     write_crash_files(crash, self.crash_dir / name)
                     entry["evidence"] = "%s/%s" % (self.crash_dir.name, name)
                 entry["said"] = crash["said"]
-                entry["cores"] = (crash.get("cores") or {}).get("cores")
-                entry["dmp"] = (crash.get("crash_files") or {}).get("dmp")
         except Exception as e:  # noqa: BLE001 - what could not be collected is said
             entry["probe_error"] = "%s: %s" % (type(e).__name__, e)
         with self._lock:
             self.launches.append(entry)
 
+    # -
+    # What the browsers wrote.
+
+    def _record_of(self, conn) -> OutputRecord | None:
+        output = getattr(conn, "output", None)
+        if output is None:
+            return None
+        with self._lock:
+            return next((r for r in self.records if r.output is output), None)
+
+    def _output_file(self, record: OutputRecord, suffix: str = "") -> str:
+        return "%02d-%s%s.txt" % (record.n, _safe("-".join(str(v) for v in record.label.values()) or "launch"), suffix)
+
+    def _write_output(self, record: OutputRecord, code=None, suffix: str = "", said: str = "") -> str | None:
+        """The browser's output of one launch, as a file of the artifact: `stderr/<NN>-<launch>.txt`, whatever the launch's end was."""
+        if self.crash_dir is None:
+            return None
+        folder = self.crash_dir / STDERR_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        name = self._output_file(record, suffix)
+        head = ["# launch %d: %s" % (record.n, ", ".join("%s %s" % kv for kv in record.label.items()) or "not named"),
+                "# stdout and stderr of the browser, merged on one pipe by the core, as the core's reader got them: %d bytes%s" % (
+                    record.size, " (kept the first %d, then the rest was dropped)" % STDERR_LIMIT if record.truncated else ""),
+                "# the parent's exit code when this was written: %s" % (describe_exit(code, self.windows) if code is not None else "not seen")]
+        if said:
+            head.append("# " + said)
+        (folder / name).write_text("\n".join(head) + "\n" + record.text(), encoding="utf-8", newline="\n")
+        record.written = "%s/%s/%s" % (self.crash_dir.name, STDERR_DIR, name)
+        return record.written
+
+    def _save_output(self, conn, entry: dict) -> None:
+        record = self._record_of(conn)
+        if record is None:
+            entry["stderr_said"] = self.stderr_said or "this launch's output was not seen by the tee (the core's `ProcessOutput` of this connection was not made while the probe was installed)"
+            return
+        entry["stderr_bytes"] = record.size
+        path = self._write_output(record, entry["returncode"])
+        if path:
+            entry["stderr"] = path
+
+    def finish(self) -> None:
+        """At the end of the dump: every launch's output once more, after its reader has had the time to read to the end (a launch's file is written when it closes, and again here),
+        and the output of a launch that never made a connection (it died while starting: the error said what it printed, the file says all of it)."""
+        for record in list(self.records):
+            try:
+                if record.output is not None:
+                    record.output.settle()
+            except Exception:  # noqa: BLE001
+                pass
+            connected = next((x for x in self.launches if x.get("stderr") == record.written and record.written), None)
+            if connected is not None:
+                self._write_output(record, connected.get("returncode"))
+            else:
+                path = self._write_output(record, suffix="-no-connection", said="no connection was made over this launch (it ended while starting, or was still open)")
+                if path:
+                    self.unconnected.append({"label": record.label, "stderr": path, "bytes": record.size})
+
     def document(self) -> dict:
-        return {"format": FORMAT, "core_limit": self.core_limit, "launches": list(self.launches)}
+        return {"format": FORMAT, "core_limit": self.core_limit, "stderr_said": self.stderr_said, "launches": list(self.launches), "launches_without_connection": list(self.unconnected)}
 
     def write(self, path=None) -> Path | None:
         path = Path(path) if path else (self.crash_dir / "exits.json" if self.crash_dir else None)
         if path is None:
             return None
+        try:
+            self.finish()
+        except Exception as e:  # noqa: BLE001 - said, not raised
+            self.stderr_said = (self.stderr_said or "") + " finish: %s: %s" % (type(e).__name__, e)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.document(), indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
         return path
@@ -575,7 +778,18 @@ def exits_of_run(crash_dir, run: str, windows: bool | None = None, needed: bool 
         return ["the run %s left no record of how its browsers ended (%s/exits.json): the probe did not see them" % (run, Path(crash_dir).name)] if needed else []
     if not document["launches"] and needed:
         return ["the run %s recorded no launch in %s/exits.json: the probe did not see a browser" % (run, Path(crash_dir).name)]
-    return exit_problems(document["launches"], run, windows)
+    problems = exit_problems(document["launches"], run, windows)
+    if document.get("stderr_said"):
+        problems.append("the run %s could not save what its browsers wrote: %s" % (run, document["stderr_said"]))
+    for launch in document["launches"]:
+        if launch.get("stderr_said"):
+            problems.append("the run %s did not save what the browser of launch %s wrote: %s" % (run, launch.get("n"), launch["stderr_said"]))
+    return problems
+
+
+def current_label() -> dict:
+    """The launch the oracle named last (`mark`), or {} when no probe is installed."""
+    return dict(PROBE.label) if PROBE is not None else {}
 
 
 @contextlib.contextmanager

@@ -2314,12 +2314,17 @@ class FakeProcess:
 
 def a_launch_through_the_core(probe, code, label, folder=None):
     """A launch as the core makes it: a `Connection` over two pipes whose process ended with `code`, closed as the wrapper closes it."""
-    from invisible_core.juggler.connection import Connection
+    from invisible_core.juggler.connection import Connection, ProcessOutput
 
     probe.set_label(**label)
     to_r, to_w = os.pipe()
     from_r, from_w = os.pipe()
+    out_r, out_w = os.pipe()
+    output = ProcessOutput(os.fdopen(out_r, "rb"))  # what `launch` makes before the connection: one reader of the browser's output, for the whole life of the process
+    os.write(out_w, b"browser says: launch of seed %d\n" % label.get("seed", 0))
+    os.close(out_w)
     conn = Connection(to_w, from_r, FakeProcess(code))
+    conn.output = output
     if folder is not None:
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "u.extra").write_text('{"CrashType": "SIGSEGV", "MozCrashReason": "MOZ_CRASH(glean)"}', encoding="utf-8")
@@ -2353,7 +2358,8 @@ def test_the_probe_sees_every_launch_the_core_makes_and_the_one_that_died_is_red
     assert "no core file written" in " | ".join(evidence["said"]) and "runs no strace" in " | ".join(evidence["said"])
     exits = tmp_path / "out" / "crash" / "exits.json"
     assert probe.write() == exits and crash.read_exits(exits)["launches"][1]["returncode"] == -11
-    assert len([p for p in (tmp_path / "out" / "crash").iterdir() if p.is_dir()]) == 1, "a launch that ended with 0 leaves no evidence folder"
+    assert len([p for p in (tmp_path / "out" / "crash").iterdir() if p.is_dir() and p.name != crash.STDERR_DIR]) == 1, "a launch that ended with 0 leaves no evidence folder"
+    assert sorted(f.name for f in (tmp_path / "out" / "crash" / crash.STDERR_DIR).iterdir()) == ["01-1-visit.txt", "02-2-relaunch-second.txt", "03-3-visit.txt"], "what the browser wrote is kept for every launch"
     assert crash.exits_of_run(tmp_path / "out" / "crash", "firefox-68", False) == lines
 
 
