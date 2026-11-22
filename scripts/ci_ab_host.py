@@ -37,10 +37,12 @@ after the warm-up is red.
 
 The exit pings (`firefox --backgroundtask pingsender`, through the session's route, never the separate `pingsender[.exe]`) leave only when Mozilla's `canUpload()` is
 true (TelemetrySend.sys.mjs:1083), once the notification of the data policy was recorded, which a short launch may or may not have reached: in a measured launch their
-number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red, and a path or a destination only they touch is not compared. The IDLE
-launch of each engine run is where they must leave: no journey, the telemetry endpoint is the lab's (loopback, `toolkit.telemetry.server`: the pings never go to the
-internet), it waits until the profile's prefs.js records the notification (the precondition, seen in a file of the launch; at most 120 s) and then closes. There the
-comparison is strict: the notification seen, three pingsenders of the three types, spawned by the parent, none of them to a public address.
+number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red. The paths and the destinations only they touch are compared when they are
+there on both sides of a launch, and left out when they are there on one side only (a destination is `public, telemetry`: the telemetry host is the third party's, and
+whether the connection succeeded is not in the verdict). The IDLE launch of each engine run is where they must leave: no journey, no pref changed, the session has no
+proxy so the route is direct and a ping going to the telemetry host is the product's behaviour; it waits until the profile's prefs.js records the notification (the
+precondition, seen in a file of the launch; at most 120 s) and then closes. There the comparison is strict on what does not depend on the third party: the notification
+seen, three pingsender processes of the three types, always the background task, spawned by the parent. Behind a session proxy a direct pingsender is the network oracle's.
 
 How the trace is taken:
 
@@ -472,25 +474,31 @@ def pingsender_problems(fp: dict) -> list:
             out.append("the three pingsenders are not the pings of a first run %s: %s" % (list(PING_TYPES), sorted(str(r["type"]) for r in records)))
         if sorted({r["parent"] for r in records}) != ["parent"]:
             out.append("the pingsenders were not all spawned by the parent: %s" % sorted({r["parent"] for r in records}))
-    direct = [e for e in fp.get("net") or [] if is_pingsender(e.split(": ", 1)[0]) and e.split(": ", 1)[-1].startswith(("connect ", "send "))]
-    if direct and fp.get("session_proxy"):
-        out.append("a pingsender connected directly to a public address behind the session's proxy (B266): %s" % ", ".join(direct[:3]))
     return out
 
 
+def pingsender_surface(fp: dict) -> tuple:
+    """`(paths only the pingsender kind touched, its destinations)` of a launch: a destination is `<kind>: connect public, telemetry` (or `send`), whatever the
+    address and the port: the telemetry host is the third party's."""
+    touched = fp.get("touched_by", {})
+    files = sorted(p for p in fp.get("files", []) if touched.get(p) and set(touched[p]) <= {PINGSENDER_KIND})
+    nets = sorted({"%s: %s public, telemetry" % (PINGSENDER_KIND, e.split(": ", 1)[1].split(" ", 1)[0])
+                   for e in fp.get("net") or [] if e.startswith(PINGSENDER_KIND + ": ")})
+    return files, nets
+
+
 def _idle_summary(idle: dict | None) -> dict | None:
-    """What the idle launch of one side shows, for the report: the notification, the pingsenders (count, types, parents), what the lab's endpoint received."""
+    """What the idle launch of one side shows, for the report: the notification, the pingsenders (count, types, parents), ."""
     if not idle:
         return None
     records = idle.get("pingsenders", [])
     return {"notified": (idle.get("idle") or {}).get("notified"), "pingsenders": idle.get("kinds", {}).get(PINGSENDER_KIND, 0),
-            "types": sorted(str(r["type"]) for r in records), "parents": sorted({r["parent"] for r in records}),
-            "endpoint_received": (idle.get("idle") or {}).get("ping_endpoint_received")}
+            "types": sorted(str(r["type"]) for r in records), "parents": sorted({r["parent"] for r in records})}
 
 
 def idle_problems(a: dict, b: dict) -> list:
     """The strict comparison of the IDLE launch (the launch in which the pings must leave): on both sides the notification was observed in the profile, three
-    pingsenders of the three types of a first run, spawned by the parent, and none of them went to a public address (the pings go to the lab's endpoint)."""
+    pingsenders of the three types of a first run, always the background task, spawned by the parent. What the connection to the telemetry host does is not here."""
     ia, ib = a.get("idle"), b.get("idle")
     if not ia and not ib:
         return []
@@ -504,10 +512,7 @@ def idle_problems(a: dict, b: dict) -> list:
                        % (side, NOTIFY_LIMIT_S, CAN_UPLOAD))
         if idle.get("kinds", {}).get(PINGSENDER_KIND, 0) != 3:
             out.append("idle launch of side %s: %d pingsender processes, the pings of a first run must leave: 3" % (side, idle.get("kinds", {}).get(PINGSENDER_KIND, 0)))
-        out += ["idle launch of side %s: %s" % (side, p) for p in pingsender_problems(dict(idle, session_proxy=True))]
-        public = [e for e in idle.get("net") or [] if is_pingsender(e.split(": ", 1)[0]) and e.split(": ", 1)[-1].startswith(("connect ", "send "))]
-        if public:
-            out.append("idle launch of side %s: a pingsender went out to a public address instead of the lab's endpoint (B266): %s" % (side, ", ".join(public[:3])))
+        out += ["idle launch of side %s: %s" % (side, p) for p in pingsender_problems(idle)]
     return out
 
 
@@ -1168,22 +1173,25 @@ def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sl
 # -
 # The comparison.
 
-def leaves_of(seed_footprint: dict) -> dict:
+def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
     """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence),
     file.<path> = 1 for every HOST path the tree touched and net.<kind>: <what> = 1 for every netlink socket, netlink request and public
     destination of a process of that kind (`network_events`)."""
     out = {}
-    only = {PINGSENDER_KIND}
     for kind, n in seed_footprint.get("kinds", {}).items():
         if kind != PINGSENDER_KIND:  # 0 or 3 of them, with their form: `pingsender_problems`; the idle launch is where they must be
             out["proc." + kind] = 1 if is_tab(kind) and n else n
-    touched = seed_footprint.get("touched_by", {})
+    # what only the pingsender kind touches or reaches is compared when it is on both sides of the launch (`with_pingsender`), left out when on one side only
+    surface_files, surface_nets = pingsender_surface(seed_footprint)
     for path in seed_footprint.get("files", []):
-        if touched.get(path) and set(touched[path]) <= only:
-            continue  # a path only a pingsender touched is there when the pingsenders are
+        if path in surface_files and not with_pingsender:
+            continue
         out["file." + path] = 1
     for entry in seed_footprint.get("net") or []:
         if not entry.startswith(PINGSENDER_KIND + ": "):
+            out["net." + entry] = 1
+    if with_pingsender:
+        for entry in surface_nets:
             out["net." + entry] = 1
     return out
 
@@ -1321,7 +1329,8 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     if sorted(seeds_a) != sorted(seeds_b):
         problems.append("the two footprints have different seeds: A %s, B %s" % (sorted(seeds_a), sorted(seeds_b)))
     for seed in sorted(set(seeds_a) & set(seeds_b)):
-        la, lb = leaves_of(seeds_a[seed]), leaves_of(seeds_b[seed])
+        both = bool(seeds_a[seed].get("kinds", {}).get(PINGSENDER_KIND)) and bool(seeds_b[seed].get("kinds", {}).get(PINGSENDER_KIND))
+        la, lb = leaves_of(seeds_a[seed], both), leaves_of(seeds_b[seed], both)
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
             for message in fp.get("problems", []) + pingsender_problems(fp):
                 problems.append("seed %s side %s: %s" % (seed, side, message))
@@ -1345,6 +1354,11 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
             problems += geolocation_problems(fp, where)
     problems += idle_problems(a, b)
+    wa, wb = a.get("warmup") or {}, b.get("warmup") or {}
+    if wa.get("kinds", {}).get(PINGSENDER_KIND) and wb.get("kinds", {}).get(PINGSENDER_KIND):
+        for what, x, y in zip(("paths", "destinations"), pingsender_surface(wa), pingsender_surface(wb)):
+            if x != y:
+                problems.append("warm-up: the pingsender %s differ: A only %s | B only %s" % (what, sorted(set(x) - set(y))[:5], sorted(set(y) - set(x))[:5]))
     stale = []
     if not a_a:
         for entry in expected or []:
@@ -1401,8 +1415,8 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
     for side, name in (("A", a_name), ("B", b_name)):
         idle = (report.get("idle") or {}).get(side)
         if idle:
-            print("IDLE (the pings must leave) %s: notification %s, %d pingsender %s by %s, the lab's endpoint received %s" % (
-                name, json.dumps(idle["notified"]), idle["pingsenders"], idle["types"], idle["parents"], idle["endpoint_received"]))
+            print("IDLE (the pings must leave) %s: notification %s, %d pingsender %s by %s" % (
+                name, json.dumps(idle["notified"]), idle["pingsenders"], idle["types"], idle["parents"]))
     for side, name in (("A", a_name), ("B", b_name)):
         for seed, names in sorted(((report.get("outside_tree") or {}).get(side) or {}).items()):
             print("OUTSIDE THE TREE (not compared) %s seed %s: %s" % (name, seed, ", ".join("%s %d paths" % kv for kv in sorted(names.items()))))
@@ -1505,9 +1519,8 @@ def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dic
 def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False) -> dict:
     """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
 
-    `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey; the engine's telemetry endpoint is the lab's (loopback); the
-    launch waits until the notification of the data policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and
-    then closes; its footprint carries `idle` (what the wait saw, what the endpoint received)."""
+    `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey and no pref changed; the launch waits until the notification of the data
+    policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and then closes; its footprint carries `idle` (what the wait saw)."""
     from playwright.sync_api import sync_playwright
 
     from fakeweb import journey_site, profile_p4
@@ -1534,12 +1547,11 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
-    ping_server, notified = (PingServer() if idle else None), None
-    prefs = {"toolkit.telemetry.server": ping_server.url} if idle else None
+    notified = None
     before = set(Path(tempfile.gettempdir()).glob("invisible_profile_*"))
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
-                               launch_timeout_ms=180_000, extra_prefs=prefs)
+                               launch_timeout_ms=180_000)
         root_pid = server.process.pid
         if not windows:
             from _strace_stand_in import _group_of
@@ -1581,15 +1593,13 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
         if idle:
-            result["idle"] = {"notified": notified, "ping_endpoint_received": sorted(ping_server.received)}
+            result["idle"] = {"notified": notified}
     except TraceError as e:
         result = {"seed": seed, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
                   "problems": ["the trace of the run could not be taken: %s" % e]}
     finally:
         stop_site()
         stop_geo()
-        if ping_server is not None:
-            ping_server.close()
         if server is not None:
             try:
                 server.close()
@@ -1603,37 +1613,6 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             trace.cleanup()
     result["problems"] = result.get("problems", []) + problems
     return result
-
-
-class PingServer:
-    """The lab's telemetry endpoint of the idle launch (`toolkit.telemetry.server`): on loopback, so the exit pings leave to the lab and never to the
-    internet, and what it received is evidence that they left. Records the `<type>` of every `/submit/telemetry/<id>/<type>/...` it was given."""
-
-    def __init__(self) -> None:
-        import http.server
-        import threading
-
-        self.received: list = []
-        outer = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):  # noqa: N802
-                self.rfile.read(int(self.headers.get("Content-Length") or 0))
-                outer.received.append(ping_type([self.path]) or self.path)
-                self.send_response(200)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-
-            def log_message(self, *args):
-                pass
-
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-
-    def close(self) -> None:
-        self.httpd.shutdown()
-        self.httpd.server_close()
 
 
 def wait_for_notification(read, period=NOTIFY_PERIOD_S, limit_s=NOTIFY_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> dict:
