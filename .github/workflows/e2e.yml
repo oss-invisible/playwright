@@ -738,3 +738,161 @@ jobs:
             ${{ runner.temp }}/host-e2e.xml
           if-no-files-found: ignore
           retention-days: 14
+
+  # ``The page oracle, final seeds``: the A/A of the 20 seeds of the `final` set of ci/persona-seeds.json (every value of every dimension the core declares), split in four
+  # shards of five seeds, on a pull request that changes a file of the page oracle (scripts/ci_ab_pr_seeds.py holds the list; `ci_ab_oracle.py touched` reads it). The
+  # shared jobs run the first seeds of the `candidate` set, or the five of it when the oracle is touched; they do not grow. This one is the control the final candidate's
+  # gate leg rests on: the published engine against itself on every seed, zero differences, before any A/B of the final set is accepted. Each shard is one test
+  # (tests/test_ab_oracle_e2e.py with AB_ORACLE_SEED_SET=final and AB_ORACLE_SHARD=i/4: its hang guard is sized from the shard's seeds) and the job refuses anything but that one test, passed.
+  # Seed 0 is in shard 1, and its second launch on a reused profile is part of that shard's A/A.
+  e2e-page-final-touched:
+    name: e2e (page oracle, is it touched)
+    needs: core-on-index
+    if: github.event_name == 'pull_request' && needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      touched: ${{ steps.touched.outputs.touched }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Does the pull request change a file of the page oracle
+        id: touched
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_oracle.py touched "$BASE_SHA" | tee -a "$GITHUB_OUTPUT"
+
+  e2e-page-final:
+    name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, linux)
+    needs: [core-on-index, e2e-page-final-touched]
+    if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: System deps (xvfb + Firefox runtime libs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        shell: bash
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle A/A on the final seeds of this shard
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_ORACLE_SEED_SET: final
+          AB_ORACLE_SHARD: ${{ matrix.shard }}/4
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-final-e2e.xml"
+          python - "$RUNNER_TEMP/page-final-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        shell: bash
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-page-final-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-final-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-page-final-windows:
+    name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, windows)
+    needs: [core-on-index, e2e-page-final-touched]
+    if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle A/A on the final seeds of this shard
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_ORACLE_SEED_SET: final
+          AB_ORACLE_SHARD: ${{ matrix.shard }}/4
+        run: |
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-final-e2e.xml"
+          python - "$RUNNER_TEMP/page-final-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-page-final-windows-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-final-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14

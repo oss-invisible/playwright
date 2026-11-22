@@ -64,7 +64,9 @@ import base64
 import fnmatch
 import gzip
 import json
+import shutil
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -87,6 +89,16 @@ ANCHOR = "win-x86_64"
 
 #: Keys under this prefix are information, never compared (see the module docstring).
 DIAG = "diag."
+
+#: The items of a visit's SECOND launch on a profile that a first launch already used (`--relaunch-seed`, the A/B oracle's) live under this prefix, next to the
+#: items of the visit on a fresh profile: the retail comparison (`compare`) never reads a dump made without that option, and the oracle compares the two
+#: sets of leaves apart. The diag. items of the second launch are not kept: what the page records about the host is information, never compared.
+RELAUNCH = "relaunch."
+
+
+def relaunch_items(items: dict) -> dict:
+    """The items of a second launch as they are stored in the visit: every key under RELAUNCH, the diag. ones left out."""
+    return {RELAUNCH + k: v for k, v in items.items() if not is_diag(k)}
 
 
 def is_diag(key: str) -> bool:
@@ -375,49 +387,84 @@ def reference_zone(reference: Path) -> str:
     return reference_items(reference, 1.0)["surface.intl"]["DateTimeFormat"]["timeZone"]
 
 
-def visit_options(firefox: str, seed: int, dpr: float | None, zone: str) -> dict:
+def visit_options(firefox: str, seed: int, dpr: float | None, zone: str, profile_dir: str | None = None) -> dict:
     """The launch of one (dpr, seed) visit. The DPR is PINNED in the persona
     (screen.dpr), so the core declares a screen, a work area and a window made
     at that scale. It used to be forced through
     extra_prefs={"layout.css.devPixelsPerPx": ...} on whatever persona the seed
     drew: a 100% persona at 1.5 read innerWidth 1920 inside an outerWidth of
     1291 (run 41325657085), an identity no machine has, which the engine now
-    refuses to start with. With dpr None nothing is pinned: the seed's own persona decides the scale."""
+    refuses to start with. With dpr None nothing is pinned: the seed's own persona decides the scale.
+    With a profile_dir the launch is the wrapper's persistent context on that folder (the profile a user keeps between runs)."""
     options = {"seed": seed, "binary_path": firefox, "headless": True, "show_cursor": False,
                "locale": "en-US", "timezone": zone}
     if dpr is not None:
         options["pin"] = {"screen.dpr": dpr}
+    if profile_dir is not None:
+        options["profile_dir"] = str(profile_dir)
     return options
 
 
-def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 180_000,
-         visits: list | None = None, pin_dpr: bool = True) -> int:
-    """`visits` is [(dpr, seed)] (default: every seed of SEEDS at every DPR of DPRS, the DPR pinned). With pin_dpr
-    False the DPR is not pinned: it is the one the seed's persona has, and `dpr` of a visit only names the file and
-    the page's query."""
+def read_page(options: dict, port: int, dpr: float, timeout_ms: int) -> dict:
+    """One launch: the page's result (with the states driven when the page answered the format), the browser closed. With a profile_dir in
+    `options` the wrapper hands back a persistent context, not a browser, and the page is opened in it."""
     from invisible_playwright import InvisiblePlaywright
 
+    with InvisiblePlaywright(**options) as browser:
+        page = browser.new_page() if "profile_dir" in options else browser.new_context().new_page()
+        # The same budget as the wait below: a cold Windows runner took
+        # more than goto's default 30 s to reach `load` on the first
+        # visit (candidate 42410156024), and passed locally 6/6.
+        page.goto("http://127.0.0.1:%d/?dpr%s" % (port, dpr), timeout=timeout_ms)
+        page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
+        result = page.evaluate("window.__hostGate")
+        if result.get("format") == FORMAT:
+            result["items"].update(drive_states(page.evaluate, page.mouse.move, page.mouse.click))
+    return result
+
+
+def second_launch(options: dict, port: int, dpr: float, timeout_ms: int, read=None) -> dict:
+    """The page's result of a SECOND launch on a profile the first one used: the same options and the same seed, on a folder of this call
+    that is made, launched on once (what that launch leaves in it is the point: cookies, cache, prefs.js, the session seed), closed,
+    launched on again, and removed. A first launch that did not answer the format is what comes back, for the caller to refuse."""
+    read = read or read_page
+    profile = tempfile.mkdtemp(prefix="host-gate-profile-")
+    try:
+        with_profile = dict(options, profile_dir=profile)
+        first = read(with_profile, port, dpr, timeout_ms)
+        if first.get("format") != FORMAT:
+            return first
+        return read(with_profile, port, dpr, timeout_ms)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 180_000,
+         visits: list | None = None, pin_dpr: bool = True, relaunch_seeds: tuple = ()) -> int:
+    """`visits` is [(dpr, seed)] (default: every seed of SEEDS at every DPR of DPRS, the DPR pinned). With pin_dpr
+    False the DPR is not pinned: it is the one the seed's persona has, and `dpr` of a visit only names the file and
+    the page's query. A seed of `relaunch_seeds` is visited once more, launched twice on one profile folder, and the
+    items of that second launch are added to the visit under RELAUNCH (the visit's own items stay those of a fresh profile)."""
     out.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
     zone = reference_zone(reference)
     first_diag = None
     try:
         for dpr, seed in (visits if visits is not None else [(d, sd) for d in DPRS for sd in SEEDS]):
-            with InvisiblePlaywright(**visit_options(firefox, seed, dpr if pin_dpr else None, zone)) as browser:
-                page = browser.new_context().new_page()
-                # The same budget as the wait below: a cold Windows runner took
-                # more than goto's default 30 s to reach `load` on the first
-                # visit (candidate 42410156024), and passed locally 6/6.
-                page.goto("http://127.0.0.1:%d/?dpr%s" % (server.server_address[1], dpr),
-                          timeout=timeout_ms)
-                page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
-                result = page.evaluate("window.__hostGate")
-                if result.get("format") == FORMAT:
-                    result["items"].update(drive_states(page.evaluate, page.mouse.move, page.mouse.click))
+            options = visit_options(firefox, seed, dpr if pin_dpr else None, zone)
+            result = read_page(options, port, dpr, timeout_ms)
             if result.get("format") != FORMAT:
                 print("the page answered format %r, not %r" % (result.get("format"), FORMAT))
                 return 2
+            if seed in relaunch_seeds:
+                again = second_launch(options, port, dpr, timeout_ms)
+                if again.get("format") != FORMAT:
+                    print("the second launch on a reused profile: the page answered format %r, not %r" % (again.get("format"), FORMAT))
+                    return 2
+                result["items"].update(relaunch_items(again["items"]))
+                print("second launch of seed %d on a reused profile: %d items" % (seed, len(again["items"])))
             path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
             path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
                             encoding="utf-8")
@@ -596,6 +643,8 @@ def main(argv=None) -> int:
                    help="visit this seed (repeatable; default: the host gate's own seeds at its own DPRs)")
     d.add_argument("--no-pin", action="store_true",
                    help="do not pin the DPR: the seed's persona has its own (the DPR of --visit only names the file)")
+    d.add_argument("--relaunch-seed", action="append", type=int, default=[], metavar="SEED",
+                   help="also launch this seed twice on one profile folder and keep the second launch's items under relaunch. (repeatable)")
     c = sub.add_parser("compare")
     c.add_argument("dumps", type=Path)
     c.add_argument("--reference", type=Path, default=REFERENCE)
@@ -604,7 +653,8 @@ def main(argv=None) -> int:
         visits = None
         if args.visit:
             visits = [(float(dpr), int(seed)) for seed, dpr in (v.split(":", 1) for v in args.visit)]
-        return dump(args.firefox, args.leg, args.out, args.reference, visits=visits, pin_dpr=not args.no_pin)
+        return dump(args.firefox, args.leg, args.out, args.reference, visits=visits, pin_dpr=not args.no_pin,
+                    relaunch_seeds=tuple(args.relaunch_seed))
     notes = []
     failures = compare(args.dumps, args.reference, load_exceptions(), notes)
     for n in notes:

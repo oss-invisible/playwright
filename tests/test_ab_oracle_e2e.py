@@ -32,11 +32,45 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_oracle.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
+import ci_ab_oracle as ab  # noqa: E402
 
-TIMEOUT_S = 40 * 60
 #: The seeds of the A/A on a pull request: the first two of the candidate set (4 launches of the page; the gate's leg runs the A/A on all of them), or every one
-#: when the pull request touches the oracle (AB_ORACLE_PR_SEEDS, from the step of e2e.yml).
+#: when the pull request touches the oracle (AB_ORACLE_PR_SEEDS, from the step of e2e.yml). The final set's A/A (AB_ORACLE_SEED_SET=final) visits every seed of its shard.
 PR_SEEDS = 2
+
+#: The hang guard of the test, sized from what it will run (the seeds of its shard, the engine runs, the second launch of seed 0). It is a safety net and never a verdict: a
+#: shard of the final set is 5 seeds, the A/A of a pull request is 2, the gate's leg with a candidate is 5 in three engine runs, and one fixed number cannot be right for all of
+#: them. These are estimates, not measurements: 120 s to start, then for each engine run 180 s for its first seed (a cold launch, which on Windows is the slowest), 100 s for each
+#: next one and 200 s for the two extra launches of seed 0 on one profile; the first A/A of each kind says what they should be and they move with it.
+SETUP_S, FIRST_SEED_S, NEXT_SEED_S, RELAUNCH_S = 120, 180, 100, 200
+
+
+def budget_s(seeds: int, engine_runs: int, relaunch: bool = False) -> int:
+    """Seconds the test may take for ``seeds`` seeds in ``engine_runs`` runs of an engine (the A/A is two, with a candidate three), with the second launch of seed 0 when ``relaunch``."""
+    return SETUP_S + engine_runs * (FIRST_SEED_S + (seeds - 1) * NEXT_SEED_S + (RELAUNCH_S if relaunch else 0))
+
+
+def asked(environ=None) -> tuple:
+    """(seed set, shard, candidate, visits) this run of the test makes, from the environment as the test reads it. The A/A of a pull request visits the first
+    PR_SEEDS seeds of the candidate set (or every one when the pull request touches the oracle); the final set's A/A, and any run with a candidate, visit every
+    seed of their shard: that is what they are for."""
+    env = os.environ if environ is None else environ
+    candidate = bool(env.get("INVISIBLE_SEAL_FILE"))
+    seed_set = env.get("AB_ORACLE_SEED_SET") or "candidate"
+    shard = env.get("AB_ORACLE_SHARD") or None
+    limit = None if candidate or seed_set == "final" else pr_seed_count("AB_ORACLE_PR_SEEDS", PR_SEEDS, env)
+    return seed_set, shard, candidate, ab.select_visits(seed_set, shard, limit=limit)
+
+
+def plan(environ=None) -> tuple:
+    """(seeds, engine runs, whether seed 0 is launched twice on a profile) of this run."""
+    _seed_set, _shard, candidate, visits = asked(environ)
+    return len(visits), 3 if candidate else 2, bool(ab.relaunch_visits(visits))
+
+
+BUDGET_S = budget_s(*plan())
+#: The subprocess ends by itself at BUDGET_S and says so; the guard of the worker comes after it.
+TIMEOUT_S = BUDGET_S
 
 
 def _out(tmp_path: Path) -> Path:
@@ -57,8 +91,7 @@ def test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_by
     candidate = bool(seal)
     if candidate:
         assert Path(seal).is_file(), "INVISIBLE_SEAL_FILE names no file: %r" % seal
-    seed_set = os.environ.get("AB_ORACLE_SEED_SET") or "candidate"
-    shard = os.environ.get("AB_ORACLE_SHARD") or None
+    seed_set, shard, _candidate, visits = asked()
     out = _out(tmp_path)
     out.mkdir(parents=True, exist_ok=True)
     leg = "win-x86_64" if sys.platform == "win32" else "linux-x86_64"
@@ -66,7 +99,9 @@ def test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_by
     if candidate:
         command[4:4] = [binary, "--candidate-seal", seal]
     else:
-        command += ["--published-binary", binary, "--limit", str(pr_seed_count("AB_ORACLE_PR_SEEDS", PR_SEEDS))]
+        command += ["--published-binary", binary]
+        if seed_set != "final":
+            command += ["--limit", str(len(visits))]
     if shard:
         command += ["--shard", shard]
     done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
@@ -76,6 +111,8 @@ def test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_by
     assert done.returncode == 0, "the oracle is red:\n" + "\n".join(verdict[:60]) + "\n" + done.stderr[-1500:]
     control = json.loads((out / "diff-a-a.json").read_text(encoding="utf-8"))
     assert control["verdict"] == "green" and control["differences"] == [] and control["problems"] == [] and len(control["compared"]) == len(control["visits"]) >= 1
+    assert len(control["visits"]) == len(visits), "every seed of the shard is visited: %s" % control["visits"]
+    assert sorted(control["relaunch"]) == sorted(ab.visit_name(*key) for key in ab.relaunch_visits(visits)), "seed 0 is launched twice on one profile, whichever shard has it"
     names = sorted(p.name for p in out.glob("*.json"))
     if candidate:
         diff = json.loads((out / "diff.json").read_text(encoding="utf-8"))

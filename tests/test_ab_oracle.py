@@ -24,13 +24,16 @@ SMALL = {dpr: 6 for dpr in gate.DPRS}
 
 
 def items(seed=11):
-    """A visit of the page: nested objects, an image, a list, and a diag. value."""
-    return {
+    """A visit of the page: nested objects, an image, a list, and a diag. value. The visit of seed 0 also has the second launch on a reused profile, under relaunch."""
+    out = {
         "surface": {"navigator": {"hardwareConcurrency": 8 + seed % 3, "language": "en-US"}, "screen": {"width": 1920, "height": 1080}},
         "text": {"fonts": ["Arial", "Segoe UI"]},
         "blend": {"data": "AAEC", "enc": "png", "w": 1, "h": 1},
         "diag.webgl": {"webgl2": True, "message": "llvmpipe"},
     }
+    if seed == ab.RELAUNCH_SEED:
+        out.update(copy.deepcopy(gate.relaunch_items(out)))
+    return out
 
 
 def visits():
@@ -658,3 +661,312 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
     import test_ab_host_e2e as host_e2e
 
     assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the job"
+
+
+# --- the second launch of seed 0 on a reused profile (H7) -----------------------------------------------------------------------------------------
+
+SEED0 = (1.0, ab.RELAUNCH_SEED)
+
+
+def zero_visits():
+    """Two visits: seed 0, which has the second launch's leaves, and seed 2, which has none."""
+    return {SEED0: items(0), (1.5, 2): items(2)}
+
+
+def zero_run(a, b, noise=(), floor=SMALL):
+    return ab.compare_visits(a, b, list(noise), floor, expected=tuple(sorted(a)))
+
+
+def test_only_seed_0_is_launched_twice_and_the_visit_of_it_is_the_one_that_has_the_second_launch():
+    assert ab.RELAUNCH_SEED == 0 and ab.relaunch_visits([(1.5, 2), (1.0, 0), (1.25, 6)]) == ((1.0, 0),)
+    assert ab.relaunch_visits([(1.5, 2)]) == ()
+    both = items(0)
+    assert sorted(k for k in both if k.startswith(gate.RELAUNCH)) == ["relaunch.blend", "relaunch.surface", "relaunch.text"], "the diag. item of the second launch is not kept"
+    assert not [k for k in items(2) if k.startswith(gate.RELAUNCH)]
+
+
+def test_the_second_launch_of_two_equal_dumps_is_green_and_is_counted_apart_from_the_visit():
+    report = zero_run(zero_visits(), zero_visits())
+    assert report["verdict"] == "green" and report["problems"] == []
+    assert report["compared"] == {"dpr1.0_seed0": 6, "dpr1.5_seed2": 6}, "the visit's own leaves only: the second launch's do not fill the floor"
+    assert report["relaunch"] == {"dpr1.0_seed0": 6}
+
+
+def test_a_leaf_that_differs_in_the_second_launch_only_is_red_and_carries_the_prefix_and_the_seed():
+    b = zero_visits()
+    b[SEED0]["relaunch.surface"]["navigator"]["language"] = "it-IT"
+    report = zero_run(zero_visits(), b)
+    assert report["verdict"] == "red" and len(report["differences"]) == 1
+    d = report["differences"][0]
+    assert (d["seed"], d["dpr"], d["leaf"], d["a"], d["b"]) == (0, 1.0, "relaunch.surface.navigator.language", "en-US", "it-IT")
+
+
+def test_a_second_launch_that_is_missing_on_one_side_is_red_and_says_which():
+    b = zero_visits()
+    for k in [k for k in b[SEED0] if k.startswith(gate.RELAUNCH)]:
+        del b[SEED0][k]
+    report = zero_run(zero_visits(), b)
+    assert report["verdict"] == "red"
+    assert any(p.startswith("side B: the second launch of dpr1.0_seed0 on a reused profile has 0 leaves") for p in report["problems"]), report["problems"]
+    assert not any(p.startswith("side A:") for p in report["problems"])
+
+
+def test_a_second_launch_that_both_sides_lack_is_red_not_green():
+    both = zero_visits()
+    for k in [k for k in both[SEED0] if k.startswith(gate.RELAUNCH)]:
+        del both[SEED0][k]
+    report = zero_run(both, copy.deepcopy(both))
+    assert report["verdict"] == "red" and report["differences"] == []
+    assert len([p for p in report["problems"] if "second launch" in p]) == 2
+
+
+def test_a_second_launch_that_dumped_less_than_the_floor_is_red_even_when_the_visit_is_full():
+    both = zero_visits()
+    del both[SEED0]["relaunch.text"]
+    report = zero_run(both, copy.deepcopy(both))
+    assert report["verdict"] == "red" and report["compared"]["dpr1.0_seed0"] == 6
+    assert all("has 5 leaves under relaunch." in p and "fewer than the 6" in p for p in report["problems"]) and len(report["problems"]) == 2
+
+
+def test_the_second_launch_does_not_make_up_for_a_visit_that_dumped_less():
+    both = zero_visits()
+    del both[SEED0]["text"]
+    report = zero_run(both, copy.deepcopy(both))
+    assert report["verdict"] == "red" and report["compared"]["dpr1.0_seed0"] == 5
+    assert report["problems"] == ["dpr1.0_seed0 compared 5 leaves, fewer than the 6 of the host gate's reference: the page dumped less than it should"]
+
+
+def test_a_second_launch_in_a_visit_that_was_not_asked_to_have_one_is_red():
+    b = zero_visits()
+    b[(1.5, 2)].update(copy.deepcopy(gate.relaunch_items(items(2))))
+    report = zero_run(zero_visits(), b)
+    assert report["verdict"] == "red" and "side B has the second launch of dpr1.5_seed2 on a reused profile, which was not asked for" in report["problems"]
+
+
+def test_a_noise_entry_names_a_leaf_of_the_second_launch_by_its_bare_name_and_diag_under_the_prefix_is_not_held():
+    b = zero_visits()
+    b[SEED0]["relaunch.surface"]["navigator"]["language"] = "it-IT"
+    b[SEED0]["relaunch.diag.webgl"] = {"message": "other"}
+    a = zero_visits()
+    a[SEED0]["relaunch.diag.webgl"] = {"message": "llvmpipe"}
+    noise = [{"keys": ["surface.navigator.language"], "why": "x"}]
+    report = zero_run(a, b, noise, floor={dpr: 5 for dpr in gate.DPRS})
+    assert report["verdict"] == "green" and report["differences"] == [] and report["relaunch"] == {"dpr1.0_seed0": 5}
+    assert zero_run(a, b, [], floor={dpr: 5 for dpr in gate.DPRS})["verdict"] == "red", "without the entry it is a difference"
+
+
+def test_a_candidate_set_visit_list_with_seed_0_expects_the_second_launch_of_it_from_judge_run_and_the_files(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    asked = ab.select_visits(limit=2)
+    assert [seed for _, seed in asked][0] == 0
+    full = {key: items(key[1]) for key in asked}
+    assert ab.judge(full, copy.deepcopy(full), [], expected=tuple(asked))["relaunch"] == {ab.visit_name(*asked[0]): 6}
+    lacking = copy.deepcopy(full)
+    for k in [k for k in lacking[asked[0]] if k.startswith(gate.RELAUNCH)]:
+        del lacking[asked[0]][k]
+    assert ab.judge(full, lacking, [], expected=tuple(asked))["verdict"] == "red"
+    ab.write_json(tmp_path / "dump-68.json", ab.pack("firefox-68", full))
+    ab.write_json(tmp_path / "dump-candidate.json", ab.pack("candidate", lacking))
+    assert ab.main(["compare", str(tmp_path), "--limit", "2"]) == 1
+    assert "second launch of dpr" in capsys.readouterr().out
+
+
+def test_the_dump_is_asked_for_the_second_launch_only_when_seed_0_is_among_the_visits(tmp_path, monkeypatch):
+    calls = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: calls.append(cmd) or Done())
+    ab.run_dump("ff", tmp_path / "s.json", "linux-x86_64", tmp_path / "o", [(1.5, 2), (1.0, 0)])
+    ab.run_dump("ff", tmp_path / "s.json", "linux-x86_64", tmp_path / "o", [(1.5, 2), (1.25, 6)])
+    ab.run_dump("ff", tmp_path / "s.json", "linux-x86_64", tmp_path / "o")
+    with_zero, without, grid = calls
+    assert with_zero[with_zero.index("--relaunch-seed") + 1] == "0" and with_zero.count("--relaunch-seed") == 1
+    assert "--relaunch-seed" not in without and "--relaunch-seed" not in grid, "the host gate's own grid and the other shards do not launch twice"
+
+
+# the dump itself, with the browser replaced: which launches it makes, on which folder, and what it keeps
+
+def _fake_read(log, answers=None):
+    """A read_page that records the options of every launch and answers items that say which launch they came from."""
+    def read(options, port, dpr, timeout_ms):
+        n = len(log)
+        log.append(dict(options))
+        answer = (answers or {}).get(n)
+        if answer is not None:
+            return answer
+        return {"format": gate.FORMAT, "items": {"surface": {"launch": n}, "diag.webgl": {"launch": n}}}
+    return read
+
+
+def _dump(tmp_path, monkeypatch, visits_asked, relaunch, log, answers=None):
+    monkeypatch.setattr(gate, "read_page", _fake_read(log, answers))
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    return gate.dump("ff", "leg", tmp_path / "dump", tmp_path / "reference", visits=visits_asked, pin_dpr=False, relaunch_seeds=relaunch)
+
+
+def test_the_dump_launches_seed_0_twice_on_one_profile_and_keeps_the_second_launch_under_its_own_prefix(tmp_path, monkeypatch, capsys):
+    log = []
+    assert _dump(tmp_path, monkeypatch, [(1.0, 0), (1.5, 2)], (0,), log) == 0
+    assert len(log) == 4
+    fresh, first, second, other = log
+    assert "profile_dir" not in fresh and "profile_dir" not in other, "the visit itself, and every other seed, are on a fresh profile as they always were"
+    assert first["profile_dir"] == second["profile_dir"] and first["seed"] == second["seed"] == 0 and first["timezone"] == second["timezone"] == "UTC"
+    assert not Path(first["profile_dir"]).exists(), "the profile folder is removed when the second launch is done"
+    zero = json.loads((tmp_path / "dump" / "leg_dpr1.0_seed0.json").read_text(encoding="utf-8"))["result"]["items"]
+    assert zero["surface"] == {"launch": 0}, "the visit's own items are those of the fresh profile"
+    assert zero["relaunch.surface"] == {"launch": 2}, "the second launch's, not the first's"
+    assert "relaunch.diag.webgl" not in zero and zero["diag.webgl"] == {"launch": 0}
+    two = json.loads((tmp_path / "dump" / "leg_dpr1.5_seed2.json").read_text(encoding="utf-8"))["result"]["items"]
+    assert not [k for k in two if k.startswith(gate.RELAUNCH)]
+    assert "second launch of seed 0 on a reused profile" in capsys.readouterr().out
+
+
+def test_the_dump_without_a_seed_to_launch_twice_launches_each_visit_once_as_the_host_gate_always_did(tmp_path, monkeypatch):
+    log = []
+    assert _dump(tmp_path, monkeypatch, [(1.0, 0), (1.5, 2)], (), log) == 0
+    assert len(log) == 2 and all("profile_dir" not in o for o in log)
+    assert gate.visit_options("ff", 6, 1.25, "UTC") == {"seed": 6, "binary_path": "ff", "headless": True, "show_cursor": False, "locale": "en-US", "timezone": "UTC",
+                                                       "pin": {"screen.dpr": 1.25}}
+    assert gate.visit_options("ff", 6, None, "UTC", "p")["profile_dir"] == "p"
+
+
+@pytest.mark.parametrize("bad", [1, 2])
+def test_a_launch_of_the_pair_that_does_not_answer_the_format_is_a_failed_dump_and_the_folder_is_removed(tmp_path, monkeypatch, capsys, bad):
+    log = []  # launch 0 is the visit on a fresh profile, 1 the first launch of the pair, 2 the second
+    rc = _dump(tmp_path, monkeypatch, [(1.0, 0)], (0,), log, answers={bad: {"format": "old", "items": {}}})
+    assert rc == 2 and len(log) == bad + 1
+    assert "format 'old'" in capsys.readouterr().out
+    assert not Path(log[-1]["profile_dir"]).exists()
+    assert not (tmp_path / "dump" / "leg_dpr1.0_seed0.json").exists(), "a visit with a broken second launch is not written as if it were whole"
+
+
+def test_the_profile_folder_is_removed_when_a_launch_of_the_pair_raises(tmp_path):
+    seen = []
+
+    def read(options, port, dpr, timeout_ms):
+        seen.append(options["profile_dir"])
+        if len(seen) == 2:
+            raise RuntimeError("the second launch hung")
+        return {"format": gate.FORMAT, "items": {}}
+
+    with pytest.raises(RuntimeError, match="hung"):
+        gate.second_launch({"seed": 0}, 1, 1.0, 1000, read=read)
+    assert len(seen) == 2 and seen[0] == seen[1] and not Path(seen[0]).exists()
+
+
+def test_a_launch_on_a_profile_opens_its_page_in_the_persistent_context_and_a_launch_without_one_in_a_new_context(monkeypatch):
+    """With a profile_dir the wrapper hands back a BrowserContext, which has no new_context(): asking it for one fails, so the persistent launch must open the page in it."""
+    import types
+
+    class Page:
+        mouse = types.SimpleNamespace(move=lambda *a: None, click=lambda *a: None)
+
+        def goto(self, url, timeout):
+            self.url = url
+
+        def wait_for_function(self, expression, timeout):
+            pass
+
+        def evaluate(self, expression):
+            return {"format": gate.FORMAT, "items": {"surface": {}}}
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+    class Browser:
+        def new_context(self):
+            return Context()
+
+    class Session:
+        def __init__(self, **options):
+            self.options = options
+
+        def __enter__(self):
+            return Context() if "profile_dir" in self.options else Browser()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, "invisible_playwright", types.SimpleNamespace(InvisiblePlaywright=Session))
+    monkeypatch.setattr(gate, "drive_states", lambda *a: {})
+    for options in ({"seed": 0}, {"seed": 0, "profile_dir": "p"}):
+        assert gate.read_page(options, 1234, 1.0, 1000)["format"] == gate.FORMAT
+
+
+# --- the final set in shards (H4): the test's guard, the e2e.yml jobs, the touched step ---------------------------------------------------------------
+
+def _e2e_module():
+    import test_ab_oracle_e2e as e2e
+
+    return e2e
+
+
+def test_the_hang_guard_grows_with_the_seeds_the_engine_runs_and_the_second_launch():
+    e2e = _e2e_module()
+    base = e2e.budget_s(5, 2)
+    assert base == e2e.SETUP_S + 2 * (e2e.FIRST_SEED_S + 4 * e2e.NEXT_SEED_S)
+    assert e2e.budget_s(2, 2) < e2e.budget_s(3, 2) < base < e2e.budget_s(5, 3) and e2e.budget_s(5, 2, True) == base + 2 * e2e.RELAUNCH_S
+    assert e2e.budget_s(5, 3, True) < 50 * 60, "the gate's leg has 50 minutes: a guard past the job's own timeout guards nothing"
+    assert e2e.budget_s(5, 2, True) + 10 * 60 <= 40 * 60, "a shard's A/A fits the 40 minutes of its job with its setup"
+
+
+def test_the_plan_reads_the_shard_the_set_and_whether_there_is_a_candidate_from_the_environment(tmp_path):
+    e2e = _e2e_module()
+    assert e2e.plan({}) == (2, 2, True), "a pull request that touches nothing: the first two seeds of the candidate set, seed 0 among them"
+    assert e2e.plan({"AB_ORACLE_PR_SEEDS": "5"}) == (5, 2, True) and e2e.plan({"AB_ORACLE_PR_SEEDS": "99"}) == (5, 2, True)
+    seal = tmp_path / "seal.json"
+    assert e2e.plan({"INVISIBLE_SEAL_FILE": str(seal), "AB_ORACLE_PR_SEEDS": "1"}) == (5, 3, True), "with a candidate every seed, whatever the limit"
+    sizes = [e2e.plan({"AB_ORACLE_SEED_SET": "final", "AB_ORACLE_SHARD": "%d/4" % i}) for i in (1, 2, 3, 4)]
+    assert sizes == [(5, 2, True), (5, 2, False), (5, 2, False), (5, 2, False)], "20 seeds in four shards of five; seed 0 is in the first"
+    assert e2e.plan({"AB_ORACLE_SEED_SET": "final", "AB_ORACLE_SHARD": "1/4", "AB_ORACLE_PR_SEEDS": "2"})[0] == 5, "the final set's A/A has no limit"
+    assert e2e.plan({"AB_ORACLE_SEED_SET": "final"})[0] == 20 and e2e.plan({"AB_ORACLE_SEED_SET": "final", "INVISIBLE_SEAL_FILE": "x"}) == (20, 3, True)
+    with pytest.raises(SystemExit):
+        e2e.plan({"AB_ORACLE_SEED_SET": "everything"})
+    with pytest.raises(SystemExit):
+        e2e.plan({"AB_ORACLE_SEED_SET": "final", "AB_ORACLE_SHARD": "5/4"})
+
+
+def test_the_hang_guard_of_the_test_is_the_budget_of_this_run_and_the_subprocess_ends_before_the_worker_is_killed():
+    e2e = _e2e_module()
+    assert e2e.BUDGET_S == e2e.budget_s(*e2e.plan()) and e2e.TIMEOUT_S == e2e.BUDGET_S
+    mark = next(m for m in e2e.test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_bytes.pytestmark if m.name == "timeout")
+    assert mark.args == (e2e.BUDGET_S + 120,) and mark.kwargs == {"method": "thread"}
+
+
+def test_the_files_of_the_final_shards_are_the_files_of_the_page_oracle_and_nothing_else_is():
+    assert ab.touched(["README.md", "scripts/ci_ab_oracle.py"]) and ab.touched(["tests/test_ab_oracle_e2e.py"]) and ab.touched(["scripts/host_gate/page/index.html"])
+    assert not ab.touched(["README.md", "src/invisible_playwright/launcher.py", "scripts/ci_ab_network.py", "tests/test_ab_host.py"]) and not ab.touched([])
+
+
+def test_the_touched_step_prints_one_line_with_a_unix_end_for_the_output_file(monkeypatch, capsys):
+    monkeypatch.setattr(pr, "changed_files", lambda base: ["tests/test_ab_oracle_e2e.py"] if base == "base1" else ["README.md"])
+    assert ab.main(["touched", "base1"]) == 0
+    out = capsys.readouterr().out
+    assert out == "touched=true\n" and "\r" not in out
+    assert ab.main(["touched", "base2"]) == 0 and capsys.readouterr().out == "touched=false\n"
+
+
+def test_the_final_set_has_jobs_of_its_own_in_four_shards_on_each_system_and_the_shared_jobs_do_not_grow():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    page = "tests/test_ab_oracle_e2e.py"
+    linux, windows, touched = _job(text, "e2e-page-final"), _job(text, "e2e-page-final-windows"), _job(text, "e2e-page-final-touched")
+    assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows and "xvfb-run -a" in linux
+    for body in (linux, windows):
+        assert "shard: [1, 2, 3, 4]" in body and "AB_ORACLE_SEED_SET: final" in body and "AB_ORACLE_SHARD: ${{ matrix.shard }}/4" in body
+        assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 40" in body and "fail-fast: false" in body
+        assert "needs: [core-on-index, e2e-page-final-touched]" in body and "needs.e2e-page-final-touched.outputs.touched == 'true'" in body
+        assert "skipped\": 0" in body and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in body, "one test, passed: a skipped one is red"
+        assert "matrix.shard" in body.split("name: invpw-evidence-page-final", 1)[1].split("path:", 1)[0], "four shards, four artifact names"
+    assert "scripts/ci_ab_oracle.py touched" in touched and "pull_request" in touched and "outputs:" in touched
+    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
+    assert "AB_ORACLE_SEED_SET" not in shared_linux + shared_windows + _job(text, "e2e-windows-control-a"), "the shared jobs run the candidate set and do not grow"
+
+
+def test_the_final_set_is_four_shards_of_five_that_reach_every_seed_once_and_seed_0_is_in_the_first():
+    parts = [ab.select_visits("final", "%d/4" % i) for i in (1, 2, 3, 4)]
+    assert [len(p) for p in parts] == [5, 5, 5, 5] and [seed for _, seed in parts[0]][0] == 0
+    assert [i + 1 for i, p in enumerate(parts) if ab.relaunch_visits(p)] == [1]
