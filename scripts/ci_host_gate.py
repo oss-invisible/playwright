@@ -56,6 +56,12 @@ the same rule.
 
     python ci_host_gate.py dump <firefox> --leg linux-x86_64 --out dumps/
     python ci_host_gate.py compare dumps/          (reference: host_gate/reference/firefox-159)
+    python ci_host_gate.py compare dumps/ --junit gate-junit/host-gate.xml
+
+--junit writes the verdict as a junit (xunit2) file, one testcase per invariant
+(name `invariant:<name>`) and one per other check (`check:<name>`), classname
+`scripts.ci_host_gate`: a failed check is a <failure>, a check with nothing to look at
+(no dumps) is a <skipped/>, never a pass. The exit status is the gate's own.
 """
 from __future__ import annotations
 
@@ -66,6 +72,7 @@ import gzip
 import json
 import sys
 import threading
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, NamedTuple
@@ -578,6 +585,61 @@ def compare(dumps: Path, reference: Path, exceptions: dict, notes: list | None =
     return failures
 
 
+# -
+# The junit: the verdict of compare() as one testcase per invariant and per
+# other check, so a judge can ask "did this invariant pass" by name.
+
+#: The classname is the script's path as a dotted module (the hook tests judge turns it back into
+#: scripts/ci_host_gate.py, the file a hook names).
+JUNIT_CLASSNAME = "scripts.ci_host_gate"
+
+#: The checks of compare() other than the invariants, with the prefix of the
+#: failure lines each one owns.
+CHECKS = (
+    ("dumps_complete", ("no dumps", "no retail reference")),
+    ("host_independence", ("host ",)),
+    ("retail_equality", ("retail ",)),
+    ("exceptions_current", ("known defect",)),
+)
+
+
+def junit_cases(failures: list, dumps_seen: int) -> list:
+    """The verdict as [(name, status, lines)], status being passed, failed or
+    skipped. Nothing to look at (no dump) skips an invariant; a failure line
+    is owned by the invariant or check it names."""
+    cases = []
+    for inv in INVARIANTS:
+        lines = [f for f in failures if f.startswith("invariant %s " % inv.name)]
+        cases.append(("invariant:" + inv.name, "failed" if lines else ("passed" if dumps_seen else "skipped"), lines))
+    no_dumps = any(f.startswith("no dumps") for f in failures)
+    no_reference = any(f.startswith("no retail reference") for f in failures)
+    for name, prefixes in CHECKS:
+        lines = [f for f in failures if f.startswith(prefixes) or (name == "dumps_complete" and ": no dump for seeds" in f)]
+        skipped = no_dumps or (no_reference and name != "dumps_complete")
+        cases.append(("check:" + name, "failed" if lines else ("skipped" if skipped else "passed"), lines))
+    return cases
+
+
+def write_junit(path: Path, cases: list, suite: str = "host-gate") -> None:
+    """cases: [(name, status, lines)] as a junit (xunit2) file at path."""
+    root = ET.Element("testsuites")
+    counts = {"failed": 0, "skipped": 0}
+    for _, status, _lines in cases:
+        if status in counts:
+            counts[status] += 1
+    ts = ET.SubElement(root, "testsuite", name=suite, tests=str(len(cases)), failures=str(counts["failed"]),
+                       errors="0", skipped=str(counts["skipped"]), time="0")
+    for name, status, lines in cases:
+        tc = ET.SubElement(ts, "testcase", classname=JUNIT_CLASSNAME, name=name, time="0")
+        if status == "failed":
+            f = ET.SubElement(tc, "failure", message=lines[0][:300] if lines else "failed")
+            f.text = "\n".join(lines[:50])
+        elif status == "skipped":
+            ET.SubElement(tc, "skipped", message="nothing to check: the gate had no dumps or no reference")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -589,6 +651,7 @@ def main(argv=None) -> int:
     c = sub.add_parser("compare")
     c.add_argument("dumps", type=Path)
     c.add_argument("--reference", type=Path, default=REFERENCE)
+    c.add_argument("--junit", type=Path, help="also write the verdict as a junit (xunit2) file")
     args = ap.parse_args(argv)
     if args.cmd == "dump":
         return dump(args.firefox, args.leg, args.out, args.reference)
@@ -598,6 +661,8 @@ def main(argv=None) -> int:
         print("NOTE " + n)
     for f in failures:
         print("FAIL " + f)
+    if args.junit:
+        write_junit(args.junit, junit_cases(failures, len(list(args.dumps.glob("*.json")))))
     print("HOST GATE %s: %d failures" % ("OK" if not failures else "FAILED", len(failures)))
     return 1 if failures else 0
 
