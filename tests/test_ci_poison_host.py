@@ -158,6 +158,7 @@ def test_stock_firefox_that_read_the_poison_is_a_sound_control():
 
 @pytest.mark.parametrize("change, requirement", [
     ({"offsets": [-420, -420]}, "timezone"),
+    ({"dark": False}, "dark"),
     ({"canary": {"with": [100, 100], "without": [100, 100], "present": False}}, "canary"),
     ({"audio": {"sampleRate": 48000, "maxChannelCount": 2}}, "audio"),
     ({"generic": [30.5, 216.0, 216.0]}, "generic"),
@@ -299,7 +300,7 @@ def test_windows_verify_names_each_value_that_is_not_in_force(tmp_path):
     font = tmp_path / poison.FONT_FILE
     font.write_bytes(poison.canary_font())
     right = Fake({"tzutil /g": poison.WINDOWS_ZONE, "(Get-Culture).Name": "ja-JP", "Get-WinUserLanguageList": "ja-JP",
-                  "AppsUseLightTheme": "0", "SystemUsesLightTheme": "0", "Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows NT": str(font)})
+                  "AppsUseLightTheme": "0", "SystemUsesLightTheme": "0", "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT": str(font)})
     assert poison.verify_windows(right, {"font": str(font)}) == []
     wrong = Fake()
     problems = poison.verify_windows(wrong, {"font": str(font)})
@@ -560,7 +561,7 @@ def test_the_e2e_writes_the_dependence_before_it_asserts_anything_on_a_poisoned_
 
 def windows_answers(font, **override):
     answers = {"tzutil /g": poison.WINDOWS_ZONE, "(Get-Culture).Name": "ja-JP", "Get-WinUserLanguageList": "ja",
-               "AppsUseLightTheme": "0", "SystemUsesLightTheme": "0", "Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows NT": str(font)}
+               "AppsUseLightTheme": "0", "SystemUsesLightTheme": "0", "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT": str(font)}
     answers.update(override)
     return Fake(answers)
 
@@ -632,16 +633,33 @@ def test_the_realm_hashes_a_png_without_its_per_launch_chunk_and_the_site_withou
 
 
 # -
-# In trial: measured and told, not required (run 45026082150: stock read no dark scheme on either system and, on Windows, did not see the per-user canary).
+# In trial: measured and told, not required. Nothing is in trial now (the two causes of run 45026082150 are taken away); the mechanism stays, with the old
+# values set by the test.
 
-def test_the_scheme_and_the_windows_canary_are_in_trial_everything_else_stays_required():
-    assert poison.IN_TRIAL == {"dark": ("linux", "windows"), "canary": ("windows",)}
-    assert set(poison.REQUIRED) >= {"timezone", "language", "canary", "audio", "generic"}
+TRIAL = {"dark": ("linux", "windows"), "canary": ("windows",)}
+
+
+@pytest.fixture()
+def trial(monkeypatch):
+    monkeypatch.setattr(poison, "IN_TRIAL", dict(TRIAL))
+
+
+def test_nothing_is_in_trial_now_and_every_requirement_is_required_on_both_systems():
+    assert poison.IN_TRIAL == {}
+    assert set(poison.REQUIRED) == {"timezone", "dark", "canary", "audio", "generic", "language"}
+    light = dict(STOCK, dark=False)
+    unseen = dict(STOCK, canary={"with": [72, 122.6], "without": [72, 122.6], "present": False})
+    for system in ("linux", "windows"):
+        assert [n for n, _ in poison.control_failures(light, system)] == ["dark"] and poison.control_trials(light, system) == []
+        assert [n for n, _ in poison.control_failures(unseen, system)] == ["canary"]
+
+
+def test_the_scheme_and_the_windows_canary_can_be_put_in_trial_and_everything_else_stays_required(trial):
     assert poison.in_trial("dark", "linux") and poison.in_trial("dark", "windows") and poison.in_trial("canary", "windows")
     assert not poison.in_trial("canary", "linux") and not poison.in_trial("timezone", "windows") and not poison.in_trial("language", "linux")
 
 
-def test_a_scheme_stock_did_not_read_is_not_a_broken_control_but_is_told():
+def test_a_scheme_stock_did_not_read_is_not_a_broken_control_but_is_told(trial):
     light = dict(STOCK, dark=False)
     for system in ("linux", "windows"):
         assert poison.control_failures(light, system) == []
@@ -649,19 +667,22 @@ def test_a_scheme_stock_did_not_read_is_not_a_broken_control_but_is_told():
     assert poison.control_trials(STOCK, "linux") == [] and poison.control_trials(None, "linux") == []
 
 
-def test_the_windows_canary_is_in_trial_and_the_linux_one_is_required():
+def test_the_windows_canary_is_in_trial_and_the_linux_one_is_required(trial):
     unseen = dict(STOCK, canary={"with": [72, 122.6], "without": [72, 122.6], "present": False})
     assert poison.control_failures(unseen, "windows") == [] and [n for n, _ in poison.control_trials(unseen, "windows")] == ["canary"]
     assert [n for n, _ in poison.control_failures(unseen, "linux")] == ["canary"] and poison.control_trials(unseen, "linux") == []
 
 
-def test_what_stays_required_stays_red_on_windows_too():
+def test_what_stays_required_stays_red_on_windows_too(trial):
     bad = dict(STOCK, dark=False, offsets=[-420, -420], intl_locale="en-US", date_full="x", canary={"present": False})
     assert sorted(n for n, _ in poison.control_failures(bad, "windows")) == ["language", "timezone"]
 
 
-def test_the_control_writes_the_trials_to_its_file_and_to_the_summary(tmp_path, monkeypatch, capsys):
+def test_the_control_writes_the_trials_to_its_file_and_to_the_summary(tmp_path, monkeypatch, capsys, trial):
     import types
+
+    launched = {}
+    make_playwright_firefox(tmp_path)
 
     class Page:
         def goto(self, url):
@@ -682,7 +703,10 @@ def test_the_control_writes_the_trials_to_its_file_and_to_the_summary(tmp_path, 
             pass
 
     class Firefox:
+        executable_path = firefox_path(tmp_path)
+
         def launch(self, **options):
+            launched.update(options)
             return Browser()
 
     class Manager:
@@ -709,3 +733,91 @@ def test_the_control_writes_the_trials_to_its_file_and_to_the_summary(tmp_path, 
     text = summary.read_text(encoding="utf-8")
     assert "Verdict: **green**" in text and "not read, in trial (dark)" in text
     assert "IN TRIAL, not required (dark)" in capsys.readouterr().out
+    assert launched["executable_path"] != firefox_path(tmp_path) and Path(launched["executable_path"]).name == "firefox"
+    assert report["reference"]["taken_out_of_playwright_cfg"] == ['pref("ui.systemUsesDarkTheme", 0);']
+
+
+# -
+# The reference is a Playwright Firefox that reads the machine's scheme: its cfg forces ui.systemUsesDarkTheme to 0 (widget/nsXPLookAndFeel.cpp reads a pref before the system).
+
+CFG = """// A neighbour
+// Use light theme by default.
+pref("ui.systemUsesDarkTheme", 0);
+
+// Do not use system colors - they are affected by themes.
+pref("ui.use_standins_for_native_colors", true);
+pref("toolkit.shutdown.fastShutdownStage", 3);
+"""
+
+
+def firefox_path(tmp_path):
+    return str(tmp_path / "pw" / "firefox" / "firefox")
+
+
+def make_playwright_firefox(tmp_path, cfg=CFG):
+    folder = tmp_path / "pw" / "firefox"
+    (folder / "defaults").mkdir(parents=True, exist_ok=True)
+    (folder / "firefox").write_bytes(b"binary")
+    (folder / "playwright.cfg").write_bytes(cfg.encode("utf-8"))
+    (folder / "defaults" / "kept.js").write_bytes(b"kept")
+    return folder
+
+
+def test_the_reference_is_a_copy_without_the_pref_that_forces_the_scheme_and_with_everything_else(tmp_path):
+    folder = make_playwright_firefox(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    exe, removed = poison.reference_firefox(str(folder / "firefox"), work)
+    copy = Path(exe).parent
+    assert copy != folder and Path(exe).name == "firefox" and Path(exe).read_bytes() == b"binary" and (copy / "defaults" / "kept.js").read_bytes() == b"kept"
+    cfg = (copy / "playwright.cfg").read_text(encoding="utf-8")
+    assert removed == ['pref("ui.systemUsesDarkTheme", 0);'] and "systemUsesDarkTheme" not in cfg
+    assert 'pref("ui.use_standins_for_native_colors", true);' in cfg and 'pref("toolkit.shutdown.fastShutdownStage", 3);' in cfg
+    assert "systemUsesDarkTheme" in (folder / "playwright.cfg").read_text(encoding="utf-8"), "Playwright's own install is not touched"
+
+
+@pytest.mark.parametrize("line", ['lockPref("ui.systemUsesDarkTheme", 0);', '  defaultPref("ui.systemUsesDarkTheme", 1);'])
+def test_the_pref_is_taken_out_whatever_way_the_cfg_sets_it(tmp_path, line):
+    folder = make_playwright_firefox(tmp_path, CFG + line + "\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    exe, removed = poison.reference_firefox(str(folder / "firefox"), work)
+    assert len(removed) == 2 and "systemUsesDarkTheme" not in (Path(exe).parent / "playwright.cfg").read_text(encoding="utf-8")
+
+
+def test_a_reference_that_would_not_differ_from_playwright_s_firefox_is_refused(tmp_path):
+    folder = make_playwright_firefox(tmp_path, 'pref("toolkit.shutdown.fastShutdownStage", 3);\n')
+    work = tmp_path / "work"
+    work.mkdir()
+    with pytest.raises(RuntimeError, match="does not force ui.systemUsesDarkTheme"):
+        poison.reference_firefox(str(folder / "firefox"), work)
+    (folder / "playwright.cfg").unlink()
+    with pytest.raises(RuntimeError, match="no playwright.cfg"):
+        poison.reference_firefox(str(folder / "firefox"), tmp_path / "other")
+
+
+def test_the_control_launches_the_reference_and_not_playwright_s_install():
+    source = (ROOT / "scripts" / "ci_poison_host.py").read_text(encoding="utf-8")
+    assert "p.firefox.launch(executable_path=executable," in source and "reference_firefox(p.firefox.executable_path" in source
+    # the control is headed, and so are the engines of the oracle (a hidden desktop, the core's _headless.py), never `-headless`
+    assert "headless=headless" in source and "def control(out: Path, headless: bool = False)" in source
+
+
+# -
+# The canary of Windows is machine-wide: the Fonts folder of the system and HKLM.
+
+def test_the_windows_canary_goes_to_the_fonts_folder_of_the_system_and_to_hklm():
+    assert poison.FONTS_KEY.startswith("HKLM:")
+    assert poison.font_path_windows({"SystemRoot": "X:" + chr(92) + "Sys"}) == Path("X:" + chr(92) + "Sys") / "Fonts" / poison.FONT_FILE
+    assert poison.font_path_windows({"WINDIR": "X:" + chr(92) + "Win"}) == Path("X:" + chr(92) + "Win") / "Fonts" / poison.FONT_FILE
+
+
+def test_windows_apply_registers_the_canary_under_hklm_and_undo_removes_that_value(tmp_path, no_session):
+    fake = Fake()
+    state = poison.apply_windows(fake, font_dir=tmp_path)
+    assert any("HKLM:" in line and poison.FONT_VALUE in line and "New-ItemProperty" in line for line in fake.text())
+    assert not any("HKCU:" in line and poison.FONT_VALUE in line for line in fake.text())
+    fake.calls.clear()
+    poison.undo_windows(state, fake)
+    assert any("Remove-ItemProperty" in line and "HKLM:" in line and poison.FONT_VALUE in line for line in fake.text())
+    assert not (tmp_path / poison.FONT_FILE).exists()
