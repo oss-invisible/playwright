@@ -193,10 +193,21 @@ class _ServerSideLog:
         except Exception:
             pass
 
-    def _step(self, what, **more):
-        record = {"ev": what}
+    def _step(self, event, /, **more):
+        # `event` is positional-only: a wrapped call records a field called `what` (the adoption's note) and must not collide with it.
+        record = {"ev": event}
         record.update(more)
         self._add(self.steps, record)
+
+    def _record(self, make):
+        """Run `make`, which records something about a call the server makes; a failure of the recording is noted in the evidence and
+        never reaches the server."""
+        try:
+            make()
+        except BaseException as exc:
+            with self._lock:
+                if len(self.problems) < 20:
+                    self.problems.append("recording failed: %r" % (exc,))
 
     def install(self):
         log = self
@@ -213,49 +224,58 @@ class _ServerSideLog:
             self.problems.append("the server modules could not be imported: %r" % (exc,))
             return
 
+        # Every wrapper takes (*args, **kwargs) and passes them on unchanged: whatever the real code passes, positional or keyword, reaches
+        # the wrapped method as it was. What a wrapper reads from the call is read inside `_record`, which never raises.
         def post(original):
-            def wrapper(client, text):
-                log._sent("RemoteClient.post", text)
-                return original(client, text)
+            def wrapper(*args, **kwargs):
+                log._record(lambda: log._sent("RemoteClient.post", args[1] if len(args) > 1 else kwargs.get("text")))
+                return original(*args, **kwargs)
             return wrapper
 
         def emit_message(original):
-            def wrapper(transport_self, message):
-                log._sent("InProcessTransport.emit_message", message)
-                return original(transport_self, message)
+            def wrapper(*args, **kwargs):
+                log._record(lambda: log._sent("InProcessTransport.emit_message", args[1] if len(args) > 1 else kwargs.get("message")))
+                return original(*args, **kwargs)
             return wrapper
 
         def adoption_init(original):
-            def wrapper(adoption, *args, **kwargs):
-                original(adoption, *args, **kwargs)
-                log._step("adoption_attached", target=adoption.target_id, opener=adoption.opener is not None, context=adoption.context_id)
+            def wrapper(*args, **kwargs):
+                result = original(*args, **kwargs)
+                adoption = args[0]
+                log._record(lambda: log._step("adoption_attached", target=adoption.target_id, opener=adoption.opener is not None,
+                                              context=adoption.context_id))
+                return result
             return wrapper
 
         def adoption_note(original):
-            def wrapper(adoption, what):
-                log._step("adoption_note", target=adoption.target_id, state=adoption.state, what=what)
-                return original(adoption, what)
+            def wrapper(*args, **kwargs):
+                adoption = args[0]
+                log._record(lambda: log._step("adoption_note", target=adoption.target_id, state=adoption.state,
+                                              what=args[1] if len(args) > 1 else kwargs.get("what")))
+                return original(*args, **kwargs)
             return wrapper
 
         def wait_until_ready(original):
-            def wrapper(page, *args, **kwargs):
-                log._step("wait_until_ready_begin", page=page.guid)
+            def wrapper(*args, **kwargs):
+                page = args[0]
+                log._record(lambda: log._step("wait_until_ready_begin", page=page.guid))
                 try:
-                    result = original(page, *args, **kwargs)
+                    result = original(*args, **kwargs)
                 except BaseException as exc:
-                    log._step("wait_until_ready_failed", page=page.guid, error=repr(exc)[:300])
+                    log._record(lambda: log._step("wait_until_ready_failed", page=page.guid, error=repr(exc)[:300]))
                     raise
-                log._step("wait_until_ready_end", page=page.guid)
+                log._record(lambda: log._step("wait_until_ready_end", page=page.guid))
                 return result
             return wrapper
 
         def announce(original):
-            def wrapper(page, *args, **kwargs):
-                log._step("announce_begin", page=page.guid)
+            def wrapper(*args, **kwargs):
+                page = args[0]
+                log._record(lambda: log._step("announce_begin", page=page.guid))
                 try:
-                    return original(page, *args, **kwargs)
+                    return original(*args, **kwargs)
                 finally:
-                    log._step("announce_end", page=page.guid)
+                    log._record(lambda: log._step("announce_end", page=page.guid))
             return wrapper
 
         wrap(remote.RemoteClient, "post", post)
