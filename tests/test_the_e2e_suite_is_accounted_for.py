@@ -73,6 +73,8 @@ EXCLUDED = {
         (("linux",), "skips on Linux: the hidden desktop is the Windows path; Linux hides via Xvfb"),
     "tests/test_first_launch_from_a_new_path.py::test_the_first_launch_from_a_new_path_works":
         (("linux",), "skips on Linux: the launcher process exists only on Windows"),
+    "tests/test_the_host_gl_probe_runs_only_on_an_undeclared_engine_linux_e2e.py":
+        (("windows",), "the GLX probe (gfxtest glx) is a child process of Firefox on GTK; Windows reads the adapter in the parent and has no such process"),
     "tests/test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e.py":
         (("windows",), "wrapper.e2e.fontconfig is linux_only: fontconfig exists only on Linux (DirectWrite opens a font from its path)"),
     "tests/test_webgl_draws_on_the_engine_s_own_gl_e2e.py::test_webgl_draws_on_the_engine_s_own_gl":
@@ -87,7 +89,11 @@ EXCLUDED = {
         (("windows",), "skips on Windows: the Linux text path"),
 }
 #: Changed by hand, together with the list above: an exclusion is a test the candidate does not run, and it may not be added in silence.
+<<<<<<< HEAD
 EXCLUDED_COUNT = 19
+=======
+EXCLUDED_COUNT = 17
+>>>>>>> origin/char69/glxtest
 
 
 @functools.lru_cache(maxsize=None)
