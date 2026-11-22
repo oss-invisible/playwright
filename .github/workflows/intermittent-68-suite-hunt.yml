@@ -1,0 +1,339 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# intermittent-68-suite-hunt.yml - a HUNT for the intermittent e2e of firefox-68, in the context that reproduces them: the WHOLE e2e suite, on the load of
+# the whole suite. It is NOT a gate, it is never merged to main (it lives on the branch `hunt/intermittent-68-suite` and is deleted with it), and no result
+# of it counts as green for anything: a green hunt proves nothing about a release, a red one is evidence to read.
+#
+# What it runs. The e2e of .github/workflows/e2e.yml on this branch, as that file runs it, ROUNDS times in sequence per job, and it never stops at a red:
+#   * linux 1..4: four identical copies of the Linux job of e2e.yml (the whole suite under xvfb-run without the root and the sandbox files, then the root
+#     step and the sandbox step, as e2e.yml runs them);
+#   * windows 1..4: the four Windows parts of e2e.yml (rows `wrapper.e2e.suite.windows.N` of ci/required-suites.json through scripts/ci_verdict.py args).
+# Left out on purpose: the gate that waits for the core on the index, and the Windows job of Control+A. Same runners, same install, same security state, same
+# fetch, same GeoIP database, same scripts/run_e2e.py with its own width (-n), its own deadline and no rerun of any kind.
+#
+# Each round leaves, in $RUNNER_TEMP/hunt/round-N/: the junit of the round, the evidence the tests save on failure (invpw-evidence), the watchdog file, the
+# log of the round and, on Linux, the junit of the root and sandbox steps. The browsers left over are closed between rounds. hunt-summary.md (also in the
+# job summary) has one line per round (passed, failed, errors, skipped) and the failed node ids with the first line of each message.
+# A job is red when any round has a failure or an error, when a round produced no junit, or when the shell broke.
+#
+# Triggered ONLY by a push to `hunt/intermittent-68-suite`: no schedule, no dispatch, no pull request.
+# ─────────────────────────────────────────────────────────────────────────────
+name: intermittent 68 suite hunt
+
+on:
+  push:
+    branches: [hunt/intermittent-68-suite]
+
+permissions:
+  contents: read
+
+# A newer push to the hunt branch replaces the run it supersedes.
+concurrency:
+  group: intermittent-68-suite-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+# Engine and GeoIP downloads go through the release API with this token (as every workflow that runs tests).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: suite hunt ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    # Up to 6 rounds of the whole suite plus the install: the ceiling is the longest a hosted job may run.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - label: linux-1
+            os: ubuntu-24.04
+            temp: /tmp
+          - label: linux-2
+            os: ubuntu-24.04
+            temp: /tmp
+          - label: linux-3
+            os: ubuntu-24.04
+            temp: /tmp
+          - label: linux-4
+            os: ubuntu-24.04
+            temp: /tmp
+          - label: windows-1
+            os: windows-2022
+            temp: 'D:\a\_temp'
+            part: 1
+          - label: windows-2
+            os: windows-2022
+            temp: 'D:\a\_temp'
+            part: 2
+          - label: windows-3
+            os: windows-2022
+            temp: 'D:\a\_temp'
+            part: 3
+          - label: windows-4
+            os: windows-2022
+            temp: 'D:\a\_temp'
+            part: 4
+    # The temporary folder of the Windows job is the one of e2e.yml (D:\a\_temp, where the runner's own temp is: the profiles on C: saturate the disk).
+    env:
+      TEMP: ${{ matrix.temp }}
+      TMP: ${{ matrix.temp }}
+    # `run:` blocks are PowerShell on Windows unless said otherwise.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: System deps (xvfb + Firefox runtime libs)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo apt-get install -y strace
+          sudo apt-get install -y gdb
+          mkdir -p "$RUNNER_TEMP/invpw-cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%e.%p"
+          echo "INVPW_CORE_DIR=$RUNNER_TEMP/invpw-cores" >> "$GITHUB_ENV"
+          sudo "$(which python)" -m playwright install-deps firefox
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        if: runner.os == 'Linux'
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: Fetch the published firefox binary (Windows)
+        if: runner.os == 'Windows'
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      # The GeoIP database made by the repository, as in e2e.yml (no download, the same bytes every run).
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      # The files of the part are the rows `wrapper.e2e.suite.windows.N` of ci/required-suites.json, as e2e.yml reads them.
+      - name: The files of this part (the row of the suite, in ci/required-suites.json)
+        if: runner.os == 'Windows'
+        run: python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.windows.${{ matrix.part }}" --os windows > "$RUNNER_TEMP/e2e_args.txt"
+
+      - name: The suite, round after round
+        env:
+          PYTHONUNBUFFERED: "1"
+          # The number of rounds: 3 unless said otherwise here, and never more than 6 (the script clamps it).
+          HUNT_ROUNDS: "3"
+          HUNT_LABEL: ${{ matrix.label }}
+          # The watchdog of tests/conftest.py, as e2e.yml sets it for the run of the runner user (the junit of the run is written beside it).
+          HUNT_WATCHDOG: ${{ runner.temp }}/e2e-watchdog.log
+          # The Linux job of e2e.yml: the root files and the sandbox file are left out of the run and run in their own steps.
+          ROOT_FILES: tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py
+          ROOT_NODES: tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick
+          SANDBOX_FILES: tests/test_the_socket_process_is_sandboxed_e2e.py
+          ROOT_TESTS: "7"
+          SANDBOX_TESTS: "1"
+        run: |
+          # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before the verdict into a red step.
+          set -euo pipefail
+          finished=0
+          trap 'if [ "$finished" != 1 ]; then echo "::error::the hunt step stopped before its verdict"; exit 1; fi' EXIT
+          if [ -z "${FF:-}" ] || [ ! -e "$FF" ]; then echo "::error::no engine binary (FF='${FF:-}')"; exit 1; fi
+          rounds="${HUNT_ROUNDS:-3}"
+          case "$rounds" in ''|*[!0-9]*) echo "::warning::HUNT_ROUNDS='$rounds' is not a number: 3 rounds"; rounds=3;; esac
+          if [ "$rounds" -lt 1 ]; then rounds=3; fi
+          if [ "$rounds" -gt 6 ]; then echo "::warning::HUNT_ROUNDS=$rounds is more than 6: 6 rounds"; rounds=6; fi
+          hunt="$RUNNER_TEMP/hunt"
+          mkdir -p "$hunt"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            mapfile -t ARGS < <(tr -d '\r' < "$RUNNER_TEMP/e2e_args.txt")
+            extras=()
+          else
+            # What the restriction on user namespaces was, to put it back after the sandbox step of every round.
+            USERNS0="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 1)"
+            extras=("root-e2e.xml=$ROOT_TESTS" "sandbox-e2e.xml=$SANDBOX_TESTS")
+          fi
+          # The reading of one round: "tests failures errors skipped junit-files problems" on the first line, then one line per red test (node id, first line of
+          # the message) and one per problem (a junit that is not there or not readable, an extra with the wrong number of tests).
+          cat > "$hunt/read_round.py" <<'PY'
+          import glob, os, sys, xml.etree.ElementTree as ET
+          sys.stdout.reconfigure(newline="\n")
+          rd = sys.argv[1]
+          exact = dict(a.split("=", 1) for a in sys.argv[2:])
+          files = sorted(glob.glob(os.path.join(rd, "e2e-junit-*.xml")))
+          problems, reds = [], []
+          tests = failures = errors = skipped = 0
+          if not files:
+              problems.append("no e2e-junit-*.xml in the round")
+          for name in sorted(exact):
+              path = os.path.join(rd, name)
+              if not os.path.exists(path):
+                  problems.append("%s is not there" % name)
+              else:
+                  files.append(path)
+          for path in files:
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception as exc:
+                  problems.append("%s is not readable: %r" % (os.path.basename(path), exc))
+                  continue
+              count = 0
+              for case in root.iter("testcase"):
+                  count += 1
+                  tests += 1
+                  if case.find("skipped") is not None:
+                      skipped += 1
+                  for kind in ("failure", "error"):
+                      bad = case.find(kind)
+                      if bad is None:
+                          continue
+                      if kind == "failure":
+                          failures += 1
+                      else:
+                          errors += 1
+                      message = (bad.get("message") or bad.text or "").strip().splitlines()
+                      reds.append("%s::%s [%s] | %s" % (case.get("classname"), case.get("name"), kind, (message[0] if message else "")[:300]))
+              want = exact.get(os.path.basename(path))
+              if want is not None and count != int(want):
+                  problems.append("%s has %d tests, exactly %s were demanded" % (os.path.basename(path), count, want))
+          print(tests, failures, errors, skipped, len(files), len(problems))
+          for line in reds:
+              print("FAIL " + line)
+          for line in problems:
+              print("PROBLEM " + line)
+          PY
+          # Every browser left by a round is closed before the next one starts (and after the last).
+          reap() {
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              powershell -NoProfile -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1 || true
+            else
+              pkill -9 -f "$(dirname "$FF")" > /dev/null 2>&1 || true
+              sudo pkill -9 -f '[/]opt/ff' > /dev/null 2>&1 || true
+              pkill -9 Xvfb > /dev/null 2>&1 || true
+            fi
+          }
+          # The run of the runner user, as e2e.yml runs it: Linux, the whole suite without the root and the sandbox files; Windows, the files of the part.
+          run_main() {
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              INVPW_TEST_WATCHDOG_FILE="$HUNT_WATCHDOG" python -u scripts/run_e2e.py "$FF" "${ARGS[@]}"
+            else
+              local IGNORE=() DESELECT=() f nodeid
+              for f in $ROOT_FILES $SANDBOX_FILES; do IGNORE+=("--ignore=$f"); done
+              for nodeid in $ROOT_NODES; do DESELECT+=("--deselect=$nodeid"); done
+              INVPW_TEST_WATCHDOG_FILE="$HUNT_WATCHDOG" xvfb-run -a python -u scripts/run_e2e.py "$FF" "${IGNORE[@]}" "${DESELECT[@]}"
+            fi
+          }
+          # THE ROOT STEP of e2e.yml (wrapper.e2e.udp.exit), after the run of the runner user.
+          run_root() {
+            sudo rm -rf /opt/ff
+            sudo cp -a "$(dirname "$FF")" /opt/ff
+            sudo chown -R root:root /opt/ff
+            sudo chmod -R go+rX /opt/ff
+            local ROOT_FF="/opt/ff/$(basename "$FF")"
+            local JUNIT="${RUNNER_TEMP}/root-e2e.xml"
+            sudo -H -E env -u PYTEST_ADDOPTS -u XDG_RUNTIME_DIR INVPW_REQUIRE_TRAP=1 "PATH=$PATH" INVPW_BINARY_PATH="$ROOT_FF" STEALTHFOX_E2E_BINARY="$ROOT_FF" \
+              python -m pytest $ROOT_FILES $ROOT_NODES -m e2e -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$JUNIT"
+          }
+          # THE SANDBOX STEP of e2e.yml (wrapper.e2e.udp.sandbox), after the root step.
+          run_sandbox() {
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            local JUNIT="${RUNNER_TEMP}/sandbox-e2e.xml"
+            xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" \
+              python -m pytest $SANDBOX_FILES -m e2e -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$JUNIT"
+          }
+          {
+            echo "## $HUNT_LABEL"
+            echo ""
+            echo "The whole e2e of e2e.yml on this branch, $rounds rounds in sequence. A hunt, not a gate: nothing here counts as green."
+            echo ""
+          } > "$hunt/hunt-summary.md"
+          rounds_run=0; rounds_red=0
+          for n in $(seq 1 "$rounds"); do
+            rd="$hunt/round-$n"
+            mkdir -p "$rd"
+            log="$rd/round.log"
+            t0=$SECONDS
+            echo "::group::round $n/$rounds"
+            code_main=-; code_root=-; code_sandbox=-
+            set +e
+            run_main 2>&1 | tee "$log"
+            code_main=${PIPESTATUS[0]}
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              run_root 2>&1 | tee -a "$log"
+              code_root=${PIPESTATUS[0]}
+              # Whatever root wrote under the evidence folder is the runner's again.
+              sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/root-e2e.xml" "$RUNNER_TEMP/invpw-evidence" > /dev/null 2>&1
+              run_sandbox 2>&1 | tee -a "$log"
+              code_sandbox=${PIPESTATUS[0]}
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns="$USERNS0" > /dev/null 2>&1
+              {
+                echo "-- files owned by root under the runner's home and /tmp"; sudo find /home/runner /tmp -maxdepth 3 -user root 2>/dev/null | head -40
+                echo "-- /etc/resolv.conf"; cat /etc/resolv.conf
+                echo "-- lo"; ip -4 addr show lo
+              } >> "$log" 2>&1
+            fi
+            reap
+            # The leg ran with the pinned GeoIP database (the step of e2e.yml, once per round here).
+            geoip_ok=1
+            python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null 2>> "$log" || geoip_ok=0
+            python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT" >> "$log" 2>&1 || geoip_ok=0
+            set -e
+            echo "::endgroup::"
+            # What this round left, moved aside so that the next one does not overwrite it.
+            shopt -s nullglob
+            for item in "$RUNNER_TEMP"/e2e-junit-*.xml "$RUNNER_TEMP/root-e2e.xml" "$RUNNER_TEMP/sandbox-e2e.xml" "$HUNT_WATCHDOG" "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json"; do
+              if [ -e "$item" ]; then mv "$item" "$rd/"; fi
+            done
+            if [ -d "$RUNNER_TEMP/invpw-evidence" ]; then mv "$RUNNER_TEMP/invpw-evidence" "$rd/invpw-evidence"; fi
+            shopt -u nullglob
+            # Python writes CRLF on Windows: every line read back loses its carriage return before it is used in an arithmetic expression.
+            python "$hunt/read_round.py" "$rd" "${extras[@]}" | tr -d '\r' > "$rd/round-read.txt"
+            read -r t f e s files problems < <(head -1 "$rd/round-read.txt")
+            for number in "$t" "$f" "$e" "$s" "$files" "$problems"; do
+              case "$number" in ''|*[!0-9]*) echo "::error::round $n: the junit read gave '$t $f $e $s $files $problems', not six numbers"; exit 1;; esac
+            done
+            rounds_run=$((rounds_run + 1))
+            red=0
+            if [ $((f + e)) -gt 0 ] || [ "$problems" -gt 0 ] || [ "$code_main" -ne 0 ] || [ "$geoip_ok" -ne 1 ]; then red=1; fi
+            if [ "$red" -eq 1 ]; then rounds_red=$((rounds_red + 1)); verdict=RED; else verdict=green; fi
+            line="round $n/$rounds: $verdict - passed $((t - f - e - s)), failed $f, errors $e, skipped $s (tests $t in $files junit files; exit main=$code_main root=$code_root sandbox=$code_sandbox; geoip ok=$geoip_ok; $((SECONDS - t0)) s)"
+            echo "$line"
+            {
+              echo "- $line"
+              tail -n +2 "$rd/round-read.txt" | sed 's/^/  - /'
+            } >> "$hunt/hunt-summary.md"
+            tail -n +2 "$rd/round-read.txt"
+          done
+          cat "$hunt/hunt-summary.md"
+          # Red means FOUND, and also NOT MEASURED: a red round, or no round at all.
+          finished=1
+          if [ "$rounds_run" -eq 0 ]; then echo "::error::no round ran"; exit 1; fi
+          if [ "$rounds_red" -ne 0 ]; then echo "::error::$rounds_red of $rounds_run rounds are red"; exit 1; fi
+
+      - name: Close every Firefox left
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: The counts in the job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/hunt/hunt-summary.md" ]; then cat "$RUNNER_TEMP/hunt/hunt-summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+      # Everything of every round, and what a round that did not end (a kill at the ceiling) left where it was.
+      - name: Upload what the hunt found (every round)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: suite-hunt-${{ matrix.label }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/hunt
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/e2e-junit-*.xml
+            ${{ runner.temp }}/root-e2e.xml
+            ${{ runner.temp }}/sandbox-e2e.xml
+            ${{ runner.temp }}/e2e-watchdog.log
+          if-no-files-found: warn
+          retention-days: 14
