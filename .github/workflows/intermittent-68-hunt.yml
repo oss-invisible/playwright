@@ -127,7 +127,15 @@ jobs:
           # No new round starts after this many seconds of the step: the artifact is uploaded with what the rounds so far found.
           HUNT_BUDGET_S: "5100"
         run: |
-          set -u
+          # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before the verdict into a red step.
+          set -euo pipefail
+          finished=0
+          trap 'if [ "$finished" != 1 ]; then echo "::error::the hunt step stopped before its verdict"; exit 1; fi' EXIT
+          # What scripts/run_e2e.py gives the pytest it starts (invisible_core/testing/e2e.py main): INVPW_BINARY_PATH and STEALTHFOX_E2E_BINARY, both the binary,
+          # and INVISIBLE_CORE_PIN taken out of the environment (one e2e asserts the pin repair that it disables). It sets nothing else; cwd is the repository.
+          if [ -z "${FF:-}" ] || [ ! -e "$FF" ]; then echo "::error::no engine binary (FF='${FF:-}')"; exit 1; fi
+          export INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF"
+          unset INVISIBLE_CORE_PIN
           out="$RUNNER_TEMP"
           mkdir -p "$out/hunt-junit" "$out/hunt-logs" "$out/invpw-evidence"
           # The result of one junit: "tests failures errors skipped" on the first line, then one line per red test (-1 for a file that is not there).
@@ -155,16 +163,16 @@ jobs:
               pkill -9 -f "$(dirname "$FF")" > /dev/null 2>&1 || true
             fi
           }
-          rounds_run=0; rounds_red=0; copies=0; copies_passed=0; copies_red=0; copies_skipped=0
+          rounds_run=0; rounds_red=0; copies=0; copies_passed=0; copies_red=0; copies_skipped=0; anomalies=0
           summary() {
             {
               echo "## $HUNT_LABEL"
               echo ""
               echo "test: \`$HUNT_NODE\`"
               echo ""
-              echo "| rounds planned | rounds run | rounds with a red | copies run (4 a round) | passed | failed | skipped |"
-              echo "|---|---|---|---|---|---|---|"
-              echo "| $HUNT_ROUNDS | $rounds_run | $rounds_red | $copies | $copies_passed | $copies_red | $copies_skipped |"
+              echo "| rounds planned | rounds run | rounds with a red | copies run (4 a round) | passed | failed | skipped | rounds that did not run 4 copies |"
+              echo "|---|---|---|---|---|---|---|---|"
+              echo "| $HUNT_ROUNDS | $rounds_run | $rounds_red | $copies | $copies_passed | $copies_red | $copies_skipped | $anomalies |"
               echo ""
               if [ -s "$out/hunt-reds.txt" ]; then echo "Reds:"; echo ""; echo '```'; cat "$out/hunt-reds.txt"; echo '```'; fi
             } > "$out/hunt-summary.md"
@@ -187,21 +195,28 @@ jobs:
             code=$?
             set -e
             reap
-            python "$out/junit_read.py" "$junit" > "$out/round-read.txt"
+            # Python writes CRLF on Windows: every line read back loses its backslash-r before it is used in an arithmetic expression.
+            python "$out/junit_read.py" "$junit" | tr -d '\r' > "$out/round-read.txt"
             read -r t f e s < <(head -1 "$out/round-read.txt")
             rounds_run=$((rounds_run + 1))
+            for number in "$t" "$f" "$e" "$s"; do
+              case "$number" in -1|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) echo "::error::round $n: the junit read gave '$t $f $e $s', not four numbers"; exit 1;; esac
+            done
             if [ "$t" -lt 0 ]; then
               # no junit: the pytest run did not get to write one (collection error, a worker that died, a kill)
-              rounds_red=$((rounds_red + 1)); copies_red=$((copies_red + 4))
+              rounds_red=$((rounds_red + 1)); copies_red=$((copies_red + 4)); anomalies=$((anomalies + 1))
               echo "round $n: exit=$code, NO JUNIT" | tee -a "$out/hunt-reds.txt"
               tail -n 30 "$log" | tee -a "$out/hunt-reds.txt"
             else
               copies=$((copies + t)); copies_red=$((copies_red + f + e)); copies_skipped=$((copies_skipped + s))
               copies_passed=$((copies_passed + t - f - e - s))
-              if [ "$code" -ne 0 ] || [ $((f + e)) -gt 0 ]; then
+              # A round that is not four copies, all run, measured less than it says: a skipped copy measured nothing and is red.
+              if [ "$t" -ne 4 ] || [ "$s" -ne 0 ]; then anomalies=$((anomalies + 1)); fi
+              if [ "$code" -ne 0 ] || [ $((f + e)) -gt 0 ] || [ "$t" -ne 4 ] || [ "$s" -ne 0 ]; then
                 rounds_red=$((rounds_red + 1))
-                echo "round $n: exit=$code, $t copies, $f failed, $e errors" >> "$out/hunt-reds.txt"
+                echo "round $n: exit=$code, $t copies, $f failed, $e errors, $s skipped" >> "$out/hunt-reds.txt"
                 tail -n +2 "$out/round-read.txt" | sed "s/^/  /" >> "$out/hunt-reds.txt"
+                if [ "$s" -ne 0 ]; then grep -a -m 3 "SKIPPED" "$log" | sed "s/^/  /" >> "$out/hunt-reds.txt" || true; fi
               fi
             fi
             echo "round $n/$HUNT_ROUNDS: exit=$code tests=$t failures=$f errors=$e skipped=$s, $((SECONDS - t0)) s"
@@ -209,9 +224,11 @@ jobs:
           done
           summary
           cat "$out/hunt-summary.md"
-          # Red means FOUND: the step fails when any copy failed, and the job's artifact is what to read.
-          [ "$copies_red" -eq 0 ] || exit 1
-          if [ "$copies_skipped" -ne 0 ]; then echo "::warning::$copies_skipped copies were skipped: the hunt did not run them"; fi
+          # Red means FOUND, and also NOT MEASURED: the step fails when any copy failed or was skipped, when a round did not run its four copies, or when no round ran.
+          finished=1
+          if [ "$rounds_run" -eq 0 ]; then echo "::error::no round ran"; exit 1; fi
+          if [ "$copies_skipped" -ne 0 ]; then echo "::error::$copies_skipped copies were skipped: the hunt measured nothing with them"; fi
+          if [ "$copies_red" -ne 0 ] || [ "$copies_skipped" -ne 0 ] || [ "$anomalies" -ne 0 ]; then exit 1; fi
 
       - name: The leg ran with the pinned GeoIP database
         if: always()
