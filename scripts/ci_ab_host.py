@@ -1922,16 +1922,21 @@ class CrashWatcher:
     def start(self) -> None:
         self._thread.start()
 
+    def scan_once(self) -> None:
+        """One look at the crash folders (what the thread does every period, and `stop` once more): a file seen empty or half written is read again when its size changes."""
+        scan_crash_files(self.dirs_fn(), self.seen)
+        self.scans += 1
+
     def _run(self) -> None:
         while not self._halt.is_set():
-            scan_crash_files(self.dirs_fn(), self.seen)
-            self.scans += 1
+            self.scan_once()
             self._halt.wait(self.period)
 
     def stop(self) -> dict:
         self._halt.set()
-        self._thread.join(timeout=10)
-        scan_crash_files(self.dirs_fn(), self.seen)
+        if self._thread.is_alive():
+            self._thread.join(timeout=10)
+        self.scan_once()
         return {"files": sorted(self.seen.values(), key=lambda f: f["name"]), "scans": self.scans}
 
 

@@ -377,7 +377,6 @@ def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the
 def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests_belong_to_the_step_that_closed_it(monkeypatch):
     """A/A run 44982522362, Windows seed 6: the tab of step 10 is closed by the walk; its two pagehide requests reached the site after the walk had moved to step 11 in 19 launches
     of 20, and before it in one (n=2 in step 10, n=1 in step 11). In every launch both were sent. The walk now goes on when the site has both."""
-    import threading
     import time
     from types import SimpleNamespace
 
@@ -385,6 +384,16 @@ def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests
 
     state = journey_site.State()
     monkeypatch.setattr(journey_site, "STATE", state)
+    arrivals = [lambda: state.record(1, "POST", "/beacon", {"t": ["pagehide"], "n": ["1"]}), lambda: state.record(1, "POST", "/beacon", {"t": ["pagehide"], "n": ["2"]})]
+    polls = []
+
+    def sleep(period):
+        """The losing interleaving, built on purpose: the walk is already waiting when the requests reach the site, one at each look of its wait: nothing is timed."""
+        polls.append(period)
+        if arrivals:
+            arrivals.pop(0)()
+
+    monkeypatch.setattr(profile_p4, "time", SimpleNamespace(monotonic=time.monotonic, sleep=sleep))
 
     class Tab:
         url = "http://journey-o.test:1/partner/8"
@@ -399,13 +408,7 @@ def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests
             return "Partner"
 
         def close(self):
-            def leave():
-                time.sleep(0.3)
-                state.record(1, "POST", "/beacon", {"t": ["pagehide"], "n": ["1"]})
-                time.sleep(0.1)
-                state.record(1, "POST", "/beacon", {"t": ["pagehide"], "n": ["2"]})
-
-            threading.Thread(target=leave, daemon=True).start()
+            pass  # the requests of the leaving page come after close() has returned, while the walk waits
 
     tab = Tab()
     ctx = SimpleNamespace(expect_page=lambda: SimpleNamespace(__enter__=None), pages=[])
@@ -428,12 +431,13 @@ def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests
     state.set_step(10)
     cleanup()
     assert state.step == 10 and [e["n"] for e in state.events if e["id"] == "pagehide"] == ["1", "2"] and {e["step"] for e in state.events} == {10}, "both are in the step that closed the tab"
+    assert len(polls) == 2, "the walk looked until it had both, and no more"
     # no pagehide page (noise off): the walk does not wait for what will not come
     Tab.url = "http://journey-o.test:1/partner/8?noise=0"
     got, cleanup = journey.s10_blank_tab()
-    started = time.monotonic()
+    polls.clear()
     cleanup()
-    assert time.monotonic() - started < 5
+    assert polls == [], "no wait at all"
     # a request that never comes does not block the walk for ever, and the site shows it missing
     monkeypatch.setattr(profile_p4, "LEAVING_FAILSAFE_S", 0.2)
     state.events.clear()

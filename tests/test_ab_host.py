@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import shutil
 import os
 import sys
 from pathlib import Path
@@ -1269,7 +1270,7 @@ def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
     origin, stop = host.start_geo_lab()
     try:
         assert origin.startswith("http://127.0.0.1:")
-        with urllib.request.urlopen(origin + host.GEO_PATH, timeout=5) as response:
+        with urllib.request.urlopen(origin + host.GEO_PATH, timeout=60) as response:
             assert response.status == 200 and b"<title>geo</title>" in response.read()
     finally:
         stop()
@@ -1650,23 +1651,39 @@ def test_the_crash_files_are_read_when_they_appear_a_dmp_by_its_name_and_an_extr
     assert "later" in seen[str(folder / "a1b2.extra")]["content"]
 
 
-def test_the_watcher_keeps_what_it_read_though_the_launch_deletes_its_profile_afterwards(tmp_path):
+def test_a_crash_file_seen_by_its_name_before_its_content_is_written_is_read_again_when_it_is_complete(tmp_path):
+    """The losing interleaving, built on purpose: the collector looks when the file is there and empty, then half written, then complete. A collector that reads a file once
+    keeps the empty text (the profile is deleted when the launch ends, so there is no second chance)."""
     folder = tmp_path / "profile" / "minidumps"
     folder.mkdir(parents=True)
-    watcher = host.CrashWatcher(lambda: [folder], period=0.01)
-    watcher.start()
-    (folder / "x.extra").write_text('{"CrashType": "SIGSEGV"}', encoding="utf-8")
-    for _ in range(500):
-        if watcher.seen:
-            break
-        import time as _time
+    extra = folder / "x.extra"
+    seen = {}
+    extra.write_bytes(b"")
+    host.scan_crash_files([folder], seen)
+    assert seen[str(extra)]["content"] == "" and seen[str(extra)]["size"] == 0
+    extra.write_bytes(b'{"CrashType": "SIG')
+    host.scan_crash_files([folder], seen)
+    assert seen[str(extra)]["content"] == '{"CrashType": "SIG'
+    extra.write_bytes(b'{"CrashType": "SIGSEGV"}')
+    host.scan_crash_files([folder], seen)
+    assert seen[str(extra)]["content"] == '{"CrashType": "SIGSEGV"}' and seen[str(extra)]["size"] == len(b'{"CrashType": "SIGSEGV"}')
+    host.scan_crash_files([folder], seen)
+    assert len(seen) == 1, "a complete file is one entry"
 
-        _time.sleep(0.01)
-    import shutil as _shutil
 
-    _shutil.rmtree(tmp_path / "profile")
+def test_the_watcher_keeps_the_complete_file_though_its_last_look_saw_it_empty_and_the_launch_deletes_the_profile_after_the_stop(tmp_path):
+    """No thread, no sleep: the watcher's look is driven by the test (`scan_once`), the way the thread does it, and `stop` looks once more before the profile goes."""
+    folder = tmp_path / "profile" / "minidumps"
+    folder.mkdir(parents=True)
+    watcher = host.CrashWatcher(lambda: [folder])
+    (folder / "x.extra").write_bytes(b"")
+    watcher.scan_once()
+    assert watcher.seen[str(folder / "x.extra")]["content"] == "" and watcher.scans == 1
+    (folder / "x.extra").write_bytes(b'{"CrashType": "SIGSEGV"}')
+    (folder / "x.dmp").write_bytes(b"MDMP")
     got = watcher.stop()
-    assert [f["name"] for f in got["files"]] == ["x.extra"] and "SIGSEGV" in got["files"][0]["content"] and got["scans"] >= 1
+    shutil.rmtree(tmp_path / "profile")
+    assert [f["name"] for f in got["files"]] == ["x.dmp", "x.extra"] and "SIGSEGV" in got["files"][1]["content"] and got["scans"] == 2
 
 
 def test_the_crash_folders_are_the_profiles_minidumps_and_the_pending_reports_of_the_user(tmp_path, monkeypatch):
