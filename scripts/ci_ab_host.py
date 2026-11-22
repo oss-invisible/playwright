@@ -6,29 +6,35 @@ change (a helper that is no longer spawned, a path of the machine it did not tou
 TRACE of the run, from the launch to the exit of the browser (the quiet point is the exit of the process, not a wait), after the same short
 journey (the first steps of the fake web's P4 walk, tests/fakeweb/profile_p4.py, no internet, driven by the stock Playwright client).
 
-Two things are compared, over the whole trace:
+Three things are compared, over the whole trace:
 
   * the processes, by KIND, from the command lines of the launch: the parent, `-contentproc` with its type, `-sandboxingKind N` and
     `-isForBrowser` / `-notForBrowser`, and the helpers (glxtest, pingsender, ...) by what they ran. Every kind and its COUNT must be identical,
     with one exception: for the content processes of type `tab` only the presence of the kind counts, because how many are alive follows the idle
     time (a spare process is prelaunched after a delay and closed after a grace period);
   * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. The SET of host
-    paths must be identical, no exception. `ours` leaves the comparison as a class (OURS below: reading its own package is not touching the host).
+    paths must be identical, no exception. `ours` leaves the comparison as a class (OURS below: reading its own package is not touching the host);
+  * the network, per kind (Linux): every NETLINK socket the tree opens, by protocol (NETLINK_ROUTE, NETLINK_KOBJECT_UEVENT, ...), with the requests
+    it sends on it (RTM_GETLINK, RTM_GETADDR, ...) and the multicast groups it binds to, and every connect or send towards a PUBLIC address, with
+    the transport, the family, the address and the port. The SET per kind must be identical, no exception, like the host paths. A destination that
+    is loopback, the lab's (the documentation ranges of LAB_NETWORKS), private or link-local, or a multicast group is not compared: it is counted
+    by class (NET_NOT_COMPARED). On Windows it is not covered (NET_WINDOWS says why).
 
 The trace is of the TREE of the launch only: what a process outside it does (on Windows a service, the antivirus) is not the engine's, so it is left out of
 the comparison and the report says how many paths each outside process name touched (`OUTSIDE THE TREE`). A path or a kind that differs names the processes
 to blame (`by A: ... | B: ...`: who touched the path, who spawned the kind).
 
 Each engine run starts with a discarded WARM-UP launch (the first seed), an experiment control and not an excuse: its trace is kept in the footprint and the
-report lists what only the warm-up did (`WARMUP-ONLY`, per kind and per path, with the process that did it), so that a first-launch-only behaviour (a
+report lists what only the warm-up did (`WARMUP-ONLY`, per kind, per path and per net entry, with the process that did it), so that a first-launch-only behaviour (a
 helper spawned at the first shutdown of a cold machine) stays visible from run to run. The measured launches are compared as they are: a kind or a count that differs
 after the warm-up is red.
 
 How the trace is taken:
 
-  * Linux: `strace -f -y` of the whole tree (the stand-in of tests/_strace_stand_in.py), calls execve, clone, fork, prctl and the file calls
-    (open, openat, stat, access, readlink, ...). The tree is named by what each process ran, or called itself when it forked without exec
-    (the forkserver's children), and the log is read after the tree has exited.
+  * Linux: `strace -f -y` of the whole tree (the stand-in of tests/_strace_stand_in.py), calls execve, clone, fork, prctl, the file calls
+    (open, openat, stat, access, readlink, ...) and the network calls (socket, connect, bind, sendto, sendmsg, sendmmsg). The tree is named by
+    what each process ran, or called itself when it forked without exec (the forkserver's children), and the log is read after the tree has exited.
+    A socket is known by the inode `-y` prints for it (`5<socket:[1234]>`), so a send names the protocol of the socket() that made it.
   * Windows: the process starts WITH their command lines come from the Security log, event 4688 (the process-creation audit with the command
     line, switched on for the run and put back after it): the kernel writes one per process, so a short-lived child cannot be missed, which a
     poll of the job's pids can. The files come from an ETW session on Microsoft-Windows-Kernel-File (the Create events: every path a process
@@ -51,6 +57,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import collections
+import ipaddress
 import json
 import os
 import re
@@ -80,9 +87,10 @@ JOURNEY = (("open home", "s1_open_home"),
            ("nav Category", "s7_nav_category"))
 #: What a seed's footprint must hold at least, per category of leaf: a footprint that holds less did not see the run.
 #: Provisional: the first A/A on both systems gives the real numbers (they are in diff.json, "leaves").
+#: There is no floor for `net`: a run that opens no netlink socket and sends nothing to a public address is a run that can exist.
 FLOORS = {"proc": 3, "file": 100}
 #: The categories of leaf a footprint has.
-CATEGORIES = ("proc", "file")
+CATEGORIES = ("proc", "file", "net")
 MISSING = "<missing>"
 #: Seconds a closed run is given to exit (an acquisition limit, never read by a verdict: `trace.exited` says whether the tree had gone).
 EXIT_LIMIT_S, EXIT_PERIOD_S = 120.0, 0.25
@@ -466,6 +474,162 @@ def spawned_counts(procs: dict) -> dict:
     return dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
 
 
+# -
+# Linux: the network of the tree. A page cannot read it, a release can change it: a netlink socket it did not open before (the machine's interfaces and
+# addresses asked of the kernel), a request it did not send, a public address it did not reach.
+
+#: The calls of the network the trace adds (tests/_strace_stand_in.py traces them when it is asked `network=True`).
+NET_CALLS = ("socket", "connect", "bind", "sendto", "sendmsg", "sendmmsg")
+#: The documentation ranges (RFC 5737) the lab gives its fake servers and exits: 192.0.2.0/24 (the DoH bootstrap of tests/_doh_servers.py),
+#: 198.51.100.0/24 (the page work of tests/_page_work.py, STUN, TURN and the exits of tests/_socks_servers.py and scripts/ci_ab_network.py, the
+#: lab exit on `lo`) and 203.0.113.0/24 (the exits and the web address of tests/_socks_servers.py).
+LAB_NETWORKS = tuple(ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"))
+#: The destinations that are not compared, by class, and why. They are counted per seed (`net_not_compared`), never excused one by one.
+NET_NOT_COMPARED = {
+    "loopback": "the engine's own processes, the oracle and the fake web talk to each other on loopback: it is the run's, not the host's network",
+    "lab": "the documentation ranges the lab gives its fake servers and exits (LAB_NETWORKS) are the lab's, not a destination on the internet",
+    "private": "RFC 1918, link-local, shared (100.64/10), unique local and the other ranges that are not global are the machine's own network",
+    "multicast": "a multicast group (mDNS, SSDP) is the local link's, not a public destination",
+}
+NET_WINDOWS = (
+    "not covered on Windows. The equivalent of a connect or a send is the Microsoft-Windows-Kernel-Network provider (TCP connect, events 12 and 28; "
+    "UDP send, 42 and 58; the process in the event's PID field, not in its header): it is not in the session, because logman takes a second "
+    "provider only through a providers file, the provider logs every packet the whole machine sends and receives (the runner's own traffic and "
+    "the fake web's loopback included), and no trace of a hosted runner has shown yet how tracerpt names its fields, so a reader written now "
+    "would need a canary of its own (a loopback datagram of the oracle's) not to be blind. The equivalent of netlink is not a socket: "
+    "GetAdaptersAddresses and NotifyIpInterfaceChange go through nsi.dll to the NSI driver by IOCTL, which no Kernel-File Create event carries "
+    "(the open of the device is a Create, in the file set).")
+_SOCK_INODE = re.compile(r"<socket:\[(\d+)\]>")
+_FD_ARG = re.compile(r"^-?\d+(?:<socket:\[(\d+)\]>)?")
+_INET4 = re.compile(r'sa_family=AF_INET, sin_port=htons\((\d+)\), sin_addr=inet_addr\("([^"]+)"\)')
+_INET6 = re.compile(r'sa_family=AF_INET6, sin6_port=htons\((\d+)\),[^}]*?inet_pton\(AF_INET6, "([^"]+)"')
+_NL_ADDR = re.compile(r"sa_family=AF_NETLINK, nl_pid=-?\d+, nl_groups=([0-9a-fA-Fx]+)")
+#: The header of a netlink message as strace decodes it: `{nlmsg_len=20, nlmsg_type=RTM_GETADDR, ...` (and `{len=20, type=RTM_GETADDR, ...` of the
+#: older builds); an unknown type is a number (`nlmsg_type=0x1d /* RTM_??? */`).
+_NL_HEADER = re.compile(r"\{(?:nlmsg_len|len)=\d+, (?:nlmsg_type|type)=([A-Za-z0-9_]+)")
+#: The requests of NETLINK_ROUTE (linux/rtnetlink.h), for a message strace printed as bytes (a socket it could not name).
+ROUTE_TYPES = {16: "RTM_NEWLINK", 18: "RTM_GETLINK", 20: "RTM_NEWADDR", 22: "RTM_GETADDR", 24: "RTM_NEWROUTE", 26: "RTM_GETROUTE",
+               28: "RTM_NEWNEIGH", 30: "RTM_GETNEIGH", 34: "RTM_GETRULE", 38: "RTM_GETQDISC", 74: "RTM_GETNETCONF"}
+_TRANSPORT = {"SOCK_STREAM": "tcp", "SOCK_DGRAM": "udp", "SOCK_RAW": "raw", "SOCK_SEQPACKET": "seqpacket"}
+
+
+def destination_class(address: str) -> str:
+    """`public`, or the class of NET_NOT_COMPARED of an address (an IPv4 address mapped in IPv6 is its IPv4). An address that cannot be read is
+    `public`: it is compared, not dropped."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return "public"
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return "loopback"
+    if any(ip in net for net in LAB_NETWORKS):
+        return "lab"
+    if ip.is_multicast:
+        return "multicast"
+    if not ip.is_global:
+        return "private"
+    return "public"
+
+
+def _socket_args(rest: str) -> list:
+    """The three arguments of a socket() line: `AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 5<socket:[1]>`."""
+    text = rest.split(" <unfinished ...>", 1)[0]
+    text = text.rsplit(") =", 1)[0] if ") =" in text else text.rstrip(")")
+    args = [a.strip() for a in text.split(",", 2)]
+    return args + ["?"] * (3 - len(args))
+
+
+def _socket_of(args: list) -> dict:
+    """{"family", "proto"} of the arguments of a socket(): the protocol of a netlink socket (`NETLINK_ROUTE`, or its number), the transport of an
+    internet socket (`tcp`, `udp`, `icmp`, ...)."""
+    family, kind, proto = args[0], args[1].split("|", 1)[0], args[2].split(" ", 1)[0]
+    if family == "AF_NETLINK":
+        return {"family": family, "proto": proto}
+    if proto.startswith("IPPROTO_") and proto != "IPPROTO_IP":
+        return {"family": family, "proto": proto[len("IPPROTO_"):].lower()}
+    return {"family": family, "proto": _TRANSPORT.get(kind, kind.lower())}
+
+
+def _raw_netlink_types(rest: str, proto: str) -> list:
+    """The type of a netlink message strace printed as bytes (the first string of the call): the u16 after the length, named for NETLINK_ROUTE."""
+    s = _STR.search(rest)
+    if not s:
+        return []
+    data = codecs.escape_decode(s.group(1).encode("latin-1", errors="replace"))[0]
+    if len(data) < 6:
+        return []
+    n = int.from_bytes(data[4:6], "little")
+    return [(ROUTE_TYPES.get(n) if proto == "NETLINK_ROUTE" else None) or "type=%d" % n]
+
+
+def network_events(lines) -> tuple:
+    """`([(pid, what)], {class: n})` of a strace log read as lines: `what` is `netlink NETLINK_ROUTE` (a socket opened, failed attempts included),
+    `netlink NETLINK_ROUTE RTM_GETADDR` (a request sent on it), `netlink NETLINK_ROUTE bind nl_groups=00000111` (a subscription to its groups),
+    `connect tcp AF_INET 93.184.216.34:443` or `send udp AF_INET6 [2001:4860::8888]:53` (a destination that is public); the destinations that are
+    not public are counted by class. A socket is known by the inode `-y` printed for it, so a send names the protocol of the socket() that made it,
+    whichever thread or process sends."""
+    socks: dict = {}
+    pending: dict = {}
+    out, skipped = [], collections.Counter()
+
+    def opened(pid, args, result):
+        sock = _socket_of(args)
+        if sock["family"] == "AF_NETLINK":
+            out.append((pid, "netlink %s" % sock["proto"]))
+        inode = _SOCK_INODE.search(result)
+        if inode:
+            socks[inode.group(1)] = sock
+
+    for line in lines:
+        m = _LINE.match(line)
+        if not m:
+            r = _RESUMED.match(line)
+            if r and r.group(2) == "socket" and int(r.group(1)) in pending:
+                opened(int(r.group(1)), pending.pop(int(r.group(1))), r.group(3))
+            continue
+        pid, call, rest = int(m.group(1)), m.group(2), m.group(3)
+        if call == "socket":
+            if "<unfinished ...>" in rest:
+                pending[pid] = _socket_args(rest)
+            else:
+                opened(pid, _socket_args(rest), rest.rsplit(") =", 1)[-1])
+            continue
+        if call not in NET_CALLS:
+            continue
+        fd = _FD_ARG.match(rest)
+        sock = socks.get(fd.group(1)) if fd and fd.group(1) else None
+        headers = _NL_HEADER.findall(rest)
+        if (sock and sock["family"] == "AF_NETLINK") or "sa_family=AF_NETLINK" in rest or headers:
+            proto = sock["proto"] if sock and sock["family"] == "AF_NETLINK" else "NETLINK_?"
+            if call == "bind":
+                groups = _NL_ADDR.search(rest)
+                if groups and int(groups.group(1), 16):
+                    out.append((pid, "netlink %s bind nl_groups=%s" % (proto, groups.group(1))))
+            elif call.startswith("send"):
+                for t in headers or _raw_netlink_types(rest, proto):
+                    out.append((pid, "netlink %s %s" % (proto, t)))
+            continue
+        if call == "bind":
+            continue  # a local address, not a destination
+        verb, transport = ("connect" if call == "connect" else "send"), (sock["proto"] if sock else "?")
+        found = [("AF_INET", port, addr, addr) for port, addr in _INET4.findall(rest)]
+        found += [("AF_INET6", port, addr, "[%s]" % addr) for port, addr in _INET6.findall(rest)]
+        for family, port, addr, shown in found:
+            cls = destination_class(addr)
+            if cls == "public":
+                out.append((pid, "%s %s %s %s:%s" % (verb, transport, family, shown, port)))
+            else:
+                skipped[cls] += 1
+    return out, dict(sorted(skipped.items()))
+
+
+def net_by_kind(events, label_of) -> list:
+    """The sorted set `<kind>: <what>` of `network_events`, `label_of(pid)` naming the process (a thread is its process's)."""
+    return sorted({"%s: %s" % (label_of(pid), what) for pid, what in events})
+
+
 def _read_lines(log: Path):
     with open(log, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -782,13 +946,16 @@ def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sl
 # The comparison.
 
 def leaves_of(seed_footprint: dict) -> dict:
-    """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence) and
-    file.<path> = 1 for every HOST path the tree touched."""
+    """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence),
+    file.<path> = 1 for every HOST path the tree touched and net.<kind>: <what> = 1 for every netlink socket, netlink request and public
+    destination of a process of that kind (`network_events`)."""
     out = {}
     for kind, n in seed_footprint.get("kinds", {}).items():
         out["proc." + kind] = 1 if is_tab(kind) and n else n
     for path in seed_footprint.get("files", []):
         out["file." + path] = 1
+    for entry in seed_footprint.get("net") or []:
+        out["net." + entry] = 1
     return out
 
 
@@ -826,7 +993,7 @@ def warmup_only(fp: dict) -> dict | None:
         return None
     m = next((s for s in fp.get("seeds", []) if s["seed"] == w["seed"]), None)
     if m is None:
-        return {"seed": w["seed"], "kinds": [], "files": [], "measured": False}
+        return {"seed": w["seed"], "kinds": [], "files": [], "net": [], "measured": False}
     kinds = []
     for kind, n in sorted(w.get("kinds", {}).items()):
         measured = m.get("kinds", {}).get(kind, 0)
@@ -834,7 +1001,9 @@ def warmup_only(fp: dict) -> dict | None:
             kinds.append({"kind": kind, "warmup": n, "measured": measured, "spawned_by": w.get("spawned_by", {}).get(kind, [])})
     measured_files = set(m.get("files", []))
     files = [{"path": path, "touched_by": w.get("touched_by", {}).get(path, [])} for path in w.get("files", []) if path not in measured_files]
-    return {"seed": w["seed"], "kinds": kinds, "files": files, "measured": True}
+    measured_net = set(m.get("net") or [])
+    net = [entry for entry in (w.get("net") or []) if entry not in measured_net]
+    return {"seed": w["seed"], "kinds": kinds, "files": files, "net": net, "measured": True}
 
 
 def _by_text(d: dict) -> str:
@@ -843,8 +1012,10 @@ def _by_text(d: dict) -> str:
 
 
 def _by(seed_footprint: dict, leaf: str) -> list:
-    """The processes to blame for a leaf in a seed's footprint: who touched a path, who spawned a kind."""
+    """The processes to blame for a leaf in a seed's footprint: who touched a path, who spawned a kind (a net leaf names its kind itself)."""
     category, _dot, name = leaf.partition(".")
+    if category == "net":
+        return []
     return list(seed_footprint.get("touched_by" if category == "file" else "spawned_by", {}).get(name, []))
 
 
@@ -904,14 +1075,19 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
            for seed in sorted(set(seeds_a) & set(seeds_b))}
     outside = {side: {str(seed): seeds[seed]["outside_tree"] for seed in sorted(seeds) if seeds[seed].get("outside_tree")}
                for side, seeds in (("A", seeds_a), ("B", seeds_b))}
+    net_skipped = {side: {str(seed): seeds[seed]["net_not_compared"] for seed in sorted(seeds) if seeds[seed].get("net_not_compared")}
+                   for side, seeds in (("A", seeds_a), ("B", seeds_b))}
+    net = ({"covered": False, "reason": NET_WINDOWS} if os_name == "windows"
+           else {"covered": True, "not_compared": NET_NOT_COMPARED, "counts": net_skipped})
     warm = {"A": warmup_only(a), "B": warmup_only(b)}
     both = None
     if warm["A"] and warm["B"]:
         both = {"kinds": sorted({k["kind"] for k in warm["A"]["kinds"]} & {k["kind"] for k in warm["B"]["kinds"]}),
-                "files": sorted({f["path"] for f in warm["A"]["files"]} & {f["path"] for f in warm["B"]["files"]})}
+                "files": sorted({f["path"] for f in warm["A"]["files"]} & {f["path"] for f in warm["B"]["files"]}),
+                "net": sorted(set(warm["A"].get("net", [])) & set(warm["B"].get("net", [])))}
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
-            "outside_tree": outside, "warmup": dict(warm, both=both), "stale": [e.get("id") for e in stale], "leaves": counts}
+            "outside_tree": outside, "warmup": dict(warm, both=both), "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
 
 
 def print_report(report: dict, a_name: str, b_name: str) -> None:
@@ -928,12 +1104,21 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
                     name, warm["seed"], k["kind"], k["warmup"], k["measured"], ", ".join(k["spawned_by"]) or "-"))
             for f in warm["files"][:100]:
                 print("WARMUP-ONLY %s seed %s file.%s (touched by: %s)" % (name, warm["seed"], f["path"], ", ".join(f["touched_by"]) or "-"))
+            for entry in warm.get("net", [])[:100]:
+                print("WARMUP-ONLY %s seed %s net.%s" % (name, warm["seed"], entry))
     for side, name in (("A", a_name), ("B", b_name)):
         for seed, names in sorted(((report.get("outside_tree") or {}).get(side) or {}).items()):
             print("OUTSIDE THE TREE (not compared) %s seed %s: %s" % (name, seed, ", ".join("%s %d paths" % kv for kv in sorted(names.items()))))
     for d in report["declared"]:
         print("DECLARED seed %s %s (%s)" % (d["seed"], d["leaf"], d["id"]))
     print("OURS (not compared): " + "; ".join("%s: %s" % kv for kv in sorted(report.get("ours", OURS).items())))
+    net = report.get("net") or {}
+    if net and not net.get("covered"):
+        print("NET NOT COVERED: " + net["reason"])
+    elif net:
+        for side, name in (("A", a_name), ("B", b_name)):
+            for seed, classes in sorted((net.get("counts") or {}).get(side, {}).items()):
+                print("NET (not compared) %s seed %s: %s" % (name, seed, ", ".join("%s %d" % kv for kv in sorted(classes.items()))))
     n = len(report["differences"])
     for p in report["problems"][:len(report["problems"]) - n]:
         print("FAIL " + p)
@@ -992,7 +1177,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
     else:
         from _strace_stand_in import _stand_in
 
-        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True)
+        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     server, steps, root_pid = None, [], None
     try:
@@ -1075,6 +1260,7 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         detail = sorted(({"label": p["label"], "cmd": p["cmd"][:300]} for p in procs.values()), key=lambda d: (d["label"], d["cmd"]))
         outside = got["outside"]
+        net, net_skipped = None, None  # NET_WINDOWS
     else:
         lines = list(_read_lines(log))
         procs = spawned_processes(lines, real)
@@ -1085,6 +1271,8 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         parents = {pid: owner_of(p["parent"], owners) for pid, p in procs.items() if p["parent"] is not None}
         label_of = lambda pid: labels.get(owner_of(pid, owners), "?")  # noqa: E731
         info, problems, outside = {"source": "strace", "exited": True}, [], {}  # strace follows our tree and nothing else
+        events, net_skipped = network_events(lines)
+        net = net_by_kind(events, label_of)
         detail = sorted(({"label": p["label"], "exec": (" ".join([os.path.basename(p["exec"][0])] + p["exec"][1][1:6]) if p["exec"] else None),
                           "name": p["name"]} for p in procs.values()), key=lambda d: (d["label"], d["exec"] or ""))
     raw = {path for _pid, path in pairs}
@@ -1093,7 +1281,8 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     info.update({"processes": len(procs), "paths": len(raw)})
     # touched_by and spawned_by are evidence, never compared: the process to blame for a path or a kind that differs
     return {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
-            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside}
+            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside,
+            "net": net, "net_not_compared": net_skipped}
 
 
 def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
@@ -1117,8 +1306,8 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
             for step in fp["steps"]:
                 if not step["ok"]:
                     problems.append("seed %d: step %d (%s) failed: %s" % (seed, step["n"], step["name"], step.get("error")))
-            print("seed %d: %s; %d host paths, %s" % (seed, json.dumps(fp["kinds"], sort_keys=True), len(fp["files"]),
-                                                      json.dumps(fp.get("ours", {}), sort_keys=True)))
+            print("seed %d: %s; %d host paths, %d net entries, %s" % (seed, json.dumps(fp["kinds"], sort_keys=True), len(fp["files"]),
+                                                                      len(fp.get("net") or []), json.dumps(fp.get("ours", {}), sort_keys=True)))
             sys.stdout.flush()
     finally:
         shutil.rmtree(work, ignore_errors=True)

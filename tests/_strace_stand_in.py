@@ -17,6 +17,8 @@ import pytest
 
 _SYSCALLS = ("execve,clone,clone3,fork,vfork,open,openat,stat,lstat,"
              "newfstatat,statx,access,faccessat,faccessat2,readlink")
+#: The network calls, traced only when a caller asks (``network=True``: scripts/ci_ab_host.py, NET_CALLS): the font tests do not.
+_NET_SYSCALLS = "socket,connect,bind,sendto,sendmsg,sendmmsg"
 
 
 def _strace_options(fd_paths: bool = False) -> str:
@@ -39,7 +41,7 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
-              timestamps: bool = False, fd_paths: bool = False) -> str:
+              timestamps: bool = False, fd_paths: bool = False, network: bool = False) -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -55,7 +57,10 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
     ``syscalls`` is what strace traces; ``timestamps`` adds ``-ttt`` (the epoch
     seconds after each pid), which ``_LINE`` does not read: a caller that asks
     for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``);
-    ``fd_paths`` adds ``-y`` (scripts/ci_ab_host.py reads the paths the tree touched)."""
+    ``fd_paths`` adds ``-y`` (scripts/ci_ab_host.py reads the paths the tree touched, and knows a socket by its inode);
+    ``network`` adds the network calls to ``syscalls`` (scripts/ci_ab_host.py reads the netlink sockets and the public destinations)."""
+    if network:
+        syscalls = syscalls + "," + _NET_SYSCALLS
     real = Path(os.path.realpath(binary))
     tree.mkdir()
     for entry in real.parent.iterdir():

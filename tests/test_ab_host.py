@@ -4,8 +4,9 @@ The oracle compares the WHOLE TRACE of a closed run, from the launch to the exit
 `tab`, whose count follows the idle time and only whose presence counts) and the set of host paths the tree touched (what is `ours` -- its package, its profile and temp
 dirs, the run's cache, its own shared memory -- leaves the comparison as a class). Nothing is excused: there is no list of noise.
 Each property is shown on the input it exists for: a host path on one side only is red (naming it), a path of ours on one side only is green, a kind with another count
-is red, a tab count that differs is green and a tab kind that is absent on one side is red, the one declared difference passes in an A/B by kind, and the Windows
-processes are named by their command lines from the audit events.
+is red, a tab count that differs is green and a tab kind that is absent on one side is red, the one declared difference passes in an A/B by kind, the Windows
+processes are named by their command lines from the audit events, and on Linux a netlink socket, a netlink request or a public destination of a kind on one side
+only is red while a loopback or lab destination is not compared.
 """
 from __future__ import annotations
 
@@ -65,7 +66,7 @@ def test_equal_footprints_are_green():
     report = judge(footprint(), footprint(), expected=[], a_a=True)
     assert report["verdict"] == "green" and report["problems"] == [] and report["differences"] == []
     assert set(report["leaves"]) == {"11", "12"}
-    assert report["leaves"]["11"] == {"proc": 4, "file": 3}
+    assert report["leaves"]["11"] == {"proc": 4, "file": 3, "net": 0}
 
 
 def test_a_host_path_touched_on_one_side_only_is_red_and_names_the_path_and_both_sides():
@@ -781,7 +782,7 @@ def test_the_report_lists_what_is_only_in_the_warm_up_and_says_when_both_engines
     b = with_warmup(footprint("firefox-68 again"), kinds=kinds, spawned_by=spawned)
     report = judge(a, b, a_a=True)
     assert report["verdict"] == "green", "a first-launch-only behaviour that the measured launches do not have is written, not red"
-    assert report["warmup"]["both"] == {"kinds": ["backgroundtask/pingsender"], "files": []}
+    assert report["warmup"]["both"] == {"kinds": ["backgroundtask/pingsender"], "files": [], "net": []}
     host.print_report(report, "firefox-68", "firefox-68 again")
     out = capsys.readouterr().out
     assert "WARMUP-ONLY firefox-68 seed 11 proc.backgroundtask/pingsender: warm-up 3, measured 0 (spawned by: parent)" in out
@@ -874,3 +875,155 @@ def test_a_closed_linux_run_keeps_the_kinds_that_touched_each_path_and_nothing_i
     fp = host._seed_result(REAL, 11, tmp_path, [], log, None, None, False)
     assert fp["touched_by"]["/etc/machine-id"] == ["glxtest", "lsb_release"]
     assert fp["spawned_by"]["glxtest"] == ["parent"] and fp["outside_tree"] == {}
+
+
+# -
+# The network of the tree (Linux): the netlink sockets, their requests, and the public destinations, per kind.
+
+NET_LOG = r"""300 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-profile", "/tmp/p"], 0x7ffd /* 40 vars */) = 0
+300 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 41<socket:[81234]>
+300 bind(41<socket:[81234]>, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000511}, 12) = 0
+300 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM, exit_signal=0, stack=0x7f}, 88) = 301
+301 sendto(41<socket:[81234]>, [{nlmsg_len=20, nlmsg_type=RTM_GETLINK, nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP, nlmsg_seq=1700000001, nlmsg_pid=0}, {ifi_family=AF_UNSPEC, ifi_type=ARPHRD_NETROM, ifi_index=0, ifi_flags=0, ifi_change=0}], 20, 0, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 20
+301 sendmsg(41<socket:[81234]>, {msg_name={sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, msg_namelen=12, msg_iov=[{iov_base=[{nlmsg_len=24, nlmsg_type=RTM_GETADDR, nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP, nlmsg_seq=1700000002, nlmsg_pid=0}, {ifa_family=AF_UNSPEC, ifa_prefixlen=0, ifa_flags=0, ifa_scope=RT_SCOPE_UNIVERSE, ifa_index=0}], iov_len=24}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 24
+300 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT <unfinished ...>
+300 <... socket resumed>) = 42<socket:[81240]>
+300 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 43<socket:[81250]>
+301 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.215.14")}, 16) = -1 EINPROGRESS (Operation now in progress)
+300 socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_UDP) = 44<socket:[81260]>
+300 sendto(44<socket:[81260]>, "\x12\x34\x01\x00\x00\x01", 6, MSG_NOSIGNAL, {sa_family=AF_INET6, sin6_port=htons(53), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:4860:4860::8888", &sin6_addr), sin6_scope_id=0}, 28) = 6
+300 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+300 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("198.51.100.9")}, 16) = 0
+300 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("10.1.0.4")}, 16) = 0
+300 sendto(44<socket:[81260]>, "\x00", 1, 0, {sa_family=AF_INET6, sin6_port=htons(5353), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "ff02::fb", &sin6_addr), sin6_scope_id=0}, 28) = 1
+300 connect(45<socket:[81270]>, {sa_family=AF_UNIX, sun_path="/run/dbus/system_bus_socket"}, 110) = 0
+300 sendto(43<socket:[81250]>, "GET / HTTP/1.1\r\n", 16, MSG_NOSIGNAL, NULL, 0) = 16
+300 fork() = 302
+302 execve("/proc/self/exe", ["/e/firefox/firefox", "-contentproc", "-prefsLen", "1", "socket"], 0x7ffd /* 40 vars */) = 0
+302 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 5<socket:[81300]>
+302 sendmmsg(5<socket:[81300]>, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(3478), sin_addr=inet_addr("74.125.250.129")}, msg_namelen=16, msg_iov=[{iov_base="\x00\x01\x00\x00", iov_len=4}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=4}], 1, 0) = 1
+302 connect(5<socket:[81300]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:203.0.113.7", &sin6_addr), sin6_scope_id=0}, 28) = 0
+"""
+
+PARENT_NET = ["parent: connect tcp AF_INET 93.184.215.14:443", "parent: netlink NETLINK_KOBJECT_UEVENT", "parent: netlink NETLINK_ROUTE",
+              "parent: netlink NETLINK_ROUTE RTM_GETADDR", "parent: netlink NETLINK_ROUTE RTM_GETLINK", "parent: netlink NETLINK_ROUTE bind nl_groups=00000511",
+              "parent: send udp AF_INET6 [2001:4860:4860::8888]:53"]
+
+
+def test_the_network_of_a_linux_run_is_its_netlink_sockets_their_requests_and_its_public_destinations_per_kind(tmp_path, monkeypatch):
+    log = tmp_path / "strace.log"
+    log.write_text(NET_LOG, encoding="utf-8")
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    monkeypatch.setattr(host, "_context", lambda binary, windows, work: host.Context("linux", app=["/e/firefox"], temp=["/tmp/ab-host-tmp-x"]))
+    fp = host._seed_result(REAL, 11, tmp_path, [], log, None, None, False)
+    assert fp["net"] == PARENT_NET + ["socket: send udp AF_INET 74.125.250.129:3478"], "a thread's request is its process's, a socket is known by its inode"
+    assert fp["net_not_compared"] == {"lab": 2, "loopback": 1, "multicast": 1, "private": 1}, "198.51.100.9 and ::ffff:203.0.113.7 are the lab's"
+    leaves = host.leaves_of(fp)
+    assert leaves["net.parent: netlink NETLINK_ROUTE RTM_GETADDR"] == 1 and not any("127.0.0.1" in k or "198.51.100" in k for k in leaves)
+
+
+def test_a_netlink_message_strace_printed_as_bytes_is_read_for_its_type():
+    lines = ["7 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 3<socket:[9]>",
+             r'7 sendto(3<socket:[9]>, "\x14\x00\x00\x00\x16\x00\x01\x03\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00", 20, 0, '
+             r"{sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 20",
+             "7 sendto(8, {{len=20, type=RTM_GETROUTE, flags=NLM_F_REQUEST|NLM_F_DUMP, seq=1, pid=0}, {rtm_family=AF_INET}}, 20, 0, NULL, 0) = 20"]
+    events, skipped = host.network_events(lines)
+    assert events == [(7, "netlink NETLINK_ROUTE"), (7, "netlink NETLINK_ROUTE RTM_GETADDR"), (7, "netlink NETLINK_? RTM_GETROUTE")] and skipped == {}
+
+
+@pytest.mark.parametrize("address,cls", [
+    ("93.184.215.14", "public"), ("2001:4860:4860::8888", "public"), ("127.0.0.53", "loopback"), ("::1", "loopback"),
+    ("192.0.2.53", "lab"), ("198.51.100.9", "lab"), ("203.0.113.80", "lab"), ("::ffff:198.51.100.5", "lab"),
+    ("10.1.0.4", "private"), ("172.17.0.1", "private"), ("192.168.1.1", "private"), ("169.254.169.254", "private"), ("fe80::1%2", "private"),
+    ("100.64.0.1", "private"), ("fd00::1", "private"), ("0.0.0.0", "private"), ("224.0.0.251", "multicast"), ("ff02::fb", "multicast"),
+    ("not-an-address", "public"),
+])
+def test_only_a_public_destination_is_compared(address, cls):
+    assert host.destination_class(address) == cls
+
+
+def with_net(fp, entries, skipped=None):
+    fp = copy.deepcopy(fp)
+    for seed in fp["seeds"]:
+        seed["net"] = list(entries)
+        seed["net_not_compared"] = dict(skipped or {})
+    return fp
+
+
+def test_a_netlink_request_of_a_kind_on_one_side_only_is_red_and_names_the_kind_and_the_request(capsys):
+    a = with_net(footprint(), PARENT_NET)
+    b = with_net(footprint("candidate"), [e for e in PARENT_NET if "RTM_GETADDR" not in e])
+    report = judge(a, b, expected=[], a_a=True)
+    assert report["verdict"] == "red"
+    assert [(d["seed"], d["category"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [
+        (11, "net", "net.parent: netlink NETLINK_ROUTE RTM_GETADDR", 1, host.MISSING), (12, "net", "net.parent: netlink NETLINK_ROUTE RTM_GETADDR", 1, host.MISSING)]
+    assert 'seed 11 net.parent: netlink NETLINK_ROUTE RTM_GETADDR: A 1 | B "<missing>"' in report["problems"]
+    host.print_report(report, "firefox-68", "candidate")
+    assert 'DIFF seed 11 net.parent: netlink NETLINK_ROUTE RTM_GETADDR: firefox-68 1 | candidate "<missing>"' in capsys.readouterr().out
+
+
+def test_the_same_request_from_another_kind_is_a_difference_too():
+    moved = [e.replace("parent: netlink NETLINK_ROUTE RTM_GETADDR", "socket: netlink NETLINK_ROUTE RTM_GETADDR") for e in PARENT_NET]
+    report = judge(with_net(footprint(), PARENT_NET), with_net(footprint("again"), moved), a_a=True)
+    assert {(d["leaf"], d["a"], d["b"]) for d in report["differences"]} == {
+        ("net.parent: netlink NETLINK_ROUTE RTM_GETADDR", 1, host.MISSING), ("net.socket: netlink NETLINK_ROUTE RTM_GETADDR", host.MISSING, 1)}
+
+
+def test_a_public_destination_only_the_candidate_reaches_is_red_and_the_declared_list_does_not_cover_it():
+    c = with_net(a_candidate_without_glxtest(), PARENT_NET + ["socket: connect tcp AF_INET 34.107.221.82:80"])
+    report = judge(with_net(footprint(), PARENT_NET), c, expected=expected())
+    assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["glxtest-69", "glxtest-69"]
+    assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [
+        (11, "net.socket: connect tcp AF_INET 34.107.221.82:80", host.MISSING, 1), (12, "net.socket: connect tcp AF_INET 34.107.221.82:80", host.MISSING, 1)]
+
+
+def test_loopback_and_lab_destinations_are_not_compared_and_are_counted_as_evidence(capsys):
+    a = with_net(footprint(), PARENT_NET, skipped={"loopback": 40, "lab": 2})
+    b = with_net(footprint("again"), PARENT_NET, skipped={"loopback": 57})
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green" and report["differences"] == []
+    assert report["net"]["covered"] and report["net"]["counts"]["A"]["11"] == {"lab": 2, "loopback": 40}
+    assert set(report["net"]["not_compared"]) == {"loopback", "lab", "private", "multicast"}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "NET (not compared) firefox-68 seed 11: lab 2, loopback 40" in capsys.readouterr().out
+
+
+def test_identical_network_sets_are_green_and_are_counted_as_leaves():
+    report = judge(with_net(footprint(), PARENT_NET), with_net(footprint("again"), PARENT_NET), a_a=True)
+    assert report["verdict"] == "green" and report["leaves"]["11"] == {"proc": 4, "file": 3, "net": len(PARENT_NET)}
+
+
+def test_a_network_entry_only_the_warm_up_had_is_listed_not_red(capsys):
+    a = with_warmup(with_net(footprint(), PARENT_NET), kinds=KINDS)
+    a["warmup"]["net"] = PARENT_NET + ["parent: connect tcp AF_INET 34.107.221.82:80"]
+    report = judge(a, with_net(footprint("again"), PARENT_NET), a_a=True)
+    assert report["verdict"] == "green" and report["warmup"]["A"]["net"] == ["parent: connect tcp AF_INET 34.107.221.82:80"]
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "WARMUP-ONLY firefox-68 seed 11 net.parent: connect tcp AF_INET 34.107.221.82:80" in capsys.readouterr().out
+
+
+def test_on_windows_the_network_is_said_not_covered_with_the_reason(capsys):
+    report = judge(footprint(platform="win32"), footprint("again", platform="win32"), a_a=True)
+    assert report["verdict"] == "green" and report["net"] == {"covered": False, "reason": host.NET_WINDOWS}
+    assert "Microsoft-Windows-Kernel-Network" in host.NET_WINDOWS and "GetAdaptersAddresses" in host.NET_WINDOWS
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "NET NOT COVERED: not covered on Windows." in capsys.readouterr().out
+
+
+def test_the_stand_in_traces_the_network_only_when_the_host_oracle_asks(tmp_path, monkeypatch):
+    import _strace_stand_in as stand_in
+
+    class Help:
+        stdout = "strace --kill-on-exit"
+
+    monkeypatch.setattr(stand_in.shutil, "which", lambda name: "/usr/bin/strace")
+    monkeypatch.setattr(stand_in.subprocess, "run", lambda *a, **k: Help())
+    (tmp_path / "ff").mkdir()
+    binary = tmp_path / "ff" / "firefox"
+    binary.write_text("", encoding="utf-8")
+    font = Path(stand_in._stand_in(str(binary), tmp_path / "font", tmp_path / "f.log", tmp_path / "f.pid")).read_text(encoding="utf-8")
+    oracle = Path(stand_in._stand_in(str(binary), tmp_path / "host", tmp_path / "h.log", tmp_path / "h.pid", syscalls=host.STRACE_CALLS,
+                                     fd_paths=True, network=True)).read_text(encoding="utf-8")
+    assert "-e trace=%s " % stand_in._SYSCALLS in font and "socket" not in font, "the font tests' default is unchanged"
+    assert "-e trace=%s,%s " % (host.STRACE_CALLS, stand_in._NET_SYSCALLS) in oracle and " -y" in oracle
+    assert set(stand_in._NET_SYSCALLS.split(",")) == set(host.NET_CALLS)
