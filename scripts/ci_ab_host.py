@@ -1237,7 +1237,7 @@ _PUBLIC_DESTINATION = re.compile(r"^(?P<kind>.+?): (?P<verb>connect|send) (?P<tr
 
 
 def net_class(entry: str) -> str:
-    """`<kind>: connect tcp AF_INET 140.82.113.3:443` is `<kind>: connect tcp public:443`; any other entry (a netlink socket, a request) is itself."""
+    """`<kind>: connect tcp AF_INET 8.8.8.8:443` is `<kind>: connect tcp public:443`; any other entry (a netlink socket, a request) is itself."""
     m = _PUBLIC_DESTINATION.match(entry)
     return "%s: %s %s public:%s" % (m.group("kind"), m.group("verb"), m.group("transport"), m.group("port")) if m else entry
 

@@ -1524,18 +1524,18 @@ def with_net_entries(fp, entries):
 
 
 def test_a_public_destination_is_compared_as_its_class_whatever_the_address_the_dns_gave():
-    a = with_net_entries(footprint(), ["parent: connect tcp AF_INET 140.82.113.3:443", "parent: connect tcp AF_INET 185.199.110.133:443", "parent: connect tcp AF_INET 151.101.129.91:80"])
-    b = with_net_entries(footprint("again"), ["parent: connect tcp AF_INET 140.82.114.4:443", "parent: connect tcp AF_INET 151.101.65.91:80", "parent: connect tcp AF_INET 185.199.109.133:443",
-                                             "parent: connect tcp AF_INET 185.199.108.133:443"])
+    a = with_net_entries(footprint(), ["parent: connect tcp AF_INET 8.8.8.8:443", "parent: connect tcp AF_INET 141.101.90.1:443", "parent: connect tcp AF_INET 1.1.1.1:80"])
+    b = with_net_entries(footprint("again"), ["parent: connect tcp AF_INET 8.8.4.4:443", "parent: connect tcp AF_INET 1.0.0.1:80", "parent: connect tcp AF_INET 172.64.41.4:443",
+                                             "parent: connect tcp AF_INET 162.159.61.4:443"])
     assert judge(a, b, a_a=True)["verdict"] == "green", "the number of distinct addresses of a class is the DNS rotation's"
     assert "DNS rotation" in host.NET_CLASS_REASON
 
 
 @pytest.mark.parametrize("entry,expected", [
-    ("parent: connect tcp AF_INET 140.82.113.3:443", "net.parent: connect tcp public:443"),
+    ("parent: connect tcp AF_INET 8.8.8.8:443", "net.parent: connect tcp public:443"),
     ("parent: connect tcp AF_INET6 [2606:4700::1]:443", "net.parent: connect tcp public:443"),
-    ("parent: connect udp AF_INET 104.20.26.136:0", "net.parent: connect udp public:0"),
-    ("Web Content: send udp AF_INET 34.54.185.247:443", "net.Web Content: send udp public:443"),
+    ("parent: connect udp AF_INET 162.159.207.1:0", "net.parent: connect udp public:0"),
+    ("Web Content: send udp AF_INET 172.32.0.5:443", "net.Web Content: send udp public:443"),
 ])
 def test_a_class_of_destination_is_the_kind_the_verb_the_transport_and_the_port(entry, expected):
     assert "net." + host.net_class(entry) == expected
@@ -1544,9 +1544,9 @@ def test_a_class_of_destination_is_the_kind_the_verb_the_transport_and_the_port(
 
 
 def test_a_class_that_only_one_side_reaches_or_another_port_or_another_kind_is_red():
-    a = with_net_entries(footprint(), ["parent: connect tcp AF_INET 140.82.113.3:443"])
-    for other, leaf in ((["parent: connect tcp AF_INET 140.82.113.3:8443"], "net.parent: connect tcp public:8443"),
-                        (["gpu: connect tcp AF_INET 140.82.113.3:443"], "net.gpu: connect tcp public:443"), ([], None)):
+    a = with_net_entries(footprint(), ["parent: connect tcp AF_INET 8.8.8.8:443"])
+    for other, leaf in ((["parent: connect tcp AF_INET 8.8.8.8:8443"], "net.parent: connect tcp public:8443"),
+                        (["gpu: connect tcp AF_INET 8.8.8.8:443"], "net.gpu: connect tcp public:443"), ([], None)):
         report = judge(a, with_net_entries(footprint("again"), other), a_a=True)
         assert report["verdict"] == "red", other
         assert (leaf is None) or leaf in {d["leaf"] for d in report["differences"]}
