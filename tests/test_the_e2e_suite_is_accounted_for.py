@@ -47,6 +47,8 @@ _BOTH = ("linux", "windows")
 #: What no row of the suite runs, by file or by ``file::test`` (every parameter of the test), the systems it holds for, and why. The skip reasons are the ones the
 #: junit of run 44942540063 carries.
 EXCLUDED = {
+    "tests/test_a_popup_after_a_held_press_hunt_e2e.py":
+        (_BOTH, "the proof of a mechanism on the branch hunt/popup-held-press (its own workflow, never main): no row of the suite runs it"),
     "tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py":
         (_BOTH, "wrapper.e2e.udp.exit: the lab's exit is an address held on lo as root (Linux only), run in the root step"),
     "tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick":
@@ -83,7 +85,7 @@ EXCLUDED = {
         (("windows",), "skips on Windows: the Linux text path"),
 }
 #: Changed by hand, together with the list above: an exclusion is a test the candidate does not run, and it may not be added in silence.
-EXCLUDED_COUNT = 17
+EXCLUDED_COUNT = 18
 
 
 @functools.lru_cache(maxsize=None)
