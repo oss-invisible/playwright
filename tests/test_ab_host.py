@@ -1031,7 +1031,7 @@ def test_a_public_destination_only_the_candidate_reaches_is_red_and_the_declared
     report = judge(with_net(footprint(), PARENT_NET), c, expected=expected())
     assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["glxtest-69", "glxtest-69"]
     assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [
-        (11, "net.socket: connect tcp AF_INET 8.8.4.4:80", host.MISSING, 1), (12, "net.socket: connect tcp AF_INET 8.8.4.4:80", host.MISSING, 1)]
+        (11, "net.socket: connect tcp public:80", host.MISSING, 1), (12, "net.socket: connect tcp public:80", host.MISSING, 1)]
 
 
 def test_loopback_and_lab_destinations_are_not_compared_and_are_counted_as_evidence(capsys):
@@ -1260,7 +1260,7 @@ def test_the_journey_has_the_geolocation_step_after_its_own_steps_in_a_run():
     source = Path(host.__file__).read_text(encoding="utf-8")
     run_seed = source[source.index("def run_seed("):source.index("def _wait_for_tree_exit(")]
     assert run_seed.index("for n, (name, method) in enumerate(JOURNEY, 1)") < run_seed.index("geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1)")
-    assert run_seed.index("geolocation_step(") < run_seed.index("browser.close()")
+    assert run_seed.index("geolocation_step(") < run_seed.rindex("browser.close()")
 
 
 def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
@@ -1511,3 +1511,122 @@ def test_the_pingsender_surface_of_the_two_warm_ups_is_compared_when_both_have_t
     report = judge(a, b, a_a=True)
     assert report["verdict"] == "red" and any("warm-up: the pingsender paths differ: A only ['/etc/machine-id'] | B only ['/etc/resolv.conf']" in p for p in report["problems"])
     assert judge(a, with_warmup(footprint("again")), a_a=True)["verdict"] == "green", "the pingsender is in one warm-up only"
+
+
+# -
+# Run 44988820319: the class of a public destination, the shortcut inventory, what the pingsenders spawn, a reused pid.
+
+def with_net_entries(fp, entries):
+    fp = copy.deepcopy(fp)
+    for seed in fp["seeds"]:
+        seed["net"] = list(entries)
+    return fp
+
+
+def test_a_public_destination_is_compared_as_its_class_whatever_the_address_the_dns_gave():
+    a = with_net_entries(footprint(), ["parent: connect tcp AF_INET 140.82.113.3:443", "parent: connect tcp AF_INET 185.199.110.133:443", "parent: connect tcp AF_INET 151.101.129.91:80"])
+    b = with_net_entries(footprint("again"), ["parent: connect tcp AF_INET 140.82.114.4:443", "parent: connect tcp AF_INET 151.101.65.91:80", "parent: connect tcp AF_INET 185.199.109.133:443",
+                                             "parent: connect tcp AF_INET 185.199.108.133:443"])
+    assert judge(a, b, a_a=True)["verdict"] == "green", "the number of distinct addresses of a class is the DNS rotation's"
+    assert "DNS rotation" in host.NET_CLASS_REASON
+
+
+@pytest.mark.parametrize("entry,expected", [
+    ("parent: connect tcp AF_INET 140.82.113.3:443", "net.parent: connect tcp public:443"),
+    ("parent: connect tcp AF_INET6 [2606:4700::1]:443", "net.parent: connect tcp public:443"),
+    ("parent: connect udp AF_INET 104.20.26.136:0", "net.parent: connect udp public:0"),
+    ("Web Content: send udp AF_INET 34.54.185.247:443", "net.Web Content: send udp public:443"),
+])
+def test_a_class_of_destination_is_the_kind_the_verb_the_transport_and_the_port(entry, expected):
+    assert "net." + host.net_class(entry) == expected
+    assert host.net_class("netlink NETLINK_ROUTE RTM_GETADDR") == "netlink NETLINK_ROUTE RTM_GETADDR", "a netlink request is itself"
+    assert "telemetry" not in host.net_class(entry) and entry.split(" ")[-1].split(":")[0] not in host.net_class(entry), "no name is made up from an address"
+
+
+def test_a_class_that_only_one_side_reaches_or_another_port_or_another_kind_is_red():
+    a = with_net_entries(footprint(), ["parent: connect tcp AF_INET 140.82.113.3:443"])
+    for other, leaf in ((["parent: connect tcp AF_INET 140.82.113.3:8443"], "net.parent: connect tcp public:8443"),
+                        (["gpu: connect tcp AF_INET 140.82.113.3:443"], "net.gpu: connect tcp public:443"), ([], None)):
+        report = judge(a, with_net_entries(footprint("again"), other), a_a=True)
+        assert report["verdict"] == "red", other
+        assert (leaf is None) or leaf in {d["leaf"] for d in report["differences"]}
+    assert {d["leaf"] for d in judge(a, with_net_entries(footprint("again"), []), a_a=True)["differences"]} == {"net.parent: connect tcp public:443"}
+
+
+INV = ["c:\\programdata\\microsoft\\windows\\start menu\\programs\\desktop.ini", "c:\\users\\public\\desktop\\desktop.ini",
+       "c:\\users\\runneradmin\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
+       "c:\\windows\\system32\\windows.fileexplorer.common.dll", "c:\\windows\\system32\\en-us\\urlmon.dll.mui"]
+
+
+def with_inventory(fp, paths=INV, present=True):
+    fp = copy.deepcopy(fp)
+    for seed in fp["seeds"]:
+        if present:
+            seed["files"] = sorted(set(seed["files"]) | set(paths))
+            seed["inventory"] = sorted(paths)
+    return fp
+
+
+def test_the_shortcut_inventory_is_absent_or_complete_one_side_with_it_and_the_other_without_is_green():
+    report = judge(with_inventory(footprint(platform="win32")), footprint("again", platform="win32"), a_a=True)
+    assert report["verdict"] == "green", report["problems"]
+    assert judge(footprint("again", platform="win32"), with_inventory(footprint(platform="win32")), a_a=True)["verdict"] == "green"
+    assert judge(with_inventory(footprint(platform="win32")), with_inventory(footprint("again", platform="win32")), a_a=True)["verdict"] == "green"
+
+
+def test_an_inventory_that_is_not_complete_on_both_sides_is_red_and_so_is_a_path_next_to_it():
+    short = with_inventory(footprint("again", platform="win32"), INV[:3])
+    report = judge(with_inventory(footprint(platform="win32")), short, a_a=True)
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file." + p for p in INV[3:]}
+    extra = with_inventory(footprint(platform="win32"))
+    extra["seeds"][0]["files"] = extra["seeds"][0]["files"] + ["c:\\users\\runneradmin\\.ssh\\config"]
+    other = judge(extra, footprint("again", platform="win32"), a_a=True)
+    assert other["verdict"] == "red" and {d["leaf"] for d in other["differences"]} == {"file.c:\\users\\runneradmin\\.ssh\\config"}, "only the inventory's own paths are left out"
+    known = with_inventory(footprint(platform="win32"), INV + [FILES[0]])
+    assert judge(known, footprint("again", platform="win32"), a_a=True)["verdict"] == "green", "a path of the inventory window that the other side has too is not left out of its side"
+
+
+def test_the_inventory_of_a_launch_is_what_the_parent_first_touched_from_the_first_to_the_last_open_of_the_places_it_walks():
+    ctx = host.Context("win32", devices={"\\Device\\HarddiskVolume3": "C:"})
+    order = {(10, "C:\\early.dll"): 1, (10, "C:\\Users\\Public\\Desktop\\desktop.ini"): 5, (10, "C:\\Windows\\System32\\windows.fileexplorer.common.dll"): 6,
+             (10, "C:\\Users\\r\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\nightly.lnk"): 8,
+             (11, "C:\\Windows\\System32\\gpu-only.dll"): 6, (10, "C:\\late.dll"): 20}
+    labels = {10: "parent", 11: "gpu"}
+    got = host.inventory_of(order, lambda pid: labels[pid], ctx)
+    assert got == ["c:\\users\\public\\desktop\\desktop.ini", "c:\\users\\r\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
+                   "c:\\windows\\system32\\windows.fileexplorer.common.dll"]
+    assert host.inventory_of({(10, "C:\\early.dll"): 1}, lambda pid: "parent", ctx) == [], "a launch that did not run it has none"
+    assert "StartupOSIntegration.sys.mjs" in open(host.__file__, encoding="utf-8").read(), "the source that launches it is cited"
+
+
+def test_the_etw_file_keeps_the_order_of_the_first_open_of_every_path(tmp_path):
+    xml = tmp_path / "files.xml"
+    xml.write_text(etw((100, "C:\\a.dll"), (100, "C:\\b.dll"), (100, "C:\\a.dll"), (102, "C:\\a.dll")), encoding="utf-8")
+    order = {}
+    host.etw_files(xml, {100, 102}, None, order)
+    assert order == {(100, "C:\\a.dll"): 1, (100, "C:\\b.dll"): 2, (102, "C:\\a.dll"): 4}
+
+
+def test_what_a_pingsender_spawns_is_named_after_it_and_comes_and_goes_with_the_pingsenders():
+    labels = {1: "parent", 2: "socket", 3: host.PINGSENDER_KIND, 4: "socket", 5: host.PINGSENDER_KIND, 6: "socket", 7: "tab/isForBrowser"}
+    parents = {2: 1, 3: 1, 4: 3, 5: 1, 6: 5, 7: 1}
+    got = host.derive_labels(labels, parents)
+    assert got == {1: "parent", 2: "socket", 3: host.PINGSENDER_KIND, 4: "socket<-pingsender", 5: host.PINGSENDER_KIND, 6: "socket<-pingsender", 7: "tab/isForBrowser"}
+    kinds = {"parent": 1, "socket": 1, "socket<-pingsender": 2, host.PINGSENDER_KIND: 2, "gpu": 1, "glxtest": 1, "tab/isForBrowser": 2}
+    # the pingsenders (and so what they spawn) on one side only: left out; the parent's own socket is compared
+    a = with_pingsenders(footprint(kinds=kinds), 3)
+    assert judge(a, footprint("again", kinds={k: n for k, n in kinds.items() if "pingsender" not in k}), a_a=True)["verdict"] == "green"
+    # on both sides the spawned processes are compared
+    b = with_pingsenders(footprint("again", kinds=dict(kinds, **{"socket<-pingsender": 3})), 3)
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "red" and {(d["leaf"], d["a"], d["b"]) for d in report["differences"]} == {("proc.socket<-pingsender", 2, 3)}
+    lost = footprint("again", kinds={k: n for k, n in kinds.items() if k != "socket"})
+    assert {d["leaf"] for d in judge(with_pingsenders(footprint(kinds=kinds), 0), lost, a_a=True)["differences"]} == {"proc.socket"}, "the parent's own socket still counts"
+
+
+def test_a_creator_pid_that_windows_reused_before_the_launch_is_not_in_its_tree():
+    events = host.parse_audit_events("\n".join([
+        audit(5, 200, 100, FIREFOX, '"%s" --backgroundtask pingsender https://t.example/submit/telemetry/1/event/x' % FIREFOX),
+        audit(10, 100, 1, FIREFOX, '"%s" -profile "D:\\t\\p"' % FIREFOX),
+        audit(12, 102, 100, FIREFOX, '"%s" -contentproc tab' % FIREFOX)]))
+    assert [e["pid"] for e in host.process_tree(events, {100})] == [100, 102], "record 5 came before the root (record 10): its creator is an older process that had the same pid"

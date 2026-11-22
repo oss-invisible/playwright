@@ -481,7 +481,7 @@ def pingsender_surface(fp: dict) -> tuple:
     """`(paths only the pingsender kind touched, its destinations)` of a launch: a destination is `<kind>: connect public, telemetry` (or `send`), whatever the
     address and the port: the telemetry host is the third party's."""
     touched = fp.get("touched_by", {})
-    files = sorted(p for p in fp.get("files", []) if touched.get(p) and set(touched[p]) <= {PINGSENDER_KIND})
+    files = sorted(p for p in fp.get("files", []) if touched.get(p) and all(is_pingsender_part(k) for k in touched[p]))
     nets = sorted({"%s: %s public, telemetry" % (PINGSENDER_KIND, e.split(": ", 1)[1].split(" ", 1)[0])
                    for e in fp.get("net") or [] if e.startswith(PINGSENDER_KIND + ": ")})
     return files, nets
@@ -658,6 +658,55 @@ def spawned_processes(lines, real: str) -> dict:
     for pid in procs:
         procs[pid]["label"] = label(pid)
     return procs
+
+
+def derive_labels(labels: dict, parents: dict) -> dict:
+    """`labels` with the processes a pingsender spawned named `<kind><-pingsender`: each background task is a Firefox of its own and starts its own socket process
+    (run 44988820319: four socket processes, the parent's and one of each of the three pingsenders, all ended with exit 0), so they come and go with the pingsenders."""
+    out: dict = {}
+
+    def label(pid, seen=()):
+        if pid in out:
+            return out[pid]
+        base, parent = labels[pid], parents.get(pid)
+        if parent in labels and pid not in seen and parent not in seen:
+            above = label(parent, seen + (pid,))
+            if above == PINGSENDER_KIND or above.endswith("<-pingsender"):
+                base = base + "<-pingsender"
+        out[pid] = base
+        return base
+
+    for pid in labels:
+        label(pid)
+    return out
+
+
+def is_pingsender_part(kind: str) -> bool:
+    """The pingsender kind and what it spawned: what is there when the pingsenders are."""
+    return kind == PINGSENDER_KIND or kind.endswith("<-pingsender")
+
+
+#: The shortcut inventory of Windows (a launch that ran it touches these): StartupOSIntegration.sys.mjs `onStartupIdle` (:165) -> `ensurePrivateBrowsingShortcutExists`
+#: (:238, `hasPinnableShortcut` :266 -> nsWindowsShellService.cpp `HasPinnableShortcut` :1672 -> `FindPinnableShortcut` :1625) and `CustomIconManager.ensureAppliedOrRevert` ->
+#: `enumerateInstallShortcuts` (CustomIconManager.sys.mjs:189 -> nsWindowsShellService.cpp `EnumerateInstallShortcutsImpl` :2960): Mozilla code at startup idle, which a short
+#: launch may or may not have reached before it closed. The marker is a path of the places it walks.
+INVENTORY_MARKER = re.compile(r"(\\start menu\\|\\users\\public\\desktop|\\quick launch\\|_shortcuts\.ini$|\\implicitappshortcuts)")
+
+
+def inventory_of(order: dict, label_of, ctx: Context) -> list:
+    """The host paths of the shortcut inventory of a launch: the paths the PARENT first touched from the first to the last open of a path of the places the
+    inventory walks, by the order of the system's log (a shell library loaded for it is in it). `[]` when the launch did not run it."""
+    mine = {}
+    for (pid, raw), position in order.items():
+        if label_of(pid) == "parent":
+            got = classify(raw, ctx)
+            if got and got[0] == "host":
+                mine[got[1]] = min(position, mine.get(got[1], position))
+    marks = [pos for path, pos in mine.items() if INVENTORY_MARKER.search(path)]
+    if not marks:
+        return []
+    low, high = min(marks), max(marks)
+    return sorted(path for path, pos in mine.items() if low <= pos <= high)
 
 
 def by_kind(pairs, label_of, ctx: Context) -> dict:
@@ -922,6 +971,8 @@ def parse_audit_events(xml_text: str) -> list:
 def process_tree(events, roots) -> list:
     """The events of `parse_audit_events` that are a root or come from a process of the tree, by the creator's pid each says, in their order."""
     wanted, chosen, changed = set(roots), set(), True
+    floor = min((e.get("rid", 0) for e in events if e["pid"] in wanted), default=0)  # a creator's pid that Windows reused: what came before the root is not its tree
+    events = [e for e in events if e.get("rid", 0) >= floor]
     while changed:
         changed = False
         for i, e in enumerate(events):
@@ -941,10 +992,11 @@ def windows_processes(tree, real: str) -> dict:
     return out
 
 
-def etw_files(path, pids=None, exits=None) -> tuple:
+def etw_files(path, pids=None, exits=None, order=None) -> tuple:
     """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
     stream: the file has every open of the machine for the length of the run. With a list in `exits`, the process stops of the same file (Kernel-Process, event 2)
-    are appended to it as `{"pid", "code", "time", "image"}`: how each process ended."""
+    are appended to it as `{"pid", "code", "time", "image"}`: how each process ended; with a dict in `order`, the position in the file (the order the system
+    logged them in, never a time) of the first open of each `(pid, name)` is put in it."""
     seen, events = set(), 0
     for _ev, el in ET.iterparse(path, events=("end",)):
         if el.tag.rsplit("}", 1)[-1] != "Event":
@@ -968,6 +1020,8 @@ def etw_files(path, pids=None, exits=None) -> tuple:
             exits.append({"pid": _number(data["ProcessID"]), "code": _number(data["ExitCode"]), "time": when, "image": data.get("ImageName", "")})
         if name and pid is not None and (pids is None or pid in pids):
             seen.add((pid, name))
+            if order is not None:
+                order.setdefault((pid, name), events)
         el.clear()
     return seen, events
 
@@ -1074,7 +1128,8 @@ class WindowsTrace:
         summary = self.work / "files.txt"
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
         exits: list = []
-        everything, events = etw_files(self.xml, None, exits)
+        order: dict = {}
+        everything, events = etw_files(self.xml, None, exits, order)
         tree_pids = {e["pid"] for e in tree}
         seen = {(p, n) for p, n in everything if p in tree_pids or p == os.getpid()}
         outside: dict = {}
@@ -1093,7 +1148,8 @@ class WindowsTrace:
         if missing:
             problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
         return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
-                "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids], "exits_available": self.exits_ok}
+                "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids], "exits_available": self.exits_ok,
+                "order": {k: v for k, v in order.items() if k[0] in tree_pids}}
 
     def cleanup(self) -> None:
         """Put the machine back: the session closed, the audit as it was."""
@@ -1173,14 +1229,28 @@ def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sl
 # -
 # The comparison.
 
+#: A public destination is compared as its CLASS: the process kind, the verb, the transport and the port, whatever the address: the name the engine connects to is
+#: answered by other addresses from one launch to the next (DNS rotation: 140.82.112-114.x:443, 185.199.108-110.133:443, 151.101.x.91:80 in run 44988820319), so the
+#: number of distinct addresses of a class is not compared. A name is never made up from an address.
+NET_CLASS_REASON = "the same name is answered by other addresses from one launch to the next (DNS rotation): a public destination is compared as its class"
+_PUBLIC_DESTINATION = re.compile(r"^(?P<kind>.+?): (?P<verb>connect|send) (?P<transport>\S+) AF_INET6? \[?[^\]\s]*\]?:(?P<port>\d+)$")
+
+
+def net_class(entry: str) -> str:
+    """`<kind>: connect tcp AF_INET 140.82.113.3:443` is `<kind>: connect tcp public:443`; any other entry (a netlink socket, a request) is itself."""
+    m = _PUBLIC_DESTINATION.match(entry)
+    return "%s: %s %s public:%s" % (m.group("kind"), m.group("verb"), m.group("transport"), m.group("port")) if m else entry
+
+
 def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
     """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence),
     file.<path> = 1 for every HOST path the tree touched and net.<kind>: <what> = 1 for every netlink socket, netlink request and public
     destination of a process of that kind (`network_events`)."""
     out = {}
     for kind, n in seed_footprint.get("kinds", {}).items():
-        if kind != PINGSENDER_KIND:  # 0 or 3 of them, with their form: `pingsender_problems`; the idle launch is where they must be
-            out["proc." + kind] = 1 if is_tab(kind) and n else n
+        if kind == PINGSENDER_KIND or (kind.endswith("<-pingsender") and not with_pingsender):
+            continue  # 0 or 3 of them, with their form (`pingsender_problems`), and what they spawned: there when they are
+        out["proc." + kind] = 1 if is_tab(kind) and n else n
     # what only the pingsender kind touches or reaches is compared when it is on both sides of the launch (`with_pingsender`), left out when on one side only
     surface_files, surface_nets = pingsender_surface(seed_footprint)
     for path in seed_footprint.get("files", []):
@@ -1189,7 +1259,7 @@ def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
         out["file." + path] = 1
     for entry in seed_footprint.get("net") or []:
         if not entry.startswith(PINGSENDER_KIND + ": "):
-            out["net." + entry] = 1
+            out["net." + net_class(entry)] = 1
     if with_pingsender:
         for entry in surface_nets:
             out["net." + entry] = 1
@@ -1331,6 +1401,15 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         both = bool(seeds_a[seed].get("kinds", {}).get(PINGSENDER_KIND)) and bool(seeds_b[seed].get("kinds", {}).get(PINGSENDER_KIND))
         la, lb = leaves_of(seeds_a[seed], both), leaves_of(seeds_b[seed], both)
+        # The shortcut inventory (Windows) is there or it is not (`INVENTORY_MARKER`): when one side ran it and the other did not, the paths it walked that the other
+        # side does not have are left out; when both ran it, its paths are compared like any other, so it has to be complete.
+        inv_a, inv_b = set(seeds_a[seed].get("inventory") or []), set(seeds_b[seed].get("inventory") or [])
+        if inv_a and not inv_b:
+            for path in inv_a - set(seeds_b[seed].get("files", [])):
+                la.pop("file." + path, None)
+        elif inv_b and not inv_a:
+            for path in inv_b - set(seeds_a[seed].get("files", [])):
+                lb.pop("file." + path, None)
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
             for message in fp.get("problems", []) + pingsender_problems(fp):
                 problems.append("seed %s side %s: %s" % (seed, side, message))
@@ -1557,10 +1636,17 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             from _strace_stand_in import _group_of
 
             pgid = _group_of(pidfile)
-        if idle:
-            notified = wait_for_notification(profile_prefs_reader(before))
-        with (contextlib.nullcontext() if idle else sync_playwright()) as p:  # nothing drives the idle browser
-            if not idle:
+        with sync_playwright() as p:
+            if idle:
+                # Run 44988820319: with no client and no page the notification was never recorded in 120 s on either system (no window, so no
+                # `sessionstore-windows-restored` for the policy to start from) and the launch had a crash reporter: the idle launch has the page of a launch, and nothing else.
+                browser = p.firefox.connect(server.ws_endpoint)
+                context = browser.new_context()
+                context.new_page()
+                notified = wait_for_notification(profile_prefs_reader(before))
+                context.close()
+                browser.close()
+            else:
                 browser = p.firefox.connect(server.ws_endpoint)
                 context = browser.new_context()
                 context.set_default_timeout(profile_p4.TIMEOUT_MS)
@@ -1664,7 +1750,9 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         pairs = list(got["files"])
         labels = {pid: p["label"] for pid, p in procs.items()}
         parents = {e["pid"]: e["ppid"] for e in got["tree"]}
+        labels = derive_labels(labels, parents)
         label_of = lambda pid: labels.get(pid, "?")  # noqa: E731
+        inventory = inventory_of(got["order"], label_of, ctx)
         info = {"source": "etw+audit", "events": got["events"], "exited": got["exited"]["exited"], "reads": got["exited"]["reads"]}
         problems = list(got["problems"])
         if not got["exited"]["exited"]:
@@ -1681,7 +1769,9 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         pairs = [(pid, path) for path, pids in by_pid.items() for pid in pids]
         labels = {pid: p["label"] for pid, p in procs.items()}
         parents = {pid: owner_of(p["parent"], owners) for pid, p in procs.items() if p["parent"] is not None}
+        labels = derive_labels(labels, parents)
         label_of = lambda pid: labels.get(owner_of(pid, owners), "?")  # noqa: E731
+        inventory = []
         calls = touched_calls(lines)
         lifecycle, fd_opens = process_lifecycle(lines, procs), proc_fd_opens(lines, owners, label_of)
         info, problems, outside = {"source": "strace", "exited": True}, [], {}  # strace follows our tree and nothing else
@@ -1691,11 +1781,11 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
                           "name": p["name"]} for p in procs.values()), key=lambda d: (d["label"], d["exec"] or ""))
     raw = {path for _pid, path in pairs}
     host, ours = classify_paths(raw, ctx)
-    kinds = dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
+    kinds = dict(sorted(collections.Counter(labels.values()).items()))
     info.update({"processes": len(procs), "paths": len(raw)})
     # touched_by, touched_calls and spawned_by are evidence, never compared: the process and the call to blame for a path or a kind that differs
     out = {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
-           "pingsenders": ping_records(procs, {pid: p["label"] for pid, p in procs.items()}, parents, windows),
+           "pingsenders": ping_records(procs, labels, parents, windows), "inventory": inventory,
            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside,
            "net": net, "net_not_compared": net_skipped, "lifecycle": lifecycle, "proc_fd_opens": fd_opens, "close": close}
     if not windows:
