@@ -8,7 +8,9 @@
 # The reds leave what the tests save on failure (RUNNER_TEMP/invpw-evidence: the engine's own log of the launch, the lab server's record, the page's timeline),
 # the junit of every round and the log of every round in the artifact of the job; the job summary counts rounds, passed and failed.
 #
-#   Linux x2 each: the journey on the fake web (networkidle where stock goes idle), HTTP/3 with no proxy (h2, h3, h3), the 25 s popup of a served browser.
+#   A moving page's read right after `goto`, all 7 cases of the test (one round = 7 cases x 4 copies = 28): Linux x1, Windows x1, 15 rounds each.
+#   Linux x1:      the journey on the fake web (networkidle where stock goes idle), the 25 s popup of a served browser.
+#   Linux x2:      HTTP/3 with no proxy (h2, h3, h3).
 #   Windows x2:    two connections on one page connect in the time of retail (the mDNS responder).
 #
 # Triggered ONLY by a push to `hunt/intermittent-68`: no schedule, no dispatch, no pull request.
@@ -43,46 +45,54 @@ jobs:
       max-parallel: 8
       matrix:
         include:
-          - label: fakeweb-journey-linux-1
+          - label: read-after-goto-linux
+            os: ubuntu-24.04
+            temp: /tmp
+            rounds: 15
+            items: 7
+            node: "tests/test_a_page_that_moves_on_e2e.py::test_a_read_right_after_goto_answers"
+          - label: read-after-goto-windows
+            os: windows-2022
+            temp: 'D:\a\_temp'
+            rounds: 15
+            items: 7
+            node: "tests/test_a_page_that_moves_on_e2e.py::test_a_read_right_after_goto_answers"
+          - label: popup-25s-linux-1
             os: ubuntu-24.04
             temp: /tmp
             rounds: 25
-            node: "tests/test_fakeweb_p4_e2e.py::test_the_journey_succeeds_on_every_step_and_idles_where_stock_does"
-          - label: fakeweb-journey-linux-2
-            os: ubuntu-24.04
-            temp: /tmp
-            rounds: 25
-            node: "tests/test_fakeweb_p4_e2e.py::test_the_journey_succeeds_on_every_step_and_idles_where_stock_does"
+            items: 1
+            node: "tests/test_a_popup_is_reported_when_the_engine_says_it_is_ready_as_playwright_does_e2e.py::test_a_popup_whose_destination_answers_after_25_seconds_is_reported_then[served]"
           - label: h3-no-proxy-linux-1
             os: ubuntu-24.04
             temp: /tmp
             rounds: 25
+            items: 1
             node: "tests/test_http3_through_the_proxy_e2e.py::test_a_page_with_no_proxy_reads_h2_then_h3_then_h3"
           - label: h3-no-proxy-linux-2
             os: ubuntu-24.04
             temp: /tmp
             rounds: 25
+            items: 1
             node: "tests/test_http3_through_the_proxy_e2e.py::test_a_page_with_no_proxy_reads_h2_then_h3_then_h3"
-          - label: popup-25s-linux-1
-            os: ubuntu-24.04
-            temp: /tmp
-            rounds: 25
-            node: "tests/test_a_popup_is_reported_when_the_engine_says_it_is_ready_as_playwright_does_e2e.py::test_a_popup_whose_destination_answers_after_25_seconds_is_reported_then[served]"
-          - label: popup-25s-linux-2
-            os: ubuntu-24.04
-            temp: /tmp
-            rounds: 25
-            node: "tests/test_a_popup_is_reported_when_the_engine_says_it_is_ready_as_playwright_does_e2e.py::test_a_popup_whose_destination_answers_after_25_seconds_is_reported_then[served]"
           - label: mdns-loopback-windows-1
             os: windows-2022
             temp: 'D:\a\_temp'
             rounds: 25
+            items: 1
             node: "tests/test_declared_host_network_e2e.py::test_two_connections_on_one_page_connect_in_the_time_of_retail"
           - label: mdns-loopback-windows-2
             os: windows-2022
             temp: 'D:\a\_temp'
             rounds: 25
+            items: 1
             node: "tests/test_declared_host_network_e2e.py::test_two_connections_on_one_page_connect_in_the_time_of_retail"
+          - label: fakeweb-journey-linux-1
+            os: ubuntu-24.04
+            temp: /tmp
+            rounds: 25
+            items: 1
+            node: "tests/test_fakeweb_p4_e2e.py::test_the_journey_succeeds_on_every_step_and_idles_where_stock_does"
     # The temporary folder of the Windows job is the one of the series gate (D:\a\_temp, where the runner's own temp is).
     env:
       TEMP: ${{ matrix.temp }}
@@ -123,6 +133,8 @@ jobs:
           INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog.log
           HUNT_NODE: ${{ matrix.node }}
           HUNT_ROUNDS: ${{ matrix.rounds }}
+          # How many tests (cases of a parametrized node count one each) the node selects: a round runs each of them on each of the four workers.
+          HUNT_ITEMS: ${{ matrix.items }}
           HUNT_LABEL: ${{ matrix.label }}
           # No new round starts after this many seconds of the step: the artifact is uploaded with what the rounds so far found.
           HUNT_BUDGET_S: "5100"
@@ -138,20 +150,25 @@ jobs:
           unset INVISIBLE_CORE_PIN
           out="$RUNNER_TEMP"
           mkdir -p "$out/hunt-junit" "$out/hunt-logs" "$out/invpw-evidence"
-          # The result of one junit: "tests failures errors skipped" on the first line, then one line per red test (-1 for a file that is not there).
+          # The result of one junit: "tests failures errors skipped names uneven" on the first line (names: the tests collected, each by its own name; uneven: how many of
+          # them did not run exactly four times), then one line per red test (-1 for a file that is not there).
           cat > "$out/junit_read.py" <<'PY'
           import sys, xml.etree.ElementTree as ET
           try:
               root = ET.parse(sys.argv[1]).getroot()
               suite = root if root.tag == "testsuite" else root.find("testsuite")
-              print(*(int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")))
+              seen = {}
+              for case in suite.iter("testcase"):
+                  key = (case.get("classname"), case.get("name"))
+                  seen[key] = seen.get(key, 0) + 1
+              print(*(int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")), len(seen), sum(1 for n in seen.values() if n != 4))
               for case in suite.iter("testcase"):
                   for kind in ("failure", "error"):
                       bad = case.find(kind)
                       if bad is not None:
                           print("RED %s | %s" % (case.get("name"), " ".join((bad.get("message") or "").split())[:400]))
           except Exception as exc:
-              print("-1 -1 -1 -1")
+              print("-1 -1 -1 -1 -1 -1")
               print("RED junit not readable: %r" % (exc,))
           PY
           if [ "$RUNNER_OS" = "Linux" ]; then PRE="xvfb-run -a"; else PRE=""; fi
@@ -170,7 +187,7 @@ jobs:
               echo ""
               echo "test: \`$HUNT_NODE\`"
               echo ""
-              echo "| rounds planned | rounds run | rounds with a red | copies run (4 a round) | passed | failed | skipped | rounds that did not run 4 copies |"
+              echo "| rounds planned | rounds run | rounds with a red | copies run (4 per test a round) | passed | failed | skipped | rounds that did not run every test 4 times |"
               echo "|---|---|---|---|---|---|---|---|"
               echo "| $HUNT_ROUNDS | $rounds_run | $rounds_red | $copies | $copies_passed | $copies_red | $copies_skipped | $anomalies |"
               echo ""
@@ -197,24 +214,27 @@ jobs:
             reap
             # Python writes CRLF on Windows: every line read back loses its backslash-r before it is used in an arithmetic expression.
             python "$out/junit_read.py" "$junit" | tr -d '\r' > "$out/round-read.txt"
-            read -r t f e s < <(head -1 "$out/round-read.txt")
+            read -r t f e s names uneven < <(head -1 "$out/round-read.txt")
             rounds_run=$((rounds_run + 1))
-            for number in "$t" "$f" "$e" "$s"; do
-              case "$number" in -1|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) echo "::error::round $n: the junit read gave '$t $f $e $s', not four numbers"; exit 1;; esac
+            for number in "$t" "$f" "$e" "$s" "$names" "$uneven"; do
+              case "$number" in -1|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) echo "::error::round $n: the junit read gave '$t $f $e $s $names $uneven', not six numbers"; exit 1;; esac
             done
             if [ "$t" -lt 0 ]; then
               # no junit: the pytest run did not get to write one (collection error, a worker that died, a kill)
-              rounds_red=$((rounds_red + 1)); copies_red=$((copies_red + 4)); anomalies=$((anomalies + 1))
+              rounds_red=$((rounds_red + 1)); copies_red=$((copies_red + 4 * HUNT_ITEMS)); anomalies=$((anomalies + 1))
               echo "round $n: exit=$code, NO JUNIT" | tee -a "$out/hunt-reds.txt"
               tail -n 30 "$log" | tee -a "$out/hunt-reds.txt"
             else
               copies=$((copies + t)); copies_red=$((copies_red + f + e)); copies_skipped=$((copies_skipped + s))
               copies_passed=$((copies_passed + t - f - e - s))
-              # A round that is not four copies, all run, measured less than it says: a skipped copy measured nothing and is red.
-              if [ "$t" -ne 4 ] || [ "$s" -ne 0 ]; then anomalies=$((anomalies + 1)); fi
-              if [ "$code" -ne 0 ] || [ $((f + e)) -gt 0 ] || [ "$t" -ne 4 ] || [ "$s" -ne 0 ]; then
+              # A round is every test of the node (HUNT_ITEMS, and the junit names that many) run four times, all run: fewer tests collected, a test that did not
+              # run four times, or a skipped copy measured less than it says and is red.
+              bad_shape=0
+              if [ "$names" -ne "$HUNT_ITEMS" ] || [ "$uneven" -ne 0 ] || [ "$t" -ne $((4 * names)) ] || [ "$s" -ne 0 ]; then bad_shape=1; fi
+              anomalies=$((anomalies + bad_shape))
+              if [ "$code" -ne 0 ] || [ $((f + e)) -gt 0 ] || [ "$bad_shape" -ne 0 ]; then
                 rounds_red=$((rounds_red + 1))
-                echo "round $n: exit=$code, $t copies, $f failed, $e errors, $s skipped" >> "$out/hunt-reds.txt"
+                echo "round $n: exit=$code, $t copies of $names tests (expected $((4 * HUNT_ITEMS)) of $HUNT_ITEMS), $f failed, $e errors, $s skipped, $uneven tests not run 4 times" >> "$out/hunt-reds.txt"
                 tail -n +2 "$out/round-read.txt" | sed "s/^/  /" >> "$out/hunt-reds.txt"
                 if [ "$s" -ne 0 ]; then grep -a -m 3 "SKIPPED" "$log" | sed "s/^/  /" >> "$out/hunt-reds.txt" || true; fi
               fi
@@ -224,7 +244,7 @@ jobs:
           done
           summary
           cat "$out/hunt-summary.md"
-          # Red means FOUND, and also NOT MEASURED: the step fails when any copy failed or was skipped, when a round did not run its four copies, or when no round ran.
+          # Red means FOUND, and also NOT MEASURED: the step fails when any copy failed or was skipped, when a round did not run every test four times, or when no round ran.
           finished=1
           if [ "$rounds_run" -eq 0 ]; then echo "::error::no round ran"; exit 1; fi
           if [ "$copies_skipped" -ne 0 ]; then echo "::error::$copies_skipped copies were skipped: the hunt measured nothing with them"; fi
