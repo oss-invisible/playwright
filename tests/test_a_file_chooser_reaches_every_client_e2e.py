@@ -18,15 +18,13 @@ WHAT THE STOCK CLIENT SENDS OVER `connect` (playwright 1.61.0, `playwright/_impl
 `convert_input_files`):
   * a PATH (str / Path): the branch `context._channel._connection.is_remote` (`connect` marks the connection remote)
     streams the file: `createTempFiles` on the context, then `WritableStream.copy` per file, then `setInputFiles`
-    with `streams`. Our server does not serve `createTempFiles` (`perimeter.py`: "the streamed upload path"), and
-    `_upload_paths` (`server.py`) reads only `localPaths`, `localDirectory` and `payloads`. So the path form is
-    expected to be refused or to arrive empty over `connect`.
+    with `streams`. The server serves `createTempFiles` and the `WritableStream` it makes (`BrowserContextDispatcher.op_create_temp_files`,
+    `WritableStreamDispatcher`), and `_upload_paths` (`server.py`) reads the `streams` as the closed files of the session. Test 8 reads
+    what the page sees of such a file: its name, size, `lastModified` and bytes.
   * an in-memory payload `{"name", "mimeType", "buffer"}`: the branch after the path one, no `createTempFiles`:
     `setInputFiles` with `payloads` (base64), which `_upload_paths` stages as a file of the session.
-`remote.py` (module docstring, "LIMITS OF THIS FIRST VERSION") says file choosers "are not carried to a remote
-client"; tests 3 to 7 are what says whether that is still true.
-
-Not a test of a fix: this is the evidence. On GitHub the red tests name the path that loses the event.
+Tests 3 to 7 say that the chooser is carried to a remote client and what its upload does; test 8 says what the page reads of a streamed file.
+The red tests name the path that loses the event.
 """
 from __future__ import annotations
 

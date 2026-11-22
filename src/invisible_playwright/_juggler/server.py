@@ -394,27 +394,79 @@ def _upload_paths(server: "JugglerServer", params: Dict) -> list:
     same engine command as a path, so the page receives it the way it
     receives a file a user picked - and, as for a user's pick, Firefox derives
     the file's type from its name; the payload's `mimeType` is not carried.
-    `streams` are the remote-connection path (`createTempFiles`), outside the
-    perimeter by decision; this client never sends them to a local server.
+    `streams` are what a client on a REMOTE connection (`connect`) sends for a
+    path: it copied each file into a `WritableStream` made by
+    `createTempFiles` (`BrowserContextDispatcher.op_create_temp_files`) and
+    names those streams here. Each one is a file of this session, already
+    closed, and goes through the engine like any other path.
 
     ⛔ A FOLDER IS REFUSED, BY NAME. The engine's `Page.setFileInputFiles`
     takes files: handed the folder's path it took the TAB down (the next call
     answered "cannot find session"), measured on firefox-34 and on the engine
     after it. Read as an empty list, as before, the engine answered with an
     exception naming neither the folder nor the reason. Both are worse than
-    saying it.
+    saying it. A folder over `connect` is `directoryStream` (and
+    `createTempFiles` with a `rootDirName`): the same sentence.
     """
     directory = params.get("localDirectory")
     if directory:
-        raise ProtocolException(
-            "set_input_files with a folder (%s) is not supported: the engine "
-            "takes files, so pass the files inside it instead" % directory)
+        raise _folder_refused(directory)
+    if params.get("directoryStream"):
+        raise _folder_refused("a folder streamed by the client")
+    streams = params.get("streams")
+    if streams:
+        return [_streamed_file(server, channel) for channel in streams]
     raw = params.get("localPaths") or params.get("files")
     if raw:
         return [entry.get("name") if isinstance(entry, dict) else entry
                 for entry in raw]
     return [server.stage_upload(payload)
             for payload in params.get("payloads") or []]
+
+
+def _folder_refused(what: str) -> ProtocolException:
+    """The refusal of an upload of a folder, in the one sentence every door of it says."""
+    return ProtocolException(
+        "set_input_files with a folder (%s) is not supported: the engine "
+        "takes files, so pass the files inside it instead" % what)
+
+
+def _streamed_file(server: "JugglerServer", channel: Any) -> str:
+    """The path of the file a `streams` entry of `setInputFiles` names: a `WritableStream` this server made and the client closed."""
+    guid = channel.get("guid") if isinstance(channel, dict) else None
+    stream = server._objects.get(guid)
+    if not isinstance(stream, WritableStreamDispatcher):
+        raise ProtocolException(
+            "set_input_files names a stream (%r) that this server did not make, or that is gone" % (guid,))
+    if not stream.closed:
+        raise ProtocolException(
+            "the stream %s is not closed: the client has not finished copying the file, and the page would read half of it" % guid)
+    return stream.path
+
+
+#: Names a Windows file system opens as a DEVICE, not a file (`CON`, `NUL`, `COM1`...), with or without an extension.
+_WINDOWS_DEVICES = frozenset(["CON", "PRN", "AUX", "NUL"] + ["COM%d" % n for n in range(1, 10)] + ["LPT%d" % n for n in range(1, 10)])
+_BACKSLASH, _NUL = chr(92), chr(0)
+
+
+def _upload_file_name(name: Any) -> str:
+    """The name a client gave a file it streams, if and only if it is ONE file name.
+
+    ⛔ THE NAME IS WHAT A CLIENT CHOSE, and it is joined to a folder of this machine. `stage_upload` reduces a payload's name to its last component
+    and writes it; here the name is REFUSED when it is anything else, because a path that is not a bare name is a client that means something
+    other than "a file called this" (a folder, a way out of the call's folder), and writing it somewhere is the wrong answer to that.
+    """
+    if not isinstance(name, str) or not name:
+        raise ProtocolException("a streamed file needs a name: the page reads it as File.name")
+    bad = (name in (".", "..") or "/" in name or _BACKSLASH in name or _NUL in name
+           or os.path.isabs(name) or os.path.splitdrive(name)[0] != "")
+    if os.name == "nt":
+        bad = (bad or ":" in name or name[-1] in ". "
+               or name.split(".")[0].rstrip(" ").upper() in _WINDOWS_DEVICES)
+    if bad:
+        raise ProtocolException(
+            "the name %r of a streamed file is not a file name: it must be one name, with no folder, no drive and no '..' in it" % name)
+    return name
 
 
 #: The four numbers JSON cannot carry, as the engine names them in a
@@ -4033,11 +4085,21 @@ class PageDispatcher(Dispatcher):
         a field, which is the shape of thing that is right until the first
         `<input multiple>`.
         """
+        def dropped(why: str) -> None:
+            # ⛔ A CHOOSER THAT CANNOT BE ANNOUNCED LEAVES A TRACE, whatever the reason. The client waits for an event nobody will send and ends on
+            # its own timeout, saying nothing of why; `handler_errors` is where this repository keeps a dropped event (the adoption of a
+            # target does the same), and the four exits below were bare `return`s: the only ones of this function that left nothing.
+            conn = self.conn
+            if len(conn.handler_errors) < 32:
+                conn.handler_errors.append("fileChooser: %s" % why)
+
         try:
             element = params.get("element") or {}
             object_id = element.get("objectId")
             context_id = params.get("executionContextId")
             if not object_id or not context_id:
+                dropped("the engine's event names no %s: %r" % (
+                    "element" if not object_id else "execution context", params))
                 return
             frame_id = self.injected.frame_of_context(context_id)
             if not frame_id:
@@ -4045,9 +4107,11 @@ class PageDispatcher(Dispatcher):
                 # the wrong frame's world answers about a different document.
                 # Saying nothing loses the event; saying the wrong thing loses
                 # the trust in every event.
+                dropped("execution context %s belongs to no frame this page knows" % context_id)
                 return
             adopted = self.injected.adopt(frame_id, object_id)
             if not adopted:
+                dropped("the input %s could not be adopted into frame %s" % (object_id, frame_id))
                 return
             frame = self.frame_for(frame_id)
             handle = ElementHandleDispatcher(self.server, frame, adopted,
@@ -4058,9 +4122,7 @@ class PageDispatcher(Dispatcher):
             self.emit("fileChooser", {"element": handle.channel,
                                       "isMultiple": multiple})
         except Exception as failure:
-            conn = self.conn
-            if len(conn.handler_errors) < 32:
-                conn.handler_errors.append("fileChooser: %s" % failure)
+            dropped(str(failure))
 
     def frame_for(self, frame_id: str) -> "FrameDispatcher":
         """The dispatcher for a frame of this page, made on first sight.
@@ -4881,6 +4943,71 @@ class StreamDispatcher(Dispatcher):
             pass
 
 
+class WritableStreamDispatcher(Dispatcher):
+    """One file a remote client copies INTO this machine: what `set_input_files` with a path does over `connect`.
+
+    A stock client on a remote connection cannot hand the server a path (it is a path of ITS disk): `createTempFiles` made one of these per
+    file, the client sends the bytes in `write` chunks (base64) and ends with `close`, and the upload then names the stream
+    (`_upload_paths`, `streams`). The file is in the call's folder (`BrowserContextDispatcher.op_create_temp_files`), under the name
+    the client gave, and `close` sets its mtime to the client's `lastModifiedMs`, which is what the page reads as `File.lastModified`.
+
+    ⛔ CLOSED IS FINAL. A `write` after `close`, or a second `close`, is refused by name: the file is what the page may already be reading, and
+    an `open(..., "wb")` again would empty it. The folder is NOT this object's to remove (a stream that the registry lets go of, by its
+    bucket's limit, must not take the file from an input that holds it): it closes the handle, and the context removes the folder.
+    """
+
+    TYPE = "WritableStream"
+    METHODS = {"write": "op_write", "close": "op_close"}
+
+    def __init__(self, server, parent, path: str, last_modified_ms: Any) -> None:
+        self.path = path
+        self._last_modified_ms = last_modified_ms
+        self._io = threading.Lock()
+        self._state = "open"
+        self._file = open(path, "wb")
+        super().__init__(server, parent, {})
+
+    @property
+    def closed(self) -> bool:
+        return self._state == "closed"
+
+    def op_write(self, params: Dict) -> Any:
+        try:
+            chunk = base64.b64decode(params.get("binary") or "", validate=True)
+        except (ValueError, TypeError) as bad:
+            raise ProtocolException("a chunk of a streamed file is base64, and this one is not: %s" % bad)
+        with self._io:
+            if self._state != "open":
+                raise ProtocolException("the stream of %r is closed: a file is written once" % os.path.basename(self.path))
+            self._file.write(chunk)
+        return None
+
+    def op_close(self, params: Dict) -> Any:
+        with self._io:
+            if self._state != "open":
+                raise ProtocolException("the stream of %r is closed already" % os.path.basename(self.path))
+            self._file.close()
+            self._state = "closed"
+        if self._last_modified_ms is not None:
+            stamp = int(self._last_modified_ms) * 1_000_000
+            os.utime(self.path, ns=(stamp, stamp))
+        return None
+
+    def release_file(self) -> None:
+        """Let go of the open handle, and of nothing else: a Windows folder cannot be removed while a file of it is open."""
+        with self._io:
+            if self._state == "open":
+                self._state = "abandoned"
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+
+    def released(self) -> None:
+        """⛔ ALSO WHEN A PARENT'S DISPOSE FORGETS IT (a client that drops in the middle of the copy: its context closes and the stream goes with it)."""
+        self.release_file()
+
+
 class ArtifactDispatcher(Dispatcher):
     """One download, as Playwright's server has it (`server/artifact.ts`).
 
@@ -4985,11 +5112,15 @@ class BrowserContextDispatcher(Dispatcher):
         "setStorageState": "op_set_storage_state",
         "setNetworkInterceptionPatterns": "op_set_interception",
         "setWebSocketInterceptionPatterns": "op_set_ws_interception",
+        "createTempFiles": "op_create_temp_files",
     }
 
     def __init__(self, server, browser: "BrowserDispatcher", options: Dict,
                  context_id: Optional[str]) -> None:
         self.browser = browser
+        #: The folders of this context's `createTempFiles` calls, removed when it ends (`released`).
+        self._upload_folders: List[str] = []
+        self._upload_folders_lock = threading.Lock()
         self.options = options
         #: `None` is the DEFAULT context - userContextId 0, the one whose
         #: cookies and storage are the profile's. It is what a persistent
@@ -5087,6 +5218,61 @@ class BrowserContextDispatcher(Dispatcher):
         forget = getattr(self.browser, "_forget_downloads_of", None)
         if forget is not None:
             forget(self.context_id)
+        self._remove_upload_folders()
+
+    def op_create_temp_files(self, params: Dict) -> Any:
+        """The streams a client on a remote connection copies its files into (`set_input_files` with a path, over `connect`).
+
+        The answer is the stock server's (`BrowserContext.createTempFiles`, playwright 1.61.0): `writableStreams`, one per item and in the item's order,
+        and `rootDir` only when the client named a folder - which is refused here, as `set_input_files` refuses a folder everywhere.
+
+        ⛔ ONE NEW FOLDER PER CALL, in the session's upload area (the one `stage_upload` uses), and one file per item in it, under the name the client
+        gave (the page reads it as `File.name`; a second call with the same name must not overwrite the first, which an input may still hold).
+        EVERY NAME IS CHECKED BEFORE ANYTHING IS MADE: a refused call leaves no folder.
+
+        ⛔ THE FOLDER LIVES AS LONG AS THIS CONTEXT, not as long as the call: a page reads an uploaded file when it submits it, which can be minutes
+        after `set_input_files` returned. It goes in `released`, which every end of a context passes - its own `close`, and the close that
+        `RemoteEndpoint._client_gone` does for a client that dropped in the middle of a copy.
+        """
+        if params.get("rootDirName"):
+            raise _folder_refused(params["rootDirName"])
+        items = params.get("items") or []
+        names = [_upload_file_name(item.get("name")) for item in items]
+        for n, name in enumerate(names):
+            if name in names[:n]:
+                raise ProtocolException(
+                    "two files of one upload have the same name (%r): the page would read one of them twice" % name)
+        folder = tempfile.mkdtemp(dir=self.server.upload_root())
+        with self._upload_folders_lock:
+            self._upload_folders.append(folder)
+        streams: List[WritableStreamDispatcher] = []
+        try:
+            for name, item in zip(names, items):
+                streams.append(WritableStreamDispatcher(self.server, self, os.path.join(folder, name), item.get("lastModifiedMs")))
+        except Exception:
+            for stream in streams:
+                stream.release_file()
+            self._remove_upload_folders(folders=[folder])
+            raise
+        return {"writableStreams": [stream.channel for stream in streams]}
+
+    def _remove_upload_folders(self, folders: Optional[List[str]] = None) -> None:
+        """Remove the folders of `createTempFiles` calls - all of them, or the ones named - after closing the files still open in them.
+
+        ⛔ THE HANDLES FIRST: this runs before the registry lets go of the streams (`Dispatcher.dispose` calls the parent's `released` first), and a
+        Windows folder with an open file in it does not go. Closing all the context's streams is for the end of the context; a call that failed
+        half way closes its own (`op_create_temp_files`).
+        """
+        with self._upload_folders_lock:
+            ending = folders is None
+            folders = list(self._upload_folders) if ending else folders
+            self._upload_folders = [f for f in self._upload_folders if f not in folders]
+        if ending:
+            for stream in self.server.descendants_of(self):
+                if isinstance(stream, WritableStreamDispatcher):
+                    stream.release_file()
+        for folder in folders:
+            remove_profile(folder)
 
     def op_context_init_script(self, params: Dict) -> Any:
         """The same, for every page of this context - present and future.
@@ -6703,15 +6889,35 @@ class JugglerServer(Server):
         if not name:
             raise ProtocolException(
                 "a file payload needs a name: the page reads it as File.name")
-        root = getattr(self, "_upload_root", None)
-        if root is None:
-            root = tempfile.mkdtemp(prefix="invisible_upload_")
-            self._upload_root = root
-            self.after_reapers(lambda: remove_profile(root))
-        path = os.path.join(tempfile.mkdtemp(dir=root), name)
+        path = os.path.join(tempfile.mkdtemp(dir=self.upload_root()), name)
         with open(path, "wb") as out:
             out.write(base64.b64decode(payload.get("buffer") or ""))
         return path
+
+    #: Guards the making of the upload area: two uploads that arrive together on a new session must find ONE folder.
+    _upload_lock = threading.Lock()
+
+    def upload_root(self) -> str:
+        """The folder this session stages every uploaded file in (a payload, a stream of `createTempFiles`), made on first use and removed with the session.
+
+        ONE AREA, ONE OWNER OF ITS END: `after_reapers` removes it when the session ends. What a context made inside it (the folder of a
+        `createTempFiles` call) it removes itself, when it closes (`BrowserContextDispatcher.released`).
+        """
+        with self._upload_lock:
+            root = getattr(self, "_upload_root", None)
+            if root is None:
+                root = tempfile.mkdtemp(prefix="invisible_upload_")
+                self._upload_root = root
+                self.after_reapers(lambda: self._remove_upload_root(root))
+            return root
+
+    def _remove_upload_root(self, root: str) -> None:
+        """The end of the session: the files a client was still copying are closed first (a Windows folder with an open file in it does not go)."""
+        with self._lock:
+            streams = [o for o in self._objects.values() if isinstance(o, WritableStreamDispatcher)]
+        for stream in streams:
+            stream.release_file()
+        remove_profile(root)
 
     def handle_root(self, method: str, params: Dict) -> Any:
         name = self.METHODS.get(method)
