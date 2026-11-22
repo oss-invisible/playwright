@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>opened</title>
+<script>
+document.write('<script src="/ab/realm.js' + location.search + '"><\/script>');
+</script>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const data = await abRealm();
+  const bar = n => { try { return window[n].visible; } catch (e) { return 'ERR'; } };
+  data.geometry = {innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY, screen: [screen.width, screen.height, screen.availWidth, screen.availHeight],
+                   bars: ['menubar', 'toolbar', 'locationbar', 'statusbar', 'scrollbars', 'personalbar'].map(bar), hasOpener: !!window.opener, name: window.name};
+  try { opener.postMessage({id: q.get('id'), data}, '*'); } catch (e) {}
+})();
+</script>

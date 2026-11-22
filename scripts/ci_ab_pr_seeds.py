@@ -28,7 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SHARED = ("scripts/ci_ab_oracle.py", "scripts/ci_ab_pr_seeds.py", "scripts/persona_cover.py", "ci/persona-seeds.json")
 #: variable -> (oracle, seeds by default on a pull request that does not touch it, the files of the oracle: exact paths or fnmatch patterns).
 ORACLES = {
-    "AB_ORACLE_PR_SEEDS": ("page", 2, SHARED + ("scripts/ci_host_gate.py", "scripts/host_gate/*", "tests/test_ab_oracle*")),
+    "AB_ORACLE_PR_SEEDS": ("page", 2, SHARED + ("scripts/ci_host_gate.py", "scripts/ci_poison_host.py", "scripts/host_gate/*", "tests/test_ab_oracle*", "tests/test_ci_host_gate*",
+                                      "tests/test_ci_poison_host.py")),
     "AB_NETWORK_PR_SEEDS": ("network", 1, SHARED + ("scripts/ci_ab_network.py", "ci/ab-network-volatile.json", "tests/test_ab_network*")),
     "AB_HOST_PR_SEEDS": ("host", 2, SHARED + ("scripts/ci_ab_host.py", "tests/_strace_stand_in.py", "ci/ab-host-expected.json", "tests/test_ab_host*")),
 }

@@ -14,6 +14,12 @@ DPR. Like the network and host oracles, it has two modes, told by whether there 
 The only differences either comparison lets through are the `noise` entries of scripts/host_gate/exceptions.json and the diag. keys. The verdict is the pytest result; the files (dump-68.json,
 dump-68-again.json, diff-a-a.json and, with a candidate, dump-candidate.json and diff.json) and the log are the evidence.
 
+Two more things the comparison cannot say are held here (`_check_ab_visit_and_poison`). The oracle's dumps carry the ab. leaves (scripts/ci_host_gate.py): the poison probe of the page on every
+seed and, on seeds 0 and 63, the extra visit of every realm and window a page can make; seed 63 must differ from seed 0 on at least AB_CONTROL_MIN of them (the count is in ab-control.json and the log).
+On the gate's leg the host is POISONED (scripts/ci_poison_host.py: another zone, language, colour scheme, a user-installed canary font and, on Linux, a null audio sink at 96000 Hz with 6 channels;
+AB_ORACLE_POISON=1): the poison is in force, Playwright's own Firefox read it (poison-control.json, written by the leg's step before this test; not read: BROKEN CONTROL), and neither engine read any of
+it (the dumps say what the persona declares).
+
 Not skipped on a machine without a candidate: a skipped test is a red one in the judge, and an oracle that did not run says nothing.
 """
 from __future__ import annotations
@@ -31,6 +37,8 @@ pytestmark = pytest.mark.e2e
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_oracle.py"
 sys.path.insert(0, str(ROOT / "scripts"))
+import ci_host_gate as gate  # noqa: E402
+import ci_poison_host as poison  # noqa: E402
 from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 import ci_ab_oracle as ab  # noqa: E402
 
@@ -73,6 +81,40 @@ BUDGET_S = budget_s(*plan())
 TIMEOUT_S = BUDGET_S
 
 
+def _items_by_seed(path: Path) -> dict:
+    return {v["seed"]: v["items"] for v in json.loads(path.read_text(encoding="utf-8"))["visits"]}
+
+
+def _check_ab_visit_and_poison(out: Path, candidate: bool) -> None:
+    """What the oracle's comparison cannot say. The ab visit ran where it was due and read something (a page that dumped nothing would pass
+    any A/B), and seed 63 reads other values than seed 0 (the control of the ab leaves; the measured count goes to ab-control.json and the log).
+    On a poisoned host (the gate's leg: AB_ORACLE_POISON=1) the poison is in force, the negative control of stock Firefox read it, and neither
+    engine read any of it: its dumps hold the identity the core declares."""
+    published = out / "dump-68.json"
+    dumps = [("the published engine", published)] + ([("the candidate", out / "dump-candidate.json")] if candidate else [])
+    problems = []
+    for name, path in dumps:
+        problems += ["%s: %s" % (name, line) for line in gate.ab_coverage(_items_by_seed(path))]
+    assert not problems, "the ab visit did not read:\n" + "\n".join(problems)
+    control = gate.ab_control(_items_by_seed(published))
+    (out / "ab-control.json").write_text(json.dumps(control, sort_keys=True), encoding="utf-8")
+    with open(out / "oracle.log", "a", encoding="utf-8") as log:
+        log.write(control["line"] + "\n")
+    assert control["status"] != "too_few", control["line"] + " (the sample: %s)" % control.get("sample")
+    if os.environ.get(poison.SWITCH) != "1":
+        return
+    not_in_force = poison.verify_here(expect_env=True)
+    assert not not_in_force, "the host is not poisoned, the oracle ran on a clean machine:\n" + "\n".join(not_in_force)
+    control_file = out / "poison-control.json"
+    assert control_file.is_file(), "BROKEN CONTROL: stock Firefox did not read the poison on this runner (no poison-control.json)"
+    verdict = json.loads(control_file.read_text(encoding="utf-8"))
+    assert verdict.get("verdict") == "green", "BROKEN CONTROL: " + json.dumps(verdict.get("failures"))
+    read = []
+    for name, path in dumps:
+        read += ["%s: %s" % (name, line) for line in poison.dump_findings(json.loads(path.read_text(encoding="utf-8")))]
+    assert not read, "the engine read the poisoned host:\n" + "\n".join(read)
+
+
 def _out(tmp_path: Path) -> Path:
     explicit = os.environ.get("AB_ORACLE_OUT")
     if explicit:
@@ -113,11 +155,12 @@ def test_the_published_engine_repeats_itself_and_the_candidate_gives_the_same_by
     assert control["verdict"] == "green" and control["differences"] == [] and control["problems"] == [] and len(control["compared"]) == len(control["visits"]) >= 1
     assert len(control["visits"]) == len(visits), "every seed of the shard is visited: %s" % control["visits"]
     assert sorted(control["relaunch"]) == sorted(ab.visit_name(*key) for key in ab.relaunch_visits(visits)), "seed 0 is launched twice on one profile, whichever shard has it"
-    names = sorted(p.name for p in out.glob("*.json"))
+    _check_ab_visit_and_poison(out, candidate)
+    names = sorted(p.name for p in out.glob("*.json") if not p.name.startswith("poison-"))
     if candidate:
         diff = json.loads((out / "diff.json").read_text(encoding="utf-8"))
         assert diff["verdict"] == "green" and diff["differences"] == [] and diff["problems"] == []
         assert len(diff["visits"]) >= 1 and len(diff["compared"]) == len(diff["visits"]), "every visit asked for is compared: %s" % diff["visits"]
-        assert names == ["diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
+        assert names == ["ab-control.json", "diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
     else:
-        assert names == ["diff-a-a.json", "dump-68-again.json", "dump-68.json"]
+        assert names == ["ab-control.json", "diff-a-a.json", "dump-68-again.json", "dump-68.json"]

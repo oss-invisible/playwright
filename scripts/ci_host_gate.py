@@ -41,6 +41,10 @@ legitimately differ on them and the retail reference does not record them.
 compare() skips them by name; dump() prints them into the job log, so a run
 tells why without its artifacts being downloaded.
 
+Values under the ab. prefix are read for the A/B oracle: what a page reads of values a host may hold and the engine must never read
+(ab.poison, with scripts/ci_poison_host.py) and, on the oracle's visits of seeds 0 and 63, the surfaces of every realm and window a page
+can make (ab_visit). compare() skips them by name, as it skips diag.: the A/B compares them between the two engines.
+
 Values under the state. prefix are the window in the states a page can drive
 it to: state.normal, state.fullscreen (entered through a real click, a user
 gesture) and state.after_fullscreen. The dump measures them after the page is
@@ -71,6 +75,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, NamedTuple
+from urllib.parse import parse_qs, urlsplit
 
 HERE = Path(__file__).resolve().parent / "host_gate"
 PAGE = HERE / "host_gate_page.html"
@@ -103,6 +108,16 @@ def relaunch_items(items: dict) -> dict:
 
 def is_diag(key: str) -> bool:
     return key.startswith(DIAG)
+
+
+#: Keys under this prefix are read for the A/B oracle (scripts/ci_ab_oracle.py compares them between two engines on one machine). The host gate
+#: does not hold them to either of its properties: the retail reference does not record them, and they are made on the oracle's machine
+#: (a poisoned host, a launch in another locale), not on the gate's.
+AB = "ab."
+
+
+def is_ab(key: str) -> bool:
+    return key.startswith(AB)
 
 
 def diag_lines(items: dict, before: dict | None = None) -> list:
@@ -440,11 +455,12 @@ def second_launch(options: dict, port: int, dpr: float, timeout_ms: int, read=No
 
 
 def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 180_000,
-         visits: list | None = None, pin_dpr: bool = True, relaunch_seeds: tuple = ()) -> int:
+         visits: list | None = None, pin_dpr: bool = True, relaunch_seeds: tuple = (), ab: bool = False) -> int:
     """`visits` is [(dpr, seed)] (default: every seed of SEEDS at every DPR of DPRS, the DPR pinned). With pin_dpr
     False the DPR is not pinned: it is the one the seed's persona has, and `dpr` of a visit only names the file and
     the page's query. A seed of `relaunch_seeds` is visited once more, launched twice on one profile folder, and the
-    items of that second launch are added to the visit under RELAUNCH (the visit's own items stay those of a fresh profile)."""
+    items of that second launch are added to the visit under RELAUNCH (the visit's own items stay those of a fresh profile).
+    With `ab`, the seeds of AB_SEEDS also get the extra visit of the A/B oracle (ab_visit): its leaves join the visit's items."""
     out.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -465,6 +481,8 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
                     return 2
                 result["items"].update(relaunch_items(again["items"]))
                 print("second launch of seed %d on a reused profile: %d items" % (seed, len(again["items"])))
+            if ab and seed in AB_SEEDS:
+                result["items"].update(ab_visit(firefox, seed, zone, dpr if pin_dpr else None))
             path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
             path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
                             encoding="utf-8")
@@ -481,6 +499,165 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     finally:
         server.shutdown()
     return 0
+
+
+# -
+# The A/B oracle's extra visit: every realm and every kind of window a page can make, in a launch of another locale and in a context of yet
+# another, on seeds 0 and 63. Its leaves are under ab. (see is_ab): scripts/ci_ab_oracle.py compares them between the two engines. It is a
+# separate launch per seed, with its own server and its own functions: nothing here changes how the visits above are made.
+#
+# Seed 63 is the CONTROL of seed 0: an identity that is not seed 0's must read other values, so the same block on both must differ on at least
+# AB_CONTROL_MIN ab. leaves (ab_control). A block that answered the same for two identities would pass an engine that ignores the identity.
+
+AB_DIR = HERE / "ab"
+AB_SEEDS = (0, 63)
+AB_LAUNCH_LOCALE = "ja-JP"
+#: (name of the context, what the context is made with). The first is the launch's own default context (locale ja-JP); the second overrides
+#: both the language and the zone.
+AB_CONTEXTS = (("launch", {}), ("context", {"locale": "de-DE", "timezone_id": "America/Lima"}))
+AB_BUDGET_MS = 240_000
+#: How many ab. leaves seed 63 must differ from seed 0 on. PROVISIONAL, from the core's prefs and not from a run: the two personas differ in their core
+#: count (12 and 32), their GPU, their screen and their DPR, so hardwareConcurrency alone differs in every realm that must have read (top, cross-site
+#: iframe, srcdoc iframe, worker, in each of the 2 contexts: 8 leaves) and the page-read GPU, the screen and the canvas leaves come on top of them.
+#: The first run on GitHub prints the measured count (ab_control's line in the oracle's log, and ab-control.json): this number then moves to a safe
+#: fraction of it, written here with the run it came from.
+AB_CONTROL_MIN = 8
+AB_CONTROL_NAMESPACES = tuple("%s%s." % (AB, name) for name, _ in AB_CONTEXTS)
+
+_AB_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+#: A one-pixel GIF: what /ab/probe answers to a fetch and to an image alike.
+_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+
+
+class _AbSite(BaseHTTPRequestHandler):
+    """The site of the ab visit: the files of scripts/host_gate/ab, /ab/probe (a pixel) and /ab/seen (the Accept-Language the server saw,
+    per context, by kind of request: `<Sec-Fetch-Dest>:<path>` -> the sorted distinct values)."""
+
+    def _send(self, status, content_type, body):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlsplit(self.path)
+        ctx = (parse_qs(url.query).get("ctx") or [""])[0]
+        if url.path == "/ab/seen":
+            with self.server.ab_lock:
+                seen = {k: sorted(v) for k, v in self.server.ab_seen.get(ctx, {}).items()}
+            return self._send(200, "application/json", json.dumps(seen, sort_keys=True).encode())
+        if url.path.startswith("/ab/"):
+            with self.server.ab_lock:
+                kind = "%s:%s" % (self.headers.get("Sec-Fetch-Dest") or "none", url.path)
+                self.server.ab_seen.setdefault(ctx, {}).setdefault(kind, set()).add(self.headers.get("Accept-Language") or "<none>")
+        if url.path.startswith("/ab/probe"):
+            return self._send(200, "image/gif", _GIF)
+        name = url.path[len("/ab/"):] if url.path.startswith("/ab/") else ""
+        path = AB_DIR / name
+        if not name or "/" in name or "\\" in name or path.suffix not in _AB_TYPES or not path.is_file():
+            return self._send(404, "text/plain", b"not found")
+        return self._send(200, _AB_TYPES[path.suffix], path.read_bytes())
+
+    def log_message(self, *args):
+        pass
+
+
+def ab_options(firefox: str, seed: int, dpr: float | None, zone: str) -> dict:
+    """The launch of the ab visit: the host gate's own, in ja-JP."""
+    options = {"seed": seed, "binary_path": firefox, "headless": True, "show_cursor": False,
+               "locale": AB_LAUNCH_LOCALE, "timezone": zone}
+    if dpr is not None:
+        options["pin"] = {"screen.dpr": dpr}
+    return options
+
+
+def ab_items(context: str, result, back) -> dict:
+    """The items of one context of the ab visit: what the page recorded (ab.<context>.<step>...), what a page that came back from the history reads
+    again (ab.<context>.bfcache: whether it was restored from the back/forward cache is the engine's, not the identity's, and goes to diag.)."""
+    body = dict(result) if isinstance(result, dict) else {"result": result}
+    body["bfcache"] = back.get("data") if isinstance(back, dict) else back
+    return {AB + context: body, DIAG + AB + context: {"bfcache_persisted": back.get("persisted") if isinstance(back, dict) else None}}
+
+
+def ab_visit(firefox: str, seed: int, zone: str, dpr: float | None = None, timeout_ms: int = AB_BUDGET_MS) -> dict:
+    """Launch `firefox` with the seed in ja-JP, and read the ab site in its default context and in a context of de-DE and America/Lima;
+    returns {key: value} to add to the visit's items."""
+    from invisible_playwright import InvisiblePlaywright
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _AbSite)
+    server.ab_seen, server.ab_lock = {}, threading.Lock()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d/ab/" % server.server_address[1]
+    items = {}
+    try:
+        with InvisiblePlaywright(**ab_options(firefox, seed, dpr, zone)) as browser:
+            for name, options in AB_CONTEXTS:
+                context = browser.new_context(**options)
+                try:
+                    page = context.new_page()
+                    page.goto(base + "surfaces.html?ctx=" + name, timeout=timeout_ms)
+                    page.wait_for_function("document.title === 'ab-done'", timeout=timeout_ms)
+                    result = page.evaluate("window.__abResult")
+                    # away and back: the page that comes back reads again (pageshow), restored from the cache or loaded anew
+                    page.goto(base + "leave.html?ctx=" + name, timeout=timeout_ms)
+                    page.go_back(timeout=timeout_ms)
+                    page.wait_for_function("window.__abBf && window.__abBf.n >= 2", timeout=timeout_ms)
+                    back = page.evaluate("window.__abBf")
+                finally:
+                    context.close()
+                items.update(ab_items(name, result, back))
+    finally:
+        server.shutdown()
+        server.server_close()
+    return items
+
+
+def ab_control(items_by_seed: dict, seeds: tuple = AB_SEEDS, minimum: int | None = None) -> dict:
+    """The control of the ab visit: on how many leaves of the ab visit seeds[1] differs from seeds[0]. `items_by_seed` maps a seed to its items.
+    Returns {"status": "ok"|"too_few"|"not_visited", "differing", "compared", "minimum", "line"}; not_visited (a run that did not visit both,
+    the pull request's two seeds) is said, and the caller decides whether that is allowed."""
+    minimum = AB_CONTROL_MIN if minimum is None else minimum
+    a, b = seeds
+    mine = {}
+    for seed in seeds:
+        items = items_by_seed.get(seed)
+        mine[seed] = None if items is None else {k: v for k, v in leaves(items).items() if k.startswith(AB_CONTROL_NAMESPACES)}
+    if not mine[a] or not mine[b]:
+        missing = [s for s in seeds if not mine[s]]
+        return {"status": "not_visited", "differing": None, "compared": None, "minimum": minimum,
+                "line": "ab control: seed %s has no ab. leaves in this run" % " and ".join(map(str, missing))}
+    keys = sorted(set(mine[a]) | set(mine[b]))
+    differing = [k for k in keys if mine[a].get(k, "<missing>") != mine[b].get(k, "<missing>")]
+    status = "ok" if len(differing) >= minimum else "too_few"
+    return {"status": status, "differing": len(differing), "compared": len(keys), "minimum": minimum, "sample": differing[:12],
+            "line": "ab control: seed %d differs from seed %d on %d of %d ab. leaves (at least %d are required)%s"
+                    % (b, a, len(differing), len(keys), minimum, "" if status == "ok" else ": an identity that is not seed %d's read the same" % a)}
+
+
+#: The steps of the ab visit that must have read something in every context: a realm that answers `timeout` or an error says the page did not
+#: read, and an A/B of two such answers compares nothing. The others (the service worker, the audio worklet, the popups) may be missing on a
+#: host that has none of it; what they answered is compared like any leaf.
+AB_REQUIRED_STEPS = ("top", "iframe_cross", "iframe_srcdoc", "worker", "accept_language")
+
+
+def ab_coverage(items_by_seed: dict, seeds: tuple = AB_SEEDS) -> list:
+    """What is missing from the ab visit of the seeds of this run that have one: [problem]. A seed of `seeds` that the run visited without an
+    ab visit, a context without its leaves, and a required step that did not read a dict are problems."""
+    problems = []
+    for seed in seeds:
+        items = items_by_seed.get(seed)
+        if items is None:
+            continue
+        for name, _ in AB_CONTEXTS:
+            body = items.get(AB + name)
+            if not isinstance(body, dict):
+                problems.append("seed %d: no %s%s leaves (the ab visit did not run, or the page recorded none)" % (seed, AB, name))
+                continue
+            for step in AB_REQUIRED_STEPS:
+                if not isinstance(body.get(step), dict):
+                    problems.append("seed %d %s%s.%s: %s" % (seed, AB, name, step, json.dumps(body.get(step))[:160]))
+    return problems
 
 
 # -
@@ -547,7 +724,7 @@ def compare(dumps: Path, reference: Path, exceptions: dict, notes: list | None =
     for path in sorted(dumps.glob("*.json")):
         d = json.loads(path.read_text(encoding="utf-8"))
         items = d["result"]["items"]
-        visits[(d["leg"], d["dpr"], d["seed"])] = {k: v for k, v in leaves(items).items() if not is_diag(k)}
+        visits[(d["leg"], d["dpr"], d["seed"])] = {k: v for k, v in leaves(items).items() if not is_diag(k) and not is_ab(k)}
         # the invariants: every leg, every visit, every state; no exception and no reference applies
         failures += invariant_lines("%s dpr %s seed %d" % (d["leg"], d["dpr"], d["seed"]), items)
     if not visits:
@@ -559,7 +736,7 @@ def compare(dumps: Path, reference: Path, exceptions: dict, notes: list | None =
         items = reference_items(reference, dpr)
         if items is None:
             return ["no retail reference for dpr %s in %s" % (dpr, reference)]
-        refs[dpr] = {k: v for k, v in leaves(items).items() if not is_diag(k)}
+        refs[dpr] = {k: v for k, v in leaves(items).items() if not is_diag(k) and not is_ab(k)}
         pending[dpr] = tuple(p for p in REFERENCE_PENDING if not any(k.startswith(p) for k in refs[dpr]))
         for p in pending[dpr]:
             if notes is not None:
@@ -641,6 +818,8 @@ def main(argv=None) -> int:
     d.add_argument("--reference", type=Path, default=REFERENCE)
     d.add_argument("--visit", action="append", metavar="SEED:DPR",
                    help="visit this seed (repeatable; default: the host gate's own seeds at its own DPRs)")
+    d.add_argument("--ab", action="store_true",
+                   help="the seeds of AB_SEEDS also get the A/B oracle's extra visit (ab. leaves)")
     d.add_argument("--no-pin", action="store_true",
                    help="do not pin the DPR: the seed's persona has its own (the DPR of --visit only names the file)")
     d.add_argument("--relaunch-seed", action="append", type=int, default=[], metavar="SEED",
@@ -654,7 +833,7 @@ def main(argv=None) -> int:
         if args.visit:
             visits = [(float(dpr), int(seed)) for seed, dpr in (v.split(":", 1) for v in args.visit)]
         return dump(args.firefox, args.leg, args.out, args.reference, visits=visits, pin_dpr=not args.no_pin,
-                    relaunch_seeds=tuple(args.relaunch_seed))
+                    relaunch_seeds=tuple(args.relaunch_seed), ab=args.ab)
     notes = []
     failures = compare(args.dumps, args.reference, load_exceptions(), notes)
     for n in notes:

@@ -281,6 +281,37 @@ await safe('surface.branding', () => Promise.all(['chrome://branding/locale/bran
 noise('history_length', history.length);
 noise('main_loop_ms', await new Promise(r => { const t = performance.now(); setTimeout(() => r(Math.round(performance.now() - t)), 20); }));
 
+// ================================================================= AB (read by the A/B oracle only, never by the retail comparison)
+// ab.poison: what the page reads of values a host may hold and the engine must never read: the zone, the language, the colour scheme, a
+// user-installed canary font (scripts/ci_poison_host.py puts them on the oracle's runner and holds the engine's dumps to the declared identity).
+// The probe between the two markers is self-contained: the negative control evaluates the same text in Playwright's own Firefox.
+// ab.poison:begin
+const abPoisonProbe = async () => {
+  const o = {}, f = (k, g) => { try { o[k] = g(); } catch (e) { o[k] = 'ERR ' + ((e && e.name) || ''); } };
+  const jan = new Date(Date.UTC(2026, 0, 15, 12)), jul = new Date(Date.UTC(2026, 6, 15, 12));
+  f('timezone', () => Intl.DateTimeFormat().resolvedOptions().timeZone);
+  f('offsets', () => [jan.getTimezoneOffset(), jul.getTimezoneOffset()]);
+  f('language', () => navigator.language);
+  f('languages', () => Array.from(navigator.languages));
+  f('intl_locale', () => Intl.DateTimeFormat().resolvedOptions().locale);
+  f('date_full', () => jan.toLocaleDateString(undefined, {dateStyle: 'full'}));
+  f('number', () => (1234567.891).toLocaleString());
+  f('dark', () => matchMedia('(prefers-color-scheme: dark)').matches);
+  // document.fonts.check answers true for a family nobody has (the specification: nothing to load), so it is recorded and the WIDTH decides
+  f('canary_check', () => document.fonts.check('12px ZZHostCanary'));
+  f('canary', () => {
+    const box = document.createElement('div'); box.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;white-space:nowrap';
+    document.documentElement.appendChild(box);
+    const width = fam => { const e = document.createElement('span'); e.style.cssText = 'font:12px ' + fam; e.textContent = 'mmmmmmmmmmmm'; box.appendChild(e); const w = e.getBoundingClientRect().width; e.remove(); return w; };
+    const out = {with: [width('ZZHostCanary, monospace'), width('ZZHostCanary, serif')], without: [width('monospace'), width('serif')]};
+    box.remove(); out.present = out.with[0] !== out.without[0] || out.with[1] !== out.without[1]; return out; });
+  try { const c = new AudioContext(); o.audio = {sampleRate: c.sampleRate, maxChannelCount: c.destination.maxChannelCount}; try { c.close(); } catch (e) {} }
+  catch (e) { o.audio = 'ERR ' + ((e && e.name) || ''); }
+  return o;
+};
+// ab.poison:end
+await safe('ab.poison', abPoisonProbe);
+
 // ================================================================= DIAG (information, never compared)
 // diag.*: why this host's WebGL is what it is (no WebGL2, no MSAA). Last, so its extra contexts
 // cannot disturb anything measured above; each is lost again once read.

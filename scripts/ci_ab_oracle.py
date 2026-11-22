@@ -15,6 +15,10 @@ seed runs at its OWN DPR (nothing is pinned):
      the archive against the seal and the engine against the seal);
   2. with the candidate binary the gate already holds, under its own seal.
 
+The dump also reads what the host gate's retail comparison leaves alone, the ab. leaves (ci_host_gate.is_ab): ab.poison on every seed (zone, language, colour scheme, a
+canary font and the audio context, which scripts/ci_poison_host.py holds to the declared identity on a poisoned host) and, on seeds 0 and 63, the extra visit of every realm and
+window a page can make (--ab; ci_host_gate.ab_visit). They are compared like every other leaf; the diag. ones are not.
+
 Then every leaf of every visit is compared. Everything must be equal. The only
 differences allowed are the `noise` entries of host_gate/exceptions.json (values that
 differ between two launches of one engine) and keys under the diag. prefix (what the
@@ -341,7 +345,7 @@ def run_dump(binary: str, seal: Path | None, leg: str, out: Path, visits: list |
     if visits is not None:
         if relaunch_visits(visits):
             cmd += ["--relaunch-seed", str(RELAUNCH_SEED)]
-        cmd += ["--no-pin"] + [a for dpr, seed in visits for a in ("--visit", "%d:%s" % (seed, dpr))]
+        cmd += ["--no-pin", "--ab"] + [a for dpr, seed in visits for a in ("--visit", "%d:%s" % (seed, dpr))]
     with tempfile.TemporaryDirectory(prefix="ab-oracle-cache-") as cache:
         return subprocess.run(cmd, env=own_cache_env(env, cache), timeout=DUMP_TIMEOUT_S).returncode
 

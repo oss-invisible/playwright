@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>frame</title>
+<script>
+document.write('<script src="/ab/realm.js' + location.search + '"><\/script>');
+</script>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const data = await abRealm();
+  data.host = location.hostname;
+  parent.postMessage({id: q.get('id'), data}, '*');
+})();
+</script>
