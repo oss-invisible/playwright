@@ -22,7 +22,7 @@ parameter (``%3A41039``); the random token of a page of the journey (``tok=``, t
 cookie are dropped. ci/ab-network-volatile.json lists the leaves that differ between two runs of ONE engine: each entry has the pattern of the leaf
 path, the reason, and the A/A run that proved it. The list is born from the A/A (``ab --a-a``, ``compare --a-a``), never written ahead of it, and it may only shrink: an
 entry that matches no leaf of a run is red as stale. An entry that is ``optional`` names a thing that may or may not have happened in a run (a resumption): when one of the two runs
-has nothing under it, what the other has is excused; when both have something, it is compared.
+has nothing under it, what the other has is excused; when both have something, it is compared; and a run that never has it on any seed while the other has it on some is red.
 
 THE POOL. What a connection and a request SAY is the engine's and is compared; how many connections there are, which one a request rode, its stream, the frames after the first
 request, a connection opened and never used, how many datagrams QUIC sent, and where in the journey a connection landed are the pool's and the timers', and are not compared as such
@@ -198,6 +198,31 @@ def _optional_leaves(patterns: List[str], la: Dict[str, Any], lb: Dict[str, Any]
     return out
 
 
+def _optional_invariants(patterns: List[str], la: Dict[str, Any], lb: Dict[str, Any], label_a: str, label_b: str) -> List[str]:
+    """What may not vanish in an optional owner: for each owner generalised over the seed (``https/h1/wire/resumed_connections`` of every seed), a run in which the thing
+    never happened on any seed, while the other run has it on some, is a problem: ticket timing decides WHICH launch of an origin resumes a connection, never whether the engine
+    resumes at all. An engine that stops resuming (or starts to) is red."""
+    problems: List[str] = []
+    for pattern in patterns:
+        seen: Dict[str, Dict[str, int]] = {}
+        for side, leaves in (("a", la), ("b", lb)):
+            for path in leaves:
+                owner = _owner(path, pattern)
+                if owner is None:
+                    continue
+                parts = owner.split("/")
+                general = "/".join(parts[:1] + ["*"] + parts[2:]) if len(parts) > 2 else owner
+                row = seen.setdefault(general, {"a": 0, "b": 0})
+                if path != owner:
+                    row[side] += 1
+        for general, row in sorted(seen.items()):
+            if (row["a"] > 0) != (row["b"] > 0):
+                has, lacks = (label_a, label_b) if row["a"] else (label_b, label_a)
+                problems.append("%s has something under %s on %d leaves and %s never has: a thing that may come and go with the timing must still happen in every run"
+                                % (has, general, max(row["a"], row["b"]), lacks))
+    return problems
+
+
 def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dict[str, str]], floor: int = 0,
                         label_a: str = "A", label_b: str = "B") -> Dict[str, Any]:
     """The verdict on two transcripts (the ``seeds`` of each, as ``run`` writes them).
@@ -213,6 +238,7 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     volatile_by_pattern = {e["pattern"]: e for e in volatile}
     excused = 0
     compared: List[str] = []
+    invariants = _optional_invariants([e["pattern"] for e in volatile if e.get("optional")], la, lb, label_a, label_b)
     optional = _optional_leaves([e["pattern"] for e in volatile if e.get("optional")], la, lb)
     for path in paths:
         hit = [e["pattern"] for e in volatile if not e.get("optional") and fnmatch.fnmatchcase(path, e["pattern"])]
@@ -240,11 +266,12 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     if len(compared) < floor:
         problems.append("only %d leaves were compared, fewer than the floor of %d: a run that saw less than it should passes anything" % (len(compared), floor))
     problems += ["a direct connection: " + d for d in direct]
+    problems += invariants
     problems += ["the volatile entry %r matches no leaf of either transcript: it is stale, drop it" % p for p in stale]
     problems += ["%s: %s %s | %s %s" % (d["path"], label_a, json.dumps(d["a"], sort_keys=True)[:160], label_b, json.dumps(d["b"], sort_keys=True)[:160])
                  for d in differences]
     return {"format": DIFF_FORMAT, "verdict": "red" if problems else "green", "problems": problems, "differences": differences, "leaves": len(compared),
-            "by_category": dict(sorted(by_category.items())), "excused": excused, "volatile": used, "stale": stale, "direct": direct, "floor": floor,
+            "by_category": dict(sorted(by_category.items())), "excused": excused, "volatile": used, "stale": stale, "direct": direct, "invariants": invariants, "floor": floor,
             "a": label_a, "b": label_b}
 
 
@@ -876,20 +903,13 @@ def phase_data(lab: Lab, phase: str) -> Dict[str, Any]:
             "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm), "requests": request_summary(lab.rec.of(phase, "http"), lab.norm)}
 
 
-def _leaving(event: Dict[str, Any]) -> bool:
-    """A request the page sends from its ``pagehide`` handler (a beacon and a keep-alive POST, ``t=pagehide`` in tests/fakeweb/journey_site.py)."""
-    return "t=pagehide" in event["target"]
-
-
 def step_data(lab: Lab, phase: str) -> Dict[str, Any]:
     """What the lab saw in ONE step of the journey: the HTTP requests of the tees and the datagrams. Not the CONNECTs and not the DNS questions: the lab cuts the journey into
     steps at the moment the driver moves on, and what the browser does on its own (a connection it opens or closes, a name it asks again when the 30 s of an answer are over)
     lands in the step that happens to be current, a different one in each run (A/A run 44946411675: the same CONNECT to ``journey-o.test`` in step 09 of one run and step 12
-    of the other). Those two are summarised over the whole journey instead (:func:`journey_data`). A request is the page's own act, driven by an event, and stays in its step,
-    except the ones the page sends as it leaves (``_leaving``): they are fired together by the ``pagehide`` of the page the driver is navigating away from, and reach the lab
-    while the driver is moving to the next step, so one of the pair lands in each step in some runs (A/A run 44982522362, Windows: ``POST A/beacon?t=pagehide&n=2`` in step 10
-    with ``n=1`` in step 11, in one run; both in step 11 in the other). They are summarised over the whole journey too, with their counts."""
-    return {"requests": request_summary([e for e in lab.rec.of(phase, "http") if not _leaving(e)], lab.norm), "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm)}
+    of the other). Those two are summarised over the whole journey instead (:func:`journey_data`). A request is the page's own act, driven by an event, and stays in its step."""
+    data = phase_data(lab, phase)
+    return {"requests": data["requests"], "udp": data["udp"]}
 
 
 def journey_data(lab: Lab) -> Dict[str, Any]:
@@ -900,8 +920,7 @@ def journey_data(lab: Lab) -> Dict[str, Any]:
     # The CONNECTs of the launch stage too: the connection to the DoH that the engine opens at start-up lands before the journey or in its first step (A/A run 44960767715,
     # Windows: one CONNECT in the launch stage of one run and none in the other).
     targets = [e["target"] for e in lab.rec.of("launch", "connect") + lab.rec.of("journey", "connect")]
-    leaving = [e for e in lab.rec.of("journey", "http") if _leaving(e)]
-    return {"connects": connect_summary(targets, lab.norm), "dns": dns_summary(queries), "leaving": request_summary(leaving, lab.norm)}
+    return {"connects": connect_summary(targets, lab.norm), "dns": dns_summary(queries)}
 
 
 def wire_summary(server: Any, phase: str, norm: Normalizer) -> Dict[str, Any]:
@@ -946,19 +965,6 @@ def _without(value: Any, *names: str) -> Any:
     return value
 
 
-#: The AEADs the ECH GREASE of the engine's TLS library draws from, one per connection: AES-128-GCM and ChaCha20-Poly1305 (A/A runs 44946411675 and 44982522362: 1 and 3 on every
-#: connection kind, resumed or not, both inside one run). Any other value is not that draw.
-GREASE_AEADS = (1, 3)
-
-
-def _grease(tls: Dict[str, Any]) -> Dict[str, Any]:
-    """``tls`` with the AEAD of its ECH GREASE written as what it is, a draw from ``GREASE_AEADS`` (``"1|3"``); a value outside them stays as it is and is a difference."""
-    ech = (tls.get("extensions") or {}).get("encrypted_client_hello")
-    if isinstance(ech, dict) and ech.get("aead") in GREASE_AEADS:
-        tls = dict(tls, extensions=dict(tls["extensions"], encrypted_client_hello=dict(ech, aead="|".join(str(a) for a in GREASE_AEADS))))
-    return tls
-
-
 def _resumed(tls: Dict[str, Any]) -> bool:
     return "pre_shared_key" in (tls.get("extensions") or {})
 
@@ -1001,9 +1007,8 @@ def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str
         if resumed:
             # the number of tickets a resumption offers is the pool's (which ticket was ready); what the ClientHello says around it is the engine's
             fingerprint["tls"] = _without(fingerprint["tls"], "identities")
-        if "tls" in fingerprint:
-            fingerprint["tls"] = _grease(fingerprint["tls"])
-        (resumptions if resumed else connections)[json.dumps(fingerprint, sort_keys=True)] = fingerprint
+        # the ECH GREASE AEAD is random per connection, fresh or resumed (ci/ab-network-volatile.json): it does not tell two fingerprints apart
+        (resumptions if resumed else connections)[json.dumps(_without(fingerprint, "aead"), sort_keys=True)] = fingerprint
 
     def regular_headers(headers: List[List[str]], marks: set) -> List[List[str]]:
         """The regular headers of a request; in a race the ones a transport adds on its own (``te: trailers`` on HTTP/2, ``alt-used`` on HTTP/3) are the connection's, not the request's."""

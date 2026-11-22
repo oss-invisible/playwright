@@ -187,7 +187,7 @@ def test_the_volatile_list_of_the_repository_is_well_formed_and_every_entry_name
     assert all(e["aa_run"].strip() and e["reason"].strip() for e in entries)
 
 
-def test_the_entries_of_the_repository_list_name_the_counts_of_connections_and_the_optional_resumptions_and_nothing_next_to_them():
+def test_the_entries_of_the_repository_list_name_the_counts_the_grease_aead_and_the_optional_resumptions_and_nothing_next_to_them():
     import fnmatch
 
     entries = ab.load_volatile()
@@ -196,10 +196,14 @@ def test_the_entries_of_the_repository_list_name_the_counts_of_connections_and_t
     assert sorted(owners) == ["seeds/*/h3/wire/resumed_connections", "seeds/*/https/*/wire/resumed_connections"]
     excused = lambda path: [q for q in patterns if fnmatch.fnmatchcase(path, q)]  # noqa: E731
     assert excused("seeds/0/journey/connects/counts/192.0.2.53:443") and excused("seeds/0/webrtc/connects/counts/192.0.2.53:443")
-    for kept in ("seeds/0/journey/connects/order/0", "seeds/0/journey/dns/order/0", "seeds/0/journey/leaving/POST A/beacon?t=pagehide&n=2/count", "seeds/0/journey/steps/01/requests/GET A//count",
-                 "seeds/0/journey/steps/01/requests/GET A//headers/0/1", "seeds/0/journey/steps/01/udp/counts/198.51.100.5:19302", "seeds/0/lab/launch/connects/order/0",
-                 "seeds/0/webrtc/connects/order/0", "seeds/0/h3/udp/order/0", "seeds/0/https/h2/wire/protocols/0", "seeds/0/https/h2/wire/connections/0/tls/extensions/server_name",
-                 "seeds/0/https/h2/wire/connections/0/tls/extensions/encrypted_client_hello/aead"):
+    ech = "/tls/extensions/encrypted_client_hello/"
+    for role in ("https/h2", "https/h1", "h3"):
+        for kind in ("connections", "resumed_connections"):
+            base = "seeds/0/%s/wire/%s/0%s" % (role, kind, ech)
+            assert excused(base + "aead") and not excused(base + "kdf") and not excused(base + "payload_length") and not excused(base + "type"), base
+    for kept in ("seeds/0/journey/connects/order/0", "seeds/0/journey/dns/order/0", "seeds/0/journey/steps/01/requests/GET A//count", "seeds/0/journey/steps/01/requests/GET A//headers/0/1",
+                 "seeds/0/journey/steps/01/requests/POST A/beacon?t=pagehide&n=2/count", "seeds/0/journey/steps/01/udp/counts/198.51.100.5:19302", "seeds/0/lab/launch/connects/order/0",
+                 "seeds/0/webrtc/connects/order/0", "seeds/0/h3/udp/order/0", "seeds/0/https/h2/wire/protocols/0", "seeds/0/https/h2/wire/connections/0/tls/extensions/server_name"):
         assert not excused(kept), kept
 
 
@@ -320,13 +324,12 @@ def test_the_error_scan_names_a_failure_of_the_run_and_not_the_text_a_page_answe
     assert ab.transcript_errors({"0": {"journey": {"steps": {"14": {"extra": {"error": "Wrong user or password."}}}}}}) == []
 
 
-def _journey_run(monkeypatch, connects_by_step, queries_by_step=None, leaving_by_step=None):
+def _journey_run(monkeypatch, connects_by_step, queries_by_step=None):
     """``ab.walk_journey`` with the driver replaced by a function that, in each step, makes the browser's connections and DNS questions arrive to the lab as the events that
     ``connects_by_step`` and ``queries_by_step`` say ({step: [target, ...]}); the requests of every step are the same."""
     from fakeweb import journey_site, profile_p4
 
     queries_by_step = queries_by_step or {}
-    leaving_by_step = leaving_by_step or {}
     with ab.Lab(journey=True, host="127.0.0.1") as lab:
         port_a = int(lab.origin_a.rsplit(":", 1)[1])
 
@@ -335,8 +338,6 @@ def _journey_run(monkeypatch, connects_by_step, queries_by_step=None, leaving_by
             for n in (1, 2, 3):
                 journey_site.STATE.set_step(n)
                 lab.rec.event("http", role="A", method="GET", target="/page%d" % n, headers=[["Host", "journey-a.test:%d" % port_a]], body_length=0)
-                for target in leaving_by_step.get(n, []):
-                    lab.rec.event("http", role="A", method="POST", target=target, headers=[["Host", "journey-a.test:%d" % port_a]], body_length=1)
                 for target in connects_by_step.get(n, []):
                     lab.rec.event("connect", target=target.replace("<A>", "127.0.0.1:%d" % port_a))
                 for name in queries_by_step.get(n, []):
@@ -355,7 +356,7 @@ def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the
     doh = "192.0.2.53:443"
     first = _journey_run(monkeypatch, {1: [doh, "<A>", doh], 3: ["<A>"]}, {1: ["journey-a.test"], 3: ["journey-a.test"]})
     second = _journey_run(monkeypatch, {1: [doh], 2: ["<A>", "<A>"], 3: [doh, doh]}, {1: ["journey-a.test"], 2: ["journey-a.test"]})
-    assert "order" not in first and set(first) == {"steps", "connects", "dns", "leaving"}
+    assert "order" not in first and set(first) == {"steps", "connects", "dns"}
     assert all(set(step) >= {"requests", "udp"} and "connects" not in step and "dns" not in step for step in first["steps"].values())
     assert first["connects"]["order"] == second["connects"]["order"] == [doh, "127.0.0.1:A"]
     assert first["dns"] == second["dns"] == {"order": ["journey-a.test"], "types": {"journey-a.test": [1]}}
@@ -373,20 +374,70 @@ def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the
     assert {"path": "seeds/11/journey/connects/order/2", "a": ab.MISSING, "b": "192.0.2.77:443"} in red["differences"]
 
 
-def test_what_the_page_sends_as_it_leaves_is_summarised_over_the_journey_because_the_pair_straddles_the_step_the_driver_moves_to(monkeypatch):
-    """A/A run 44982522362, Windows: `POST A/beacon?t=pagehide&n=2` in step 10 and `n=1` in step 11 in one run, both in step 11 in the other (51 leaves)."""
-    one = _journey_run(monkeypatch, connects_by_step={}, leaving_by_step={2: ["/beacon?t=pagehide&n=1", "/beacon?t=pagehide&n=2"]})
-    two = _journey_run(monkeypatch, connects_by_step={}, leaving_by_step={1: ["/beacon?t=pagehide&n=2"], 2: ["/beacon?t=pagehide&n=1"]})
-    assert one["leaving"] == two["leaving"] and set(one["leaving"]) == {"POST A/beacon?t=pagehide&n=1", "POST A/beacon?t=pagehide&n=2"}
-    assert all("pagehide" not in key for step in one["steps"].values() for key in step["requests"]) and "GET A/page2" in one["steps"]["02"]["requests"]
-    a, b = transcript(), transcript("b")
-    a["seeds"]["11"]["journey"], b["seeds"]["11"]["journey"] = one, two
-    assert compare(a, b)["verdict"] == "green"
-    three = _journey_run(monkeypatch, connects_by_step={}, leaving_by_step={2: ["/beacon?t=pagehide&n=1"]})
-    c = transcript("c")
-    c["seeds"]["11"]["journey"] = three
-    red = compare(a, c)
-    assert red["verdict"] == "red" and any("/journey/leaving/POST A/beacon?t=pagehide&n=2" in d["path"] for d in red["differences"]), "a beacon that is no longer sent is a difference"
+def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests_belong_to_the_step_that_closed_it(monkeypatch):
+    """A/A run 44982522362, Windows seed 6: the tab of step 10 is closed by the walk; its two pagehide requests reached the site after the walk had moved to step 11 in 19 launches
+    of 20, and before it in one (n=2 in step 10, n=1 in step 11). In every launch both were sent. The walk now goes on when the site has both."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from fakeweb import journey_site, profile_p4
+
+    state = journey_site.State()
+    monkeypatch.setattr(journey_site, "STATE", state)
+
+    class Tab:
+        url = "http://journey-o.test:1/partner/8"
+
+        def wait_for_load_state(self, *a, **k):
+            pass
+
+        def wait_for_selector(self, *a, **k):
+            pass
+
+        def inner_text(self, *a, **k):
+            return "Partner"
+
+        def close(self):
+            def leave():
+                time.sleep(0.3)
+                state.record(1, "POST", "/beacon", {"t": ["pagehide"], "n": ["1"]})
+                time.sleep(0.1)
+                state.record(1, "POST", "/beacon", {"t": ["pagehide"], "n": ["2"]})
+
+            threading.Thread(target=leave, daemon=True).start()
+
+    tab = Tab()
+    ctx = SimpleNamespace(expect_page=lambda: SimpleNamespace(__enter__=None), pages=[])
+
+    class Info:
+        value = tab
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    ctx.expect_page = lambda: Info()
+    journey = profile_p4.Journey.__new__(profile_p4.Journey)
+    journey.ctx, journey.extra = ctx, {}
+    journey.page = SimpleNamespace(click=lambda selector: None)
+    got, cleanup = journey.s10_blank_tab()
+    assert got is tab
+    state.set_step(10)
+    cleanup()
+    assert state.step == 10 and [e["n"] for e in state.events if e["id"] == "pagehide"] == ["1", "2"] and {e["step"] for e in state.events} == {10}, "both are in the step that closed the tab"
+    # no pagehide page (noise off): the walk does not wait for what will not come
+    Tab.url = "http://journey-o.test:1/partner/8?noise=0"
+    got, cleanup = journey.s10_blank_tab()
+    started = time.monotonic()
+    cleanup()
+    assert time.monotonic() - started < 5
+    # a request that never comes does not block the walk for ever, and the site shows it missing
+    monkeypatch.setattr(profile_p4, "LEAVING_FAILSAFE_S", 0.2)
+    state.events.clear()
+    assert profile_p4.wait_for_pagehide_requests(2, failsafe=0.2) is False and profile_p4.pagehide_requests() == 0
 
 
 def test_no_two_servers_of_a_lab_share_a_port_number_and_a_lab_that_has_two_is_made_again():
@@ -419,26 +470,59 @@ def test_no_two_servers_of_a_lab_share_a_port_number_and_a_lab_that_has_two_is_m
         ab.Lab = original
 
 
+def _tls(resumed=False, aead=1, cipher="0x1301"):
+    hello = copy.deepcopy(wc.parse_client_hello(build_hello()))
+    hello["cipher_suites"] = [cipher] + hello["cipher_suites"][1:]
+    hello["extensions"]["encrypted_client_hello"] = {"type": 0, "kdf": 1, "aead": aead, "enc_length": 32, "payload_length": 528 if resumed else 240}
+    hello["extensions"].pop("pre_shared_key", None)
+    if resumed:
+        hello["extensions"]["pre_shared_key"] = {"identities": 1, "binder_lengths": [48]}
+    return hello
+
+
+def _headers(path, kind="*/*", pseudo=(":method", ":path", ":authority", ":scheme")):
+    values = {":method": "GET", ":path": path, ":authority": "h3.lab.test:h3", ":scheme": "https"}
+    return [[n, values[n]] for n in pseudo] + [["user-agent", "Mozilla/5.0"], ["accept", kind], ["accept-language", "en-US,en;q=0.9"]]
+
+
+def _h2(tls, requests, frames_after=3, priority=None, pseudo=(":method", ":path", ":authority", ":scheme")):
+    """An HTTP/2 connection as ``wire_summary`` writes it; ``requests`` is [(stream, path)]."""
+    return {"alpn": "h2", "tls": tls, "h2": {
+        "settings": [[1, 65536], [2, 0], [4, 131072], [5, 16384]], "frame_types_before_the_first_request": ["SETTINGS", "WINDOW_UPDATE"],
+        "window_updates_before_the_first_request": [{"stream": 0, "increment": 12517377}], "priority": [], "priority_update": [], "settings_ack_sent_by_client": True,
+        "frames_after_the_first_request": frames_after,
+        "headers_priority": [{"depends_on": 0, "exclusive": False, "stream": n, "weight": (priority or {}).get(path, 22)} for n, path in requests],
+        "requests": [{"stream": n, "pseudo_order": list(pseudo), "header_names": ["user-agent", "accept", "accept-language"], "headers": _headers(path, pseudo=pseudo), "end_stream": True}
+                     for n, path in requests]}}
+
+
+def _quic(requests, pseudo=(":method", ":scheme", ":authority", ":path")):
+    return {"alpn": "h3", "transport_parameters": {"max_idle_timeout": 30000}, "h3_settings": [["QPACK_MAX_TABLE_CAPACITY", 65536]],
+            "requests": [{"pseudo_order": list(pseudo), "header_names": ["user-agent", "accept", "accept-language"], "headers": _headers(path, pseudo=pseudo)} for path in requests]}
+
+
 def test_an_optional_entry_excuses_what_one_run_has_and_the_other_has_not_and_compares_what_both_have():
     """A/A run 44982522362: an origin had a resumed connection in one run and none in the other (108 leaves per seed)."""
     base = {"connections": [_h2(_tls(), [(3, "/a"), (5, "/b")])], "quic": []}
     with_resumption = {"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []}
     entry = {"pattern": "seeds/*/https/*/wire/resumed_connections", "optional": True, "reason": "ticket", "aa_run": "x"}
 
-    def side(label, wire):
+    def side(label, wire, other=None):
         t = transcript(label)
         t["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(wire)}}
+        if other is not None:
+            t["seeds"]["12"]["https"] = {"h2": {"wire": ab.fold_wire(other)}}
         return t
 
-    one_sided = compare(side("a", base), side("b", with_resumption), [entry])
+    one_sided = compare(side("a", base, with_resumption), side("b", with_resumption, base), [entry])
     assert one_sided["verdict"] == "green" and one_sided["differences"] == [] and one_sided["excused"] > 0 and one_sided["stale"] == []
     assert one_sided["volatile"][0]["differing"] > 0
-    assert compare(side("a", base), side("b", with_resumption))["verdict"] == "red", "without the entry the resumption is a difference"
-    both = compare(side("a", with_resumption), side("b", with_resumption), [entry])
+    assert compare(side("a", base, with_resumption), side("b", with_resumption, base))["verdict"] == "red", "without the entry the resumption is a difference"
+    both = compare(side("a", with_resumption, with_resumption), side("b", with_resumption, with_resumption), [entry])
     assert both["verdict"] == "green" and both["excused"] == 0, "the same resumption on both sides is compared, not excused"
     changed = copy.deepcopy(with_resumption)
     changed["connections"][1]["tls"]["extensions"]["pre_shared_key"]["binder_lengths"] = [32]
-    red = compare(side("a", with_resumption), side("b", changed), [entry])
+    red = compare(side("a", with_resumption, with_resumption), side("b", changed, with_resumption), [entry])
     assert red["verdict"] == "red" and any("resumed_connections/0/tls/extensions/pre_shared_key/binder_lengths/0" in d["path"] for d in red["differences"])
     neither = compare(side("a", base), side("b", base), [entry])
     assert neither["verdict"] == "green" and neither["excused"] == 1 and neither["stale"] == [], "an origin with none on both sides has the owner leaf (an empty list), so the entry is not stale"
@@ -449,13 +533,34 @@ def test_an_optional_entry_excuses_what_one_run_has_and_the_other_has_not_and_co
     assert compare(side("a", with_resumption), side("b", other), [entry])["verdict"] == "red"
 
 
-def test_the_random_ech_aead_is_a_draw_from_the_two_the_library_draws_from_and_any_other_value_is_a_difference():
-    one = ab.fold_wire({"connections": [_h2(_tls(aead=1), [(3, "/a")]), _h2(_tls(resumed=True, aead=3), [(3, "/b")])], "quic": []})
-    two = ab.fold_wire({"connections": [_h2(_tls(aead=3), [(3, "/a")]), _h2(_tls(resumed=True, aead=1), [(3, "/b")])], "quic": []})
-    assert one == two and one["connections"][0]["tls"]["extensions"]["encrypted_client_hello"]["aead"] == "1|3"
-    assert one["resumed_connections"][0]["tls"]["extensions"]["encrypted_client_hello"]["aead"] == "1|3"
-    odd = ab.fold_wire({"connections": [_h2(_tls(aead=2), [(3, "/a")])], "quic": []})
-    assert odd["connections"][0]["tls"]["extensions"]["encrypted_client_hello"]["aead"] == 2 and odd != one
+def test_a_connection_whose_clienthello_differs_is_red_and_so_is_a_request_that_differs_and_a_pseudo_header_order_that_changed():
+    paths = ["/?v=1", "/wire.css"]
+    base = {"connections": [_h2(_tls(), [(3, paths[0]), (5, paths[1])])], "quic": []}
+    a = transcript()
+    a["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(base)}}
+
+    def red(change):
+        summary = copy.deepcopy(base)
+        change(summary)
+        b = transcript("b")
+        b["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(summary)}}
+        report = compare(a, b)
+        assert report["verdict"] == "red"
+        return [d["path"] for d in report["differences"]]
+
+    paths_cipher = red(lambda s: s["connections"][0].update(tls=_tls(cipher="0x1302")))
+    assert any("/wire/connections/0/tls/cipher_suites/0" in p for p in paths_cipher), paths_cipher
+    swapped = red(lambda s: s["connections"][0]["h2"].update(settings=[[1, 65536], [2, 0], [4, 262144], [5, 16384]]))
+    assert any("/h2/settings/2/1" in p for p in swapped)
+    header = red(lambda s: s["connections"][0]["h2"]["requests"][1]["headers"].__setitem__(4, ["accept", "text/css"]))
+    assert any(p.startswith("seeds/11/https/h2/wire/requests/") for p in header)
+    weight = red(lambda s: s["connections"][0]["h2"]["headers_priority"][1].update(weight=12))
+    assert any("/priority/weight" in p for p in weight)
+    missing = red(lambda s: s["connections"][0]["h2"]["requests"].pop())
+    assert missing
+    order = ab.fold_wire({"connections": [_h2(_tls(), [(3, paths[0])], pseudo=(":method", ":scheme", ":authority", ":path"))], "quic": []})
+    assert order["connections"][0]["pseudo_orders"] == [[":method", ":scheme", ":authority", ":path"]]
+    assert order != ab.fold_wire({"connections": [_h2(_tls(), [(3, paths[0])])], "quic": []}), "the order of the pseudo-headers is the engine's"
 
 
 def _h3_run(visits, message="quic-short"):
@@ -504,37 +609,6 @@ def test_the_datagrams_of_the_http3_walk_are_summarised_over_the_walk_and_by_kin
     assert _h3_run([12, 8], message="quic-long")["udp"] != one["udp"], "another kind of datagram is a difference"
 
 
-def _tls(resumed=False, aead=1, cipher="0x1301"):
-    hello = copy.deepcopy(wc.parse_client_hello(build_hello()))
-    hello["cipher_suites"] = [cipher] + hello["cipher_suites"][1:]
-    hello["extensions"]["encrypted_client_hello"] = {"type": 0, "kdf": 1, "aead": aead, "enc_length": 32, "payload_length": 528 if resumed else 240}
-    hello["extensions"].pop("pre_shared_key", None)
-    if resumed:
-        hello["extensions"]["pre_shared_key"] = {"identities": 1, "binder_lengths": [48]}
-    return hello
-
-
-def _headers(path, kind="*/*", pseudo=(":method", ":path", ":authority", ":scheme")):
-    values = {":method": "GET", ":path": path, ":authority": "h3.lab.test:h3", ":scheme": "https"}
-    return [[n, values[n]] for n in pseudo] + [["user-agent", "Mozilla/5.0"], ["accept", kind], ["accept-language", "en-US,en;q=0.9"]]
-
-
-def _h2(tls, requests, frames_after=3, priority=None, pseudo=(":method", ":path", ":authority", ":scheme")):
-    """An HTTP/2 connection as ``wire_summary`` writes it; ``requests`` is [(stream, path)]."""
-    return {"alpn": "h2", "tls": tls, "h2": {
-        "settings": [[1, 65536], [2, 0], [4, 131072], [5, 16384]], "frame_types_before_the_first_request": ["SETTINGS", "WINDOW_UPDATE"],
-        "window_updates_before_the_first_request": [{"stream": 0, "increment": 12517377}], "priority": [], "priority_update": [], "settings_ack_sent_by_client": True,
-        "frames_after_the_first_request": frames_after,
-        "headers_priority": [{"depends_on": 0, "exclusive": False, "stream": n, "weight": (priority or {}).get(path, 22)} for n, path in requests],
-        "requests": [{"stream": n, "pseudo_order": list(pseudo), "header_names": ["user-agent", "accept", "accept-language"], "headers": _headers(path, pseudo=pseudo), "end_stream": True}
-                     for n, path in requests]}}
-
-
-def _quic(requests, pseudo=(":method", ":scheme", ":authority", ":path")):
-    return {"alpn": "h3", "transport_parameters": {"max_idle_timeout": 30000}, "h3_settings": [["QPACK_MAX_TABLE_CAPACITY", 65536]],
-            "requests": [{"pseudo_order": list(pseudo), "header_names": ["user-agent", "accept", "accept-language"], "headers": _headers(path, pseudo=pseudo)} for path in requests]}
-
-
 def test_the_pool_does_not_show_in_the_fold_of_a_walk_the_number_of_connections_the_streams_the_frames_and_where_a_request_rode_are_not_kept():
     """A/A run 44960767715: Linux had a second connection with no request in one run (and in another stage); Windows had the page's requests 4 and 1 on HTTP/2 and HTTP/3 in one run, 1 and 4 in the other."""
     paths = ["/?v=1", "/wire.css", "/wire.js", "/wire.svg", "/favicon.ico"]
@@ -561,34 +635,28 @@ def test_the_pool_does_not_show_in_the_fold_of_a_walk_the_number_of_connections_
     assert all("priority" in r for r in plain["requests"] if r["pseudo"][":path"] != "/favicon.ico")
 
 
-def test_a_connection_whose_clienthello_differs_is_red_and_so_is_a_request_that_differs_and_a_pseudo_header_order_that_changed():
-    paths = ["/?v=1", "/wire.css"]
-    base = {"connections": [_h2(_tls(), [(3, paths[0]), (5, paths[1])])], "quic": []}
-    a = transcript()
-    a["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(base)}}
-
-    def red(change):
-        summary = copy.deepcopy(base)
-        change(summary)
-        b = transcript("b")
-        b["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(summary)}}
-        report = compare(a, b)
-        assert report["verdict"] == "red"
-        return [d["path"] for d in report["differences"]]
-
-    paths_cipher = red(lambda s: s["connections"][0].update(tls=_tls(cipher="0x1302")))
-    assert any("/wire/connections/0/tls/cipher_suites/0" in p for p in paths_cipher), paths_cipher
-    swapped = red(lambda s: s["connections"][0]["h2"].update(settings=[[1, 65536], [2, 0], [4, 262144], [5, 16384]]))
-    assert any("/h2/settings/2/1" in p for p in swapped)
-    header = red(lambda s: s["connections"][0]["h2"]["requests"][1]["headers"].__setitem__(4, ["accept", "text/css"]))
-    assert any(p.startswith("seeds/11/https/h2/wire/requests/") for p in header)
-    weight = red(lambda s: s["connections"][0]["h2"]["headers_priority"][1].update(weight=12))
-    assert any("/priority/weight" in p for p in weight)
-    missing = red(lambda s: s["connections"][0]["h2"]["requests"].pop())
-    assert missing
-    order = ab.fold_wire({"connections": [_h2(_tls(), [(3, paths[0])], pseudo=(":method", ":scheme", ":authority", ":path"))], "quic": []})
-    assert order["connections"][0]["pseudo_orders"] == [[":method", ":scheme", ":authority", ":path"]]
-    assert order != ab.fold_wire({"connections": [_h2(_tls(), [(3, paths[0])])], "quic": []}), "the order of the pseudo-headers is the engine's"
+def test_the_resumed_clienthellos_are_a_set_of_their_own_and_a_resumption_that_differs_is_red():
+    plain = {"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []}
+    one = ab.fold_wire(plain)
+    twice = ab.fold_wire({"connections": plain["connections"] + [_h2(_tls(resumed=True, aead=3), [(3, "/c")]), _h2(_tls(), [(3, "/d")])], "quic": []})
+    assert len(one["resumed_connections"]) == 1 and len(twice["resumed_connections"]) == 1 and len(twice["connections"]) == 1, "the same resumption twice is one fingerprint"
+    assert "pre_shared_key" in one["resumed_connections"][0]["tls"]["extensions"] and "pre_shared_key" not in one["connections"][0]["tls"]["extensions"]
+    assert "identities" not in json.dumps(one["resumed_connections"])
+    more_tickets = copy.deepcopy(plain)
+    more_tickets["connections"][1]["tls"]["extensions"]["pre_shared_key"]["identities"] = 2
+    assert ab.fold_wire(more_tickets) == one, "how many tickets were offered is the pool's"
+    a, b = transcript(), transcript("b")
+    a["seeds"]["11"]["https"], b["seeds"]["11"]["https"] = {"h2": {"wire": one}}, {"h2": {"wire": twice}}
+    other = copy.deepcopy(plain)
+    other["connections"][1]["tls"]["extensions"]["pre_shared_key"]["binder_lengths"] = [32]
+    changed = ab.fold_wire(other)
+    assert changed["resumed_connections"] != one["resumed_connections"] and changed["connections"] == one["connections"]
+    c = transcript("c")
+    c["seeds"]["11"]["https"] = {"h2": {"wire": changed}}
+    red = compare(a, c)
+    assert red["verdict"] == "red" and any("/wire/resumed_connections/0/tls/extensions/pre_shared_key/binder_lengths/0" in d["path"] for d in red["differences"])
+    gone = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [])], "quic": []})
+    assert gone["resumed_connections"] == [] != one["resumed_connections"], "a resumption that no longer happens on a connection that asks is a difference"
 
 
 def test_what_a_transport_adds_to_a_request_on_its_own_is_the_connections_in_a_race_and_a_change_of_it_is_red():
@@ -614,28 +682,37 @@ def test_what_a_transport_adds_to_a_request_on_its_own_is_the_connections_in_a_r
     assert ab.fold_wire({"connections": [over_h2("/wire.css")], "quic": []})["requests"][0]["headers"][-1] == ["te", "trailers"], "outside a race the request keeps every header"
 
 
-def test_the_resumed_clienthellos_are_a_set_of_their_own_and_a_resumption_that_differs_is_red():
-    plain = {"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []}
-    one = ab.fold_wire(plain)
-    twice = ab.fold_wire({"connections": plain["connections"] + [_h2(_tls(resumed=True, aead=3), [(3, "/c")]), _h2(_tls(), [(3, "/d")])], "quic": []})
-    assert len(one["resumed_connections"]) == 1 and len(twice["resumed_connections"]) == 1 and len(twice["connections"]) == 1, "the same resumption twice is one fingerprint"
-    assert "pre_shared_key" in one["resumed_connections"][0]["tls"]["extensions"] and "pre_shared_key" not in one["connections"][0]["tls"]["extensions"]
-    assert "identities" not in json.dumps(one["resumed_connections"])
-    more_tickets = copy.deepcopy(plain)
-    more_tickets["connections"][1]["tls"]["extensions"]["pre_shared_key"]["identities"] = 2
-    assert ab.fold_wire(more_tickets) == one, "how many tickets were offered is the pool's"
-    a, b = transcript(), transcript("b")
-    a["seeds"]["11"]["https"], b["seeds"]["11"]["https"] = {"h2": {"wire": one}}, {"h2": {"wire": twice}}
-    other = copy.deepcopy(plain)
-    other["connections"][1]["tls"]["extensions"]["pre_shared_key"]["binder_lengths"] = [32]
-    changed = ab.fold_wire(other)
-    assert changed["resumed_connections"] != one["resumed_connections"] and changed["connections"] == one["connections"]
-    c = transcript("c")
-    c["seeds"]["11"]["https"] = {"h2": {"wire": changed}}
-    red = compare(a, c)
-    assert red["verdict"] == "red" and any("/wire/resumed_connections/0/tls/extensions/pre_shared_key/binder_lengths/0" in d["path"] for d in red["differences"])
-    gone = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [])], "quic": []})
-    assert gone["resumed_connections"] == [] != one["resumed_connections"], "a resumption that no longer happens on a connection that asks is a difference"
+def test_a_resumption_that_never_happens_in_a_run_is_red_whatever_the_timing_of_the_tickets():
+    """A thing that may come and go per launch (a resumption) must still happen in every run: an engine that stops resuming stays red."""
+    base = {"connections": [_h2(_tls(), [(3, "/a"), (5, "/b")])], "quic": []}
+    resumes = {"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []}
+    entry = {"pattern": "seeds/*/https/*/wire/resumed_connections", "optional": True, "reason": "ticket", "aa_run": "x"}
+
+    def run(label, per_seed):
+        t = transcript(label)
+        for seed, wire in per_seed.items():
+            t["seeds"][str(seed)]["https"] = {"h1": {"wire": ab.fold_wire(wire)}}
+        return t
+
+    with_some = run("a", {11: resumes, 12: base})
+    timing = run("b", {11: base, 12: resumes})
+    report = compare(with_some, timing, [entry])
+    assert report["verdict"] == "green" and report["invariants"] == [], "which seed resumes follows the timing"
+    never = run("c", {11: base, 12: base})
+    red = compare(with_some, never, [entry])
+    assert red["verdict"] == "red" and len(red["invariants"]) == 1
+    assert "a has something under seeds/*/https/h1/wire/resumed_connections" in red["invariants"][0] and "c never has" in red["invariants"][0]
+    assert any("never has" in p for p in red["problems"])
+    assert compare(never, with_some, [entry])["verdict"] == "red", "and the other way round: an engine that starts to resume where the published one does not"
+    both_never = compare(never, run("d", {11: base, 12: base}), [entry])
+    assert both_never["verdict"] == "green" and both_never["invariants"] == [], "an origin that never resumes in the published engine is not an invariant"
+
+
+def test_two_connections_that_differ_only_by_the_random_aead_are_one_fingerprint():
+    one = ab.fold_wire({"connections": [_h2(_tls(aead=1), [(3, "/a")]), _h2(_tls(aead=3), [(3, "/b")]), _h2(_tls(resumed=True, aead=3), [(3, "/c")])], "quic": []})
+    two = ab.fold_wire({"connections": [_h2(_tls(aead=3), [(3, "/a")]), _h2(_tls(resumed=True, aead=1), [(3, "/c")]), _h2(_tls(aead=3), [(3, "/b")])], "quic": []})
+    assert len(one["connections"]) == len(two["connections"]) == 1 and len(one["resumed_connections"]) == len(two["resumed_connections"]) == 1
+    assert one["requests"] == two["requests"]
 
 
 def test_the_protocols_that_carried_a_request_are_a_set_per_role_and_an_engine_that_drops_or_adds_one_is_red():
