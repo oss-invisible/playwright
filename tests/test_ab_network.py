@@ -187,20 +187,19 @@ def test_the_volatile_list_of_the_repository_is_well_formed_and_every_entry_name
     assert all(e["aa_run"].strip() and e["reason"].strip() for e in entries)
 
 
-def test_the_entries_of_the_repository_list_excuse_the_counts_of_connections_and_the_grease_aead_and_nothing_next_to_them():
+def test_the_entries_of_the_repository_list_name_the_counts_of_connections_and_the_optional_resumptions_and_nothing_next_to_them():
     import fnmatch
 
-    patterns = [e["pattern"] for e in ab.load_volatile()]
-    def excused(path):
-        return [q for q in patterns if fnmatch.fnmatchcase(path, q)]
-
-    base = "seeds/0/https/h2/wire/connections/0/tls/extensions/encrypted_client_hello/"
-    assert excused(base + "aead") and not excused(base + "kdf") and not excused(base + "payload_length") and not excused(base + "type")
-    assert excused("seeds/0/h3/wire/connections/0/tls/extensions/encrypted_client_hello/aead")
+    entries = ab.load_volatile()
+    patterns = [e["pattern"] for e in entries if not e.get("optional")]
+    owners = [e["pattern"] for e in entries if e.get("optional")]
+    assert sorted(owners) == ["seeds/*/h3/wire/resumed_connections", "seeds/*/https/*/wire/resumed_connections"]
+    excused = lambda path: [q for q in patterns if fnmatch.fnmatchcase(path, q)]  # noqa: E731
     assert excused("seeds/0/journey/connects/counts/192.0.2.53:443") and excused("seeds/0/webrtc/connects/counts/192.0.2.53:443")
-    for kept in ("seeds/0/journey/connects/order/0", "seeds/0/journey/dns/order/0", "seeds/0/journey/steps/01/requests/GET A//count", "seeds/0/journey/steps/01/requests/GET A//headers/0/1",
-                 "seeds/0/journey/steps/01/udp/counts/198.51.100.5:19302", "seeds/0/lab/launch/connects/order/0", "seeds/0/webrtc/connects/order/0", "seeds/0/h3/udp/counts/10.0.0.1:h3",
-                 "seeds/0/https/h2/wire/connections/0/tls/extensions/server_name"):
+    for kept in ("seeds/0/journey/connects/order/0", "seeds/0/journey/dns/order/0", "seeds/0/journey/leaving/POST A/beacon?t=pagehide&n=2/count", "seeds/0/journey/steps/01/requests/GET A//count",
+                 "seeds/0/journey/steps/01/requests/GET A//headers/0/1", "seeds/0/journey/steps/01/udp/counts/198.51.100.5:19302", "seeds/0/lab/launch/connects/order/0",
+                 "seeds/0/webrtc/connects/order/0", "seeds/0/h3/udp/order/0", "seeds/0/https/h2/wire/protocols/0", "seeds/0/https/h2/wire/connections/0/tls/extensions/server_name",
+                 "seeds/0/https/h2/wire/connections/0/tls/extensions/encrypted_client_hello/aead"):
         assert not excused(kept), kept
 
 
@@ -321,12 +320,13 @@ def test_the_error_scan_names_a_failure_of_the_run_and_not_the_text_a_page_answe
     assert ab.transcript_errors({"0": {"journey": {"steps": {"14": {"extra": {"error": "Wrong user or password."}}}}}}) == []
 
 
-def _journey_run(monkeypatch, connects_by_step, queries_by_step=None):
+def _journey_run(monkeypatch, connects_by_step, queries_by_step=None, leaving_by_step=None):
     """``ab.walk_journey`` with the driver replaced by a function that, in each step, makes the browser's connections and DNS questions arrive to the lab as the events that
     ``connects_by_step`` and ``queries_by_step`` say ({step: [target, ...]}); the requests of every step are the same."""
     from fakeweb import journey_site, profile_p4
 
     queries_by_step = queries_by_step or {}
+    leaving_by_step = leaving_by_step or {}
     with ab.Lab(journey=True, host="127.0.0.1") as lab:
         port_a = int(lab.origin_a.rsplit(":", 1)[1])
 
@@ -335,6 +335,8 @@ def _journey_run(monkeypatch, connects_by_step, queries_by_step=None):
             for n in (1, 2, 3):
                 journey_site.STATE.set_step(n)
                 lab.rec.event("http", role="A", method="GET", target="/page%d" % n, headers=[["Host", "journey-a.test:%d" % port_a]], body_length=0)
+                for target in leaving_by_step.get(n, []):
+                    lab.rec.event("http", role="A", method="POST", target=target, headers=[["Host", "journey-a.test:%d" % port_a]], body_length=1)
                 for target in connects_by_step.get(n, []):
                     lab.rec.event("connect", target=target.replace("<A>", "127.0.0.1:%d" % port_a))
                 for name in queries_by_step.get(n, []):
@@ -353,7 +355,7 @@ def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the
     doh = "192.0.2.53:443"
     first = _journey_run(monkeypatch, {1: [doh, "<A>", doh], 3: ["<A>"]}, {1: ["journey-a.test"], 3: ["journey-a.test"]})
     second = _journey_run(monkeypatch, {1: [doh], 2: ["<A>", "<A>"], 3: [doh, doh]}, {1: ["journey-a.test"], 2: ["journey-a.test"]})
-    assert "order" not in first and set(first) == {"steps", "connects", "dns"}
+    assert "order" not in first and set(first) == {"steps", "connects", "dns", "leaving"}
     assert all(set(step) >= {"requests", "udp"} and "connects" not in step and "dns" not in step for step in first["steps"].values())
     assert first["connects"]["order"] == second["connects"]["order"] == [doh, "127.0.0.1:A"]
     assert first["dns"] == second["dns"] == {"order": ["journey-a.test"], "types": {"journey-a.test": [1]}}
@@ -369,6 +371,91 @@ def test_a_connection_or_a_name_that_lands_in_another_step_of_the_journey_is_the
     red = compare(a, c, volatile)
     assert red["verdict"] == "red"
     assert {"path": "seeds/11/journey/connects/order/2", "a": ab.MISSING, "b": "192.0.2.77:443"} in red["differences"]
+
+
+def test_what_the_page_sends_as_it_leaves_is_summarised_over_the_journey_because_the_pair_straddles_the_step_the_driver_moves_to(monkeypatch):
+    """A/A run 44982522362, Windows: `POST A/beacon?t=pagehide&n=2` in step 10 and `n=1` in step 11 in one run, both in step 11 in the other (51 leaves)."""
+    one = _journey_run(monkeypatch, connects_by_step={}, leaving_by_step={2: ["/beacon?t=pagehide&n=1", "/beacon?t=pagehide&n=2"]})
+    two = _journey_run(monkeypatch, connects_by_step={}, leaving_by_step={1: ["/beacon?t=pagehide&n=2"], 2: ["/beacon?t=pagehide&n=1"]})
+    assert one["leaving"] == two["leaving"] and set(one["leaving"]) == {"POST A/beacon?t=pagehide&n=1", "POST A/beacon?t=pagehide&n=2"}
+    assert all("pagehide" not in key for step in one["steps"].values() for key in step["requests"]) and "GET A/page2" in one["steps"]["02"]["requests"]
+    a, b = transcript(), transcript("b")
+    a["seeds"]["11"]["journey"], b["seeds"]["11"]["journey"] = one, two
+    assert compare(a, b)["verdict"] == "green"
+    three = _journey_run(monkeypatch, connects_by_step={}, leaving_by_step={2: ["/beacon?t=pagehide&n=1"]})
+    c = transcript("c")
+    c["seeds"]["11"]["journey"] = three
+    red = compare(a, c)
+    assert red["verdict"] == "red" and any("/journey/leaving/POST A/beacon?t=pagehide&n=2" in d["path"] for d in red["differences"]), "a beacon that is no longer sent is a difference"
+
+
+def test_no_two_servers_of_a_lab_share_a_port_number_and_a_lab_that_has_two_is_made_again():
+    """A/A run 44982522362, Linux seed 4: the port of the origin O and the port of the HTTP/3 server were the same number, so 667 leaves read `journey-o.test:h3`."""
+    with ab.Lab(journey=True, wire=True, host="127.0.0.1") as lab:
+        assert lab.collisions == [] and len(set(lab.roles)) == len(lab.roles)
+        before = dict(lab.roles)
+        lab._claim(lab.h3.port, "h3")
+        assert lab.collisions == [], "the same role claiming its own port again is no collision"
+        lab._claim(int(lab.origin_o.rsplit(":", 1)[1]), "h3")
+        assert lab.collisions == [(int(lab.origin_o.rsplit(":", 1)[1]), "O", "h3")]
+        assert before != lab.roles
+    made = []
+
+    class Flaky:
+        def __init__(self, **options):
+            made.append(options)
+            if len(made) < 3:
+                raise ab.PortCollision("%d: O and h3" % len(made))
+
+    original = ab.Lab
+    ab.Lab = Flaky
+    try:
+        assert isinstance(ab.open_lab(journey=True), Flaky) and len(made) == 3
+        made.clear()
+        ab.Lab = type("Never", (), {"__init__": lambda self, **o: (_ for _ in ()).throw(ab.PortCollision("1: O and h3"))})
+        with pytest.raises(RuntimeError, match="in a row"):
+            ab.open_lab()
+    finally:
+        ab.Lab = original
+
+
+def test_an_optional_entry_excuses_what_one_run_has_and_the_other_has_not_and_compares_what_both_have():
+    """A/A run 44982522362: an origin had a resumed connection in one run and none in the other (108 leaves per seed)."""
+    base = {"connections": [_h2(_tls(), [(3, "/a"), (5, "/b")])], "quic": []}
+    with_resumption = {"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []}
+    entry = {"pattern": "seeds/*/https/*/wire/resumed_connections", "optional": True, "reason": "ticket", "aa_run": "x"}
+
+    def side(label, wire):
+        t = transcript(label)
+        t["seeds"]["11"]["https"] = {"h2": {"wire": ab.fold_wire(wire)}}
+        return t
+
+    one_sided = compare(side("a", base), side("b", with_resumption), [entry])
+    assert one_sided["verdict"] == "green" and one_sided["differences"] == [] and one_sided["excused"] > 0 and one_sided["stale"] == []
+    assert one_sided["volatile"][0]["differing"] > 0
+    assert compare(side("a", base), side("b", with_resumption))["verdict"] == "red", "without the entry the resumption is a difference"
+    both = compare(side("a", with_resumption), side("b", with_resumption), [entry])
+    assert both["verdict"] == "green" and both["excused"] == 0, "the same resumption on both sides is compared, not excused"
+    changed = copy.deepcopy(with_resumption)
+    changed["connections"][1]["tls"]["extensions"]["pre_shared_key"]["binder_lengths"] = [32]
+    red = compare(side("a", with_resumption), side("b", changed), [entry])
+    assert red["verdict"] == "red" and any("resumed_connections/0/tls/extensions/pre_shared_key/binder_lengths/0" in d["path"] for d in red["differences"])
+    neither = compare(side("a", base), side("b", base), [entry])
+    assert neither["verdict"] == "green" and neither["excused"] == 1 and neither["stale"] == [], "an origin with none on both sides has the owner leaf (an empty list), so the entry is not stale"
+    assert compare(side("a", base), side("b", base), [dict(entry, pattern="seeds/*/https/*/wire/nothing_here")])["stale"] == ["seeds/*/https/*/wire/nothing_here"]
+    # a fresh connection that differs is red whatever the entry says
+    other = copy.deepcopy(with_resumption)
+    other["connections"][0]["tls"] = _tls(cipher="0x1302")
+    assert compare(side("a", with_resumption), side("b", other), [entry])["verdict"] == "red"
+
+
+def test_the_random_ech_aead_is_a_draw_from_the_two_the_library_draws_from_and_any_other_value_is_a_difference():
+    one = ab.fold_wire({"connections": [_h2(_tls(aead=1), [(3, "/a")]), _h2(_tls(resumed=True, aead=3), [(3, "/b")])], "quic": []})
+    two = ab.fold_wire({"connections": [_h2(_tls(aead=3), [(3, "/a")]), _h2(_tls(resumed=True, aead=1), [(3, "/b")])], "quic": []})
+    assert one == two and one["connections"][0]["tls"]["extensions"]["encrypted_client_hello"]["aead"] == "1|3"
+    assert one["resumed_connections"][0]["tls"]["extensions"]["encrypted_client_hello"]["aead"] == "1|3"
+    odd = ab.fold_wire({"connections": [_h2(_tls(aead=2), [(3, "/a")])], "quic": []})
+    assert odd["connections"][0]["tls"]["extensions"]["encrypted_client_hello"]["aead"] == 2 and odd != one
 
 
 def _h3_run(visits, message="quic-short"):

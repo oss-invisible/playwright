@@ -21,7 +21,8 @@ THE NORMALISATION. A port of the lab becomes the role of its server (``A``, ``O`
 parameter (``%3A41039``); the random token of a page of the journey (``tok=``, the ids ``lp``, ``park``, ``kapark`` and ``sf``, which the page draws at every load) and the values of a
 cookie are dropped. ci/ab-network-volatile.json lists the leaves that differ between two runs of ONE engine: each entry has the pattern of the leaf
 path, the reason, and the A/A run that proved it. The list is born from the A/A (``ab --a-a``, ``compare --a-a``), never written ahead of it, and it may only shrink: an
-entry that matches no leaf of a run is red as stale.
+entry that matches no leaf of a run is red as stale. An entry that is ``optional`` names a thing that may or may not have happened in a run (a resumption): when one of the two runs
+has nothing under it, what the other has is excused; when both have something, it is compared.
 
 THE POOL. What a connection and a request SAY is the engine's and is compared; how many connections there are, which one a request rode, its stream, the frames after the first
 request, a connection opened and never used, how many datagrams QUIC sent, and where in the journey a connection landed are the pool's and the timers', and are not compared as such
@@ -87,6 +88,8 @@ H3_VISITS = 5
 #: The safety nets of a run, in seconds: a launch that does not come back, a run that does not end. Never a verdict.
 RUN_TIMEOUT_S = 40 * 60
 WAIT_S = 30
+#: How many times a lab is made again when two of its servers share a port number.
+MAX_LAB_TRIES = 50
 #: Whose categories a transcript holds under each seed.
 CATEGORIES = ("journey", "https", "h3", "webrtc", "idle", "lab")
 
@@ -147,6 +150,8 @@ def load_volatile(path: Path = VOLATILE_FILE) -> List[Dict[str, str]]:
         for field in ("pattern", "reason", "aa_run"):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
                 raise SystemExit("%s: every entry needs a non-empty %s (%r)" % (path, field, entry))
+        if not isinstance(entry.get("optional", False), bool):
+            raise SystemExit("%s: optional is true or false (%r)" % (path, entry))
         if entry["pattern"] in seen:
             raise SystemExit("%s: the pattern %r is listed twice" % (path, entry["pattern"]))
         seen.add(entry["pattern"])
@@ -163,6 +168,36 @@ def direct_problems(transcript: Dict[str, Any], side: str) -> List[str]:
     return out
 
 
+def _owner(path: str, pattern: str) -> Optional[str]:
+    """The shortest prefix of ``path`` (by segments) that ``pattern`` matches: the thing an optional entry is about (``seeds/2/https/h1/wire/resumed_connections``)."""
+    parts = path.split("/")
+    for i in range(1, len(parts) + 1):
+        if fnmatch.fnmatchcase("/".join(parts[:i]), pattern):
+            return "/".join(parts[:i])
+    return None
+
+
+def _optional_leaves(patterns: List[str], la: Dict[str, Any], lb: Dict[str, Any]) -> Dict[str, List[Tuple[str, bool]]]:
+    """For the entries of the volatile list that are ``optional``: ``{leaf path: [(pattern, one_sided)]}`` for every leaf under an owner of the pattern. An owner is one thing
+    that may or may not have happened in a run (a resumed connection of an origin: whether a resumption happens at all follows the ticket and the pool). ``one_sided`` is True when
+    one of the two transcripts has nothing under the owner, and then all its leaves are excused; when both have something under it, it is compared like any other leaf."""
+    out: Dict[str, List[Tuple[str, bool]]] = {}
+    for pattern in patterns:
+        owners: Dict[str, Dict[str, bool]] = {}
+        for side, leaves in (("a", la), ("b", lb)):
+            for path in leaves:
+                owner = _owner(path, pattern)
+                if owner is not None:
+                    owners.setdefault(owner, {"a": False, "b": False})
+                    if path != owner:
+                        owners[owner][side] = True
+        for path in set(la) | set(lb):
+            owner = _owner(path, pattern)
+            if owner is not None:
+                out.setdefault(path, []).append((pattern, not (owners[owner]["a"] and owners[owner]["b"])))
+    return out
+
+
 def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dict[str, str]], floor: int = 0,
                         label_a: str = "A", label_b: str = "B") -> Dict[str, Any]:
     """The verdict on two transcripts (the ``seeds`` of each, as ``run`` writes them).
@@ -175,12 +210,19 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     if set(a.get("seeds") or {}) != set(b.get("seeds") or {}):
         problems.append("the sides ran different seeds: %s and %s" % (sorted(a.get("seeds") or {}), sorted(b.get("seeds") or {})))
     matched: Dict[str, List[str]] = {e["pattern"]: [] for e in volatile}
+    volatile_by_pattern = {e["pattern"]: e for e in volatile}
     excused = 0
     compared: List[str] = []
+    optional = _optional_leaves([e["pattern"] for e in volatile if e.get("optional")], la, lb)
     for path in paths:
-        hit = [e["pattern"] for e in volatile if fnmatch.fnmatchcase(path, e["pattern"])]
-        for pattern in hit:
+        hit = [e["pattern"] for e in volatile if not e.get("optional") and fnmatch.fnmatchcase(path, e["pattern"])]
+        for pattern, one_sided in optional.get(path, []):
             matched[pattern].append(path)
+            if one_sided:
+                hit.append(pattern)
+        for pattern in hit:
+            if not volatile_by_pattern[pattern].get("optional"):
+                matched[pattern].append(path)
         if hit:
             excused += 1
         else:
@@ -697,6 +739,22 @@ def lab_prefs() -> Dict[str, Any]:
             "network.http.http3.disable_when_third_party_roots_found": False}
 
 
+class PortCollision(RuntimeError):
+    """Two servers of one lab got the same port number (on different addresses, which the system allows)."""
+
+
+def open_lab(**options: Any) -> "Lab":
+    """A :class:`Lab` none of whose servers shares a port number with another: a lab where two do is closed and made again (a port is normalised into the ROLE of its server, and a
+    number two roles share would read as the one that registered last, in some runs and not in others: A/A run 44982522362, seed 4 on Linux, where the port of the origin O and
+    that of the HTTP/3 server were the same number and 667 leaves read ``journey-o.test:h3`` in one run)."""
+    for _ in range(MAX_LAB_TRIES):
+        try:
+            return Lab(**options)
+        except PortCollision:
+            continue
+    raise RuntimeError("%d labs in a row had two servers on the same port number" % MAX_LAB_TRIES)
+
+
 class Lab:
     """Everything the lab is, for ONE launch of the browser: the fake DoH, the gateway, the witness, the servers that write down what they are sent, and the
     recorder that says which stage of the run each thing belongs to. ``journey`` adds the P4 site behind its tees, ``wire`` the HTTPS and HTTP/3 servers."""
@@ -711,6 +769,7 @@ class Lab:
         self.exit_ip = LAB_EGRESS_IP
         self.rec = Recorder()
         self.roles: Dict[int, str] = {}
+        self.collisions: List[Tuple[int, str, str]] = []
         self.norm = Normalizer(self.roles)
         self._closers: List[Callable[[], None]] = []
         self.h1 = self.h2 = self.h3 = None
@@ -725,7 +784,7 @@ class Lab:
         self.rec.attach("doh", self.doh.queries)
         self.witness = Witness(self.host)
         self._closers.append(self.witness.close)
-        self.roles[self.witness.port] = "witness"
+        self._claim(self.witness.port, "witness")
         self.turn = turn_class(self.host)
         self._closers.append(self.turn.close)
         self.gateway = gateway_class(self.rec, self.doh, self.turn, self.host, self.exit_ip)
@@ -737,11 +796,20 @@ class Lab:
             self._start_journey()
         if wire:
             self._start_wire()
+        if self.collisions:
+            self.close()
+            raise PortCollision(", ".join("%d: %s and %s" % c for c in self.collisions))
+
+    def _claim(self, port: int, role: str) -> None:
+        """Gives ``port`` the role of the server that holds it, and remembers a number that already belongs to another role."""
+        if port in self.roles and self.roles[port] != role:
+            self.collisions.append((port, self.roles[port], role))
+        self.roles[port] = role
 
     def _tee(self, port: int, role: str) -> None:
         tee = RawTee(self.rec, port, role)
         self._closers.append(tee.close)
-        self.roles[port] = role
+        self._claim(port, role)
         self.gateway.reroute[port] = tee.port
 
     def _start_journey(self) -> None:
@@ -759,6 +827,7 @@ class Lab:
             original(n)
 
         state.set_step = set_step
+        self._closers.append(lambda: setattr(state, "set_step", original))      # a lab that is gone leaves the walk's step counter as it found it
 
     def _start_wire(self) -> None:
         from _wire_capture import WireServer
@@ -769,7 +838,7 @@ class Lab:
         self.h3 = WireServer(self.host, alpn=("h2", "http/1.1"), h3=True, phase=phase, dns_names=(H3_NAME,))
         for server, role in ((self.h1, "h1"), (self.h2, "h2"), (self.h3, "h3")):
             self._closers.append(server.close)
-            self.roles[server.port] = role
+            self._claim(server.port, role)
             self.gateway.allowed_tcp.add((self.host, server.port))
         self.gateway.udp_allowed.add((self.host, self.h3.port))
 
@@ -807,13 +876,20 @@ def phase_data(lab: Lab, phase: str) -> Dict[str, Any]:
             "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm), "requests": request_summary(lab.rec.of(phase, "http"), lab.norm)}
 
 
+def _leaving(event: Dict[str, Any]) -> bool:
+    """A request the page sends from its ``pagehide`` handler (a beacon and a keep-alive POST, ``t=pagehide`` in tests/fakeweb/journey_site.py)."""
+    return "t=pagehide" in event["target"]
+
+
 def step_data(lab: Lab, phase: str) -> Dict[str, Any]:
     """What the lab saw in ONE step of the journey: the HTTP requests of the tees and the datagrams. Not the CONNECTs and not the DNS questions: the lab cuts the journey into
     steps at the moment the driver moves on, and what the browser does on its own (a connection it opens or closes, a name it asks again when the 30 s of an answer are over)
     lands in the step that happens to be current, a different one in each run (A/A run 44946411675: the same CONNECT to ``journey-o.test`` in step 09 of one run and step 12
-    of the other). Those two are summarised over the whole journey instead (:func:`journey_data`). A request is the page's own act, driven by an event, and stays in its step."""
-    data = phase_data(lab, phase)
-    return {"requests": data["requests"], "udp": data["udp"]}
+    of the other). Those two are summarised over the whole journey instead (:func:`journey_data`). A request is the page's own act, driven by an event, and stays in its step,
+    except the ones the page sends as it leaves (``_leaving``): they are fired together by the ``pagehide`` of the page the driver is navigating away from, and reach the lab
+    while the driver is moving to the next step, so one of the pair lands in each step in some runs (A/A run 44982522362, Windows: ``POST A/beacon?t=pagehide&n=2`` in step 10
+    with ``n=1`` in step 11, in one run; both in step 11 in the other). They are summarised over the whole journey too, with their counts."""
+    return {"requests": request_summary([e for e in lab.rec.of(phase, "http") if not _leaving(e)], lab.norm), "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm)}
 
 
 def journey_data(lab: Lab) -> Dict[str, Any]:
@@ -824,7 +900,8 @@ def journey_data(lab: Lab) -> Dict[str, Any]:
     # The CONNECTs of the launch stage too: the connection to the DoH that the engine opens at start-up lands before the journey or in its first step (A/A run 44960767715,
     # Windows: one CONNECT in the launch stage of one run and none in the other).
     targets = [e["target"] for e in lab.rec.of("launch", "connect") + lab.rec.of("journey", "connect")]
-    return {"connects": connect_summary(targets, lab.norm), "dns": dns_summary(queries)}
+    leaving = [e for e in lab.rec.of("journey", "http") if _leaving(e)]
+    return {"connects": connect_summary(targets, lab.norm), "dns": dns_summary(queries), "leaving": request_summary(leaving, lab.norm)}
 
 
 def wire_summary(server: Any, phase: str, norm: Normalizer) -> Dict[str, Any]:
@@ -869,6 +946,19 @@ def _without(value: Any, *names: str) -> Any:
     return value
 
 
+#: The AEADs the ECH GREASE of the engine's TLS library draws from, one per connection: AES-128-GCM and ChaCha20-Poly1305 (A/A runs 44946411675 and 44982522362: 1 and 3 on every
+#: connection kind, resumed or not, both inside one run). Any other value is not that draw.
+GREASE_AEADS = (1, 3)
+
+
+def _grease(tls: Dict[str, Any]) -> Dict[str, Any]:
+    """``tls`` with the AEAD of its ECH GREASE written as what it is, a draw from ``GREASE_AEADS`` (``"1|3"``); a value outside them stays as it is and is a difference."""
+    ech = (tls.get("extensions") or {}).get("encrypted_client_hello")
+    if isinstance(ech, dict) and ech.get("aead") in GREASE_AEADS:
+        tls = dict(tls, extensions=dict(tls["extensions"], encrypted_client_hello=dict(ech, aead="|".join(str(a) for a in GREASE_AEADS))))
+    return tls
+
+
 def _resumed(tls: Dict[str, Any]) -> bool:
     return "pre_shared_key" in (tls.get("extensions") or {})
 
@@ -911,8 +1001,9 @@ def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str
         if resumed:
             # the number of tickets a resumption offers is the pool's (which ticket was ready); what the ClientHello says around it is the engine's
             fingerprint["tls"] = _without(fingerprint["tls"], "identities")
-        # the ECH GREASE AEAD is random per connection (ci/ab-network-volatile.json): it does not order the fingerprints
-        (resumptions if resumed else connections)[json.dumps(_without(fingerprint, "aead"), sort_keys=True)] = fingerprint
+        if "tls" in fingerprint:
+            fingerprint["tls"] = _grease(fingerprint["tls"])
+        (resumptions if resumed else connections)[json.dumps(fingerprint, sort_keys=True)] = fingerprint
 
     def regular_headers(headers: List[List[str]], marks: set) -> List[List[str]]:
         """The regular headers of a request; in a race the ones a transport adds on its own (``te: trailers`` on HTTP/2, ``alt-used`` on HTTP/3) are the connection's, not the request's."""
@@ -1116,7 +1207,7 @@ def run_main(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
     from _leaks import Watcher
 
     out: Dict[str, Any] = {}
-    with Lab(journey=True, wire=True) as lab:
+    with open_lab(journey=True, wire=True) as lab:
         trap = start_trap()
         watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
         try:
@@ -1147,7 +1238,7 @@ def run_idle(binary: str, seed: int, condition: str, patch: Any) -> Dict[str, An
     """A launch with no action, ended at an event the lab drives (see IDLE in the docstring of this file): ``c1`` at the first round trip of a sentinel, ``c2`` when two
     rounds in a row leave what is not the sentinel unchanged."""
     out: Dict[str, Any] = {}
-    with Lab() as lab:
+    with open_lab() as lab:
         with launch(binary, seed, lab, patch) as browser:
             lab.rec.set_phase("idle")
             page = browser.new_context(ignore_https_errors=True).new_page()

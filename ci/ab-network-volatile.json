@@ -13,14 +13,16 @@
       "aa_run": "44946411675 (windows)"
     },
     {
-      "pattern": "seeds/*/https/*/wire/connections/*/tls/extensions/encrypted_client_hello/aead",
-      "reason": "The engine sends an ECH extension with no real configuration (GREASE) and its TLS library picks the AEAD of the HPKE suite at random for each connection, 1 (AES-128-GCM) or 3 (ChaCha20-Poly1305): on Windows the h2 connection of the first visit read 1 in one run and 3 in the other, the first h1 connection 3 and 1, both values inside one run. The rest of the extension (type, kdf, enc and payload lengths) stays compared.",
-      "aa_run": "44946411675 (windows)"
+      "pattern": "seeds/*/https/*/wire/resumed_connections",
+      "optional": true,
+      "reason": "Whether a connection that resumes a session carried a request at all follows the ticket and the pool: an origin had one in a run and none in the other (seed 2 and seed 4 on Linux, h1: 108 leaves each), so what is under it is compared where both runs have a resumption and excused where only one has. The fresh connections (wire/connections) and the protocols stay compared always.",
+      "aa_run": "44982522362 (linux)"
     },
     {
-      "pattern": "seeds/*/h3/wire/connections/*/tls/extensions/encrypted_client_hello/aead",
-      "reason": "The same ECH GREASE on the HTTP/3 connection: 1 in one run and 3 in the other, on Linux and on Windows.",
-      "aa_run": "44946411675 (linux, windows)"
+      "pattern": "seeds/*/h3/wire/resumed_connections",
+      "optional": true,
+      "reason": "The same for the HTTP/3 site's resumed connection.",
+      "aa_run": "44982522362 (linux)"
     }
   ]
 }
