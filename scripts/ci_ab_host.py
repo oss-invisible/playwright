@@ -35,6 +35,13 @@ report lists what only the warm-up did (`WARMUP-ONLY`, per kind, per path and pe
 helper spawned at the first shutdown of a cold machine) stays visible from run to run. The measured launches are compared as they are: a kind or a count that differs
 after the warm-up is red.
 
+The exit pings (`firefox --backgroundtask pingsender`, through the session's route, never the separate `pingsender[.exe]`) leave only when Mozilla's `canUpload()` is
+true (TelemetrySend.sys.mjs:1083), once the notification of the data policy was recorded, which a short launch may or may not have reached: in a measured launch their
+number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red, and a path or a destination only they touch is not compared. The IDLE
+launch of each engine run is where they must leave: no journey, the telemetry endpoint is the lab's (loopback, `toolkit.telemetry.server`: the pings never go to the
+internet), it waits until the profile's prefs.js records the notification (the precondition, seen in a file of the launch; at most 120 s) and then closes. There the
+comparison is strict: the notification seen, three pingsenders of the three types, spawned by the parent, none of them to a public address.
+
 How the trace is taken:
 
   * Linux: `strace -f -y` of the whole tree (the stand-in of tests/_strace_stand_in.py), calls execve, clone, fork, prctl, the file calls
@@ -62,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import collections
 import ipaddress
 import json
@@ -144,6 +152,29 @@ TAB_REASON = ("the number of content processes of type tab follows the idle time
 
 # -
 # Kinds of process.
+
+#: The exit pings of the engine leave as `firefox[.exe] --backgroundtask pingsender URL path` (toolkit/components/telemetry/app/StealthPingsender.sys.mjs, B266),
+#: through the session's route, never as the separate `pingsender[.exe]`, which took its road from the host. Whether they leave at all is Mozilla's
+#: `canUpload()` (TelemetrySend.sys.mjs:1083: `options.usePingSender && !this._isOSShutdown && TelemetryReportingPolicy.canUpload()`), true once the data-policy
+#: notification was recorded (TelemetryReportingPolicy.sys.mjs:988 `_userNotified`, from `ensureUserIsNotified` at `sessionstore-windows-restored`, :1140-1175):
+#: a launch that stays short may or may not have got there, so it has 0 of them or all 3 (the first run sends new-profile, first-shutdown and event; the shutdown
+#: ping waits for the second session, TelemetrySession.sys.mjs:1011).
+PINGSENDER_KIND = "backgroundtask/pingsender"
+PINGSENDER_EXES = ("pingsender", "pingsender.exe")
+PING_TYPES = ("event", "first-shutdown", "new-profile")
+PINGSENDER_COUNTS = (0, 3)
+CAN_UPLOAD = "TelemetrySend.sys.mjs:1083"
+#: The pref the policy writes when the notification is recorded (TelemetryUtils.sys.mjs:80, TelemetryReportingPolicy.sys.mjs:1025): the profile's prefs.js says
+#: it, a file of the launch's own, so the precondition of the pings is observed without any channel into the engine.
+NOTIFIED_PREF = "datareporting.policy.dataSubmissionPolicyNotifiedTime"
+#: The idle launch: how long it waits for the notification to be recorded (the first-run infobar is at 60 s, NOTIFICATION_DELAY_FIRST_RUN_MSEC, :51) and how
+#: often it looks. A limit of acquisition: that the pref was seen is the verdict, never how long it took.
+NOTIFY_LIMIT_S, NOTIFY_PERIOD_S = 120.0, 0.5
+
+
+def is_pingsender(kind: str) -> bool:
+    return kind == PINGSENDER_KIND or kind in PINGSENDER_EXES
+
 
 def kind_of(cmdline) -> str:
     """parent = no `-contentproc`; else the last argument (tab, gpu, socket, rdd, utility, forkserver ...) plus
@@ -401,6 +432,83 @@ def process_lifecycle(lines, procs: dict) -> list:
         if pid in ended:
             events.append((ended[pid][0], 1, p["label"], ended[pid][1]))
     return [{"line": i, "event": "end" if e else "start", "kind": k, "how": h} for i, e, k, h in sorted(events)]
+
+
+def ping_type(argv) -> str | None:
+    """The type of the ping a pingsender is given: the url is `.../submit/telemetry/<id>/<type>/Firefox/<version>/...`."""
+    for a in argv:
+        m = re.search(r"/submit/telemetry/[^/]+/([^/]+)/", str(a))
+        if m:
+            return m.group(1)
+    return None
+
+
+def ping_records(procs: dict, labels: dict, parents: dict, windows: bool) -> list:
+    """`[{"type", "form", "parent"}]` of the pingsender processes of a tree: `form` is `backgroundtask` for `firefox --backgroundtask pingsender`, else the
+    name of the program that ran; `parent` the kind of the process that spawned it."""
+    out = []
+    for pid, p in procs.items():
+        if not is_pingsender(labels.get(pid, p.get("label", ""))):
+            continue
+        argv = split_command_line(p["cmd"]) if windows else (p["exec"][1] if p.get("exec") else [])
+        out.append({"type": ping_type(argv), "form": "backgroundtask" if labels.get(pid) == PINGSENDER_KIND else labels.get(pid),
+                    "parent": labels.get(parents.get(pid), "(oracle)")})
+    return sorted(out, key=lambda r: (str(r["type"]), r["parent"]))
+
+
+def pingsender_problems(fp: dict) -> list:
+    """What is wrong with the exit pings of one launch (a short measured launch, or the idle one asking `strict`): the separate executable ran, a number of
+    pingsenders that is not 0 or 3, three that are not the three pings of a first run or not spawned by the parent."""
+    kinds, out = fp.get("kinds", {}), []
+    for exe in PINGSENDER_EXES:
+        if kinds.get(exe):
+            out.append("the separate %s ran (B266: the pings leave as `firefox --backgroundtask pingsender`, through the session's route)" % exe)
+    n = kinds.get(PINGSENDER_KIND, 0)
+    if n not in PINGSENDER_COUNTS:
+        out.append("%d pingsender processes, not 0 or 3 (they leave only when canUpload is true, %s)" % (n, CAN_UPLOAD))
+    if n == 3:
+        records = [r for r in fp.get("pingsenders", []) if r["form"] == "backgroundtask"]
+        if sorted(str(r["type"]) for r in records) != list(PING_TYPES):
+            out.append("the three pingsenders are not the pings of a first run %s: %s" % (list(PING_TYPES), sorted(str(r["type"]) for r in records)))
+        if sorted({r["parent"] for r in records}) != ["parent"]:
+            out.append("the pingsenders were not all spawned by the parent: %s" % sorted({r["parent"] for r in records}))
+    direct = [e for e in fp.get("net") or [] if is_pingsender(e.split(": ", 1)[0]) and e.split(": ", 1)[-1].startswith(("connect ", "send "))]
+    if direct and fp.get("session_proxy"):
+        out.append("a pingsender connected directly to a public address behind the session's proxy (B266): %s" % ", ".join(direct[:3]))
+    return out
+
+
+def _idle_summary(idle: dict | None) -> dict | None:
+    """What the idle launch of one side shows, for the report: the notification, the pingsenders (count, types, parents), what the lab's endpoint received."""
+    if not idle:
+        return None
+    records = idle.get("pingsenders", [])
+    return {"notified": (idle.get("idle") or {}).get("notified"), "pingsenders": idle.get("kinds", {}).get(PINGSENDER_KIND, 0),
+            "types": sorted(str(r["type"]) for r in records), "parents": sorted({r["parent"] for r in records}),
+            "endpoint_received": (idle.get("idle") or {}).get("ping_endpoint_received")}
+
+
+def idle_problems(a: dict, b: dict) -> list:
+    """The strict comparison of the IDLE launch (the launch in which the pings must leave): on both sides the notification was observed in the profile, three
+    pingsenders of the three types of a first run, spawned by the parent, and none of them went to a public address (the pings go to the lab's endpoint)."""
+    ia, ib = a.get("idle"), b.get("idle")
+    if not ia and not ib:
+        return []
+    out = []
+    for side, idle in (("A", ia), ("B", ib)):
+        if not idle:
+            out.append("side %s has no idle launch" % side)
+            continue
+        if not ((idle.get("idle") or {}).get("notified") or {}).get("observed"):
+            out.append("idle launch of side %s: the notification of the data policy was not recorded in the profile within %d s (%s is false: the pings cannot leave)"
+                       % (side, NOTIFY_LIMIT_S, CAN_UPLOAD))
+        if idle.get("kinds", {}).get(PINGSENDER_KIND, 0) != 3:
+            out.append("idle launch of side %s: %d pingsender processes, the pings of a first run must leave: 3" % (side, idle.get("kinds", {}).get(PINGSENDER_KIND, 0)))
+        out += ["idle launch of side %s: %s" % (side, p) for p in pingsender_problems(dict(idle, session_proxy=True))]
+        public = [e for e in idle.get("net") or [] if is_pingsender(e.split(": ", 1)[0]) and e.split(": ", 1)[-1].startswith(("connect ", "send "))]
+        if public:
+            out.append("idle launch of side %s: a pingsender went out to a public address instead of the lab's endpoint (B266): %s" % (side, ", ".join(public[:3])))
+    return out
 
 
 def windows_lifecycle(tree, exits, procs: dict) -> list:
@@ -1065,12 +1173,18 @@ def leaves_of(seed_footprint: dict) -> dict:
     file.<path> = 1 for every HOST path the tree touched and net.<kind>: <what> = 1 for every netlink socket, netlink request and public
     destination of a process of that kind (`network_events`)."""
     out = {}
+    only = {PINGSENDER_KIND}
     for kind, n in seed_footprint.get("kinds", {}).items():
-        out["proc." + kind] = 1 if is_tab(kind) and n else n
+        if kind != PINGSENDER_KIND:  # 0 or 3 of them, with their form: `pingsender_problems`; the idle launch is where they must be
+            out["proc." + kind] = 1 if is_tab(kind) and n else n
+    touched = seed_footprint.get("touched_by", {})
     for path in seed_footprint.get("files", []):
+        if touched.get(path) and set(touched[path]) <= only:
+            continue  # a path only a pingsender touched is there when the pingsenders are
         out["file." + path] = 1
     for entry in seed_footprint.get("net") or []:
-        out["net." + entry] = 1
+        if not entry.startswith(PINGSENDER_KIND + ": "):
+            out["net." + entry] = 1
     return out
 
 
@@ -1209,7 +1323,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         la, lb = leaves_of(seeds_a[seed]), leaves_of(seeds_b[seed])
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
-            for message in fp.get("problems", []):
+            for message in fp.get("problems", []) + pingsender_problems(fp):
                 problems.append("seed %s side %s: %s" % (seed, side, message))
         per = {c: 0 for c in CATEGORIES}
         for leaf in set(la) | set(lb):
@@ -1230,6 +1344,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     if os_name == "windows" and not a_a:
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
             problems += geolocation_problems(fp, where)
+    problems += idle_problems(a, b)
     stale = []
     if not a_a:
         for entry in expected or []:
@@ -1263,7 +1378,8 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                 "net": sorted(set(warm["A"].get("net", [])) & set(warm["B"].get("net", [])))}
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
-            "outside_tree": outside, "warmup": dict(warm, both=both), "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
+            "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))},
+            "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
 
 
 def print_report(report: dict, a_name: str, b_name: str) -> None:
@@ -1282,6 +1398,11 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
                 print("WARMUP-ONLY %s seed %s file.%s (touched by: %s)" % (name, warm["seed"], f["path"], ", ".join(f["touched_by"]) or "-"))
             for entry in warm.get("net", [])[:100]:
                 print("WARMUP-ONLY %s seed %s net.%s" % (name, warm["seed"], entry))
+    for side, name in (("A", a_name), ("B", b_name)):
+        idle = (report.get("idle") or {}).get(side)
+        if idle:
+            print("IDLE (the pings must leave) %s: notification %s, %d pingsender %s by %s, the lab's endpoint received %s" % (
+                name, json.dumps(idle["notified"]), idle["pingsenders"], idle["types"], idle["parents"], idle["endpoint_received"]))
     for side, name in (("A", a_name), ("B", b_name)):
         for seed, names in sorted(((report.get("outside_tree") or {}).get(side) or {}).items()):
             print("OUTSIDE THE TREE (not compared) %s seed %s: %s" % (name, seed, ", ".join("%s %d paths" % kv for kv in sorted(names.items()))))
@@ -1381,8 +1502,12 @@ def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dic
     return step
 
 
-def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dict:
-    """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own)."""
+def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False) -> dict:
+    """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
+
+    `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey; the engine's telemetry endpoint is the lab's (loopback); the
+    launch waits until the notification of the data policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and
+    then closes; its footprint carries `idle` (what the wait saw, what the endpoint received)."""
     from playwright.sync_api import sync_playwright
 
     from fakeweb import journey_site, profile_p4
@@ -1409,34 +1534,40 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
+    ping_server, notified = (PingServer() if idle else None), None
+    prefs = {"toolkit.telemetry.server": ping_server.url} if idle else None
+    before = set(Path(tempfile.gettempdir()).glob("invisible_profile_*"))
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
-                               launch_timeout_ms=180_000)
+                               launch_timeout_ms=180_000, extra_prefs=prefs)
         root_pid = server.process.pid
         if not windows:
             from _strace_stand_in import _group_of
 
             pgid = _group_of(pidfile)
-        with sync_playwright() as p:
-            browser = p.firefox.connect(server.ws_endpoint)
-            context = browser.new_context()
-            context.set_default_timeout(profile_p4.TIMEOUT_MS)
-            context.set_default_navigation_timeout(profile_p4.TIMEOUT_MS)
-            profile_p4.install_route(context)
-            page = context.new_page()
-            journey = profile_p4.Journey(context, page, origin_a, origin_o)
-            journey_site.STATE.begin_walk()
-            for n, (name, method) in enumerate(JOURNEY, 1):
-                journey.extra = {}
-                journey_site.STATE.set_step(n)
-                try:
-                    getattr(journey, method)()
-                    steps.append({"n": n, "name": name, "ok": True})
-                except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
-                    steps.append({"n": n, "name": name, "ok": False, "error": str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc)})
-            steps.append(geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1))
-            context.close()
-            browser.close()
+        if idle:
+            notified = wait_for_notification(profile_prefs_reader(before))
+        with (contextlib.nullcontext() if idle else sync_playwright()) as p:  # nothing drives the idle browser
+            if not idle:
+                browser = p.firefox.connect(server.ws_endpoint)
+                context = browser.new_context()
+                context.set_default_timeout(profile_p4.TIMEOUT_MS)
+                context.set_default_navigation_timeout(profile_p4.TIMEOUT_MS)
+                profile_p4.install_route(context)
+                page = context.new_page()
+                journey = profile_p4.Journey(context, page, origin_a, origin_o)
+                journey_site.STATE.begin_walk()
+                for n, (name, method) in enumerate(JOURNEY, 1):
+                    journey.extra = {}
+                    journey_site.STATE.set_step(n)
+                    try:
+                        getattr(journey, method)()
+                        steps.append({"n": n, "name": name, "ok": True})
+                    except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
+                        steps.append({"n": n, "name": name, "ok": False, "error": str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc)})
+                steps.append(geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1))
+                context.close()
+                browser.close()
         # The close: the run ends with the exit of the browser, and the trace is read after it.
         root = server.process
         started = time.monotonic()
@@ -1449,12 +1580,16 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
         if exited is not None and not exited:
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
+        if idle:
+            result["idle"] = {"notified": notified, "ping_endpoint_received": sorted(ping_server.received)}
     except TraceError as e:
         result = {"seed": seed, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
                   "problems": ["the trace of the run could not be taken: %s" % e]}
     finally:
         stop_site()
         stop_geo()
+        if ping_server is not None:
+            ping_server.close()
         if server is not None:
             try:
                 server.close()
@@ -1468,6 +1603,67 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
             trace.cleanup()
     result["problems"] = result.get("problems", []) + problems
     return result
+
+
+class PingServer:
+    """The lab's telemetry endpoint of the idle launch (`toolkit.telemetry.server`): on loopback, so the exit pings leave to the lab and never to the
+    internet, and what it received is evidence that they left. Records the `<type>` of every `/submit/telemetry/<id>/<type>/...` it was given."""
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        self.received: list = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                outer.received.append(ping_type([self.path]) or self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def wait_for_notification(read, period=NOTIFY_PERIOD_S, limit_s=NOTIFY_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> dict:
+    """Reads the profile's prefs (`read()` returns the text of prefs.js, or None while there is none) until the notification of the data policy is recorded in it, or
+    until `limit_s`: `{"observed": bool, "polls": n}`. The event is the verdict; the limit only ends the wait of a launch that never gets there."""
+    end, polls = now() + limit_s, 0
+    while True:
+        text = read()
+        polls += 1
+        if text and NOTIFIED_PREF in text:
+            return {"observed": True, "polls": polls}
+        if now() >= end:
+            return {"observed": False, "polls": polls}
+        sleep(period)
+
+
+def profile_prefs_reader(before: set):
+    """`read()` for `wait_for_notification`: the prefs.js of the profile the launch made (the `invisible_profile_*` folder of the run's temp root that was not
+    there before it)."""
+    root = Path(tempfile.gettempdir())
+
+    def read():
+        for folder in sorted(set(root.glob("invisible_profile_*")) - before):
+            try:
+                return (folder / "prefs.js").read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return None
+
+    return read
 
 
 def _wait_for_tree_exit(pgid):
@@ -1520,6 +1716,7 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     info.update({"processes": len(procs), "paths": len(raw)})
     # touched_by, touched_calls and spawned_by are evidence, never compared: the process and the call to blame for a path or a kind that differs
     out = {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
+           "pingsenders": ping_records(procs, {pid: p["label"] for pid, p in procs.items()}, parents, windows),
            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside,
            "net": net, "net_not_compared": net_skipped, "lifecycle": lifecycle, "proc_fd_opens": fd_opens, "close": close}
     if not windows:
@@ -1556,9 +1753,13 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
             print("seed %d: %s; %d host paths, %d net entries, %s" % (seed, json.dumps(fp["kinds"], sort_keys=True), len(fp["files"]),
                                                                       len(fp.get("net") or []), json.dumps(fp.get("ours", {}), sort_keys=True)))
             sys.stdout.flush()
+        idle = run_seed(binary, seeds[0], work, name="idle", idle=True)
+        problems += ["idle: %s" % p for p in idle.get("problems", [])]
+        print("idle (seed %d): %s; notification %s" % (seeds[0], json.dumps(idle["kinds"], sort_keys=True), json.dumps((idle.get("idle") or {}).get("notified"))))
+        sys.stdout.flush()
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "problems": problems,
+    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "idle": idle, "problems": problems,
             "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
 
 

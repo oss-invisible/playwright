@@ -687,14 +687,12 @@ def test_the_uuid_of_the_uninstall_ping_is_not_a_difference_and_the_rest_of_its_
 
 
 def test_a_background_task_of_the_engine_is_a_kind_of_its_own_by_its_command_line():
-    exe = "C:\\Lab\\labrunner\\AppData\\Local\\invisible-playwright\\Cache\\firefox.exe"
+    exe = "C:\\Users\\runneradmin\\AppData\\Local\\invisible-playwright\\Cache\\firefox.exe"
     cmd = exe + " --backgroundtask pingsender https://incoming.telemetry.mozilla.org/submit/telemetry/244041fe/first-shutdown/Firefox/159.0/release/2026?v=4 C:\\x\\ping"
     events = host.parse_audit_events(audit(1, 200, 100, exe, cmd))
     assert host.windows_processes(events, exe)[200]["label"] == "backgroundtask/pingsender"
     assert host.label_of_exec("/e/firefox/firefox", ["/e/firefox/firefox", "--backgroundtask", "uninstall"], REAL) == "backgroundtask/uninstall"
-    a = footprint(platform="win32", kinds=dict(KINDS, **{"backgroundtask/pingsender": 3}))
-    report = judge(a, footprint("again", platform="win32"), a_a=True)
-    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc.backgroundtask/pingsender"}
+    assert host.ping_type(host.split_command_line(cmd)) == "first-shutdown"
 
 
 def test_the_session_is_recording_when_the_last_start_canary_is_in_the_trace_even_if_the_first_ones_are_not(tmp_path, monkeypatch):
@@ -710,6 +708,15 @@ def test_the_session_is_recording_when_the_last_start_canary_is_in_the_trace_eve
 # -
 # The warm-up: a discarded launch of each engine before its measured ones, kept as evidence, never an excuse.
 
+def with_pingsenders(fp, n, types=("event", "first-shutdown", "new-profile"), parent="parent"):
+    fp = copy.deepcopy(fp)
+    for seed in fp["seeds"]:
+        seed["kinds"][host.PINGSENDER_KIND] = n
+        seed["pingsenders"] = [{"type": types[i % len(types)], "form": "backgroundtask", "parent": parent} for i in range(n)]
+        seed["spawned_by"] = {host.PINGSENDER_KIND: [parent]}
+    return fp
+
+
 def with_warmup(fp, kinds=None, files=None, touched_by=None, spawned_by=None, seed=11):
     fp = copy.deepcopy(fp)
     fp["warmup"] = {"seed": seed, "steps": [], "problems": [], "kinds": dict(KINDS if kinds is None else kinds), "files": list(FILES if files is None else files),
@@ -717,22 +724,22 @@ def with_warmup(fp, kinds=None, files=None, touched_by=None, spawned_by=None, se
     return fp
 
 
-def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_and_then_its_measured_ones(tmp_path, monkeypatch):
+def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_then_its_measured_ones_and_the_idle_launch_last(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run_seed(binary, seed, work, name=None):
-        calls.append((seed, name))
+    def fake_run_seed(binary, seed, work, name=None, idle=False):
+        calls.append((seed, name, idle))
         return seed_footprint(seed)
 
     monkeypatch.setattr(host, "run_seed", fake_run_seed)
     monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
     doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68")
-    assert calls == [(11, "warmup"), (11, None), (12, None)]
-    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["problems"] == []
+    assert calls == [(11, "warmup", False), (11, None, False), (12, None, False), (11, "idle", True)]
+    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["idle"]["seed"] == 11 and doc["problems"] == []
 
 
 def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(monkeypatch):
-    def fake_run_seed(binary, seed, work, name=None):
+    def fake_run_seed(binary, seed, work, name=None, idle=False):
         fp = seed_footprint(seed)
         if name == "warmup":
             fp["problems"] = ["the file trace did not see the end canary file of the oracle"]
@@ -790,19 +797,46 @@ def test_the_report_lists_what_is_only_in_the_warm_up_and_says_when_both_engines
     assert "WARMUP-ONLY firefox-68 again seed 11 proc.backgroundtask/pingsender" in out
 
 
-def test_a_pingsender_count_that_differs_after_the_warm_up_is_red_and_names_who_spawned_it():
-    warm = dict(KINDS, **{"backgroundtask/pingsender": 3})
-    a = with_warmup(footprint(kinds=dict(KINDS, **{"backgroundtask/pingsender": 3})), kinds=warm)
-    b = with_warmup(footprint("firefox-68 again"), kinds=warm)
+def test_the_pingsenders_of_a_short_launch_are_none_or_the_three_of_a_first_run_and_nothing_else():
+    pings = with_pingsenders(footprint(), 3)
+    assert judge(pings, footprint("again"), a_a=True)["verdict"] == "green", "3 on one side and 0 on the other is the approved tolerance"
+    assert judge(with_pingsenders(footprint(), 3), with_pingsenders(footprint("again"), 3), a_a=True)["verdict"] == "green"
+    for n in (1, 2, 4):
+        report = judge(with_pingsenders(footprint(), n), footprint("again"), a_a=True)
+        assert report["verdict"] == "red" and any("%d pingsender processes, not 0 or 3" % n in p and "TelemetrySend.sys.mjs:1083" in p for p in report["problems"]), n
+
+
+def test_three_pingsenders_that_are_not_the_pings_of_a_first_run_or_not_spawned_by_the_parent_are_red():
+    wrong = with_pingsenders(footprint(), 3, types=("event", "event", "new-profile"))
+    assert any("not the pings of a first run" in p for p in judge(wrong, footprint("again"), a_a=True)["problems"])
+    orphan = with_pingsenders(footprint(), 3, parent="gpu")
+    assert any("not all spawned by the parent" in p for p in judge(orphan, footprint("again"), a_a=True)["problems"])
+
+
+def test_the_separate_pingsender_executable_is_red_whatever_the_count():
+    for exe in ("pingsender", "pingsender.exe"):
+        fp = footprint(kinds=dict(KINDS, **{exe: 1}))
+        assert any("the separate %s ran (B266" % exe in p for p in judge(fp, footprint("again"), a_a=True)["problems"])
+
+
+def test_a_path_only_a_pingsender_touched_and_its_destinations_are_there_when_the_pingsenders_are():
+    a = with_pingsenders(footprint(files=FILES + ["c:\\windows\\system32\\imagehlp.dll"]), 3)
     for seed in a["seeds"]:
-        seed["spawned_by"] = {"backgroundtask/pingsender": ["parent"]}
-    report = judge(a, b, a_a=True)
-    assert report["verdict"] == "red"
-    assert {(d["leaf"], d["a"], d["b"]) for d in report["differences"]} == {("proc.backgroundtask/pingsender", 3, host.MISSING)}
-    assert all(d["by"] == {"A": ["parent"], "B": []} for d in report["differences"])
-    assert any("proc.backgroundtask/pingsender: A 3 | B \"<missing>\" (by A: parent | B: -)" in p for p in report["problems"])
-    same = judge(a, with_warmup(footprint("again", kinds=dict(KINDS, **{"backgroundtask/pingsender": 3})), kinds=warm), a_a=True)
-    assert same["verdict"] == "green"
+        seed["touched_by"] = {"c:\\windows\\system32\\imagehlp.dll": ["backgroundtask/pingsender"]}
+        seed["net"] = ["backgroundtask/pingsender: connect tcp AF_INET 34.120.1.1:443"]
+    report = judge(a, footprint("again"), a_a=True)
+    assert report["verdict"] == "green", report["problems"]
+    a["seeds"][0]["touched_by"] = {"c:\\windows\\system32\\imagehlp.dll": ["backgroundtask/pingsender", "parent"]}
+    assert {d["leaf"] for d in judge(a, footprint("again"), a_a=True)["differences"]} == {"file.c:\\windows\\system32\\imagehlp.dll"}
+
+
+def test_a_pingsender_that_connects_to_a_public_address_behind_a_session_proxy_is_red():
+    fp = with_pingsenders(footprint(), 3)
+    fp["seeds"][0]["net"] = ["backgroundtask/pingsender: connect tcp AF_INET 34.120.1.1:443"]
+    assert judge(fp, footprint("again"), a_a=True)["verdict"] == "green", "no session proxy: the pings go where the session goes"
+    fp["seeds"][0]["session_proxy"] = True
+    report = judge(fp, footprint("again"), a_a=True)
+    assert report["verdict"] == "red" and any("connected directly to a public address behind the session's proxy (B266)" in p for p in report["problems"])
 
 
 def test_a_path_that_differs_names_the_kinds_that_touched_it():
@@ -1363,3 +1397,95 @@ def test_a_closed_linux_run_keeps_the_lifecycle_the_close_and_the_proc_fd_opens(
     assert fp["close"] == {"root_returncode": 0, "close_s": 1.5}
     assert [e["kind"] for e in fp["lifecycle"] if e["event"] == "start"] == ["parent", "utility/sandboxingKind=0", "backgroundtask/pingsender"]
     assert fp["proc_fd_opens"][0]["kind"] == "parent" and "/proc/self/fd/7" in fp["proc_fd_opens"][0]["line"]
+
+
+# -
+# The idle launch: the launch in which the exit pings MUST leave (the precondition is seen in the profile, then the browser closes).
+
+def with_idle(fp, n=3, types=("event", "first-shutdown", "new-profile"), parent="parent", observed=True, net=None, received=("event", "first-shutdown", "new-profile")):
+    fp = copy.deepcopy(fp)
+    idle = seed_footprint(11, kinds=dict(KINDS, **{host.PINGSENDER_KIND: n}))
+    idle["pingsenders"] = [{"type": types[i % len(types)], "form": "backgroundtask", "parent": parent} for i in range(n)]
+    idle["net"] = list(net or [])
+    idle["idle"] = {"notified": {"observed": observed, "polls": 7}, "ping_endpoint_received": list(received)}
+    fp["idle"] = idle
+    return fp
+
+
+def test_the_idle_launch_is_green_when_the_notification_was_seen_and_the_three_pings_left_by_the_background_task_of_the_parent(capsys):
+    a, b = with_idle(footprint()), with_idle(footprint("firefox-68 again"))
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green", report["problems"]
+    assert report["idle"]["A"] == {"notified": {"observed": True, "polls": 7}, "pingsenders": 3, "types": ["event", "first-shutdown", "new-profile"],
+                                   "parents": ["parent"], "endpoint_received": ["event", "first-shutdown", "new-profile"]}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "IDLE (the pings must leave) firefox-68: notification" in capsys.readouterr().out
+    assert judge(footprint(), footprint("again"), a_a=True)["idle"] == {"A": None, "B": None}, "a footprint with no idle launch has nothing to compare"
+
+
+@pytest.mark.parametrize("kwargs,words", [
+    ({"observed": False}, "the notification of the data policy was not recorded in the profile within 120 s (TelemetrySend.sys.mjs:1083 is false"),
+    ({"n": 0}, "0 pingsender processes, the pings of a first run must leave: 3"),
+    ({"n": 2}, "2 pingsender processes"),
+    ({"types": ("event", "event", "new-profile")}, "not the pings of a first run"),
+    ({"parent": "gpu"}, "not all spawned by the parent"),
+    ({"net": ["backgroundtask/pingsender: connect tcp AF_INET 34.120.1.1:443"]}, "went out to a public address instead of the lab's endpoint (B266)"),
+])
+def test_an_idle_launch_in_which_the_pings_did_not_leave_as_they_must_is_red(kwargs, words):
+    report = judge(with_idle(footprint(), **kwargs), with_idle(footprint("firefox-68 again")), a_a=True)
+    assert report["verdict"] == "red" and any(words in p and p.startswith("idle launch of side A") for p in report["problems"]), report["problems"]
+
+
+def test_the_separate_pingsender_executable_in_the_idle_launch_is_red_and_a_side_with_no_idle_launch_is_red():
+    fp = with_idle(footprint())
+    fp["idle"]["kinds"]["pingsender.exe"] = 1
+    assert any("idle launch of side A: the separate pingsender.exe ran (B266" in p for p in judge(fp, with_idle(footprint("again")), a_a=True)["problems"])
+    assert any("side B has no idle launch" in p for p in judge(with_idle(footprint()), footprint("again"), a_a=True)["problems"])
+
+
+def test_the_notification_is_waited_for_in_the_profile_until_it_is_recorded_or_the_limit():
+    texts = iter([None, "user_pref(\"a\", 1);", "user_pref(\"%s\", \"1\");" % host.NOTIFIED_PREF])
+    clock = iter(range(1000))
+    got = host.wait_for_notification(lambda: next(texts), sleep=lambda s: None, now=lambda: next(clock))
+    assert got == {"observed": True, "polls": 3}
+    clock = iter(range(0, 10 ** 6, 50))
+    never = host.wait_for_notification(lambda: "user_pref(\"a\", 1);", limit_s=120, sleep=lambda s: None, now=lambda: next(clock))
+    assert never["observed"] is False and never["polls"] >= 2
+
+
+def test_the_prefs_read_are_those_of_the_profile_the_launch_made_not_an_older_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(host.tempfile, "gettempdir", lambda: str(tmp_path))
+    old = tmp_path / "invisible_profile_old"
+    old.mkdir()
+    (old / "prefs.js").write_text("user_pref(\"%s\", \"1\");" % host.NOTIFIED_PREF, encoding="utf-8")
+    read = host.profile_prefs_reader(set(tmp_path.glob("invisible_profile_*")))
+    assert read() is None, "no new profile yet"
+    new = tmp_path / "invisible_profile_new"
+    new.mkdir()
+    assert read() is None, "the profile has no prefs.js yet"
+    (new / "prefs.js").write_text("user_pref(\"a\", 1);", encoding="utf-8")
+    assert read() == "user_pref(\"a\", 1);"
+
+
+def test_the_lab_endpoint_of_the_idle_launch_records_the_type_of_every_ping_it_is_given():
+    import urllib.request
+
+    server = host.PingServer()
+    try:
+        for kind in ("new-profile", "event"):
+            req = urllib.request.Request(server.url + "/submit/telemetry/0668ac73/%s/Firefox/159.0/release/2026?v=4" % kind, data=b"{}", method="POST")
+            assert urllib.request.urlopen(req, timeout=10).status == 200
+    finally:
+        server.close()
+    assert server.received == ["new-profile", "event"] and server.url.startswith("http://127.0.0.1:")
+
+
+def test_the_pingsender_records_say_the_type_the_form_and_the_parent_of_each_process():
+    cmd = "C:\\lab\\ff\\firefox.exe --backgroundtask pingsender https://t.example/submit/telemetry/1/new-profile/Firefox/159.0/release/2026?v=4 C:\\p\\ping"
+    procs = {7: {"label": host.PINGSENDER_KIND, "cmd": cmd}, 8: {"label": "pingsender.exe", "cmd": "C:\\lab\\ff\\pingsender.exe https://t.example/submit/telemetry/2/event/x"},
+             1: {"label": "parent", "cmd": "firefox.exe"}}
+    labels = {pid: p["label"] for pid, p in procs.items()}
+    assert host.ping_records(procs, labels, {7: 1, 8: 1}, True) == [
+        {"type": "event", "form": "pingsender.exe", "parent": "parent"}, {"type": "new-profile", "form": "backgroundtask", "parent": "parent"}]
+    linux = {7: {"label": host.PINGSENDER_KIND, "exec": ("/e/firefox", ["firefox", "--backgroundtask", "pingsender", "https://t.example/submit/telemetry/1/first-shutdown/Firefox/1/r", "/p/x"])}}
+    assert host.ping_records(linux, {7: host.PINGSENDER_KIND}, {}, False) == [{"type": "first-shutdown", "form": "backgroundtask", "parent": "(oracle)"}]
