@@ -134,13 +134,13 @@ def test_eval_on_selector_all_takes_a_date(page):
 
 def test_wait_for_function_takes_a_date(page):
     epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-    handle = page.wait_for_function("d => d instanceof Date && d.getTime() === 0", epoch)
+    handle = page.wait_for_function("d => d instanceof Date && d.getTime() === 0", arg=epoch)
     assert handle.json_value() is True
 
 
 def test_wait_for_function_takes_a_handle(page):
     outer = page.query_selector("#outer")
-    handle = page.wait_for_function("e => e.id === 'outer'", outer)
+    handle = page.wait_for_function("e => e.id === 'outer'", arg=outer)
     assert handle.json_value() is True
 
 
@@ -173,8 +173,12 @@ def test_a_handle_of_another_page_is_refused_with_stock_s_text(page):
 def test_an_exposed_function_answering_a_date_hands_the_page_a_date(page):
     # stock: the result of a binding goes to the page through the same `parseEvaluationResultValue`
     page.expose_function("whenIsIt", lambda: WHEN)
-    assert page.evaluate("async () => { const r = await window.whenIsIt(); return [r instanceof Date, r.toISOString()]; }") == [
-        True, "2021-07-28T20:26:32.123Z"]
+    # ⛔ THE PAGE ASKS ITSELF: a script tag runs in the page's own realm, where the answer is delivered (the binding lives in the page's world and
+    # so does the decoder that makes the Date). An `evaluate` runs in the caller's world, a realm of its own whose `Date` is another one: asked from
+    # there, `instanceof Date` compares with that other `Date`, so it says nothing about the realm the answer was made in.
+    page.add_script_tag(content="window.__asked = async () => { const r = await window.whenIsIt();"
+                                " return [r instanceof Date, Object.getPrototypeOf(r) === Date.prototype, r.toISOString()]; };")
+    assert page.evaluate("() => window.__asked()") == [True, True, "2021-07-28T20:26:32.123Z"]
 
 
 COUNTING = """<!doctype html><button id="touch" onclick="window.__touch()">touch</button>
