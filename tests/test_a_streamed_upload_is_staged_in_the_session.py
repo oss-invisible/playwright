@@ -24,13 +24,14 @@ from __future__ import annotations
 import base64
 import itertools
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from invisible_core.juggler.connection import EventListeners
 from invisible_playwright._juggler import remote
 from invisible_playwright._juggler.dispatcher import ProtocolException
-from invisible_playwright._juggler.server import LocalUtilsDispatcher, _upload_paths
+from invisible_playwright._juggler.server import ElementHandleDispatcher, FrameDispatcher, LocalUtilsDispatcher, _upload_paths
 from _browser_census import closes_with_the_test
 
 pytestmark = pytest.mark.unit
@@ -109,6 +110,26 @@ def _item(name, ms=MTIME_MS):
 
 def _chunk(data):
     return {"binary": base64.b64encode(data).decode()}
+
+
+def _the_element_uploads(endpoint, context, params):
+    """What the ElementHandle's `setInputFiles` hands the engine for this request, on an element of a page of `context`: its paths."""
+    sent = []
+    actions = SimpleNamespace(set_input_files=lambda handle, paths, **kwargs: sent.append(paths))
+    element = SimpleNamespace(server=endpoint.server, frame=SimpleNamespace(page=SimpleNamespace(context=context), actions=actions),
+                              _act_args=lambda p: {})
+    ElementHandleDispatcher.op_set_input_files(element, params)
+    return sent[0]
+
+
+def _the_frame_uploads(endpoint, context, params):
+    """The same for the Frame's `setInputFiles`, on a frame of a page of `context`."""
+    sent = []
+    actions = SimpleNamespace(set_input_files=lambda selector, paths, **kwargs: sent.append(paths))
+    frame = SimpleNamespace(server=endpoint.server, page=SimpleNamespace(context=context), actions=actions,
+                            enter_frames=lambda selector: ("f1", selector), _timeout=lambda p: None, _act_opts=lambda p: {})
+    FrameDispatcher.op_set_input_files(frame, params)
+    return sent[0]
 
 
 def _streams(endpoint, answer):
@@ -228,7 +249,7 @@ def test_upload_paths_resolves_the_streams_to_the_closed_files(served):
     streams = _streams(served, _temp_files(served, client, context, [_item("a.txt"), _item("b.txt")]))
     for stream, data in zip(streams, (b"first", b"second")):
         _copy(served, client, stream, data)
-    paths = _upload_paths(served.server, {"streams": [s.channel for s in streams]})
+    paths = _the_element_uploads(served, context, {"streams": [s.channel for s in streams]})
     assert paths == [s.path for s in streams]
     assert [os.path.basename(p) for p in paths] == ["a.txt", "b.txt"]
 
@@ -239,17 +260,57 @@ def test_upload_paths_refuses_a_stream_that_is_not_closed(served):
     stream, = _streams(served, _temp_files(served, client, context, [_item("a.txt")]))
     _send(served, client, stream.guid, "write", _chunk(b"half"))
     with pytest.raises(ProtocolException, match="not closed"):
-        _upload_paths(served.server, {"streams": [stream.channel]})
+        _the_element_uploads(served, context, {"streams": [stream.channel]})
 
 
-def test_upload_paths_refuses_a_stream_nobody_made(served):
-    with pytest.raises(ProtocolException, match="stream"):
-        _upload_paths(served.server, {"streams": [{"guid": "writablestream@999"}]})
+def test_upload_paths_refuses_a_stream_nobody_made_with_the_stock_servers_sentence(served):
+    """Stock (`dispatcher.ts`, `_tChannelImplFromWire`, coreBundle.js 18313): `<path>: no object with guid <guid>`, the path being `streams[<index>]`."""
+    context = _context(served, _client(served))
+    with pytest.raises(ProtocolException) as refused:
+        _the_element_uploads(served, context, {"streams": [{"guid": "writablestream@999"}]})
+    assert str(refused.value) == "streams[0]: no object with guid writablestream@999"
 
 
 def test_upload_paths_refuses_a_directory_stream_by_the_same_sentence(served):
     with pytest.raises(ProtocolException, match="folder"):
         _upload_paths(served.server, {"directoryStream": {"guid": "writablestream@1"}})
+
+
+def _closed_stream(served, client, context, name="a.txt", data=b"data"):
+    stream, = _streams(served, _temp_files(served, client, context, [_item(name)]))
+    _copy(served, client, stream, data)
+    return stream
+
+
+def test_a_closed_stream_of_another_context_is_unknown_to_this_one(served):
+    """A stream belongs to the context that made it: the stock server's streams are objects of one connection and one context's scope, and a guid outside them is `no object`."""
+    client = _client(served)
+    mine, other = _context(served, client), _context(served, client)
+    foreign = _closed_stream(served, client, other)
+    own = _closed_stream(served, client, mine, "own.txt")
+    with pytest.raises(ProtocolException) as refused:
+        _the_element_uploads(served, mine, {"streams": [own.channel, foreign.channel]})
+    assert str(refused.value) == "streams[1]: no object with guid %s" % foreign.guid
+
+
+def test_a_closed_stream_of_another_client_is_unknown_to_this_one(served):
+    me, someone = _client(served), _client(served)
+    mine, theirs = _context(served, me), _context(served, someone)
+    foreign = _closed_stream(served, someone, theirs, "theirs.txt", b"not yours")
+    with pytest.raises(ProtocolException) as refused:
+        _the_element_uploads(served, mine, {"streams": [foreign.channel]})
+    assert str(refused.value) == "streams[0]: no object with guid %s" % foreign.guid
+
+
+def test_an_own_stream_is_accepted_by_the_frame_door_and_a_foreign_one_is_not(served):
+    """The Frame's `setInputFiles` (a selector) reads the request with the same helper as the element's."""
+    client = _client(served)
+    mine, other = _context(served, client), _context(served, client)
+    own, foreign = _closed_stream(served, client, mine, "own.txt"), _closed_stream(served, client, other, "foreign.txt")
+    assert _the_frame_uploads(served, mine, {"selector": "input", "streams": [own.channel]}) == [own.path]
+    with pytest.raises(ProtocolException) as refused:
+        _the_frame_uploads(served, mine, {"selector": "input", "streams": [foreign.channel]})
+    assert str(refused.value) == "streams[0]: no object with guid %s" % foreign.guid
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------
