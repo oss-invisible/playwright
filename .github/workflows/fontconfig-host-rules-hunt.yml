@@ -5,7 +5,7 @@
 # on the index), on Linux: do the HOST's fontconfig rules (rgba, lcdfilter,
 # autohint, embeddedbitmap, and an alias of system-ui) change the pixels of the
 # text a page reads with getImageData, on an opaque canvas and on a default one,
-# with faces of the bundle that carry embedded bitmaps? Six launches of one seed,
+# with faces of the bundle that carry embedded bitmaps? Nine launches of one seed,
 # each with its own FONTCONFIG_FILE; the test asserts the same bytes in all of
 # them and records every hash to result.json (artifact fcrules-<run id>).
 #
@@ -62,7 +62,7 @@ jobs:
         shell: bash
         run: python scripts/ci_lab_geoip.py build
 
-      - name: The measurement (six launches, one seed)
+      - name: The measurement (nine launches, one seed)
         env:
           PYTHONUNBUFFERED: "1"
           FCRULES_RESULT_DIR: ${{ runner.temp }}/fcrules

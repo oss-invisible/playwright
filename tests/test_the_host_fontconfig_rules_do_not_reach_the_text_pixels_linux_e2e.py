@@ -22,18 +22,26 @@ launch:
 Each row returns the sha256 of the ``getImageData`` bytes, the number of pixels with R != G or G != B (subpixel anti-aliasing: grayscale text has
 none), the number of pixels that are not white (the text is there) and the width ``measureText`` gives.
 
-Six launches, one engine, one seed, each with its own ``FONTCONFIG_FILE``:
+Nine launches, one engine, one seed, each with its own ``FONTCONFIG_FILE``:
 
   1. nothing: ``/etc/fonts/fonts.conf`` alone (the rules of the runner, whatever they are);
   2. ``rgba=rgb`` and ``lcdfilter=lcddefault``;
   3. ``autohint=true``;
   4. ``embeddedbitmap=false``;
   4b. ``embeddedbitmap=true``;
-  5. launch 1 and an ``<alias>`` that makes the generic ``system-ui`` (and ``Sans``, ``sans-serif``, which the toolkit's default font goes
-     through) prefer a face of another family (DejaVu Serif, copied into a folder of its own that fontconfig is told to scan first).
+  5b. a rule that really moves ``system-ui`` inside fontconfig: the folder with a copy of a face of another family scanned first, and, after the
+      base file, ``<match target="pattern">`` on family ``system-ui`` with ``<edit name="family" mode="prepend_first" binding="strong">`` of that
+      family (the engine builds exactly such a pattern for a generic family: FC_FAMILY = "system-ui", FC_SCALABLE, FC_LANG, then
+      ``FcConfigSubstitute`` and ``FcFontSort``; a plain ``<alias><prefer>`` landed behind the lists of the base file's generic rules and moved
+      nothing in run 45076853395);
+  6. ``rgba=none`` and ``lcdfilter=lcdnone`` (the runner's own rules already say rgba=rgb: this is the other side of it);
+  7. ``hintstyle=hintfull`` and 8. ``antialias=false``: the two parameters the engine DECLARES (value 1 and 1), so a host rule must not move them.
+
+Before each engine starts, ``fc-match`` runs with that launch's ``FONTCONFIG_FILE`` and says whether the rule is in force (the raw lines are in
+result.json). A launch whose rule is not in force measures nothing, and every assertion starts by saying so for each launch.
 
 Every config includes the base file first, then adds ``<match target="font">`` (and the same under ``target="pattern"``, so a rule that fontconfig
-applies at either stage is there) with ``<edit mode="assign">``. In launches 1 and 5 (all of them, the cost is nothing) the page reads
+applies at either stage is there) with ``<edit mode="assign">``. In every launch the page reads
 ``getComputedStyle(...).fontFamily`` of an element in ``system-ui`` and, by canvas and by layout, the width of a Latin string and of one CJK
 character in ``system-ui``: a width that moves is a face of the host that reached the page.
 
@@ -52,9 +60,9 @@ swallowed: the record never changes the outcome.
 
 The assertions (the principle: same seed, same bytes):
   * every row drew text (a blank canvas would make the comparison empty);
-  * the configs bite in fontconfig itself (``fc-match`` says the rule), or the equality below would be vacuous;
-  * launches 1, 2, 3, 4 and 4b give the same bytes as launch 1, per canvas, row by row;
-  * the ``system-ui`` reads of launch 5 equal those of launch 1.
+  * the rule of every launch is in force in fontconfig itself (``fc-match``, before the engine starts), or the equality below would be vacuous;
+  * every launch gives the same bytes as launch 1, per canvas, row by row;
+  * the ``system-ui`` reads of launch 5b equal those of launch 1.
 
 Not in any gate: this is a measurement (``.github/workflows/fontconfig-host-rules-hunt.yml``, a temporary workflow on a branch of its own).
 
@@ -104,16 +112,30 @@ LAUNCHES = [
     ("3_autohint", [("autohint", "bool", "true")]),
     ("4_embeddedbitmap_off", [("embeddedbitmap", "bool", "false")]),
     ("4b_embeddedbitmap_on", [("embeddedbitmap", "bool", "true")]),
-    ("5_system_ui_alias", []),
+    ("5b_system_ui_prepend", []),
+    ("6_rgba_none_lcdnone", [("rgba", "const", "none"), ("lcdfilter", "const", "lcdnone")]),
+    # The two the engine DECLARES (``zoom.stealth.text.freetype_hintstyle`` and ``..._antialias``, both 1): a host rule must not move them either.
+    ("7_hintstyle_full", [("hintstyle", "const", "hintfull")]),
+    ("8_antialias_off", [("antialias", "bool", "false")]),
 ]
-#: What fontconfig itself must say for the config of each launch (``fc-match -f``): the proof that the rule is in force.
+SYSTEM_UI_LAUNCH = "5b_system_ui_prepend"
+#: The pattern the engine builds for a generic family (``gfxFcPlatformFontList::FindGenericFamilies``: FC_FAMILY = the generic name, FC_SCALABLE true,
+#: FC_LANG = the sample language) and the plain name.
+ENGINE_PATTERN = "system-ui:scalable=true:lang=en"
+PROPERTIES = ("rgba", "lcdfilter", "autohint", "embeddedbitmap", "hintstyle", "antialias")
+#: What ``fc-match -f '%{property}'`` prints for the config of each launch: the integers are fontconfig's own constants (FC_RGBA_RGB 1,
+#: FC_RGBA_NONE 5, FC_LCD_DEFAULT 1, FC_LCD_NONE 0, FC_HINT_FULL 3), a boolean prints True or False. The raw ``fc-match -v`` lines of every launch are
+#: in result.json beside them. A value that is not the one written here still counts as the rule in force when it is DIFFERENT from what launch 1
+#: prints for the same property (the form is uncertain, the move is not); both are recorded.
 EXPECTED_FC = {
     "2_rgba_rgb_lcddefault": {"rgba": "1", "lcdfilter": "1"},
     "3_autohint": {"autohint": "True"},
     "4_embeddedbitmap_off": {"embeddedbitmap": "False"},
     "4b_embeddedbitmap_on": {"embeddedbitmap": "True"},
+    "6_rgba_none_lcdnone": {"rgba": "5", "lcdfilter": "0"},
+    "7_hintstyle_full": {"hintstyle": "3"},
+    "8_antialias_off": {"antialias": "False"},
 }
-SYSTEM_UI_ALIASES = ("system-ui", "Sans", "sans-serif")
 
 #: Draws every row. ``args`` = [fonts, sizes]. Returns [{canvas, font, size, sha256, subpixel, ink, width, fallback_width}].
 ROWS_JS = """async (args) => {
@@ -189,11 +211,16 @@ class _Server(socketserver.ThreadingTCPServer):
 def _config_text(name: str, rules, base: str, host_dir, host_family: str) -> str:
     """The fonts.conf of a launch: the base file, then the rules."""
     parts = ['<?xml version="1.0"?>', '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">', "<fontconfig>"]
-    if name == "5_system_ui_alias":
+    if name == SYSTEM_UI_LAUNCH:
         parts.append("  <dir>%s</dir>" % host_dir)
-        for family in SYSTEM_UI_ALIASES:
-            parts.append('  <alias binding="same"><family>%s</family><prefer><family>%s</family></prefer></alias>' % (family, host_family))
     parts.append('  <include ignore_missing="no">%s</include>' % base)
+    if name == SYSTEM_UI_LAUNCH:
+        # After the base file: its own generic rules have put their list in front of system-ui by now, and this one goes first.
+        # An <alias><prefer> lands behind that list (run 45076853395: fc-match system-ui stayed on DejaVu Sans).
+        parts.append('  <match target="pattern">')
+        parts.append('    <test qual="any" name="family"><string>system-ui</string></test>')
+        parts.append('    <edit name="family" mode="prepend_first" binding="strong"><string>%s</string></edit>' % host_family)
+        parts.append("  </match>")
     for target in ("pattern", "font"):
         if rules:
             parts.append('  <match target="%s">' % target)
@@ -210,17 +237,47 @@ def _fc_match(conf: Path, pattern: str, fmt: str) -> str:
     return done.stdout.strip()
 
 
-def _what_fontconfig_says(name: str, conf: Path) -> dict:
-    """What fontconfig itself says for this config (the host tool, not the browser)."""
+def _what_fontconfig_says(conf: Path) -> dict:
+    """What fontconfig itself says for this config (the host tool, not the browser): the value of each property, the raw ``fc-match -v`` lines of
+    them, and the family it answers to ``system-ui`` (the plain name and the pattern the engine builds)."""
     out = {}
     try:
-        for key in ("rgba", "lcdfilter", "autohint", "embeddedbitmap"):
+        for key in PROPERTIES:
             out[key] = _fc_match(conf, "sans", "%%{%s}" % key)
+        env = dict(os.environ, FONTCONFIG_FILE=str(conf))
+        verbose = subprocess.run(["fc-match", "-v", "sans"], env=env, capture_output=True, text=True, timeout=60).stdout
+        out["raw"] = [line.strip() for line in verbose.splitlines() if line.strip().split(":", 1)[0] in PROPERTIES + ("hinting",)]
         out["system-ui_family"] = _fc_match(conf, "system-ui", "%{family}")
+        out["system-ui_engine_pattern_family"] = _fc_match(conf, ENGINE_PATTERN, "%{family}")
         out["sans_family"] = _fc_match(conf, "sans", "%{family}")
-    except Exception as exc:  # recorded, never decides
+    except Exception as exc:  # recorded; the precondition below then names it
         out["error"] = repr(exc)
     return out
+
+
+def _rule_in_force(name: str, said: dict, base_said: dict, host_family: str) -> dict:
+    """The precondition of a launch, decided BEFORE its engine starts: does fontconfig, with this launch's FONTCONFIG_FILE, apply the rule? A launch
+    whose rule is not in force measures nothing (it would equal launch 1 whatever the engine does)."""
+    problems, notes = [], []
+    if "error" in said:
+        problems.append("fc-match could not be run: %s" % said["error"])
+    for prop, want in EXPECTED_FC.get(name, {}).items():
+        got = said.get(prop)
+        if got == want:
+            continue
+        if got and got != base_said.get(prop):
+            notes.append("%s prints %r, not %r, and it is not what launch 1 prints (%r): the form is uncertain, the move is not"
+                         % (prop, got, want, base_said.get(prop)))
+        else:
+            problems.append("%s: fc-match prints %r (launch 1 prints %r), the rule wants %r" % (prop, got, base_said.get(prop), want))
+    if name == SYSTEM_UI_LAUNCH:
+        got = said.get("system-ui_engine_pattern_family", "")
+        if not got.startswith(host_family):
+            problems.append("fc-match %s answers %r (launch 1: %r), the rule wants %r"
+                            % (ENGINE_PATTERN, got, base_said.get("system-ui_engine_pattern_family"), host_family))
+        if not said.get("system-ui_family", "").startswith(host_family):
+            notes.append("the plain name system-ui answers %r, not %r" % (said.get("system-ui_family"), host_family))
+    return {"ok": not problems, "problems": problems, "notes": notes}
 
 
 def _engine_environ(binary: str, conf: Path) -> dict:
@@ -307,7 +364,7 @@ def _table(results: dict, base: str) -> str:
             if diff[name][canvas]:
                 lines.append("  %s %s differs in: %s" % (name, canvas, ", ".join(diff[name][canvas])))
     lines.append("system-ui reads:")
-    for name in (base, "5_system_ui_alias"):
+    for name in (base, SYSTEM_UI_LAUNCH):
         if name in results:
             lines.append("  %-24s %s" % (name, json.dumps(results[name]["system_ui"], sort_keys=True)))
     return "\n".join(lines)
@@ -334,10 +391,13 @@ def launches(firefox_binary, tmp_path_factory):
         for name, rules in LAUNCHES:
             conf = work / ("%s.conf" % name)
             conf.write_text(_config_text(name, rules, base, host_dir, host_family), encoding="utf-8")
-            fc[name] = _what_fontconfig_says(name, conf)
+            # Before the engine starts: fontconfig with THIS file. Its answer says whether the launch measures anything.
+            fc[name] = _what_fontconfig_says(conf)
+            precondition = _rule_in_force(name, fc[name], fc.get("1_nothing", fc[name]), host_family)
             results[name] = _launch(firefox_binary, conf, url)
             results[name]["config"] = conf.read_text(encoding="utf-8")
             results[name]["fc_match"] = fc[name]
+            results[name]["precondition"] = precondition
     finally:
         server.shutdown()
         server.server_close()
@@ -360,8 +420,22 @@ def launches(firefox_binary, tmp_path_factory):
     return results
 
 
-def test_the_host_fontconfig_rules_do_not_move_a_pixel_of_the_text_a_page_reads(launches):
+def _every_launch_measures_something(launches):
+    """The first assertion of every test: a launch whose rule fontconfig does not apply measures nothing, and the comparison would say "equal"."""
     assert set(launches) == {n for n, _r in LAUNCHES}, "not every launch ran: %s" % sorted(launches)
+    for name, _rules in LAUNCHES:
+        pre = launches[name]["precondition"]
+        assert pre["ok"], "launch %s measures nothing: fontconfig does not apply its rule: %s (it said: %r)" % (
+            name, "; ".join(pre["problems"]), launches[name]["fc_match"])
+
+
+def test_every_launch_has_its_rule_in_force_in_fontconfig_itself(launches):
+    """Without this the equalities below would say nothing: a config fontconfig ignores is equal to any other."""
+    _every_launch_measures_something(launches)
+
+
+def test_the_host_fontconfig_rules_do_not_move_a_pixel_of_the_text_a_page_reads(launches):
+    _every_launch_measures_something(launches)
     base = "1_nothing"
     # The comparison is not empty: every row drew text, and the environment of the launch is the config of the launch.
     blank = [(n, k) for n, res in launches.items() for k, r in _by_row(res["rows"]).items() if r["ink"] == 0]
@@ -371,26 +445,16 @@ def test_the_host_fontconfig_rules_do_not_move_a_pixel_of_the_text_a_page_reads(
         if seen.get("processes"):
             assert seen["with_the_file"] > 0, (
                 "%s: FONTCONFIG_FILE did not reach the engine's processes (%r)" % (name, seen))
-    diff = _compare({n: launches[n] for n in launches if n != "5_system_ui_alias"}, base)
+    diff = _compare(launches, base)
     moved = {n: d for n, d in diff.items() if n != base and any(d.values())}
     assert not moved, (
         "the host's fontconfig rules change the pixels of the text a page reads (rows that differ from launch 1, by launch and canvas): %s"
         % json.dumps(moved, sort_keys=True))
 
 
-def test_the_rules_are_in_force_in_fontconfig_itself(launches):
-    """Without this the equality above would say nothing: a config fontconfig ignores is equal to any other."""
-    for name, expected in EXPECTED_FC.items():
-        said = launches[name]["fc_match"]
-        wrong = {k: (said.get(k), v) for k, v in expected.items() if said.get(k) != v}
-        assert not wrong, "%s: fontconfig does not say what the config sets (got, wanted): %r (all it said: %r)" % (name, wrong, said)
-    said = launches["5_system_ui_alias"]["fc_match"]
-    assert said.get("system-ui_family") != launches["1_nothing"]["fc_match"].get("system-ui_family"), (
-        "launch 5: fontconfig answers system-ui as it does with no rule: %r against %r" % (said, launches["1_nothing"]["fc_match"]))
-
-
 def test_a_host_rule_does_not_choose_the_system_ui_face_a_page_reads(launches):
-    first, fifth = launches["1_nothing"]["system_ui"], launches["5_system_ui_alias"]["system_ui"]
-    assert first == fifth, (
-        "a fontconfig alias of system-ui reaches what a page reads of it: launch 1 read %s, launch 5 read %s"
-        % (json.dumps(first, sort_keys=True), json.dumps(fifth, sort_keys=True)))
+    _every_launch_measures_something(launches)
+    first, other = launches["1_nothing"]["system_ui"], launches[SYSTEM_UI_LAUNCH]["system_ui"]
+    assert first == other, (
+        "a fontconfig rule on system-ui reaches what a page reads of it: launch 1 read %s, launch %s read %s"
+        % (json.dumps(first, sort_keys=True), SYSTEM_UI_LAUNCH, json.dumps(other, sort_keys=True)))
