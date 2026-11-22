@@ -12,7 +12,7 @@ same runner reads them. The engine's dumps are then held to the identity the cor
                   Linux `LANG`
   colour scheme   dark: Windows AppsUseLightTheme=0, Linux `GTK_THEME`        the scheme of the seed's persona (dark for 40% of them)
   fonts           a user-installed CANARY font, family `ZZHostCanary`:        no such family: a user font is not the declared machine's
-                  Windows per-user fonts, Linux ~/.local/share/fonts
+                  Windows machine-wide fonts (the Fonts folder of the system and HKLM; the runner is an administrator), Linux ~/.local/share/fonts
   audio (Linux)   a null sink at 96000 Hz and 6 channels, the default sink    the persona's sample rate (44100 or 48000) and channel count
 
 The canary is generated here, byte for byte the same every time (`canary_font()`: a TrueType font of three glyphs, written from the
@@ -63,7 +63,7 @@ SWITCH = "AB_ORACLE_POISON"
 #: The variable that names the file `apply` wrote its undo state to.
 STATE_SWITCH = "AB_ORACLE_POISON_STATE"
 THEME_KEY = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-FONTS_KEY = r"HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+FONTS_KEY = r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
 FONT_VALUE = FAMILY + " (TrueType)"
 
 Run = Callable[[list], tuple]
@@ -326,10 +326,11 @@ def write_dependence(out: Path, summary: Path | None = None) -> dict | None:
 
 #: The requirements of the control: what stock Firefox must read of the poison on the poisoned runner, or the control is broken.
 REQUIRED = ("timezone", "dark", "canary", "audio", "generic", "language")
-#: IN TRIAL: requirements whose reading by stock Firefox is not yet shown on GitHub (run 45026082150: dark=false on both systems, and on Windows the
-#: per-user canary font not seen). They are still measured and printed (poison-control.json, "in_trial", and the job summary), never silently, but they do
-#: not make the control broken until a run shows that stock reads them. {requirement: the systems where it is in trial}.
-IN_TRIAL = {"dark": ("linux", "windows"), "canary": ("windows",)}
+#: IN TRIAL: requirements whose reading by stock Firefox is not yet shown on GitHub. They are still measured and printed (poison-control.json, "in_trial",
+#: and the job summary), never silently, but they do not make the control broken until a run shows that stock reads them. {requirement: the systems where
+#: it is in trial}. Empty since the two causes of run 45026082150 were taken away (the theme pref of Playwright's cfg, see reference_firefox; the per-user
+#: font, now machine-wide); a requirement that a run shows unread goes back here, never silently dropped.
+IN_TRIAL: dict = {}
 
 
 def in_trial(requirement: str, system: str) -> bool:
@@ -399,6 +400,37 @@ def system_name() -> str:
     return "windows" if sys.platform == "win32" else "linux"
 
 
+#: What Playwright's Firefox forces in its own playwright.cfg that the poison is about: a pref, set before anything reads the host, answers the scheme
+#: whatever the system says (widget/nsXPLookAndFeel.cpp GetIntValue reads the pref first, NativeGetInt after). The reference is a Firefox WITHOUT it.
+CFG_DARK_PREF = "ui.systemUsesDarkTheme"
+
+
+def reference_firefox(executable: str, dest: Path) -> tuple:
+    """A copy of Playwright's own Firefox in `dest` whose playwright.cfg does not force the colour scheme; returns (path of its executable,
+    [the lines taken out]). The copy is the same build with the same other prefs: only the pref that overrides the system's theme is gone, so the
+    reference is a Firefox that reads the machine. Raises when the cfg is not where Playwright puts it or has no such line (the reference would not
+    be what it is said to be)."""
+    import shutil
+
+    source = Path(executable).resolve().parent
+    shutil.copytree(source, dest / source.name, symlinks=True)
+    root = dest / source.name
+    cfgs = sorted(root.glob("playwright.cfg")) or sorted(root.rglob("playwright.cfg"))
+    if not cfgs:
+        raise RuntimeError("Playwright's Firefox has no playwright.cfg under %s: the reference cannot be made" % source.name)
+    removed, kept = [], []
+    text = cfgs[0].read_bytes().decode("utf-8")
+    for line in text.splitlines(keepends=True):
+        if re.match(r"\s*(pref|lockPref|defaultPref)\(\"%s\"" % re.escape(CFG_DARK_PREF), line):
+            removed.append(line.strip())
+        else:
+            kept.append(line)
+    if not removed:
+        raise RuntimeError("playwright.cfg does not force %s: the reference was expected to differ from it" % CFG_DARK_PREF)
+    cfgs[0].write_bytes("".join(kept).encode("utf-8"))
+    return str(root / Path(executable).name), removed
+
+
 def control(out: Path, headless: bool = False) -> int:
     """Launch Playwright's own Firefox (headed: a headless Firefox has no theme to read) on this runner, read the probe, write `out`.
     0 when it read the poison, 2 BROKEN CONTROL (the poison is not in force or the control cannot see it)."""
@@ -407,9 +439,13 @@ def control(out: Path, headless: bool = False) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     probe = None
     error = None
+    removed = []
     try:
-        with sync_playwright() as p:
-            browser = p.firefox.launch(headless=headless, firefox_user_prefs={"intl.regional_prefs.use_os_locales": True})
+        import tempfile
+
+        with sync_playwright() as p, tempfile.TemporaryDirectory(prefix="poison-control-", ignore_cleanup_errors=True) as work:
+            executable, removed = reference_firefox(p.firefox.executable_path, Path(work))
+            browser = p.firefox.launch(executable_path=executable, headless=headless, firefox_user_prefs={"intl.regional_prefs.use_os_locales": True})
             try:
                 # Playwright's default is a LIGHT scheme (an emulation): the control must follow the system, as a user's browser does
                 page = browser.new_context(color_scheme="no-override").new_page()
@@ -423,7 +459,8 @@ def control(out: Path, headless: bool = False) -> int:
     trials = control_trials(probe, system_name())
     report = {"format": "poison-control/1", "system": system_name(), "probe": probe, "language": language_reads(probe),
               "failures": [{"requirement": n, "message": m} for n, m in failures], "verdict": "green" if not failures else "broken",
-              "in_trial": {"requirements": {k: list(v) for k, v in IN_TRIAL.items()}, "not_read": [{"requirement": n, "message": m} for n, m in trials]}}
+              "in_trial": {"requirements": {k: list(v) for k, v in IN_TRIAL.items()}, "not_read": [{"requirement": n, "message": m} for n, m in trials]},
+              "reference": {"taken_out_of_playwright_cfg": removed}}
     out.write_text(json.dumps(report, sort_keys=True, indent=1, ensure_ascii=False), encoding="utf-8")
     print("stock Firefox read: %s" % json.dumps(probe, sort_keys=True, ensure_ascii=False))
     print("language, informational: %s" % json.dumps(report["language"], sort_keys=True, ensure_ascii=False))
@@ -472,7 +509,9 @@ def _try(run: Run, cmd: list) -> str:
 
 
 def font_path_windows(env=None) -> Path:
-    return Path((env or os.environ)["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "Fonts" / FONT_FILE
+    """Where the canary goes on Windows: the Fonts folder of the system, which every user and every process reads (HKLM lists it, FONTS_KEY)."""
+    env = env or os.environ
+    return Path(env.get("SystemRoot") or env.get("WINDIR") or "C:" + chr(92) + "Windows") / "Fonts" / FONT_FILE
 
 
 def font_dir_linux(env=None) -> Path:
