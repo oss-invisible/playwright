@@ -684,6 +684,29 @@ def _refuse_parameter(operation: str, parameter: str):
     raise ProtocolException(perimeter.parameter_refusal(operation, parameter))
 
 
+def _refuse_unserved_screenshot_parameters(params: Dict) -> None:
+    """⛔ WHAT STOCK DOES BY MODIFYING THE PAGE IS REFUSED, NOT IGNORED, AND BEFORE THE PAGE IS TOUCHED. `mask`, `style` and
+    `animations="disabled"` change the page before the picture in Playwright; this server took them without reading them, and the
+    picture came back as if they had not been written. `caret="initial"` asks for the text caret to be drawn, which the engine never
+    does. `omitBackground` with png is Firefox's own `Not implemented` (stock reaches it only for png). The sentences are
+    `perimeter.REFUSED_PARAMETERS`'.
+
+    ⛔ THE ONE CHECK, CALLED FIRST BY THE PAGE'S SCREENSHOT AND BY THE ELEMENT'S (a locator's is the element's): the element's call
+    scrolls the element into view and measures it, and a call that is going to be refused must not have done either. It reads
+    `params` and nothing else, so calling it again with the same parameters, as the element's call does through the page's, answers
+    the same."""
+    if params.get("mask"):
+        _refuse_parameter("screenshot", "mask")
+    if params.get("style"):
+        _refuse_parameter("screenshot", "style")
+    if params.get("animations") == "disabled":
+        _refuse_parameter("screenshot", "animations")
+    if params.get("caret") == "initial":
+        _refuse_parameter("screenshot", "caret")
+    if params.get("omitBackground") and params.get("type") != "jpeg":
+        _refuse_parameter("screenshot", "omitBackground")
+
+
 def _round_px(value: float) -> int:
     """To the nearest whole pixel, halves up (Python's `round` goes to even: 0.5 -> 0, 1.5 -> 2)."""
     import math
@@ -1079,6 +1102,8 @@ class ElementHandleDispatcher(Dispatcher):
         Playwright's screenshotter does: the left and top edges to the nearest
         pixel, the size from the rounded right and bottom edges.
         """
+        # ⛔ THE REFUSAL COMES BEFORE THE SCROLL AND THE MEASURE: a call that is refused must not have moved the page.
+        _refuse_unserved_screenshot_parameters(params)
         # An element with no layout object (display: none, detached) cannot be scrolled to: the engine says so
         # with an exception of its own. For the caller that is the same answer as an empty box.
         try:
@@ -4485,21 +4510,10 @@ class PageDispatcher(Dispatcher):
         # A clip the CALLER supplied is passed through untouched. Playwright
         # documents it in page coordinates, which is what the engine wants, so
         # there is nothing to translate.
-        # ⛔ WHAT STOCK DOES BY MODIFYING THE PAGE IS REFUSED, NOT IGNORED. `mask`, `style` and `animations="disabled"` change the
-        # page before the picture in Playwright; this server took them without reading them, and the picture came back as if they
-        # had not been written. `caret="initial"` asks for the text caret to be drawn, which the engine never does. `omitBackground`
-        # with png is Firefox's own `Not implemented` (stock reaches it only for png). The element's screenshot comes through here
-        # with the caller's parameters, so this is the one place; the sentences are `perimeter.REFUSED_PARAMETERS`'.
-        if params.get("mask"):
-            _refuse_parameter("screenshot", "mask")
-        if params.get("style"):
-            _refuse_parameter("screenshot", "style")
-        if params.get("animations") == "disabled":
-            _refuse_parameter("screenshot", "animations")
-        if params.get("caret") == "initial":
-            _refuse_parameter("screenshot", "caret")
-        if params.get("omitBackground") and params.get("type") != "jpeg":
-            _refuse_parameter("screenshot", "omitBackground")
+        # ⛔ THE REFUSALS ARE `_refuse_unserved_screenshot_parameters`, THE FIRST THING HERE AND THE FIRST THING IN THE ELEMENT'S SCREENSHOT.
+        # It is idempotent, so the element's call, which hands its rectangle and the caller's parameters to this one, passes it twice
+        # and the second pass is the same answer.
+        _refuse_unserved_screenshot_parameters(params)
         clip = params.get("clip")
         if not clip:
             box = self.injected.evaluate(

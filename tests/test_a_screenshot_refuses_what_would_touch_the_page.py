@@ -5,8 +5,8 @@ infinite ones cancelled) and `caret` (hidden with `caret-color: transparent`, dr
 after. `PageDispatcher.op_screenshot` never read any of them: the call succeeded and the picture came back as if the parameter had not been written. The caller cannot tell
 a masked picture from an unmasked one, and the picture is the one thing that must not lie. They are refused now, each by its name, with what to do instead.
 
-The single point is `PageDispatcher.op_screenshot` (the element's reaches it with the caller's parameters, and a locator's is the element's), so the page, the full page,
-a clip, an element and a locator are checked here at the wire. What passes: `animations="allow"`, `caret="hide"` (the engine never draws the caret, which is what stock's
+The single check is `_refuse_unserved_screenshot_parameters`, the first thing in `PageDispatcher.op_screenshot` and in `ElementHandleDispatcher.op_screenshot` (a locator's is the
+element's), so the page, the full page, a clip, an element and a locator are checked at the wire, and the element's refusal comes before it scrolls or measures. What passes: `animations="allow"`, `caret="hide"` (the engine never draws the caret, which is what stock's
 default produces), an empty `mask`, an empty `style`, a `maskColor` with no mask, and `omitBackground` with jpeg (stock does nothing there).
 
 `omitBackground` with png is Firefox's own: stock's `setBackgroundColor` throws `Not implemented` there (`FFPage.setBackgroundColor`, reached from `Screenshotter._screenshot`
