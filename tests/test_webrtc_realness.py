@@ -34,6 +34,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from _evidence_on_failure import FailureEvidence
+from _far_away_probes import FarAwayProbes
 from _host_address import this_host_address
 from _socks_servers import MEASURE_NUMBER, STUN_NUMBER, STUN_PORT, Socks5TcpOnly
 from _udp_line import bench_report, declared_udp, declared_udp_or_absent, egress_by_proxy, measure_servers
@@ -517,6 +518,11 @@ class _Watch:
         evidence.note_records("gateway-control-connections", self.control)
         evidence.note_records("gateway-udp-datagrams", self.udp)
         evidence.note_records("page-view", self.page)
+        # The recorders of the machine and of the core's own measurement (tests/_far_away_probes.py): started with the watch, stopped with it.
+        self.probes = FarAwayProbes(gateway.t0)
+        evidence.note_records("stall-witness", self.probes.stall_records)
+        evidence.note_records("runner-load", self.probes.load_records)
+        evidence.note_records("core-udp-exit-log", self.probes.core_records)
         self.bnd_ports = set()
         self._reads = threading.local()
         self.cells["relay_host"] = relay_host
@@ -524,15 +530,37 @@ class _Watch:
         self._wrap_the_sockets(monkeypatch)
 
     def __enter__(self):
+        if self.active:
+            self.safely(self.probes.start)
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if self.active:
+            self.safely(self.probes.stop)
             try:
                 self.snapshot()
             except Exception as problem:      # the evidence never hides the failure it is about
                 sys.stderr.write("gateway evidence: could not be taken: %r\n" % (problem,))
+            if exc is not None:               # a failure that is not an assertion of the test (a wait, a launch) says it too
+                self.safely(lambda: exc.add_note(self.summary()))
         return False
+
+    def mark(self, what):
+        """A moment of the test on the scale of the core's records (the launch that runs the core's UDP measurement starts, returns)."""
+        if self.active:
+            self.safely(lambda: self.probes.mark(what))
+
+    def summary(self):
+        """The lines a failed gather adds to its message: the control connections' times, the core's UDP measurement, the stalls of the
+        process and the runner's load (the evidence has them whole). Empty when no evidence is kept. Never raises."""
+        if not self.active:
+            return ""
+        try:
+            with self.control.lock:
+                records = list(self.control.records)
+            return self.probes.lines(records)
+        except Exception as problem:  # noqa: BLE001
+            return "far-away probes: not read (%r)" % (problem,)
 
     # ---- the clocks ---------------------------------------------------------------------------------------------------------
     def _gw(self):
@@ -821,6 +849,9 @@ class _Watch:
     def snapshot(self):
         """The gateway's own lists, taken before it closes (times in seconds from its start; ``wall0`` is that instant on the wall clock)."""
         gateway = self.gateway
+        with self.control.lock:
+            control = list(self.control.records)
+        self.safely(lambda: self.cells.update(self.probes.cells(control)))
         self.cells["gateway"] = {
             "wall0_epoch_seconds_of_the_gateway_start": gateway.wall0,
             "udp": gateway.udp, "wants_credentials": gateway.user is not None, "rtt_s": gateway.rtt,
@@ -873,7 +904,9 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
         watch.arm()
         launched = _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs)
         watch.launched(launched)
+        watch.mark("launch starts")
         with launched as browser:
+            watch.mark("launch returned")
             page = browser.new_context().new_page()
             page.goto("about:blank")
             res = watch.evaluate(page, _RELAY_PROBE_JS, stun)
@@ -888,6 +921,9 @@ def _gather_behind_a_coherent_gateway(monkeypatch, credentials, ice_prefs, rtt_m
                f"ICE errors: {res['errors']}; gather timings (ms from the offer): {res['at_ms']}; "
                f"datagrams the relay carried: {carried}; STUN requests the server answered: {stun_requests}; "
                f"UDP ASSOCIATEs the gateway saw: {associates}; round trip to the gateway: {rtt_ms} ms; {bench}")
+    probes = watch.summary()
+    if probes:
+        verdict += "\n" + probes
     return bool(srflx) and (STUN_NUMBER, STUN_PORT) in carried, verdict, res["at_ms"]
 
 
@@ -1039,31 +1075,46 @@ def test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_
     from _socks_servers import STUN_NUMBER, STUN_PORT, WEB_ADDRESS, coherent
     from _waits import wait_until, watch
     stun = f"stun:{STUN_NUMBER}:{STUN_PORT}"
-    with coherent(user="alice", password="s3cret", relay_host=this_host_address(), rtt_ms=250) as gateway:
-        monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
-        extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True}
-        with _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs) as browser:
-            page = browser.new_context().new_page()
-            page.goto("http://%s/" % WEB_ADDRESS)       # by address: the browser resolves names itself
-            # the pool makes its associations: wait until the gateway has granted one of the engine's (the first granted is the
-            # core's probe); the verdict names what it saw if none came
-            wait_until(lambda: len([a for a in gateway.associations if a[1] is not None]) >= 2, 30,
-                       lambda: page.wait_for_timeout(50))
-            page.evaluate(_START_A_GATHER_JS, stun)
-            srflx = watch(lambda: page.evaluate("window.__gather.srflx"), lambda at: at is not None, 30,
-                          lambda: page.wait_for_timeout(50))
-            gather = page.evaluate("window.__gather")
-        associations = [list(a) for a in gateway.associations]
-        via = list(gateway.datagram_via)
-        born = gather["born"] / 1000.0 - gateway.wall0
-    seen = (f"candidates: {gather['candidates']}; ICE errors: {gather['errors']}; associations (start, end) seen by the gateway: "
-            f"{associations}; datagrams and the association each left on: {via}; srflx looks: {srflx.render()}")
-    assert srflx.ok, "no srflx within 30 s behind a gateway 250 ms away. " + seen
-    problem = cold_association_problem(associations, via, STUN_NUMBER, born)
-    assert problem is None, f"{problem}. {seen}"
-    assert gather["host"] is not None and gather["host"] < gather["srflx"], (
-        f"the host candidate (at {gather['host']} ms) did not come before the srflx ({gather['srflx']} ms): it waited for the "
-        f"road to the server. {seen}")
+    # When it fails it saves, under `invpw-evidence/webrtc-gather-after-load-250/`, what the far-away test saves (cells.json, the control
+    # connections and datagrams of the gateway with their times, the stall witness, the runner's load and the core's own log of its UDP
+    # measurement); the lines of the same record are in the message. No assertion, wait or deadline below differs from before.
+    relay_host = this_host_address()
+    with FailureEvidence("webrtc-gather-after-load-250") as evidence:
+        cells = {"test": "gather after the page loaded", "rtt_ms": 250}
+        evidence.note_cells(cells)
+        with coherent(user="alice", password="s3cret", relay_host=relay_host, rtt_ms=250) as gateway, \
+                _Watch(gateway, monkeypatch, evidence, relay_host) as record:
+            monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
+            extra_prefs = {"media.peerconnection.ice.obfuscate_host_addresses": True}
+            launched = _launch_behind(gateway, binary_path=binary, extra_prefs=extra_prefs)
+            record.mark("launch starts")
+            with launched as browser:
+                record.mark("launch returned")
+                page = browser.new_context().new_page()
+                page.goto("http://%s/" % WEB_ADDRESS)       # by address: the browser resolves names itself
+                # the pool makes its associations: wait until the gateway has granted one of the engine's (the first granted is the
+                # core's probe); the verdict names what it saw if none came
+                wait_until(lambda: len([a for a in gateway.associations if a[1] is not None]) >= 2, 30,
+                           lambda: page.wait_for_timeout(50))
+                page.evaluate(_START_A_GATHER_JS, stun)
+                srflx = watch(lambda: page.evaluate("window.__gather.srflx"), lambda at: at is not None, 30,
+                              lambda: page.wait_for_timeout(50))
+                gather = page.evaluate("window.__gather")
+            associations = [list(a) for a in gateway.associations]
+            via = list(gateway.datagram_via)
+            born = gather["born"] / 1000.0 - gateway.wall0
+        seen = (f"candidates: {gather['candidates']}; ICE errors: {gather['errors']}; associations (start, end) seen by the gateway: "
+                f"{associations}; datagrams and the association each left on: {via}; srflx looks: {srflx.render()}")
+        cells["seen"] = seen
+        probes = record.summary()
+        if probes:
+            seen += "\n" + probes
+        assert srflx.ok, "no srflx within 30 s behind a gateway 250 ms away. " + seen
+        problem = cold_association_problem(associations, via, STUN_NUMBER, born)
+        assert problem is None, f"{problem}. {seen}"
+        assert gather["host"] is not None and gather["host"] < gather["srflx"], (
+            f"the host candidate (at {gather['host']} ms) did not come before the srflx ({gather['srflx']} ms): it waited for the "
+            f"road to the server. {seen}")
 
 
 @pytest.mark.e2e

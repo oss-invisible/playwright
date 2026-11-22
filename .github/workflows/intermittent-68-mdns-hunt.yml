@@ -1,0 +1,270 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# intermittent-68-mdns-hunt.yml - an EXPERIMENT for the mDNS analysis of the two-connections test. NOT a gate, never to be
+# merged to main: it exists on the branch `hunt/intermittent-68-mdns` and is deleted with it.
+#
+# The question. `test_two_connections_on_one_page_connect_in_the_time_of_retail` went red once on Windows (open after 9.7 s) while other browsers ran on the machine;
+# alone it is green 200 of 200. Every engine holds an mDNS responder on 0.0.0.0:5353 joined to 224.0.0.251 on 127.0.0.1, so the engines of a machine share one loopback
+# multicast group. If the red appears only when OTHER engines are alive, the shared group is the cause.
+#
+# What it does. Four jobs on windows-2022, one per number of neighbour engines kept alive while the test runs: 0, 1, 2, 3. A neighbour is an engine with a page that
+# gathered ICE candidates with the mDNS obfuscation active (a host candidate with a .local name) and stays open (scripts/hunt_mdns_neighbours.py, which also proves on
+# the wire that the responder answers for each name). The test then runs 30 rounds, one pytest per round with `-n 0` (the test alone on its own xdist-less process),
+# never stopping at a red, no rerun plugin: the junit and the evidence the test saves on failure (RUNNER_TEMP/invpw-evidence) of each round go to round-K/ of the artifact.
+#
+# Triggered ONLY by a push to `hunt/intermittent-68-mdns`: no schedule, no dispatch, no pull request.
+# ─────────────────────────────────────────────────────────────────────────────
+name: intermittent 68 mdns hunt
+
+on:
+  push:
+    branches: [hunt/intermittent-68-mdns]
+
+permissions:
+  contents: read
+
+# A newer push to the hunt branch replaces the run it supersedes; the group is this hunt's own.
+concurrency:
+  group: intermittent-68-mdns-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+# Engine and GeoIP downloads go through the release API with this token (as every workflow that runs tests).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: hunt, ${{ matrix.neighbours }} neighbour engines
+    runs-on: windows-2022
+    # 30 rounds of five cold launches, plus the install. The ceiling must never be what stops the hunt before its own time budget does (no new round starts after
+    # 90 minutes of the step and the artifact is still uploaded).
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        neighbours: [0, 1, 2, 3]
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder), as the Windows e2e jobs: the Firefox profiles land in TEMP and on C: they saturate the disk. On the job, not in
+    # a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
+    # `run:` blocks are PowerShell on Windows unless said otherwise.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      # The GeoIP database made by the repository, as in e2e.yml (no download, the same bytes every run).
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+
+      - name: The neighbours, then the test 30 rounds
+        env:
+          PYTHONUNBUFFERED: "1"
+          INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog.log
+          HUNT_NODE: "tests/test_declared_host_network_e2e.py::test_two_connections_on_one_page_connect_in_the_time_of_retail"
+          HUNT_NEIGHBOURS: ${{ matrix.neighbours }}
+          HUNT_ROUNDS: "30"
+          # No new round starts after this many seconds of the step: the artifact is uploaded with what the rounds so far found.
+          HUNT_BUDGET_S: "5400"
+        run: |
+          # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before the verdict into a red step.
+          set -euo pipefail
+          finished=0
+          helper_pid=""
+          trap 'if [ "$finished" != 1 ]; then echo "::error::the hunt step stopped before its verdict"; exit 1; fi' EXIT
+          # What scripts/run_e2e.py gives the pytest it starts: INVPW_BINARY_PATH and STEALTHFOX_E2E_BINARY, both the binary, and INVISIBLE_CORE_PIN taken out of the
+          # environment (one e2e asserts the pin repair that it disables). The neighbours read the same variables.
+          if [ -z "${FF:-}" ] || [ ! -e "$FF" ]; then echo "::error::no engine binary (FF='${FF:-}')"; exit 1; fi
+          export INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF"
+          unset INVISIBLE_CORE_PIN
+          out="$RUNNER_TEMP"
+          mkdir -p "$out/hunt" "$out/invpw-evidence" "$out/neighbours"
+          # The result of one junit: "tests failures errors skipped" on the first line, then one line per red test with the FIRST line of its message (-1 for a file that is not there).
+          cat > "$out/junit_read.py" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          try:
+              root = ET.parse(sys.argv[1]).getroot()
+              suite = root if root.tag == "testsuite" else root.find("testsuite")
+              print(*(int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")))
+              for case in suite.iter("testcase"):
+                  for kind in ("failure", "error"):
+                      bad = case.find(kind)
+                      if bad is not None:
+                          text = (bad.get("message") or bad.text or "").strip()
+                          print("RED %s | %s" % (case.get("name"), (text.splitlines() or [""])[0][:400]))
+          except Exception as exc:
+              print("-1 -1 -1 -1")
+              print("RED junit not readable: %r" % (exc,))
+          PY
+          # Every browser left is closed (the whole tree), then counted.
+          reap() {
+            powershell -NoProfile -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1 || true
+          }
+          # ---- the neighbours: N engines with a live mDNS responder, kept alive by an open pipe (closing it closes them) ----
+          if [ "$HUNT_NEIGHBOURS" -gt 0 ]; then
+            fifo="$out/helper.stdin"
+            mkfifo "$fifo"
+            python -u scripts/hunt_mdns_neighbours.py --neighbours "$HUNT_NEIGHBOURS" --out "$out/neighbours" --stop-file "$out/neighbours.stop" \
+              < "$fifo" > "$out/helper.out" 2> "$out/helper.err" &
+            helper_pid=$!
+            exec 7> "$fifo"
+            ready=0
+            for _ in $(seq 1 300); do
+              if [ "$(tr -d '\r' < "$out/helper.out" | grep -cx "ready $HUNT_NEIGHBOURS" || true)" -ge 1 ]; then ready=1; break; fi
+              if ! kill -0 "$helper_pid" 2> /dev/null; then break; fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "::error::the $HUNT_NEIGHBOURS neighbours were not ready"
+              tail -n 40 "$out/helper.err" || true
+              exit 1
+            fi
+            echo "ready $HUNT_NEIGHBOURS: firefox processes now: $(powershell -NoProfile -Command '@(Get-Process firefox -ErrorAction SilentlyContinue).Count' | tr -d '\r')"
+            cat "$out/helper.err" || true
+          fi
+          close_neighbours() {
+            if [ -n "$helper_pid" ]; then
+              touch "$out/neighbours.stop"
+              exec 7>&-
+              for _ in $(seq 1 90); do
+                if ! kill -0 "$helper_pid" 2> /dev/null; then break; fi
+                sleep 1
+              done
+              if kill -0 "$helper_pid" 2> /dev/null; then echo "::warning::the neighbours did not close: killed"; kill -9 "$helper_pid" 2> /dev/null || true; fi
+              helper_pid=""
+            fi
+          }
+          rounds_run=0; rounds_red=0; anomalies=0
+          : > "$out/hunt-reds.txt"
+          : > "$out/hunt-rounds.md"
+          summary() {
+            {
+              echo "## $HUNT_NEIGHBOURS neighbour engines kept alive"
+              echo ""
+              echo "test: \`$HUNT_NODE\`"
+              echo ""
+              if [ -s "$out/neighbours/neighbours.json" ]; then
+                echo "neighbour names registered and answered on the wire:"
+                python -c "import json,sys; d=json.load(open(sys.argv[1])); [print('- %s answered=%s' % (n['name'], n['probe']['answered'])) for n in d['neighbours']]" "$out/neighbours/neighbours.json" | tr -d '\r'
+                echo ""
+              fi
+              echo "rounds planned $HUNT_ROUNDS, run $rounds_run, with a red $rounds_red, that did not run exactly the one test $anomalies"
+              echo ""
+              echo "| round | result | first line of the failure, or the measure |"
+              echo "|---|---|---|"
+              cat "$out/hunt-rounds.md"
+            } > "$out/hunt-summary.md"
+          }
+          for n in $(seq 1 "$HUNT_ROUNDS"); do
+            if [ "$SECONDS" -gt "$HUNT_BUDGET_S" ]; then
+              echo "::warning::time budget reached after $rounds_run rounds of $HUNT_ROUNDS: no new round"
+              break
+            fi
+            # The neighbours are the condition of the experiment: a round without them measures another thing.
+            if [ -n "$helper_pid" ] && ! kill -0 "$helper_pid" 2> /dev/null; then
+              echo "::error::the neighbours are gone before round $n"; tail -n 40 "$out/helper.err" || true; exit 1
+            fi
+            dir="$out/hunt/round-$n"
+            mkdir -p "$dir"
+            # The evidence folder of the previous round was moved away: this round's evidence starts from nothing.
+            rm -rf "$out/invpw-evidence"; mkdir -p "$out/invpw-evidence"
+            t0=$SECONDS
+            # The test alone in its own process (-n 0), no rerun plugin, a per-test deadline that ends a hang with its name.
+            set +e
+            python -u -m pytest "$HUNT_NODE" -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures \
+              -n 0 --timeout 420 --timeout-method thread -o faulthandler_timeout=399 \
+              -v --tb=short --junitxml="$dir/junit.xml" > "$dir/pytest.log" 2>&1
+            code=$?
+            set -e
+            reap
+            # Python writes CRLF on Windows: every line read back loses its carriage return before it is used in an arithmetic expression.
+            python "$out/junit_read.py" "$dir/junit.xml" | tr -d '\r' > "$dir/junit-read.txt"
+            read -r t f e s < <(head -1 "$dir/junit-read.txt")
+            for number in "$t" "$f" "$e" "$s"; do
+              case "$number" in -1|[0-9]|[0-9][0-9]) ;; *) echo "::error::round $n: the junit read gave '$t $f $e $s', not four numbers"; exit 1;; esac
+            done
+            # What the test saved on failure (its own log, the page's timeline, the mDNS wire), and the measure line of a round that passed.
+            mv "$out/invpw-evidence"/* "$dir/" 2> /dev/null || true
+            rounds_run=$((rounds_run + 1))
+            measure="$(grep -a -m1 '\[measure\]' "$dir/pytest.log" | tr -d '\r' | tr '|' '/' || true)"
+            if [ "$t" -lt 0 ]; then
+              # no junit: the pytest run did not get to write one (collection error, a kill)
+              rounds_red=$((rounds_red + 1)); anomalies=$((anomalies + 1))
+              echo "round $n: exit=$code, NO JUNIT" | tee -a "$out/hunt-reds.txt"
+              tail -n 30 "$dir/pytest.log" | tee -a "$out/hunt-reds.txt"
+              echo "| $n | RED | no junit (exit $code) |" >> "$out/hunt-rounds.md"
+            else
+              # The round is the one test, run, and passed. A skipped test measured nothing and is red; so is a count that is not exactly one test.
+              bad_shape=0
+              if [ "$t" -ne 1 ] || [ "$s" -ne 0 ]; then bad_shape=1; fi
+              anomalies=$((anomalies + bad_shape))
+              if [ "$code" -ne 0 ] || [ $((f + e)) -gt 0 ] || [ "$bad_shape" -ne 0 ]; then
+                rounds_red=$((rounds_red + 1))
+                echo "round $n: exit=$code, $t tests, $f failed, $e errors, $s skipped" >> "$out/hunt-reds.txt"
+                tail -n +2 "$dir/junit-read.txt" | sed "s/^/  /" >> "$out/hunt-reds.txt"
+                if [ "$s" -ne 0 ]; then grep -a -m 3 "SKIPPED" "$dir/pytest.log" | sed "s/^/  /" >> "$out/hunt-reds.txt" || true; fi
+                first="$(sed -n '2p' "$dir/junit-read.txt" | tr '|' '/' || true)"
+                if [ -z "$first" ]; then first="exit $code, $t tests, $s skipped"; fi
+                echo "| $n | RED | $first |" >> "$out/hunt-rounds.md"
+              else
+                echo "| $n | green | ${measure:--} |" >> "$out/hunt-rounds.md"
+              fi
+            fi
+            echo "round $n/$HUNT_ROUNDS: exit=$code tests=$t failures=$f errors=$e skipped=$s, $((SECONDS - t0)) s"
+            summary
+          done
+          close_neighbours
+          reap
+          echo "firefox processes left: $(powershell -NoProfile -Command '@(Get-Process firefox -ErrorAction SilentlyContinue).Count' | tr -d '\r')"
+          summary
+          cat "$out/hunt-summary.md"
+          # Red means FOUND, and also NOT MEASURED: the step fails when any round was red, when a round did not run exactly the one test, or when no round ran.
+          finished=1
+          if [ "$rounds_run" -eq 0 ]; then echo "::error::no round ran"; exit 1; fi
+          if [ "$rounds_red" -ne 0 ] || [ "$anomalies" -ne 0 ]; then exit 1; fi
+
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: The rounds in the job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/hunt-summary.md" ]; then cat "$RUNNER_TEMP/hunt-summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Upload what the hunt found (junit, log and evidence of every round, the neighbours)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mdns-hunt-${{ matrix.neighbours }}-neighbours-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hunt
+            ${{ runner.temp }}/neighbours
+            ${{ runner.temp }}/helper.out
+            ${{ runner.temp }}/helper.err
+            ${{ runner.temp }}/hunt-summary.md
+            ${{ runner.temp }}/hunt-reds.txt
+            ${{ runner.temp }}/e2e-watchdog.log
+          if-no-files-found: warn
+          retention-days: 14
