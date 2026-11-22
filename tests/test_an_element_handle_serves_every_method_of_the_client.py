@@ -303,6 +303,35 @@ def test_wait_for_element_state_on_a_node_that_left_the_document_fails_at_once_w
     assert page.injected.element_states.call_count == 1
 
 
+#: What the injected script answers `checkElementStates(node, [state])` for a node that is not in the document, per state. Read from stock's `InjectedScript.elementState`
+#: (`if (!element || !element.isConnected) { if (state === "hidden") return { matches: true, ... }; return { matches: false, received: "error:notconnected" } }`) and
+#: `checkElementStates` (no `missingState` for a match, "error:notconnected" for the rest), and MEASURED on the core's own `injected.js` run on a detached node:
+#: visible, enabled, disabled and editable answer `"error:notconnected"`; hidden answers nothing (met); stable answers nothing either, because a detached element
+#: has a box that does not move (`retarget` does not lose it: only a text node without a parent does). The core's `element_states` turns them into these verdicts.
+GONE = {"error:notconnected": {"ok": False, "missing": "error:notconnected"}, "met": {"ok": True}}
+STATE_OF_A_NODE_OUT_OF_THE_DOCUMENT = {
+    "visible": "error:notconnected", "enabled": "error:notconnected", "disabled": "error:notconnected", "editable": "error:notconnected",
+    "hidden": "met", "stable": "met"}
+
+
+@pytest.mark.parametrize("state", sorted(STATE_OF_A_NODE_OUT_OF_THE_DOCUMENT))
+def test_wait_for_element_state_of_a_node_that_left_the_document_answers_as_stock_does_for_each_state(page, element, state, monkeypatch):
+    """`hidden` is met at once (the node is not shown), `stable` is met (its box does not move), the four others are `Element is not attached to the DOM` at once:
+    one question asked, no pause between two, and the timeout is never the answer."""
+    page.injected.element_states.return_value = GONE[STATE_OF_A_NODE_OUT_OF_THE_DOCUMENT[state]]
+    paused = []
+    monkeypatch.setattr("invisible_playwright._juggler.server.time.sleep", paused.append)
+    params = {"state": state, "timeout": 5000}
+    if STATE_OF_A_NODE_OUT_OF_THE_DOCUMENT[state] == "met":
+        assert element.call("waitForElementState", params) is None
+    else:
+        with pytest.raises(ProtocolException) as failure:
+            element.call("waitForElementState", params)
+        assert str(failure.value) == NOT_ATTACHED
+    assert page.injected.element_states.call_count == 1
+    assert paused == []
+
+
 def test_wait_for_element_state_that_is_never_met_ends_in_a_timeout(page, element):
     page.injected.element_states.return_value = {"ok": False, "missing": "enabled"}
     with pytest.raises(TimeoutError, match="Timeout 150ms exceeded"):

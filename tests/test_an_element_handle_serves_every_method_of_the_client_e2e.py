@@ -154,6 +154,22 @@ def test_a_node_that_left_the_document_is_hidden_and_has_no_other_state(page):
         gone.wait_for_element_state("visible")
 
 
+@pytest.mark.parametrize("state", ["hidden", "stable", "visible", "enabled", "disabled", "editable"])
+def test_wait_for_element_state_of_a_node_removed_from_the_document_answers_as_stock_does_for_each_state(page, state):
+    """Stock's `checkElementStates` on a node that is not connected: `hidden` is met at once, `stable` is met (the box of a removed node does not move), the four others are
+    `Element is not attached to the DOM`, at once and not after the timeout."""
+    from invisible_playwright.sync_api import Error
+
+    handle = page.query_selector("#gone")
+    page.evaluate("e => e.remove()", handle)
+    if state in ("hidden", "stable"):
+        handle.wait_for_element_state(state, timeout=30000)
+    else:
+        with pytest.raises(Error, match="Element is not attached to the DOM") as failure:
+            handle.wait_for_element_state(state, timeout=30000)
+        assert "Timeout" not in str(failure.value)
+
+
 def test_wait_for_element_state_returns_when_the_state_is_met(page):
     page.query_selector("#go").wait_for_element_state("visible")
     page.query_selector("#go").wait_for_element_state("stable")
