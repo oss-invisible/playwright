@@ -1682,7 +1682,7 @@ def test_the_crash_folders_are_the_profiles_minidumps_and_the_pending_reports_of
 def test_the_crash_evidence_says_how_the_parent_ended_who_the_crash_reporters_are_and_what_files_the_crash_left():
     fp = {"lifecycle": [{"event": "start", "kind": "parent", "line": 0, "how": ""}, {"event": "end", "kind": "crashreporter", "line": 5, "how": "exited 0"},
                         {"event": "end", "kind": "parent", "line": 9, "how": "killed by SIGSEGV"}],
-          "processes": [{"label": "parent", "exec": "firefox -profile /tmp/p"}, {"label": "crashreporter", "exec": "crashreporter --ping-cleanup /home/r/.config/mozilla/firefox/Crash Reports /tmp/p"},
+          "processes": [{"label": "parent", "exec": "firefox -profile /tmp/p"}, {"label": "crashreporter", "exec": "crashreporter --ping-cleanup /srv/lab/r/.config/mozilla/firefox/Crash Reports /tmp/p"},
                         {"label": "minidump-analyzer", "exec": "minidump-analyzer /tmp/p/minidumps/x.dmp"}], "close": {"root_returncode": -11}}
     got = host.crash_evidence({"files": [{"name": "x.dmp", "size": 5}], "scans": 7}, fp, {"core_pattern": "core", "cores": ["core.123"], "backtraces": {"core.123": "#0 0x0 in ?? ()"}})
     assert got["parent_exits"] == ["killed by SIGSEGV"] and got["root_returncode"] == -11
@@ -1737,13 +1737,13 @@ def test_a_path_the_tree_asked_the_system_to_make_is_told_from_one_it_only_opene
     ini = "C:\\ProgramData\\Mozilla-1de4eec8\\firefox_S-1-5-21-500_shortcuts.ini"
     xml = tmp_path / "files.xml"
     xml.write_text("<Events>" + create_event(10, ini, 0x03000060) + create_event(10, "C:\\Windows\\System32\\kernel32.dll", 0x01000060)
-                   + create_event(11, "C:\\Users\\r\\x.lnk", 0x02000044) + create_event(10, "C:\\Users\\r\\old.tmp", 0x05000040) + "</Events>", encoding="utf-8")
+                   + create_event(11, "D:\\lab\\r\\x.lnk", 0x02000044) + create_event(10, "D:\\lab\\r\\old.tmp", 0x05000040) + "</Events>", encoding="utf-8")
     dispositions = {}
     host.etw_files(xml, {10, 11}, None, None, dispositions)
     assert dispositions[(10, ini)] == {3} and dispositions[(10, "C:\\Windows\\System32\\kernel32.dll")] == {1}
     got = host.creates_of({k: sorted(v) for k, v in dispositions.items()}, lambda pid: {10: "parent", 11: "tab"}[pid], host.Context("win32"))
     assert got == [{"path": "c:\\programdata\\mozilla-1de4eec8\\firefox_s-1-5-21-500_shortcuts.ini", "kinds": ["parent"], "how": ["OPEN_IF"]},
-                   {"path": "c:\\users\\r\\old.tmp", "kinds": ["parent"], "how": ["OVERWRITE_IF"]}, {"path": "c:\\users\\r\\x.lnk", "kinds": ["tab"], "how": ["CREATE"]}]
+                   {"path": "d:\\lab\\r\\old.tmp", "kinds": ["parent"], "how": ["OVERWRITE_IF"]}, {"path": "d:\\lab\\r\\x.lnk", "kinds": ["tab"], "how": ["CREATE"]}]
 
 
 def test_the_report_carries_the_bare_launch_without_comparing_it(capsys):
