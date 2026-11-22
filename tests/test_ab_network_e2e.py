@@ -40,9 +40,9 @@ FLOOR = {"linux": 500, "win32": 500}
 #: The hang guard of the test, sized from what it will run. It is a safety net and never a verdict: the pull request's default timeout of 420 s (`--timeout 420 --timeout-method thread`
 #: of run_e2e.py) killed the xdist worker of the A/A on 5 seeds, on Linux and on Windows (run 44963364060), because the run takes minutes per seed.
 #: Measured (runs 44946411675 and 44960767715, A/A of one seed, two engine runs): 4:00 on Linux and 4:50 on Windows, so 120 s and 145 s per engine run for the first seed, which also
-#: has the two idle launches. The budget allows 240 s for the first seed of an engine run, 150 s for each next one (as slow as a whole first seed on Windows), and 120 s to start: 5 seeds
-#: in an A/A are 35 minutes at most, expected about 18 on Linux and 22 on Windows (the exit-ping launch adds 1 to 2.3 minutes per engine run); with a candidate (three engine runs on every seed) 51 minutes at most.
-SETUP_S, FIRST_SEED_S, NEXT_SEED_S = 120, 240, 150
+#: has the two idle launches. The budget allows 220 s for the first seed of an engine run (145 s measured on Windows), 120 s for each next one, and 120 s to start, so that the guard plus the 10 minutes of the job's own steps fit its 40 minutes: 5 seeds
+#: in an A/A are 30 minutes at most, expected about 18 on Linux and 22 on Windows (the exit-ping launch adds 1 to 2.3 minutes per engine run); with a candidate (three engine runs on every seed) 44 minutes at most.
+SETUP_S, FIRST_SEED_S, NEXT_SEED_S = 120, 220, 120
 #: The idle launch that waits for the engine to record that it told the user about its data reporting policy (60 s timer of the infobar, or the first-run tab) and then closes
 #: to count the exit pings: 140 s at most per engine run (the wait has a limit of 120 s, then the launch and the shutdown), on the first seed only.
 EXIT_PINGS_S = 140

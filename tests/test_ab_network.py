@@ -987,7 +987,7 @@ def test_the_hang_guard_of_the_e2e_grows_with_the_seeds_and_the_subprocess_ends_
     """Run 44963364060: 5 seeds under the default 420 s killed the xdist worker on Linux and on Windows."""
     import test_ab_network_e2e as e2e
 
-    assert e2e.budget_s(1, 2) == 880 and e2e.budget_s(5, 2) == 2080 and e2e.budget_s(5, 3) == 3060
+    assert e2e.budget_s(1, 2) == 840 and e2e.budget_s(5, 2) == 1800 and e2e.budget_s(5, 3) == 2640
     assert e2e.budget_s(5, 2) > 420 and e2e.budget_s(2, 2) < e2e.budget_s(3, 2)
     monkeypatch.delenv("INVISIBLE_SEAL_FILE", raising=False)
     monkeypatch.delenv("AB_NETWORK_PR_SEEDS", raising=False)
