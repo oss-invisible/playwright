@@ -1539,3 +1539,100 @@ def test_a_candidate_that_differs_from_a_sound_control_is_red_and_the_a_a_alone_
     args[2] = str(tmp_path / "aa")
     assert ab.main(args) == 0 and [c[2] for c in calls] == ["firefox-68", "firefox-68-again"]
     assert ab.main(_ab_args(tmp_path)) == 2, "neither a candidate nor --a-a: nothing to run"
+
+
+# ----------------------------------------------------------------------------------------------------------------- how each launch's parent ended
+def exits_of(*codes, platform=None):
+    """The `exits` a run writes (scripts/ci_crash_evidence.py): one launch per code, named as the oracle names its launches."""
+    names = [("main", 11), ("idle-c1", 11), ("idle-c2", 11), ("exit-pings", 11), ("main", 12)]
+    return {"format": "launch-exits/1", "launches": [{"n": n + 1, "label": {"seed": names[n][1], "launch": names[n][0]}, "pid": 100 + n, "returncode": code}
+                                                     for n, code in enumerate(codes)]}
+
+
+def test_a_transcript_whose_launches_all_ended_with_0_is_green_with_or_without_the_record():
+    a, b = transcript("a"), transcript("b")
+    a["exits"], b["exits"] = exits_of(0, 0, 0, 0, 0), exits_of(0, 0, 0, 0, 0)
+    assert compare(a, b)["verdict"] == "green" and compare(a, transcript("b"))["verdict"] == "green"
+    assert "exits" not in ab.flatten(a["seeds"]) and not any(p.startswith("exits") for p in ab.flatten(a))
+
+
+def test_a_launch_that_died_is_red_and_names_the_side_the_seed_the_launch_and_the_code_on_either_side():
+    a, b = transcript("firefox-68"), transcript("firefox-68-again")
+    a["exits"], b["exits"] = exits_of(0, 0, 0, 0, 0), exits_of(0, 0, -11, 0, 0)
+    b["platform"] = "linux"
+    report = compare(a, b)
+    assert report["verdict"] == "red" and report["differences"] == [], "the leaves are equal: the launch is what is red"
+    [line] = report["problems"]
+    for part in ("code -11 (SIGSEGV)", "run firefox-68-again", "side B", "seed 11", "launch idle-c2"):
+        assert part in line, part
+    swapped = compare(b, a)
+    assert "side A" in swapped["problems"][0] and "run firefox-68-again" in swapped["problems"][0]
+    windows = transcript("candidate")
+    windows["platform"] = "win32"
+    windows["exits"] = exits_of(3221225477)
+    assert "0xC0000005 (access violation)" in compare(transcript("firefox-68"), windows)["problems"][0]
+
+
+def test_a_run_that_recorded_no_launch_is_red_because_its_probe_did_not_see_a_browser():
+    a, b = transcript("a"), transcript("b")
+    a["exits"], b["exits"] = exits_of(0), {"format": "launch-exits/1", "launches": []}
+    report = compare(a, b)
+    assert report["verdict"] == "red" and "recorded no launch (side B)" in report["problems"][0]
+
+
+def test_the_run_writes_how_every_launch_ended_into_the_transcript_and_prints_the_one_that_died(tmp_path, monkeypatch, capsys):
+    import os
+
+    import ci_crash_evidence as crash
+    import _lab_egress
+
+    def walk_seed(binary, seed, with_idle, patch):
+        for code, launch in ((0, "main"), (-11, "idle-c1")) if with_idle else ((0, "main"),):
+            crash.mark(seed=seed, launch=launch)
+            from invisible_core.juggler.connection import Connection
+
+            class Process:
+                pid = 4242
+
+                def poll(self):
+                    return code
+
+                def terminate(self):
+                    pass
+
+            to_r, to_w = os.pipe()
+            from_r, from_w = os.pipe()
+            conn = Connection(to_w, from_r, Process())
+            conn.close()
+            os.close(from_w)
+            os.close(to_r)
+        return {"journey": {}}
+
+    monkeypatch.setattr(ab, "walk_seed", walk_seed)
+    monkeypatch.setattr(_lab_egress, "install", lambda patch, work: None)
+    monkeypatch.setenv(crash.CRASH_DIR_ENV, str(tmp_path / "t.crash"))
+    try:
+        assert ab.run("/e/firefox", "firefox-68", (11, 12), tmp_path / "t.json") == 0
+    finally:
+        crash.stop_probe()
+    document = json.loads((tmp_path / "t.json").read_text(encoding="utf-8"))
+    assert [(x["label"]["seed"], x["label"]["launch"], x["returncode"]) for x in document["exits"]["launches"]] == [(11, "main", 0), (11, "idle-c1", -11), (12, "main", 0)]
+    assert "EXIT the parent process exited with code" in capsys.readouterr().out
+    assert (tmp_path / "t.crash" / "exits.json").is_file() and (tmp_path / "t.crash" / "02-11-idle-c1" / "crash.json").is_file()
+    other = transcript("firefox-68-again")
+    other["exits"] = exits_of(0, 0, 0)
+    document["platform"] = "linux"
+    assert compare(document, other)["verdict"] == "red"
+
+
+def test_the_engine_run_is_given_a_folder_for_what_a_launch_that_died_leaves_beside_its_transcript(tmp_path, monkeypatch):
+    import ci_crash_evidence as crash
+
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append(env.get(crash.CRASH_DIR_ENV)) or Done())
+    assert ab.run_engine("ff", None, "firefox-68-again", (0,), tmp_path / "out" / "transcript-68-again.json") == 0
+    assert seen == [str(tmp_path / "out" / "transcript-68-again.crash")]

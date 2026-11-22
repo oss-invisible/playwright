@@ -68,6 +68,7 @@ import base64
 import fnmatch
 import gzip
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -76,6 +77,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_crash_evidence as crash  # noqa: E402  (how each launch's parent ended: the A/B oracle of the page turns a code other than 0 into a red line)
 
 HERE = Path(__file__).resolve().parent / "host_gate"
 PAGE = HERE / "host_gate_page.html"
@@ -446,9 +450,11 @@ def second_launch(options: dict, port: int, dpr: float, timeout_ms: int, read=No
     profile = tempfile.mkdtemp(prefix="host-gate-profile-")
     try:
         with_profile = dict(options, profile_dir=profile)
+        crash.mark(seed=options.get("seed"), dpr=dpr, launch="relaunch-first")
         first = read(with_profile, port, dpr, timeout_ms)
         if first.get("format") != FORMAT:
             return first
+        crash.mark(seed=options.get("seed"), dpr=dpr, launch="relaunch-second")
         return read(with_profile, port, dpr, timeout_ms)
     finally:
         shutil.rmtree(profile, ignore_errors=True)
@@ -460,8 +466,13 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     False the DPR is not pinned: it is the one the seed's persona has, and `dpr` of a visit only names the file and
     the page's query. A seed of `relaunch_seeds` is visited once more, launched twice on one profile folder, and the
     items of that second launch are added to the visit under RELAUNCH (the visit's own items stay those of a fresh profile).
-    With `ab`, the seeds of AB_SEEDS also get the extra visit of the A/B oracle (ab_visit): its leaves join the visit's items."""
+    With `ab`, the seeds of AB_SEEDS also get the extra visit of the A/B oracle (ab_visit): its leaves join the visit's items.
+
+    When the oracle that runs this dump names a folder for it (`AB_CRASH_DIR`, scripts/ci_ab_oracle.py), a probe sees how each launch's parent ends (scripts/ci_crash_evidence.py)
+    and writes it to `exits.json` there, whatever the dump's own result: a launch that did not end with 0 is red in the oracle, and what it left is saved in that folder."""
     out.mkdir(parents=True, exist_ok=True)
+    crash_dir = os.environ.get(crash.CRASH_DIR_ENV)
+    probe = crash.start_probe(firefox, crash_dir) if crash_dir else None
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
@@ -470,6 +481,7 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     try:
         for dpr, seed in (visits if visits is not None else [(d, sd) for d in DPRS for sd in SEEDS]):
             options = visit_options(firefox, seed, dpr if pin_dpr else None, zone)
+            crash.mark(seed=seed, dpr=dpr, launch="visit")
             result = read_page(options, port, dpr, timeout_ms)
             if result.get("format") != FORMAT:
                 print("the page answered format %r, not %r" % (result.get("format"), FORMAT))
@@ -482,6 +494,7 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
                 result["items"].update(relaunch_items(again["items"]))
                 print("second launch of seed %d on a reused profile: %d items" % (seed, len(again["items"])))
             if ab and seed in AB_SEEDS:
+                crash.mark(seed=seed, dpr=dpr, launch="ab-visit")
                 result["items"].update(ab_visit(firefox, seed, zone, dpr if pin_dpr else None))
             path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
             path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
@@ -498,6 +511,11 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
                 first_diag = {k: v for k, v in leaves(result["items"]).items() if is_diag(k)}
     finally:
         server.shutdown()
+        if probe is not None:
+            crash.stop_probe()
+            probe.write()
+            for line in crash.exit_problems(probe.launches, "this dump", windows=leg.startswith("win")):
+                print("EXIT " + line)
     return 0
 
 

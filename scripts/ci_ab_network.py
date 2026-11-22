@@ -43,6 +43,12 @@ whether it stopped by itself). Both record the destinations they saw; the A/A sa
     python ci_ab_network.py compare A.json B.json [--floor N] [--out diff.json] [--a-a]
     python ci_ab_network.py ab --out DIR [--candidate BIN --candidate-seal SEAL] [--published-binary B] [--a-a] [--floor N]
 
+HOW EACH LAUNCH ENDS. Every browser a run launches (the main launch of each seed and the idle and exit-ping launches of the first) is seen by a probe
+(scripts/ci_crash_evidence.py: the exit code of the browser's parent after the close the launch already makes, and a watcher on the crash folders): the transcript carries them
+under ``exits``, outside the leaves that are compared, and a parent that did not end with 0, or whose code was not seen, or a run that recorded no launch, is a RED line that names
+the side, the seed, the launch and the code. What a launch that died left is kept beside the transcript (``transcript-68.json`` -> ``transcript-68.crash/``): the core through gdb with
+the build ids, the ``.extra`` and the minidump names, ``said.txt`` for what the collectors did not find. This oracle runs no strace (a trace would change the outcome it observes).
+
 Exit codes: 0 green, 1 red (a finding), 2 broken control (the A/A is red) or a run that could not run.
 """
 from __future__ import annotations
@@ -67,6 +73,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "tests"))
+import ci_crash_evidence as crash  # noqa: E402  (how each launch's parent ended: a code other than 0 is red, and what it left is saved)
 
 FORMAT = "ab-network/1"
 DIFF_FORMAT = "ab-network-diff/1"
@@ -259,6 +266,17 @@ def _udp_attribution(la: Dict[str, Any], lb: Dict[str, Any]) -> Tuple[set, List[
     return paths, differences, unattributed
 
 
+def exit_lines(transcript: Dict[str, Any], label: str, side: str) -> List[str]:
+    """The red lines of the launches of one side that did not end with 0 (``exits``, which ``run`` writes: scripts/ci_crash_evidence.py). A transcript that has no ``exits``
+    was not made by ``run`` and says nothing about it; one that has it and no launch in it is a run whose probe saw no browser, which is red."""
+    exits = transcript.get("exits")
+    if exits is None:
+        return []
+    if not exits.get("launches"):
+        return ["the run %s recorded no launch (side %s): the probe did not see a browser, so how its browsers ended is not known" % (label, side)]
+    return crash.exit_problems(exits["launches"], label, transcript.get("platform") == "win32", side=side)
+
+
 def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dict[str, str]], floor: int = 0,
                         label_a: str = "A", label_b: str = "B") -> Dict[str, Any]:
     """The verdict on two transcripts (the ``seeds`` of each, as ``run`` writes them).
@@ -303,6 +321,7 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     if len(compared) < floor:
         problems.append("only %d leaves were compared, fewer than the floor of %d: a run that saw less than it should passes anything" % (len(compared), floor))
     problems += ["a direct connection: " + d for d in direct]
+    problems += exit_lines(a, label_a, "A") + exit_lines(b, label_b, "B")
     problems += invariants
     problems += ["the volatile entry %r matches no leaf of either transcript: it is stale, drop it" % p for p in stale]
     problems += ["%s: %s %s | %s %s" % (d["path"], label_a, json.dumps(d["a"], sort_keys=True)[:160], label_b, json.dumps(d["b"], sort_keys=True)[:160])
@@ -1249,7 +1268,8 @@ class Trusting:
 
 
 def launch(binary: str, seed: int, lab: Lab, patch: Any) -> Any:
-    """The browser of a launch behind the gateway of ``lab``, as the realness suite launches it (the exit is declared, nothing asks the internet)."""
+    """The browser of a launch behind the gateway of ``lab``, as the realness suite launches it (the exit is declared, nothing asks the internet). The caller names the launch
+    for the probe that sees how its parent ends (``crash.mark``: ``main``, ``idle-c1``, ``exit-pings``)."""
     from invisible_core import _geo
     from _lab_egress import LAB_EGRESS_IP
     from _session_end import EndingPlaywright
@@ -1389,6 +1409,7 @@ def run_main(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
         trap = start_trap()
         watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
         try:
+            crash.mark(seed=seed, launch="main")
             with launch(binary, seed, lab, patch) as browser:
                 out["journey"] = guarded(lambda: walk_journey(browser, lab))
                 out["https"] = {"h2": guarded(lambda: walk_https(browser, lab, "h2", lab.h2, H2_NAME)),
@@ -1417,6 +1438,7 @@ def run_idle(binary: str, seed: int, condition: str, patch: Any) -> Dict[str, An
     rounds in a row leave what is not the sentinel unchanged."""
     out: Dict[str, Any] = {}
     with open_lab(attribute_in=("launch", "idle", "sentinel")) as lab:
+        crash.mark(seed=seed, launch="idle-" + condition)
         with launch(binary, seed, lab, patch) as browser:
             out["launch"] = lab.norm.walk(launch_data(lab))      # who asks what while the browser starts: the STUN Binding at launch is the core's measurement, not the browser's
             lab.rec.set_phase("idle")
@@ -1499,6 +1521,7 @@ def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
         watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
         recorded = False
         try:
+            crash.mark(seed=seed, launch="exit-pings")
             session = launch(binary, seed, lab, patch)
             with session as browser:
                 lab.rec.set_phase("exit.wait")
@@ -1526,9 +1549,14 @@ def walk_seed(binary: str, seed: int, with_idle: bool, patch: Any) -> Dict[str, 
 
 
 def run(binary: str, label: str, seeds: Tuple[int, ...], out: Path) -> int:
-    """One engine, every seed: the transcript JSON. The idle launches run on the first seed only (what an idle browser asks is the engine's, not the persona's)."""
+    """One engine, every seed: the transcript JSON. The idle launches run on the first seed only (what an idle browser asks is the engine's, not the persona's).
+
+    A probe sees how every launch's parent ends (scripts/ci_crash_evidence.py): ``exits`` of the transcript, outside the leaves that are compared; a code other than 0 is red in
+    ``compare_transcripts``, and what the launch left (the core through gdb, the build ids, the ``.extra`` and the minidump names; this oracle runs no strace) is saved in the folder
+    ``AB_CRASH_DIR`` names (``run_engine`` gives it one beside the transcript)."""
     import pytest
 
+    probe = crash.start_probe(binary, os.environ.get(crash.CRASH_DIR_ENV))
     patch = pytest.MonkeyPatch()
     work = Path(tempfile.mkdtemp(prefix="ab-network-run-"))
     try:
@@ -1540,12 +1568,18 @@ def run(binary: str, label: str, seeds: Tuple[int, ...], out: Path) -> int:
             print("=== %s: seed %d" % (label, seed))
             sys.stdout.flush()
             transcript["seeds"][str(seed)] = walk_seed(binary, seed, index == 0, patch)
+        crash.stop_probe()
+        transcript["exits"] = probe.document()
+        probe.write()
+        for line in crash.exit_problems(probe.launches, label, windows=sys.platform == "win32"):
+            print("EXIT " + line)
         write_json(out, transcript)
         for path in transcript_errors(transcript["seeds"]):
             print("ERROR in the transcript at %s" % path)
         print("transcript written: %s (%d leaves)" % (out, len(flatten(transcript["seeds"]))))
         return 0
     finally:
+        crash.stop_probe()
         patch.undo()
         shutil.rmtree(work, ignore_errors=True)
 
@@ -1567,6 +1601,7 @@ def run_engine(binary: str, seal: Optional[str], label: str, seeds: Tuple[int, .
         env["INVISIBLE_SEAL_FILE"] = str(seal)
     for name in ("MOZ_LOG", "MOZ_LOG_FILE"):
         env.pop(name, None)
+    env[crash.CRASH_DIR_ENV] = str(Path(out).parent / (Path(out).stem + ".crash"))  # footprint-68.json -> transcript-68.crash/: what a launch that did not end with 0 left
     command = [sys.executable, "-u", str(Path(__file__).resolve()), "run", "--binary", binary, "--label", label, "--seeds", ",".join(map(str, seeds)), "--out", str(out)]
     print("=== run %s: %s (seal %s)" % (label, binary, seal or "the one this process has"))
     sys.stdout.flush()

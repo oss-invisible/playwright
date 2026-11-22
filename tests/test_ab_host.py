@@ -1356,7 +1356,7 @@ def test_the_open_of_a_proc_self_fd_names_the_process_the_line_and_the_memfd_tha
     assert host.STRACE_CALLS.split(",").count("memfd_create") == 1
 
 
-def test_the_strace_stand_in_keeps_the_exit_lines_and_drops_the_signals_when_asked(monkeypatch):
+def test_the_strace_stand_in_keeps_the_exit_lines_and_records_the_fatal_signals_when_asked(monkeypatch):
     import _strace_stand_in as stand_in
 
     class Help:
@@ -1364,9 +1364,25 @@ def test_the_strace_stand_in_keeps_the_exit_lines_and_drops_the_signals_when_ask
 
     monkeypatch.setattr(stand_in.shutil, "which", lambda name: "/usr/bin/strace")
     monkeypatch.setattr(stand_in.subprocess, "run", lambda *a, **k: Help())
-    assert " -qq " in stand_in._strace_options() + " " and "-e signal=none" not in stand_in._strace_options()
+    assert " -qq " in stand_in._strace_options() + " " and "-e signal" not in stand_in._strace_options()
     asked = stand_in._strace_options(exit_status=True)
-    assert "-q " in asked and "-qq" not in asked and "-e signal=none" in asked
+    assert "-q " in asked and "-qq" not in asked.replace("SIGQUIT", ""), "-q keeps the `+++ exited with N +++` lines"
+    assert "-e signal=none" not in asked and "-e signal=%s " % stand_in.RECORDED_SIGNALS in asked + " ", "the signals are recorded now: the line that says who sent SIGSEGV and where it faulted"
+    assert {"SIGSEGV", "SIGBUS", "SIGABRT", "SIGILL", "SIGTERM"} <= set(stand_in.RECORDED_SIGNALS.split(","))
+
+
+def test_the_signal_lines_the_trace_now_records_are_not_data_of_the_comparison(tmp_path):
+    """The known-bad input is a log with the lines `-e signal=none` used to drop: read as data they would be a process, a path, a call. They are dropped where the log is read, and
+    the footprint of a log with them is the footprint of the log without."""
+    clean = tmp_path / "clean.log"
+    clean.write_text(SHUTDOWN_LOG, encoding="utf-8")
+    lines = SHUTDOWN_LOG.splitlines()
+    noisy = tmp_path / "noisy.log"
+    signals = ["100 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=104, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---",
+               "100 --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=0x7f00dead} ---"]
+    noisy.write_text("\n".join([lines[0]] + signals + lines[1:]) + "\n", encoding="utf-8")
+    assert list(host._read_lines(noisy)) == list(host._read_lines(clean)) and not any("---" in x for x in host._read_lines(noisy))
+    assert any("--- SIGSEGV" in x for x in noisy.read_text(encoding="utf-8").splitlines()), "the log itself keeps them: the evidence of a crash reads it"
 
 
 def etw_stop(pid, code, time, image="firefox.exe"):
@@ -1726,7 +1742,7 @@ def test_a_linux_core_is_found_where_the_launch_ran_and_its_backtrace_is_asked_o
     assert host.core_info(tmp_path / "empty-nowhere", "x")["cores"] == []
 
 
-def test_the_stand_in_of_the_bare_launch_allows_core_dumps_in_its_own_folder_and_the_others_do_not(tmp_path, monkeypatch):
+def test_the_stand_in_allows_core_dumps_in_every_launch_and_only_the_bare_one_moves_to_its_own_folder(tmp_path, monkeypatch):
     import _strace_stand_in as stand_in
 
     class Help:
@@ -1738,7 +1754,9 @@ def test_the_stand_in_of_the_bare_launch_allows_core_dumps_in_its_own_folder_and
     real.parent.mkdir()
     real.write_text("x", encoding="utf-8")
     plain = Path(stand_in._stand_in(str(real), tmp_path / "t1", tmp_path / "l1", tmp_path / "p1"))
-    assert "ulimit" not in plain.read_text(encoding="utf-8")
+    assert "ulimit" not in plain.read_text(encoding="utf-8"), "the font tests' stand-in is as it was"
+    every = Path(stand_in._stand_in(str(real), tmp_path / "t3", tmp_path / "l3", tmp_path / "p3", cores=True)).read_text(encoding="utf-8")
+    assert "ulimit -c unlimited\nexec " in every and "\ncd " not in every, "a measured launch may dump core and its working directory is the launcher's (the paths the trace reads are the same)"
     cores = Path(stand_in._stand_in(str(real), tmp_path / "t2", tmp_path / "l2", tmp_path / "p2", core_dir=tmp_path / "cores"))
     text = cores.read_text(encoding="utf-8")
     assert "ulimit -c unlimited\ncd %s\nexec " % (tmp_path / "cores") in text
@@ -2036,3 +2054,326 @@ def test_in_an_ab_the_excused_files_stay_listed_per_run_and_a_new_library_shows_
     assert mui("old") in system["listed_mui_and_cat"]["68"] and CATDIR + "old.cat" in system["listed_mui_and_cat"]["68"] and mui("newlib") in system["listed_mui_and_cat"]["candidate"]
     orphan = judge(published, with_system(win("candidate"), {11: [dll("old"), mui("lonely")]}), expected=[])
     assert [d["leaf"] for d in orphan["differences"]] == ["file." + mui("lonely")] and orphan["system_modules"]["orphans"] == [mui("lonely")]
+
+
+# -
+# A launch whose parent did not end with 0 is red in EVERY launch of the oracle, and what it left is saved (scripts/ci_crash_evidence.py: run 45030727459 had a firefox-68 parent
+# die with -11 in a normal close and nothing was kept). Each recorder is shown on the input that makes it fail: a launch that died.
+
+import ci_crash_evidence as crash  # noqa: E402
+
+CRASH_LOG = "".join('%d openat(AT_FDCWD, "/usr/lib/x%d", O_RDONLY) = 3\n' % (100, i) for i in range(300)) + (
+    "100 --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_USER, si_pid=4000, si_uid=1000} ---\n"
+    + "".join('100 write(2, "crash reporter line %d\\n", 20) = 20\n' % i for i in range(150))
+    + "100 +++ killed by SIGSEGV (core dumped) +++\n")
+
+
+class Run:
+    """A stand-in for `subprocess.run` that answers by the tool it is asked for, and keeps what it was asked."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        text = self.answers.get(os.path.basename(argv[0]), "")
+
+        class Done:
+            stdout, stderr = text, ""
+
+        return Done()
+
+
+def with_tools(*names):
+    return lambda name: "/usr/bin/" + name if name in names else None
+
+
+def test_the_exit_code_of_a_parent_is_told_by_its_signal_on_linux_and_by_its_status_on_windows():
+    assert crash.describe_exit(-11, False) == "-11 (SIGSEGV)" and crash.describe_exit(-6, False) == "-6 (SIGABRT)" and crash.describe_exit(1, False) == "1"
+    assert crash.describe_exit(3221225477, True) == "0xC0000005 (access violation)" and crash.describe_exit(-1073741819, True) == "0xC0000005 (access violation)"
+    assert "not seen" in crash.describe_exit(None, False)
+
+
+def test_a_launch_that_did_not_end_with_0_is_a_red_line_that_names_the_seed_the_launch_and_the_code():
+    assert crash.exit_problem(0, False, seed=5, launch="measured") is None
+    line = crash.exit_problem(-11, False, seed=5, launch="measured")
+    assert line == "the parent process exited with code -11 (SIGSEGV): seed 5, launch measured"
+    assert "not seen" in crash.exit_problem(None, False, seed=5, launch="idle"), "an oracle that did not see how its browser ended did not see it"
+    launches = [{"n": 1, "label": {"seed": 7, "dpr": 1.5, "launch": "visit"}, "returncode": 0},
+                {"n": 2, "label": {"seed": 7, "launch": "relaunch-second"}, "returncode": -11, "evidence": "crash/02-7-relaunch-second"}]
+    got = crash.exit_problems(launches, "firefox-68-again", False)
+    assert len(got) == 1 and "code -11 (SIGSEGV)" in got[0] and "run firefox-68-again" in got[0] and "side B" in got[0] and "seed 7" in got[0] and "launch relaunch-second" in got[0]
+    assert "(evidence: crash/02-7-relaunch-second)" in got[0]
+    assert "side A" in crash.exit_problems(launches, "firefox-68", False)[0] and "side B" in crash.exit_problems(launches, "candidate", False)[0]
+    assert "side A" in crash.exit_problems(launches, "x", False, side="A")[0]
+
+
+def test_a_parent_the_lifecycle_says_did_not_exit_0_is_red_when_the_root_code_said_nothing_of_it():
+    lifecycle = [{"event": "start", "kind": "parent", "how": ""}, {"event": "end", "kind": "tab", "how": "exited 1"}, {"event": "end", "kind": "parent", "how": "exited 3221225477"}]
+    got = crash.parent_exit_problems(lifecycle, 0, seed=4, launch="measured")
+    assert len(got) == 1 and "exited 3221225477" in got[0] and "seed 4" in got[0]
+    assert crash.parent_exit_problems(lifecycle, -11, seed=4) == [], "the root's own code already said it"
+    assert crash.parent_exit_problems([{"event": "end", "kind": "parent", "how": "exited 0"}], 0) == []
+
+
+def test_the_strace_tail_is_the_last_100_lines_and_the_signal_line_that_is_further_back_is_kept_apart(tmp_path):
+    log = tmp_path / "strace.log"
+    log.write_text(CRASH_LOG, encoding="utf-8")
+    tail = crash.strace_tail(log)
+    assert len(tail) == 100 and tail[-1].endswith("+++ killed by SIGSEGV (core dumped) +++") and not any("--- SIGSEGV" in x for x in tail)
+    signals = crash.strace_signals(log)
+    assert len(signals) == 1 and signals[0][0] == 301 and "si_pid=4000" in signals[0][1], "the signal line is there though the crash reporter's calls pushed it out of the tail"
+    short = tmp_path / "short.log"
+    short.write_text('1 execve("/e", [], 0x1) = 0\n', encoding="utf-8")
+    assert crash.strace_tail(short) == ['1 execve("/e", [], 0x1) = 0']
+
+
+def test_the_core_is_run_through_gdb_with_the_three_commands_and_the_build_ids_are_asked_of_readelf_and_eu_unstrip(tmp_path):
+    core = tmp_path / "core.firefox.4242.1"
+    core.write_bytes(b"\x7fELF")
+    binary = tmp_path / "engine" / "firefox"
+    binary.parent.mkdir()
+    binary.write_bytes(b"x")
+    (binary.parent / "libxul.so").write_bytes(b"x")
+    run = Run({"gdb": 'Thread 1 (Thread 0x7f (LWP 4242) "firefox"):\n#0  0x0 in mozilla::ShutdownXPCOM ()\n$1: 0x1 "MOZ_CRASH(shutdown)"\nFrom To Syms Read Shared Object Library\n',
+               "readelf": "    Build ID: abc123\n", "eu-unstrip": "0x1+0x2 deadbeef@0x3 /usr/lib/libc.so.6 libc.so.6\n"})
+    got = crash.collect(-11, str(binary), strace_log=None, watched={"files": [], "scans": 3}, core_folders=[tmp_path], since=0, windows=False, run=run,
+                        which=with_tools("gdb", "readelf", "eu-unstrip"))
+    gdb = [c for c in run.calls if c[0].endswith("gdb")][0]
+    assert gdb[:2] == ["/usr/bin/gdb", "-batch"] and gdb[-2:] == [str(binary), str(core)]
+    commands = [gdb[i + 1] for i, a in enumerate(gdb) if a == "-ex"]
+    assert commands == ["thread apply all bt", "x/s *(char**)&gMozCrashReason", "info sharedlibrary"]
+    assert "Thread 1 (" in got["cores"]["backtraces"][core.name] and "MOZ_CRASH(shutdown)" in got["cores"]["backtraces"][core.name]
+    ids = got["cores"]["build_ids"][core.name]
+    assert ids["binary"] == "Build ID: abc123" and ids["libxul"] == "Build ID: abc123" and "deadbeef" in ids["core"]
+    assert [c for c in run.calls if c[0].endswith("eu-unstrip")][0][1:] == ["-n", "--core", str(core)]
+
+
+def test_a_collector_that_finds_nothing_says_so_and_never_stays_silent(tmp_path):
+    binary = tmp_path / "firefox"
+    binary.write_bytes(b"x")
+    got = crash.collect(-11, str(binary), strace_log=None, watched={"files": [], "scans": 0}, core_folders=[tmp_path / "cores"], since=0, windows=False, run=Run({}),
+                        which=with_tools())
+    said = " | ".join(got["said"])
+    assert "runs no strace" in said and "no core file written" in said and "no minidump and no `.extra`" in said
+    assert got["cores"]["cores"] == [] and got["cores"]["build_ids"]["binary only (no core)"]["binary"] == "readelf is not installed"
+    core = tmp_path / "cores" / "core.firefox.1.1"
+    core.parent.mkdir()
+    core.write_bytes(b"\x7fELF")
+    got = crash.collect(-11, str(binary), strace_log=None, watched={"files": []}, core_folders=[core.parent], since=0, windows=False, run=Run({}), which=with_tools())
+    assert got["cores"]["backtraces"][core.name] == "gdb is not installed" and got["cores"]["build_ids"][core.name]["core"] == "eu-unstrip is not installed"
+    missing = crash.collect(-11, str(binary), strace_log=tmp_path / "nowhere.log", watched={"files": []}, core_folders=[], windows=False, run=Run({}), which=with_tools())
+    assert any("strace log could not be read" in s for s in missing["said"])
+    quiet = tmp_path / "quiet.log"
+    quiet.write_text("1 +++ exited with 1 +++\n", encoding="utf-8")
+    assert any("no fatal signal line" in s
+               for s in crash.collect(1, str(binary), strace_log=quiet, watched={"files": []}, core_folders=[], windows=False, run=Run({}), which=with_tools())["said"])
+    files = [{"name": "a.dmp", "dir": "d", "size": 5}, {"name": "a.extra", "dir": "d", "size": 9, "content": '{"CrashType": "ACCESS"}'}]
+    windows = crash.collect(3221225477, str(binary), strace_log=None, watched={"files": files}, windows=True)
+    assert windows["strace"] is None and windows["cores"] is None and windows["crash_files"]["dmp"] == ["a.dmp"] and windows["crash_files"]["extra"][0]["name"] == "a.extra"
+    assert windows["exit"]["text"] == "0xC0000005 (access violation)" and any("no strace and no core on Windows" in s for s in windows["said"])
+    assert not any("no minidump" in s for s in windows["said"])
+
+
+def test_a_core_of_an_earlier_launch_is_not_this_one_s(tmp_path):
+    old, new = tmp_path / "core.old.1.1", tmp_path / "core.new.2.2"
+    old.write_bytes(b"x")
+    new.write_bytes(b"x")
+    os.utime(old, (1000, 1000))
+    now = new.stat().st_mtime
+    assert crash.find_cores([tmp_path, tmp_path / "missing"], since=now - 1) == [new] and crash.find_cores([tmp_path], since=None) == [new, old]
+    assert crash.core_dirs({crash.CORE_DIR_ENV: "/cores"}, pattern="|/usr/share/apport/apport -p%p") == [Path("/cores")], "a pipe leaves no file to look for"
+    assert crash.core_dirs({}, pattern="/var/cores/core.%e.%p") == [Path("/var/cores")] and crash.core_dirs({}, pattern=None) == []
+
+
+def test_the_evidence_is_written_as_files_a_person_can_read_in_the_artifact(tmp_path):
+    log = tmp_path / "strace.log"
+    log.write_text(CRASH_LOG, encoding="utf-8")
+    core = tmp_path / "core.firefox.4242.1"
+    core.write_bytes(b"\x7fELF")
+    run = Run({"gdb": 'Thread 2 (Thread 0x7f (LWP 4243) "Socket Thread"):\n', "readelf": "Build ID: aa\n", "eu-unstrip": "x\n"})
+    binary = tmp_path / "engine" / "firefox"
+    binary.parent.mkdir()
+    binary.write_bytes(b"x")
+    watched = {"files": [{"name": "u.extra", "dir": "d", "size": 9, "content": '{"MozCrashReason": "MOZ_CRASH(x)"}'}, {"name": "u.dmp", "dir": "d", "size": 4}], "scans": 5}
+    evidence = crash.collect(-11, str(binary), strace_log=log, watched=watched, core_folders=[tmp_path], since=0, windows=False, run=run,
+                             which=with_tools("gdb", "readelf", "eu-unstrip"))
+    written = crash.write_crash_files(evidence, tmp_path / "out" / "crash")
+    assert {"strace-tail.txt", "strace-signals.txt", "gdb-core.firefox.4242.1.txt", "build-ids.txt", "u.extra.txt", "minidumps.txt", "said.txt", "crash.json"} <= set(written)
+    folder = tmp_path / "out" / "crash"
+    assert "--- SIGSEGV" in (folder / "strace-signals.txt").read_text(encoding="utf-8")
+    assert "killed by SIGSEGV (core dumped)" in (folder / "strace-tail.txt").read_text(encoding="utf-8")
+    assert "Thread 2 (" in (folder / "gdb-core.firefox.4242.1.txt").read_text(encoding="utf-8") and "MOZ_CRASH(x)" in (folder / "u.extra.txt").read_text(encoding="utf-8")
+    assert (folder / "minidumps.txt").read_text(encoding="utf-8") == "u.dmp\n"
+    assert json.loads((folder / "crash.json").read_text(encoding="utf-8"))["exit"]["code"] == -11
+
+
+def test_a_fake_launch_that_died_with_minus_11_is_a_red_line_with_the_evidence_and_one_that_ended_with_0_is_neither(tmp_path):
+    log = tmp_path / "strace.log"
+    log.write_text(CRASH_LOG, encoding="utf-8")
+    watched = {"files": [{"name": "u.extra", "dir": "d", "size": 9, "content": '{"CrashType": "SIGSEGV"}'}], "scans": 2}
+    problems, left = host.end_of_launch(-11, False, 11, "measured", [], "/e/firefox", log, watched, None, 0.0, folders=[], run=Run({}))
+    assert problems == ["the parent process exited with code -11 (SIGSEGV): seed 11, launch measured"]
+    assert left["exit"] == {"code": -11, "text": "-11 (SIGSEGV)"} and left["strace"]["signals"][0][1].startswith("100 --- SIGSEGV")
+    assert left["crash_files"]["extra"][0]["name"] == "u.extra"
+    assert host.end_of_launch(0, False, 11, "measured", [], "/e/firefox", log, watched, None, 0.0, folders=[]) == ([], None)
+    problems, left = host.end_of_launch(None, False, 11, "idle", [], "/e/firefox", log, {}, None, 0.0, folders=[], run=Run({}))
+    assert "not seen" in problems[0] and left is not None
+    windows, kept = host.end_of_launch(3221225477, True, 11, "bare", [], "D:\\e\\firefox.exe", None, {"files": []}, None, 0.0, run=Run({}))
+    assert "0xC0000005 (access violation)" in windows[0] and "launch bare" in windows[0] and kept["strace"] is None
+
+
+def test_the_bare_launch_looks_in_its_own_folder_for_a_core_as_well(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(host.crash, "collect", lambda code, binary, **kw: seen.update(kw) or {"exit": {}, "said": []})
+    monkeypatch.setattr(host.crash, "core_dirs", lambda *a, **k: [Path("/job/cores")])
+    host.end_of_launch(-11, False, 1, "bare", [], "b", tmp_path / "l", {}, tmp_path, 5.0)
+    assert seen["core_folders"] == [Path("/job/cores"), tmp_path] and seen["since"] == 5.0
+
+
+def test_a_launch_that_did_not_end_with_0_is_in_the_verdict_of_the_run_named_by_side_seed_and_launch_whatever_launch_it_was(monkeypatch, tmp_path):
+    bad = crash.exit_problem(-11, False, seed=12, launch="measured")
+
+    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
+        fp = seed_footprint(seed)
+        if name is None and seed == 12:
+            fp["problems"] = [bad]
+            fp["crash"] = {"exit": {"code": -11, "text": "-11 (SIGSEGV)"}, "said": ["no core file written"], "strace": None, "cores": None, "crash_files": {"dmp": [], "extra": []}}
+        if name == "bare":
+            fp["exit_problems"] = [crash.exit_problem(-6, False, seed=11, launch="bare")]
+        if name == "idle":
+            fp["problems"] = [crash.exit_problem(1, False, seed=11, launch="idle")]
+        return fp
+
+    monkeypatch.setattr(host, "run_seed", fake_run_seed)
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68", tmp_path / "x.crash")
+    assert "idle: the parent process exited with code 1: seed 11, launch idle" in doc["problems"]
+    assert "bare: the parent process exited with code -6 (SIGABRT): seed 11, launch bare" in doc["problems"]
+    assert (tmp_path / "x.crash" / "seed12" / "crash.json").is_file()
+    assert (tmp_path / "x.crash" / "seed12" / "said.txt").read_text(encoding="utf-8") == "no core file written\n"
+    other = footprint()
+    other["seeds"][1] = doc["seeds"][1]
+    red = judge(footprint(), other, a_a=True)
+    assert red["verdict"] == "red" and "seed 12 side B: the parent process exited with code -11 (SIGSEGV): seed 12, launch measured" in red["problems"]
+    named = judge(dict(footprint(), problems=doc["problems"]), footprint(), a_a=True)
+    assert "side A: idle: the parent process exited with code 1: seed 11, launch idle" in named["problems"]
+
+
+def test_the_signal_the_recorder_is_tested_with_goes_to_the_browser_s_parent_and_not_to_strace_or_a_content_process():
+    class Child:
+        def __init__(self, pid, cmd):
+            self.pid, self._cmd = pid, cmd
+
+        def cmdline(self):
+            return self._cmd
+
+    assert host.browser_parent(1, lambda: [Child(7, ["firefox", "-contentproc", "tab"]), Child(8, ["firefox", "-profile", "/tmp/p"])]) == 8
+    with pytest.raises(RuntimeError, match="no browser parent"):
+        host.browser_parent(1, lambda: [Child(7, ["firefox", "-contentproc", "tab"])])
+    sent = []
+
+    class Process:
+        polls = 0
+
+        def poll(self):
+            Process.polls += 1
+            return -11 if Process.polls > 2 else None
+
+    assert host.crash_the_parent(1, Process(), 11, kill=lambda pid, sig: sent.append((pid, sig)), parent=8, sleep=lambda s: None) == 8
+    assert sent == [(8, 11)] and Process.polls == 3, "it waits for the root to end, and sends the signal once"
+
+
+def test_the_crash_probe_is_red_when_the_launch_that_died_is_in_the_footprint_and_fails_when_the_recorder_did_not_see_it(tmp_path, capsys):
+    def made(problems):
+        def run(binary, seal, leg, out, label, seeds, crash_with=None):
+            assert crash_with == "SIGSEGV" and seeds == [11]
+            Path(out).write_text(json.dumps({"format": host.FORMAT, "problems": problems, "seeds": []}), encoding="utf-8")
+            return 0
+        return run
+
+    red = host.crash_probe("ff", "linux-x86_64", tmp_path / "a", 11, run=made([crash.exit_problem(-11, False, seed=11, launch="crash")]))
+    assert red == 1 and "AB HOST CRASH PROBE FAILED" in capsys.readouterr().out
+    assert host.crash_probe("ff", "linux-x86_64", tmp_path / "b", 11, run=made([])) == 0, "a recorder that saw nothing in a launch that died: the e2e test fails on this"
+    assert "AB HOST CRASH PROBE OK" in capsys.readouterr().out
+    assert host.crash_probe("ff", "linux-x86_64", tmp_path / "c", 11, run=lambda *a: 3) == 2
+
+
+class FakeProcess:
+    pid = 4242
+
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+    def terminate(self):
+        pass
+
+
+def a_launch_through_the_core(probe, code, label, folder=None):
+    """A launch as the core makes it: a `Connection` over two pipes whose process ended with `code`, closed as the wrapper closes it."""
+    from invisible_core.juggler.connection import Connection
+
+    probe.set_label(**label)
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
+    conn = Connection(to_w, from_r, FakeProcess(code))
+    if folder is not None:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "u.extra").write_text('{"CrashType": "SIGSEGV", "MozCrashReason": "MOZ_CRASH(glean)"}', encoding="utf-8")
+    conn.close()
+    os.close(from_w)
+    os.close(to_r)
+    return conn
+
+
+def test_the_probe_sees_every_launch_the_core_makes_and_the_one_that_died_is_red_with_its_crash_files_while_the_others_are_not(tmp_path):
+    from invisible_core.juggler.connection import Connection
+
+    folder = tmp_path / "profile" / "minidumps"
+    probe = crash.LaunchProbe("/e/firefox", tmp_path / "out" / "crash", windows=False, folders=[folder], which=with_tools(), run=Run({}))
+    before = (Connection.__init__, Connection.close)
+    probe.install()
+    try:
+        assert (Connection.__init__, Connection.close) != before
+        a_launch_through_the_core(probe, 0, {"seed": 1, "launch": "visit"})
+        a_launch_through_the_core(probe, -11, {"seed": 2, "launch": "relaunch-second"}, folder)
+        a_launch_through_the_core(probe, 0, {"seed": 3, "launch": "visit"})
+    finally:
+        probe.uninstall()
+    assert (Connection.__init__, Connection.close) == before
+    assert [x["returncode"] for x in probe.launches] == [0, -11, 0]
+    lines = crash.exit_problems(probe.launches, "firefox-68", False)
+    assert len(lines) == 1 and "code -11 (SIGSEGV)" in lines[0] and "seed 2" in lines[0] and "launch relaunch-second" in lines[0] and "side A" in lines[0]
+    evidence = [x for x in probe.launches if x["returncode"]][0]
+    saved = tmp_path / "out" / "crash" / evidence["evidence"].split("/", 1)[1]
+    assert "MOZ_CRASH(glean)" in (saved / "u.extra.txt").read_text(encoding="utf-8")
+    assert "no core file written" in " | ".join(evidence["said"]) and "runs no strace" in " | ".join(evidence["said"])
+    exits = tmp_path / "out" / "crash" / "exits.json"
+    assert probe.write() == exits and crash.read_exits(exits)["launches"][1]["returncode"] == -11
+    assert len([p for p in (tmp_path / "out" / "crash").iterdir() if p.is_dir()]) == 1, "a launch that ended with 0 leaves no evidence folder"
+    assert crash.exits_of_run(tmp_path / "out" / "crash", "firefox-68", False) == lines
+
+
+def test_a_run_whose_probe_wrote_nothing_is_red_because_the_oracle_did_not_see_its_browsers(tmp_path):
+    assert "left no record" in crash.exits_of_run(tmp_path / "out" / "crash" / "firefox-68", "firefox-68")[0]
+    folder = tmp_path / "crash" / "firefox-68"
+    folder.mkdir(parents=True)
+    (folder / "exits.json").write_text(json.dumps({"format": crash.FORMAT, "launches": []}), encoding="utf-8")
+    assert "recorded no launch" in crash.exits_of_run(folder, "firefox-68")[0]
+    assert crash.exits_of_run(folder, "firefox-68", needed=False) == [] and crash.exits_of_run(None, "x") == []
+    (folder / "exits.json").write_text("not json", encoding="utf-8")
+    assert "left no record" in crash.exits_of_run(folder, "firefox-68")[0]
+
+
+def test_a_crash_watcher_does_not_take_the_reports_of_earlier_crashes_for_the_launch_s(tmp_path):
+    pending = tmp_path / "Crash Reports" / "pending"
+    pending.mkdir(parents=True)
+    (pending / "old.extra").write_text('{"CrashType": "OLD"}', encoding="utf-8")
+    already = crash.existing_crash_files([pending])
+    watcher = crash.CrashWatcher(lambda: [pending], ignore=already)
+    (pending / "new.extra").write_text('{"CrashType": "NEW"}', encoding="utf-8")
+    got = watcher.stop()
+    assert [f["name"] for f in got["files"]] == ["new.extra"]

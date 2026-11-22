@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import ci_ab_oracle as ab  # noqa: E402
+import ci_crash_evidence as crash  # noqa: E402
 import ci_host_gate as gate  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -205,6 +207,16 @@ def write_gate_dump(directory, engine_visits):
     for (dpr, seed), its in engine_visits.items():
         (directory / ("leg_dpr%s_seed%d.json" % (dpr, seed))).write_text(
             json.dumps({"leg": "leg", "dpr": dpr, "seed": seed, "result": {"format": gate.FORMAT, "items": its}}), encoding="utf-8")
+    write_exits(0)
+
+
+def write_exits(code, launches=1):
+    """What the probe of the dump process writes where the oracle told it (`AB_CRASH_DIR`): how each launch's parent ended."""
+    where = os.environ.get(crash.CRASH_DIR_ENV)
+    if where:
+        Path(where).mkdir(parents=True, exist_ok=True)
+        (Path(where) / "exits.json").write_text(json.dumps({"format": crash.FORMAT, "launches": [
+            {"n": n + 1, "label": {"seed": 0, "dpr": 1.0, "launch": "visit"}, "pid": 100 + n, "returncode": code} for n in range(launches)]}), encoding="utf-8")
 
 
 def test_the_visits_read_back_from_the_gate_s_dump_and_from_the_packed_file(tmp_path):
@@ -236,7 +248,8 @@ def test_a_run_writes_the_three_files_and_is_green_when_the_engines_agree(tmp_pa
     rc = _fake_run(tmp_path, monkeypatch, candidate=visits())
     out = capsys.readouterr().out
     assert rc == 0 and "AB ORACLE OK" in out
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir() if p.is_file()) == ["diff.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out" / "crash").iterdir()) == ["candidate", "firefox-68"], "how each engine's browsers ended is in the artifact, a folder per run"
     diff = json.loads((tmp_path / "out" / "diff.json").read_text(encoding="utf-8"))
     assert diff["verdict"] == "green" and diff["engine"] == "firefox-68" and diff["differences"] == []
 
@@ -446,7 +459,8 @@ def test_the_a_a_alone_runs_the_published_engine_twice_and_is_green_when_it_repe
     out = capsys.readouterr().out
     assert rc == 0 and "AB ORACLE A/A OK" in out
     assert [c[0] for c in calls] == ["pub", "pub"] and all(c[1] is None and len(c[3]) == 2 for c in calls)
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff-a-a.json", "dump-68-again.json", "dump-68.json"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir() if p.is_file()) == ["diff-a-a.json", "dump-68-again.json", "dump-68.json"]
+    assert sorted(p.name for p in (tmp_path / "out" / "crash").iterdir()) == ["firefox-68", "firefox-68-again"]
     diff = json.loads((tmp_path / "out" / "diff-a-a.json").read_text(encoding="utf-8"))
     assert diff["verdict"] == "green" and diff["control"] is True and len(diff["visits"]) == 2
 
@@ -477,7 +491,8 @@ def test_with_a_candidate_the_a_a_comes_first_and_the_a_b_is_against_the_first_d
     out = capsys.readouterr().out
     assert rc == 0 and "AB ORACLE A/A OK" in out and "AB ORACLE OK" in out
     assert [(c[0], c[1]) for c in calls] == [("pub", None), ("pub", None), ("cand", str(tmp_path / "cand.seal.json"))]
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir() if p.is_file()) == ["diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out" / "crash").iterdir()) == ["candidate", "firefox-68", "firefox-68-again"]
 
 
 def test_with_a_candidate_that_differs_the_a_b_is_red_exit_1_not_a_broken_control(tmp_path, monkeypatch, capsys):
@@ -559,7 +574,7 @@ def test_a_pull_request_that_touches_the_files_of_one_oracle_runs_every_seed_of_
     assert got == dict(DEFAULT, **{only: 5}), got
 
 
-@pytest.mark.parametrize("path", ["scripts/ci_ab_oracle.py", "scripts/persona_cover.py", "ci/persona-seeds.json", "scripts/ci_ab_pr_seeds.py"])
+@pytest.mark.parametrize("path", ["scripts/ci_ab_oracle.py", "scripts/ci_crash_evidence.py", "scripts/persona_cover.py", "ci/persona-seeds.json", "scripts/ci_ab_pr_seeds.py"])
 def test_what_the_oracles_share_runs_every_seed_of_all_of_them(path):
     assert pr.pr_seed_counts([path], every=5) == ALL
 
@@ -655,13 +670,47 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
     linux, windows = _job(text, "e2e-host"), _job(text, "e2e-host-windows")
     assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
-    for body in (linux, windows):
-        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and "needs: core-on-index" in body
+    for body, minutes in ((linux, 65), (windows, 45)):
+        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: %d" % minutes in body and "needs: core-on-index" in body
         assert "      - name: Run the host oracle's A/A\n" in body and "skipped\": 0" in body
     assert "apt-get install -y strace" in linux and "xvfb-run -a" in linux, "Linux traces the tree with strace"
     import test_ab_host_e2e as host_e2e
+    import test_ab_host_crash_linux_e2e as crash_e2e
 
-    assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the job"
+    assert host_e2e.TIMEOUT_S + crash_e2e.TIMEOUT_S + 10 * 60 <= 65 * 60, "the A/A and the recorder's own test, one after the other, fit the Linux job"
+    assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the Windows job"
+
+
+def test_the_linux_jobs_of_the_three_oracles_install_gdb_and_elfutils_and_point_the_kernel_s_core_pattern_at_a_folder_of_the_job():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    for name in ("e2e-network", "e2e-host", "e2e-page", "e2e-page-final"):
+        body = _job(text, name)
+        step = body[body.index("      - name: Cores of a browser that did not end with 0"):]
+        step = step[:step.index("      - name: The security state")]
+        assert "apt-get install -y gdb elfutils" in step and 'sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"' in step, name
+        assert 'INVPW_CORE_DIR=$RUNNER_TEMP/cores' in step, name
+        assert body.index("System deps (xvfb") < body.index("Cores of a browser") < body.index("Fetch the published firefox binary"), "after the apt update, before any launch"
+        assert "MOZ_CRASHREPORTER" not in body and "extra_prefs" not in step, "no environment variable of the browser, no pref, no crash reporter option"
+    for name in ("e2e-network-windows", "e2e-host-windows", "e2e-page-windows", "e2e-page-final-windows"):
+        assert "Cores of a browser" not in _job(text, name), "Windows reads the `.extra` and the minidump names: no core, no gdb"
+
+
+def test_the_recorders_own_test_runs_in_the_host_job_after_the_a_a_and_is_left_out_of_the_shared_job_and_has_its_own_linux_row():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    crash_file = "tests/test_ab_host_crash_linux_e2e.py"
+    host_job = _job(text, "e2e-host")
+    assert host_job.index("Run the host oracle's A/A") < host_job.index("The host oracle's recorder of a browser that dies") < host_job.index("The leg ran with the pinned GeoIP database")
+    step = host_job[host_job.index("      - name: The host oracle's recorder"):host_job.index("      - name: The leg ran with the pinned GeoIP database")]
+    assert step.count(crash_file) == 1 and "if: success() || failure()" in step and "xvfb-run -a" in step and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in step
+    assert "host-crash-e2e.xml" in host_job.split("Upload what the test saved")[1]
+    shared = _job(text, "e2e")
+    assert crash_file not in _job(text, "e2e-host-windows") and crash_file in shared.split("OWN_JOB_FILES: ")[1].splitlines()[0]
+    rows = {r["id"]: r for r in json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))}
+    row = rows["wrapper.e2e.ab_host_crash"]
+    assert row["os"] == ["linux"] and row["linux_only"].strip() and row["tests"] == [crash_file] and row["min_tests"] == 1 and row["exact"] is True and row["marker"] == "e2e"
+    assert rows["wrapper.e2e.ab_host"]["min_tests"] == 1 and rows["wrapper.e2e.ab_host"]["tests"] == ["tests/test_ab_host_e2e.py"], "the A/A is still the one test of its row"
 
 
 def test_the_page_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs_leave_its_file_out():
@@ -993,3 +1042,148 @@ def test_the_final_set_is_four_shards_of_five_that_reach_every_seed_once_and_see
     parts = [ab.select_visits("final", "%d/4" % i) for i in (1, 2, 3, 4)]
     assert [len(p) for p in parts] == [5, 5, 5, 5] and [seed for _, seed in parts[0]][0] == 0
     assert [i + 1 for i, p in enumerate(parts) if ab.relaunch_visits(p)] == [1]
+
+
+# --- a launch whose parent did not end with 0 is red in the page oracle (scripts/ci_crash_evidence.py) --------------------------------------------------
+
+def a_launch_through_the_core(code, folder=None):
+    """A launch as the core makes it: a `Connection` over two pipes whose process ended with `code`, closed as the wrapper closes it."""
+    from invisible_core.juggler.connection import Connection
+
+    class Process:
+        pid = 4242
+
+        def poll(self):
+            return code
+
+        def terminate(self):
+            pass
+
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
+    conn = Connection(to_w, from_r, Process())
+    conn.close()
+    os.close(from_w)
+    os.close(to_r)
+
+
+def test_a_dump_with_a_launch_that_died_is_red_and_names_the_side_the_seed_the_launch_and_the_code(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        if len(calls) == 1:  # the second dump of the published engine: its launch of seed 12 died
+            where = Path(os.environ[crash.CRASH_DIR_ENV])
+            (where / "exits.json").write_text(json.dumps({"format": crash.FORMAT, "launches": [
+                {"n": 1, "label": {"seed": 11, "dpr": 1.0, "launch": "visit"}, "returncode": 0},
+                {"n": 2, "label": {"seed": 12, "dpr": 1.5, "launch": "visit"}, "returncode": -11, "evidence": "crash/firefox-68-again/02-12-1.5-visit"}]}), encoding="utf-8")
+        calls.append(binary)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out", "firefox-68", ("pub", None), None, None, ab.select_visits(limit=2))
+    out = capsys.readouterr().out
+    assert rc == 2 and "BROKEN CONTROL" in out
+    line = [x for x in out.splitlines() if x.startswith("FAIL the parent process exited with code")]
+    assert len(line) == 1
+    for part in ("code -11 (SIGSEGV)", "run firefox-68-again", "side B", "seed 12", "dpr 1.5", "launch visit", "(evidence: crash/firefox-68-again/02-12-1.5-visit)"):
+        assert part in line[0], part
+    diff = json.loads((tmp_path / "out" / "diff-a-a.json").read_text(encoding="utf-8"))
+    assert diff["verdict"] == "red" and diff["differences"] == [], "the dumps are equal: it is the launch that is red"
+
+
+def test_a_dump_whose_probe_wrote_nothing_is_red_and_an_a_b_with_a_candidate_that_died_is_red_not_a_broken_control(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        where = Path(os.environ[crash.CRASH_DIR_ENV])
+        if len(calls) == 0:
+            (where / "exits.json").unlink()
+        calls.append(binary)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out", "firefox-68", ("pub", None), "cand", tmp_path / "s.json", ab.select_visits(limit=2))
+    out = capsys.readouterr().out
+    assert rc == 2 and "left no record of how its browsers ended" in out and "the probe did not see them" in out
+
+    def fake_again(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        if binary == "cand":
+            write_exits(-6)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_again)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out2", "firefox-68", ("pub", None), "cand", tmp_path / "s.json", ab.select_visits(limit=2))
+    out = capsys.readouterr().out
+    assert rc == 1 and "BROKEN CONTROL" not in out and "code -6 (SIGABRT): run candidate, side B" in out
+    assert json.loads((tmp_path / "out2" / "diff.json").read_text(encoding="utf-8"))["verdict"] == "red"
+
+
+def test_the_published_engine_dump_of_a_run_that_died_is_red_in_the_old_run_too(tmp_path, monkeypatch, capsys):
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        write_exits(-11 if binary == "cand" else 0, launches=2)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run("cand", tmp_path / "cand.seal.json", "linux-x86_64", tmp_path / "out", "firefox-68", published=("pub", tmp_path / "pub.seal.json"), visits=list(VISITS))
+    out = capsys.readouterr().out
+    assert rc == 1 and out.count("FAIL the parent process exited with code -11") == 2 and "run candidate, side B" in out
+
+
+def test_the_dump_process_names_each_launch_and_writes_how_it_ended_where_the_oracle_said(tmp_path, monkeypatch, capsys):
+    """The dump of the page, with the browser replaced by launches through the core's own `Connection` (no browser): the probe sees each one, the labels come from the dump
+    (the visit, and the two launches of the pair on one profile), and `exits.json` is there whatever the dump says of the page."""
+    codes = iter([0, 0, -11])
+
+    def read(options, port, dpr, timeout_ms):
+        a_launch_through_the_core(next(codes))
+        return {"format": gate.FORMAT, "items": {"surface": {"x": 1}}}
+
+    monkeypatch.setattr(gate, "read_page", read)
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    monkeypatch.setenv(crash.CRASH_DIR_ENV, str(tmp_path / "crash"))
+    try:
+        assert gate.dump("/e/firefox", "linux-x86_64", tmp_path / "dump", tmp_path / "reference", visits=[(1.0, 0)], pin_dpr=False, relaunch_seeds=(0,)) == 0
+    finally:
+        crash.stop_probe()
+    exits = crash.read_exits(tmp_path / "crash" / "exits.json")
+    assert [(x["label"]["launch"], x["returncode"]) for x in exits["launches"]] == [("visit", 0), ("relaunch-first", 0), ("relaunch-second", -11)]
+    assert [x["label"]["seed"] for x in exits["launches"]] == [0, 0, 0]
+    assert "EXIT the parent process exited with code -11 (SIGSEGV): run this dump, side A, seed 0, dpr 1.0, launch relaunch-second" in capsys.readouterr().out
+    assert (tmp_path / "crash" / "03-0-1.0-relaunch-second" / "crash.json").is_file() and not (tmp_path / "crash" / "01-0-1.0-visit").exists()
+
+
+def test_a_dump_that_was_not_given_a_folder_installs_no_probe_and_launches_as_the_host_gate_always_did(tmp_path, monkeypatch):
+    from invisible_core.juggler.connection import Connection
+
+    before = (Connection.__init__, Connection.close)
+    monkeypatch.delenv(crash.CRASH_DIR_ENV, raising=False)
+    seen = []
+    monkeypatch.setattr(gate, "read_page", lambda *a: seen.append((Connection.__init__, Connection.close)) or {"format": gate.FORMAT, "items": {}})
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    assert gate.dump("ff", "leg", tmp_path / "dump", tmp_path / "reference", visits=[(1.0, 2)], pin_dpr=False) == 0
+    assert seen == [before] and not (tmp_path / "dump" / "exits.json").exists()
+
+
+def test_the_dump_of_an_oracle_run_is_given_its_own_folder_for_the_probe_and_the_environment_is_put_back(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        seen.append(os.environ.get(crash.CRASH_DIR_ENV))
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.delenv(crash.CRASH_DIR_ENV, raising=False)
+    rc, problems = ab.dump_with_exits("firefox-68-again", "pub", None, "linux-x86_64", [(1.0, 0)], tmp_path / "t", tmp_path / "out")
+    assert rc == 0 and problems == [] and seen == [str(tmp_path / "out" / "crash" / "firefox-68-again")]
+    assert crash.CRASH_DIR_ENV not in os.environ, "the variable is the dump's, not the run's"
+    monkeypatch.setattr(ab, "run_dump", lambda *a: (_ for _ in ()).throw(ab.subprocess.TimeoutExpired("x", 1)))
+    rc, problems = ab.dump_with_exits("firefox-68", "pub", None, "linux-x86_64", [(1.0, 0)], tmp_path / "t", tmp_path / "out")
+    assert rc == "timeout" and problems == [], "a dump that timed out is red already (the dump ended with timeout); its missing record is not said twice"

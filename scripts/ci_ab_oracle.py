@@ -48,6 +48,13 @@ keeps between runs): the dump keeps the items of the second launch in that visit
 profile), so the retail comparison of the host gate is never touched. They are compared apart: the visit must have them on both sides, and as many as the
 floor (they are not counted in the visit's own leaves, so a page that dumped less cannot hide behind them). The A/A and the A/B hold them to equality like the rest.
 
+HOW EACH LAUNCH ENDS. Every browser a dump launches (the visits, the two launches of the pair on one profile, the ab visit) is seen by a probe in the dump process
+(scripts/ci_crash_evidence.py: it reads the exit code of the browser's parent after the close the launch already makes, and a watcher reads the crash folders while it lives). A
+parent that did not end with 0, or whose code was not seen, is a RED line that names the side, the seed, the dpr, the launch and the code, in the A/A and in the A/B alike; a dump
+process whose probe wrote nothing is red too. What the launch left is kept in `<out>/crash/<run>/`: the core run through `gdb -batch` with the build ids, the `.extra` and the minidump
+names, `said.txt` for what the collectors did not find, and `exits.json` with how every launch ended. This oracle runs no strace (a trace would slow the browser and change the
+outcome it observes): the strace tail is the host oracle's.
+
     python ci_ab_oracle.py touched BASE_SHA     (prints touched=true|false: does a pull request change a file of this oracle; e2e.yml's final-set job reads it)
 
 Writes, in --out: dump-<N>.json and dump-<N>-again.json (the published engine's items, twice), diff-a-a.json (the A/A),
@@ -67,6 +74,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_crash_evidence as crash  # noqa: E402
 import ci_host_gate as gate  # noqa: E402
 import persona_cover as personas  # noqa: E402
 
@@ -334,6 +342,19 @@ def own_cache_env(env: dict, folder: str, platform: str | None = None) -> dict:
     return out
 
 
+def dump_with_exits(name: str, exe: str, seal_file, leg: str, visits, target: Path, out: Path) -> tuple:
+    """The dump of one engine run as `run_dump` makes it, with the folder where its probe writes how each browser ended (`<out>/crash/<name>`, named to the dump process by
+    AB_CRASH_DIR): `(rc or "timeout", the red lines of the launches that did not end with 0, or that nobody saw)`. A dump process whose probe wrote nothing is red: an oracle
+    that does not see how its browsers end does not see them."""
+    crash_dir = out / "crash" / name
+    try:
+        with crash.environment(**{crash.CRASH_DIR_ENV: crash_dir}):
+            rc = run_dump(exe, Path(seal_file) if seal_file else None, leg, target, visits)
+    except subprocess.TimeoutExpired:
+        rc = "timeout"
+    return rc, crash.exits_of_run(crash_dir, name, windows=leg.startswith("win"), needed=(rc == 0))
+
+
 def run_dump(binary: str, seal: Path | None, leg: str, out: Path, visits: list | None = None) -> int:
     """The host gate's dump of `visits` ([(dpr, seed)], each seed at its own DPR) as a subprocess; None is the host gate's own grid."""
     env = dict(os.environ, INVISIBLE_CORE_AUTOFIX="off", INVISIBLE_CORE_PIN="allow")
@@ -365,12 +386,10 @@ def run(candidate: str, candidate_seal: Path, leg: str, out: Path, engine_tag: s
             print("=== dump with %s: %s (seal %s), seeds %s"
                   % (name, exe, seal_file, " ".join("%d@%s" % (seed, dpr) for dpr, seed in visits)))
             sys.stdout.flush()
-            try:
-                rc = run_dump(exe, Path(seal_file), leg, target, visits)
-            except subprocess.TimeoutExpired:
-                rc = "timeout"
+            rc, exits = dump_with_exits(name, exe, seal_file, leg, visits, target, out)
             if rc != 0:
                 problems.append("the dump with %s ended with %s" % (name, rc))
+            problems += exits
             dumps[name] = read_visits(target) if target.is_dir() else {}
             write_json(out / (dump_name(engine_tag) if name == engine_tag else "dump-%s.json" % CANDIDATE),
                        pack(name, dumps[name]))
@@ -402,11 +421,8 @@ def _dump_visits(name: str, exe: str, seal_file, leg: str, visits: list, work: P
     print("=== dump with %s: %s (seal %s), seeds %s"
           % (name, exe, seal_file or "of the core", " ".join("%d@%s" % (seed, dpr) for dpr, seed in visits)))
     sys.stdout.flush()
-    try:
-        rc = run_dump(exe, Path(seal_file) if seal_file else None, leg, target, visits)
-    except subprocess.TimeoutExpired:
-        rc = "timeout"
-    problems = [] if rc == 0 else ["the dump with %s ended with %s" % (name, rc)]
+    rc, exits = dump_with_exits(name, exe, seal_file, leg, visits, target, out)
+    problems = ([] if rc == 0 else ["the dump with %s ended with %s" % (name, rc)]) + exits
     dumped = read_visits(target) if target.is_dir() else {}
     write_json(out / file_name, pack(name, dumped))
     return dumped, problems
