@@ -614,14 +614,14 @@ def _job(text, name):
 def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
-    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows")}
+    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows")}
     step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
             "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
             '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
-    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows"], "the jobs that run the oracles' tests, and only those"
-    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows"):
+    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"], "the jobs that run the oracles' tests, and only those"
+    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"):
         assert legs[name].index("actions/setup-python") < legs[name].index(step) < legs[name].index("Fetch the published firefox binary")
-    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 6 and "uses:" not in step
+    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 8 and "uses:" not in step
     for variable, source in (("AB_ORACLE_PR_SEEDS", "test_ab_oracle_e2e.py"), ("AB_NETWORK_PR_SEEDS", "test_ab_network_e2e.py"), ("AB_HOST_PR_SEEDS", "test_ab_host_e2e.py")):
         assert 'pr_seed_count("%s"' % variable in (root / "tests" / source).read_text(encoding="utf-8")
         assert variable in pr.ORACLES
@@ -640,8 +640,9 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
     assert "OWN_JOB_FILES: " + network in shared_linux and "$ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES" in shared_linux
     host_file = "tests/test_ab_host_e2e.py"
-    assert "OWN_JOB_FILES: %s %s" % (network, host_file) in shared_linux
-    assert 'own_job = ["%s", "%s"]' % (network, host_file) in shared_windows and "f not in left_out and f not in own_job" in shared_windows
+    page_file = "tests/test_ab_oracle_e2e.py"
+    assert "OWN_JOB_FILES: %s %s %s" % (network, host_file, page_file) in shared_linux
+    assert 'own_job = ["%s", "%s", "%s"]' % (network, host_file, page_file) in shared_windows and "f not in left_out and f not in own_job" in shared_windows
     assert network not in _job(text, "e2e-windows-control-a")
     # the budget of the test itself fits the job: 5 seeds, two engine runs, with its own setup
     import test_ab_network_e2e as network_e2e
@@ -661,6 +662,28 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
     import test_ab_host_e2e as host_e2e
 
     assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the job"
+
+
+def test_the_page_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs_leave_its_file_out():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    page = "tests/test_ab_oracle_e2e.py"
+    code = lambda job: "\n".join(line for line in job.splitlines() if not line.lstrip().startswith("#"))  # the comment that follows the last job is the next one's
+    linux, windows = code(_job(text, "e2e-page")), code(_job(text, "e2e-page-windows"))
+    assert "name: e2e (page oracle, linux)" in linux and "name: e2e (page oracle, windows)" in windows
+    assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
+    for body in (linux, windows):
+        assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and "needs: core-on-index" in body
+        assert "AB_ORACLE_SEED_SET" not in body, "the A/A of a pull request, not a shard of the final seeds (those have their own jobs)"
+        assert "      - name: Run the page oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
+    assert "xvfb-run -a" in linux
+    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
+    assert page in shared_linux.split("OWN_JOB_FILES: ")[1].splitlines()[0] and '"%s"]  # ' % page in shared_windows and "f not in left_out and f not in own_job" in shared_windows
+    assert page not in _job(text, "e2e-windows-control-a")
+    import test_ab_oracle_e2e as page_e2e
+
+    # the A/A of a pull request that touches the oracle: 5 seeds, two engine runs, the second launch of seed 0; the guard of the test plus its margin fits the job with the setup
+    assert page_e2e.budget_s(5, 2, True) + 120 + 12 * 60 <= 45 * 60, "the test's own limit fits the job"
 
 
 # --- the second launch of seed 0 on a reused profile (H7) -----------------------------------------------------------------------------------------
