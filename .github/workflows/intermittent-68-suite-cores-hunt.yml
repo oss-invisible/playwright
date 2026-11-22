@@ -8,6 +8,9 @@
 # red: three identical copies (the whole suite under xvfb-run without the root and the sandbox files, then the root step and the sandbox step, as e2e.yml
 # runs them). No Windows, no one-file security-state job. Left out on purpose: the gate that waits for the core on the index. Same runner, same install, same
 # security state, same fetch, same GeoIP database, same scripts/run_e2e.py with its own width (-n), its own deadline and no rerun of any kind.
+# The job linux-3-loaded also runs, DURING the main run of every round, 4 background loops of tests/test_security_state_engine_e2e.py::
+# test_the_engine_generates_the_security_state_it_is_given (see "THE BACKGROUND LOOPS" in the step): the -11 of the generation did not happen alone, only
+# inside the suite. A red iteration, or a core of a background engine, makes the job red; the summary lists node, iteration and engine exit code.
 # What this branch adds to the tests: tests/conftest.py raises RLIMIT_CORE and, after a test that fails, tests/_crash_cores.py has gdb read every core in
 # $INVPW_CORE_DIR (gdb, kernel.core_pattern and INVPW_CORE_DIR are set in the system-deps step, as in e2e.yml); the gdb texts are in
 # invpw-evidence/cores/<test>/, which moves with invpw-evidence into round-N.
@@ -52,8 +55,9 @@ jobs:
             temp: /tmp
           - label: linux-2
             temp: /tmp
-          - label: linux-3
+          - label: linux-3-loaded
             temp: /tmp
+            load: secstate-x4
     env:
       TEMP: ${{ matrix.temp }}
       TMP: ${{ matrix.temp }}
@@ -80,6 +84,11 @@ jobs:
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%e.%p"
           echo "INVPW_CORE_DIR=$RUNNER_TEMP/invpw-cores" >> "$GITHUB_ENV"
           sudo "$(which python)" -m playwright install-deps firefox
+      # The loaded job: 4 background loops run the engine from their own copy of its folder (/tmp/ffbg-K), and the name of a core carries the path of the executable
+      # (%E, slashes as '!'), so that the core of a background engine is told from the cores of the main run: tests/_crash_cores.py leaves the first to the loops.
+      - name: Core names carry the executable's path (loaded job)
+        if: matrix.load == 'secstate-x4'
+        run: sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%E.%p"
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
       # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
       - name: The security state (a fixed directory of the repository)
@@ -96,6 +105,8 @@ jobs:
           HUNT_ROUNDS: ${{ matrix.rounds || '3' }}
           # `suite`: the e2e of e2e.yml (the Linux job or the Windows part); `secstate`: only tests/test_security_state_engine_e2e.py, on Linux.
           HUNT_MODE: ${{ matrix.mode || 'suite' }}
+          # The loaded job (matrix.load): this many background loops of the generation of the security state run during the main run of every round; else none.
+          HUNT_BG: ${{ matrix.load == 'secstate-x4' && '4' || '0' }}
           # No new round starts after this many seconds of the step, so that the artifact is uploaded before the job's ceiling.
           HUNT_BUDGET_S: "19000"
           HUNT_LABEL: ${{ matrix.label }}
@@ -184,9 +195,128 @@ jobs:
               powershell -NoProfile -Command "Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1 || true
             else
               pkill -9 -f "$(dirname "$FF")" > /dev/null 2>&1 || true
+              pkill -9 -f '[/]tmp/ffbg-' > /dev/null 2>&1 || true
               sudo pkill -9 -f '[/]opt/ff' > /dev/null 2>&1 || true
               pkill -9 Xvfb > /dev/null 2>&1 || true
             fi
+          }
+          # THE BACKGROUND LOOPS (loaded job only): while the main run of a round goes on, HUNT_BG copies of the generation of the security state loop, each one pytest
+          # (-n 0) after the other until the round's main run ends. A loop has its own copy of the engine folder (/tmp/ffbg-K: the name of its cores says so), its own
+          # basetemp (the work dir of the test and the engine's profile are under it), its own RUNNER_TEMP (the evidence the test saves) and no INVPW_CORE_DIR (the hooks
+          # of tests/conftest.py touch nothing): after each iteration the loop reads and deletes the cores of ITS engine with gdb itself (tests/_crash_cores.py gdb_text).
+          cat > "$hunt/bg_cores.py" <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, "tests")
+          import _crash_cores
+          coredir, mark, into = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+          if coredir and os.path.isdir(coredir):
+              for core in sorted(p for p in Path(coredir).glob("core*") if p.is_file() and mark in p.name):
+                  into.mkdir(parents=True, exist_ok=True)
+                  print(_crash_cores.gdb_text(core, into))
+                  core.unlink()
+          PY
+          cat > "$hunt/bg_loop.sh" <<'SH'
+          #!/usr/bin/env bash
+          # bg_loop.sh K ROUND_DIR STOP_FILE HUNT_DIR: one pytest after the other of the generation test until STOP_FILE exists. FF and INVPW_CORE_DIR come from the step.
+          k=$1; rd=$2; stop=$3; hunt=$4
+          d="$rd/secstate-bg-$k"
+          mkdir -p "$d"
+          bin="/tmp/ffbg-$k/$(basename "$FF")"
+          node="tests/test_security_state_engine_e2e.py::test_the_engine_generates_the_security_state_it_is_given"
+          n=0
+          while [ ! -e "$stop" ]; do
+            n=$((n + 1))
+            it="$d/it-$n"
+            mkdir -p "$it/rt"
+            echo "$n" > "$d/current"
+            t0=$SECONDS
+            env -u INVPW_CORE_DIR -u GEOIP_USED_OUT -u PYTEST_ADDOPTS RUNNER_TEMP="$it/rt" INVPW_TEST_WATCHDOG_FILE="$it/watchdog.log" \
+              STEALTHFOX_E2E_BINARY="$bin" INVPW_BINARY_PATH="$bin" \
+              python -u -m pytest "$node" -m e2e -n 0 -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs \
+              --basetemp="$it/base" --junitxml="$it/e2e-junit-bg.xml" > "$it/log.txt" 2>&1
+            code=$?
+            secs=$((SECONDS - t0))
+            python "$hunt/bg_cores.py" "$INVPW_CORE_DIR" "!ffbg-$k!" "$it/cores" > "$it/cores.txt" 2>&1
+            ncores=$(grep -c '^core ' "$it/cores.txt")
+            python "$hunt/read_round.py" "$it" 2>&1 | tr -d '\r' > "$it/read.txt"
+            read -r t f e s files problems < <(head -1 "$it/read.txt")
+            state=green
+            if [ "$code" -ne 0 ] || [ "${t:-x}" != 1 ] || [ "${f:-x}" != 0 ] || [ "${e:-x}" != 0 ] || [ "${s:-x}" != 0 ] || [ "${problems:-x}" != 0 ]; then state=RED; fi
+            if [ "$ncores" -gt 0 ]; then state=RED; fi
+            engine=$(grep -o 'exit code -\?[0-9]*' "$it/read.txt" | head -1)
+            case "$engine" in *" -11") engine="$engine (SIGSEGV)";; esac
+            printf '%s\t%s\tpytest exit %s\t%s s\t%s\t%s cores\n' "$n" "$state" "$code" "$secs" "${engine:-no engine exit code in the message}" "$ncores" >> "$d/bg.tsv"
+            if [ "$state" = RED ]; then
+              echo "bg-$k iteration $n: RED, pytest exit $code, ${engine:-no engine exit code in the message}, $ncores core(s), $secs s, $node | $(grep -m1 '^FAIL\|^PROBLEM' "$it/read.txt" | cut -c1-300)" >> "$d/red.txt"
+            else
+              rm -rf "$it/base"
+            fi
+            rm -f "$d/current"
+          done
+          SH
+          bg_n="${HUNT_BG:-0}"
+          case "$bg_n" in ''|*[!0-9]*) bg_n=0;; esac
+          bg_pids=()
+          if [ "$bg_n" -gt 0 ]; then
+            for k in $(seq 1 "$bg_n"); do rm -rf "/tmp/ffbg-$k"; cp -a "$(dirname "$FF")" "/tmp/ffbg-$k"; done
+          fi
+          bg_start() {
+            local rd=$1 k
+            [ "$bg_n" -gt 0 ] || return 0
+            rm -f "$rd/bg-stop"
+            bg_pids=()
+            for k in $(seq 1 "$bg_n"); do
+              setsid xvfb-run -a bash "$hunt/bg_loop.sh" "$k" "$rd" "$rd/bg-stop" "$hunt" > "$rd/bg-$k.log" 2>&1 &
+              bg_pids+=("$!")
+            done
+          }
+          # The main run has ended: no new iteration, the one in progress ends by itself (a generation lasts a few seconds; at most 420 s are waited), then the loops that
+          # are still there are killed with their group. Nothing outlives the round.
+          bg_stop() {
+            local rd=$1 waited=0 pid alive
+            [ "$bg_n" -gt 0 ] || return 0
+            touch "$rd/bg-stop"
+            while [ "$waited" -lt 420 ]; do
+              alive=0
+              for pid in "${bg_pids[@]}"; do if kill -0 "$pid" 2>/dev/null; then alive=1; fi; done
+              if [ "$alive" = 0 ]; then break; fi
+              sleep 3
+              waited=$((waited + 3))
+            done
+            for pid in "${bg_pids[@]}"; do
+              if kill -0 "$pid" 2>/dev/null; then
+                echo "::warning::a background loop (pid $pid) was still running $waited s after the end of the main run: killed"
+                echo "a background loop (pid $pid) was killed $waited s after the end of the main run" >> "$rd/bg-killed.txt"
+                kill -TERM -- "-$pid" 2>/dev/null; sleep 2; kill -KILL -- "-$pid" 2>/dev/null
+              fi
+              wait "$pid" 2>/dev/null
+            done
+            bg_pids=()
+            pkill -9 -f '[/]tmp/ffbg-' > /dev/null 2>&1
+            # The cores of a background engine that a killed iteration left.
+            python "$hunt/bg_cores.py" "${INVPW_CORE_DIR:-}" '!ffbg-' "$rd/bg-leftover-cores" > "$rd/bg-leftover-cores.txt" 2>&1
+          }
+          # The count of the loops of a round: bg_iters, bg_red, and the lines for the summary in $1/bg-summary.txt.
+          bg_read() {
+            local rd=$1 k d
+            bg_iters=0; bg_red=0
+            : > "$rd/bg-summary.txt"
+            [ "$bg_n" -gt 0 ] || return 0
+            for k in $(seq 1 "$bg_n"); do
+              d="$rd/secstate-bg-$k"
+              local it=0 red=0
+              if [ -f "$d/bg.tsv" ]; then it=$(wc -l < "$d/bg.tsv"); red=$(grep -c "RED" "$d/bg.tsv" || true); fi
+              bg_iters=$((bg_iters + it)); bg_red=$((bg_red + red))
+              echo "secstate loop $k: $it iterations, $red red" >> "$rd/bg-summary.txt"
+              if [ -f "$d/red.txt" ]; then sed 's/^/  RED /' "$d/red.txt" >> "$rd/bg-summary.txt"; fi
+              if [ -f "$d/current" ]; then echo "  iteration $(cat "$d/current") was cut at the end of the round (not counted)" >> "$rd/bg-summary.txt"; fi
+            done
+            if [ -s "$rd/bg-killed.txt" ]; then sed 's/^/  /' "$rd/bg-killed.txt" >> "$rd/bg-summary.txt"; fi
+            if [ -s "$rd/bg-leftover-cores.txt" ] && grep -q '^core ' "$rd/bg-leftover-cores.txt"; then
+              bg_red=$((bg_red + 1)); sed 's/^/  RED leftover /' "$rd/bg-leftover-cores.txt" >> "$rd/bg-summary.txt"
+            fi
+            if [ "$bg_iters" -eq 0 ]; then bg_red=$((bg_red + 1)); echo "  RED no iteration of any loop ended in the round: not measured" >> "$rd/bg-summary.txt"; fi
           }
           # The run of the runner user, as e2e.yml runs it: Linux, the whole suite without the root and the sandbox files; Windows, the files of the part.
           run_main() {
@@ -241,8 +371,10 @@ jobs:
             echo "::group::round $n/$rounds"
             code_main=-; code_root=-; code_sandbox=-
             set +e
+            bg_start "$rd"
             run_main 2>&1 | tee "$log"
             code_main=${PIPESTATUS[0]}
+            bg_stop "$rd"
             if [ "$RUNNER_OS" = "Linux" ] && [ "$HUNT_MODE" = "suite" ]; then
               run_root 2>&1 | tee -a "$log"
               code_root=${PIPESTATUS[0]}
@@ -283,7 +415,9 @@ jobs:
               case "$number" in ''|*[!0-9]*) echo "::error::round $n: the junit read gave '$t $f $e $s $files $problems', not six numbers"; exit 1;; esac
             done
             rounds_run=$((rounds_run + 1))
+            bg_read "$rd"
             red=0
+            if [ "$bg_red" -gt 0 ]; then red=1; fi
             if [ $((f + e)) -gt 0 ] || [ "$problems" -gt 0 ] || [ "$code_main" -ne 0 ] || [ "$geoip_ok" -ne 1 ]; then red=1; fi
             if [ "$red" -eq 1 ]; then rounds_red=$((rounds_red + 1)); verdict=RED; else verdict=green; fi
             line="round $n/$rounds: $verdict - passed $((t - f - e - s)), failed $f, errors $e, skipped $s (tests $t in $files junit files; exit main=$code_main root=$code_root sandbox=$code_sandbox; geoip ok=$geoip_ok; $((SECONDS - t0)) s)"
@@ -291,8 +425,10 @@ jobs:
             {
               echo "- $line"
               tail -n +2 "$rd/round-read.txt" | sed 's/^/  - /'
+              sed 's/^/  - /' "$rd/bg-summary.txt"
             } >> "$hunt/hunt-summary.md"
             tail -n +2 "$rd/round-read.txt"
+            cat "$rd/bg-summary.txt"
           done
           cat "$hunt/hunt-summary.md"
           # Red means FOUND, and also NOT MEASURED: a red round, or no round at all.

@@ -96,7 +96,8 @@ def _cores():
     where = os.environ.get("INVPW_CORE_DIR")
     if not where or not Path(where).is_dir():
         return None, []
-    return Path(where), sorted((path for path in Path(where).glob("core*") if path.is_file()), key=lambda path: path.stat().st_mtime)
+    # A core of a background engine of the hunt (/tmp/ffbg-K, the executable's path is in the core's name) is read by the loop that owns it, never by the run's hooks.
+    return Path(where), sorted((path for path in Path(where).glob("core*") if path.is_file() and "!ffbg-" not in path.name), key=lambda path: path.stat().st_mtime)
 
 
 def executable_of(core, command):
