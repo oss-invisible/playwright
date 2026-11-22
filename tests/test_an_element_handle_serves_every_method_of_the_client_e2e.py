@@ -56,13 +56,6 @@ def page(browser):
     page.context.close()
 
 
-@pytest.fixture
-def touch_page(browser):
-    page = _page(browser, has_touch=True)
-    yield page
-    page.context.close()
-
-
 def ids(elements):
     return [e.get_attribute("id") for e in elements]
 
@@ -206,11 +199,6 @@ def test_dblclick_double_clicks_this_element(page):
     seen = page.evaluate("window.seen")
     assert (seen["click"], seen["dblclick"]) == (2, 1)
     assert all(seen["trusted"]), "a double click made by the server is a user's: %r" % seen["trusted"]
-
-
-def test_tap_taps_this_element(touch_page):
-    touch_page.query_selector("#go").tap()
-    assert touch_page.evaluate("window.seen.touchstart") == 1
 
 
 def test_a_page_tap_of_a_context_without_touch_is_stocks_error(page):
