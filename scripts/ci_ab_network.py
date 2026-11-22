@@ -232,6 +232,33 @@ def _optional_invariants(patterns: List[str], la: Dict[str, Any], lb: Dict[str, 
     return problems
 
 
+_UDP_OPENERS = re.compile(r"^(?P<where>.*/udp)/openers/(?P<target>[^/]+)/\d+$")
+
+
+def _udp_attribution(la: Dict[str, Any], lb: Dict[str, Any]) -> Tuple[set, List[Dict[str, Any]], int]:
+    """The attribution of the datagrams, which loses a race with the life of the socket (A/A run 44993377458: ``browser:parent`` on one side of a destination and nothing on the
+    other, on both systems). It is compared as the SET of kinds found per destination over the whole transcript (``seeds/<seed>/.../udp``): a side that found none says nothing,
+    two sides that found kinds must have found the same, and two different kinds (``browser:parent`` against ``core``) are a difference. Returns the paths that take part (they
+    are not compared leaf by leaf), the differences, and how many datagrams were unattributed (counted, printed, not in the verdict)."""
+    groups: Dict[Tuple[str, str], Dict[str, set]] = {}
+    paths: set = set()
+    unattributed = 0
+    for side, leaves in (("a", la), ("b", lb)):
+        for path, value in leaves.items():
+            m = _UDP_OPENERS.match(path)
+            if m:
+                paths.add(path)
+                groups.setdefault((m.group("where"), m.group("target")), {"a": set(), "b": set()})[side].add(value)
+            elif path.endswith("/udp/unattributed") and isinstance(value, int):
+                paths.add(path)
+                unattributed += value
+    differences = []
+    for (where, target), kinds in sorted(groups.items()):
+        if kinds["a"] and kinds["b"] and kinds["a"] != kinds["b"]:
+            differences.append({"path": "%s/openers/%s" % (where, target), "a": sorted(kinds["a"]), "b": sorted(kinds["b"])})
+    return paths, differences, unattributed
+
+
 def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dict[str, str]], floor: int = 0,
                         label_a: str = "A", label_b: str = "B") -> Dict[str, Any]:
     """The verdict on two transcripts (the ``seeds`` of each, as ``run`` writes them).
@@ -239,7 +266,8 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     Red when a compared leaf differs (``differences``: path and both values), when a side reached the network around the proxy, when the two sides did not
     run the same seeds, when fewer than ``floor`` leaves were compared, or when an entry of the volatile list matches no leaf of either transcript (``stale``)."""
     la, lb = flatten(a.get("seeds") or {}), flatten(b.get("seeds") or {})
-    paths = sorted(set(la) | set(lb))
+    attribution, attribution_differences, unattributed = _udp_attribution(la, lb)
+    paths = sorted((set(la) | set(lb)) - attribution)
     problems: List[str] = []
     if set(a.get("seeds") or {}) != set(b.get("seeds") or {}):
         problems.append("the sides ran different seeds: %s and %s" % (sorted(a.get("seeds") or {}), sorted(b.get("seeds") or {})))
@@ -262,7 +290,7 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
             excused += 1
         else:
             compared.append(path)
-    differences = []
+    differences = list(attribution_differences)
     for path in compared:
         va, vb = la.get(path, MISSING), lb.get(path, MISSING)
         if not _same(va, vb):
@@ -280,7 +308,7 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     problems += ["%s: %s %s | %s %s" % (d["path"], label_a, json.dumps(d["a"], sort_keys=True)[:160], label_b, json.dumps(d["b"], sort_keys=True)[:160])
                  for d in differences]
     return {"format": DIFF_FORMAT, "verdict": "red" if problems else "green", "problems": problems, "differences": differences, "leaves": len(compared),
-            "by_category": dict(sorted(by_category.items())), "excused": excused, "volatile": used, "stale": stale, "direct": direct, "invariants": invariants, "floor": floor,
+            "by_category": dict(sorted(by_category.items())), "excused": excused, "volatile": used, "stale": stale, "direct": direct, "invariants": invariants, "unattributed_datagrams": unattributed, "floor": floor,
             "a": label_a, "b": label_b}
 
 
@@ -305,6 +333,8 @@ def print_report(report: Dict[str, Any], control: bool) -> None:
         print("DIFF %s: %s %s | %s %s" % (d["path"], report["a"], json.dumps(d["a"], sort_keys=True)[:160], report["b"], json.dumps(d["b"], sort_keys=True)[:160]))
     if n > PRINT_LIMIT:
         print("... and %d more differences in the diff file" % (n - PRINT_LIMIT))
+    if report.get("unattributed_datagrams"):
+        print("%d datagrams were not attributed to a process (the association was made in a stage that was not looked at, or the socket was gone): counted, not compared" % report["unattributed_datagrams"])
     for problem in report["problems"]:
         if not any(problem.startswith(d["path"] + ":") for d in report["differences"]):
             print("FAIL " + problem)
@@ -432,6 +462,9 @@ def udp_summary(events: List[Dict[str, Any]], norm: Normalizer) -> Dict[str, Any
     who = _openers([norm.text(e["target"]) for e in events], [e.get("opener") for e in events])
     if who:
         out["openers"] = who
+        # A datagram is attributed by the association it rode, looked up when the association was made; one on an association made in a stage that was not looked at is
+        # unattributed. They are counted for the report (``unattributed_datagrams``), never compared.
+        out["unattributed"] = sum(1 for e in events if e.get("opener") is None)
     return out
 
 

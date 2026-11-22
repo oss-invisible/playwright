@@ -1318,7 +1318,46 @@ def test_a_connect_of_the_launch_stage_on_one_side_only_is_red_and_names_who_ope
     assert other["verdict"] == "red" and {(d["a"], d["b"]) for d in other["differences"]} == {("core", "browser:socket")}
     # and so is the STUN Binding of the launch coming from the browser where the published engine's core sent it
     stun = compare(_with_launch(transcript("a")), _with_launch(transcript("b"), udp="browser:parent"))
-    assert stun["verdict"] == "red" and any(d["path"].endswith("/lab/launch/udp/openers/198.51.100.6:19302/0") and d["b"] == "browser:parent" for d in stun["differences"])
+    assert stun["verdict"] == "red" and any(d["path"].endswith("/lab/launch/udp/openers/198.51.100.6:19302") and d["a"] == ["core"] and d["b"] == ["browser:parent"] for d in stun["differences"])
+
+
+def _with_h3_udp(t, openers=None, unattributed=None):
+    for seed in t["seeds"].values():
+        udp = {"order": ["10.1.0.13:h3"], "messages": {"10.1.0.13:h3": ["quic-short"]}}
+        if openers is not None:
+            udp["openers"] = {"10.1.0.13:h3": openers}
+        if unattributed is not None:
+            udp["unattributed"] = unattributed
+        seed["h3"] = {"udp": udp}
+    return t
+
+
+def test_the_attribution_of_datagrams_is_the_set_of_kinds_per_destination_and_a_side_that_found_none_says_nothing():
+    """A/A run 44993377458: `browser:parent` on one side of a destination and nothing on the other (2 leaves on Linux, 3 on Windows): the attribution loses a race with the socket."""
+    both = compare(_with_h3_udp(transcript("a"), ["browser:parent"], 0), _with_h3_udp(transcript("b"), ["browser:parent"], 0))
+    assert both["verdict"] == "green"
+    one_side = compare(_with_h3_udp(transcript("a"), ["browser:parent"], 0), _with_h3_udp(transcript("b"), None, 4))
+    assert one_side["verdict"] == "green" and one_side["differences"] == [] and one_side["unattributed_datagrams"] == 8 and one_side["leaves"] > 100
+    neither = compare(_with_h3_udp(transcript("a")), _with_h3_udp(transcript("b")))
+    assert neither["verdict"] == "green"
+    # two different kinds are red, and the order of the list does not matter
+    red = compare(_with_h3_udp(transcript("a"), ["browser:parent"]), _with_h3_udp(transcript("b"), ["core"]))
+    assert red["verdict"] == "red" and {"path": "seeds/11/h3/udp/openers/10.1.0.13:h3", "a": ["browser:parent"], "b": ["core"]} in red["differences"]
+    more = compare(_with_h3_udp(transcript("a"), ["browser:parent"]), _with_h3_udp(transcript("b"), ["browser:parent", "core"]))
+    assert more["verdict"] == "red", "a kind more on one side is a difference when both sides found some"
+    same = compare(_with_h3_udp(transcript("a"), ["browser:parent", "core"]), _with_h3_udp(transcript("b"), ["browser:parent", "core"]))
+    assert same["verdict"] == "green"
+
+
+def test_the_unattributed_datagrams_are_counted_and_printed_and_connects_stay_strict(capsys):
+    report = compare(_with_h3_udp(transcript("a"), ["core"], 2), _with_h3_udp(transcript("b"), ["core"], 5))
+    assert report["verdict"] == "green" and report["unattributed_datagrams"] == 14
+    ab.print_report(report, True)
+    assert "14 datagrams were not attributed" in capsys.readouterr().out
+    # a CONNECT with no opener on one side is not relaxed
+    one = _with_launch(transcript("a"), [("203.0.113.9:443", "core")])
+    two = _with_launch(transcript("b"), [("203.0.113.9:443", None)])
+    assert compare(one, two)["verdict"] == "red"
 
 
 def test_the_script_names_the_categories_the_run_writes_and_the_e2e_floor_is_below_a_minimal_run():
