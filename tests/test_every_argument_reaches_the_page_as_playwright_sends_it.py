@@ -620,3 +620,94 @@ def test_a_minus_zero_that_stays_a_plain_value_is_minus_zero_and_not_null():
     """The consumers that keep `_deserialize` (an event's init, an expected value) carry a value as JSON: `-0` is a number there."""
     value = server._deserialize({"v": "-0"})
     assert value == 0.0 and math.copysign(1.0, value) == -1.0
+
+
+# --- the tags: every one the protocol validator of the installed driver accepts, and the one its page side adds --------------------------------
+
+#: One value of each tag, as the client sends it (`{"value": <this>, "handles": [...]}`); the value is the tag's own node, or a container that holds it where a
+#: node alone cannot stand (a BigInt is refused as the whole argument).
+_SAMPLES = {
+    "n": lambda page: ({"n": 1.5}, []),
+    "b": lambda page: ({"b": True}, []),
+    "s": lambda page: ({"s": "x"}, []),
+    "v": lambda page: ({"v": "NaN"}, []),
+    "d": lambda page: ({"d": "2021-07-28T20:26:32.123456Z"}, []),
+    "u": lambda page: ({"u": "https://page.test/a"}, []),
+    "bi": lambda page: ({"a": [{"bi": "12345678901234567890"}], "id": 1}, []),
+    "ab": lambda page: ({"ab": {"b": "AAEC"}}, []),
+    "ta": lambda page: ({"ta": {"b": "AQID", "k": "ui8"}}, []),
+    "e": lambda page: ({"e": {"m": "boom", "n": "Error", "s": "Error: boom\n"}}, []),
+    "r": lambda page: ({"r": {"p": "a+", "f": "gi"}}, []),
+    "a": lambda page: ({"a": [{"n": 1}], "id": 1}, []),
+    "o": lambda page: ({"o": [{"k": "k", "v": {"n": 1}}], "id": 1}, []),
+    "h": lambda page: ({"h": 0}, [handle(page, "main", "obj-9", world="caller", node=False, context="world-1").guid]),
+    "ref": lambda page: ({"o": [{"k": "self", "v": {"ref": 1}}], "id": 1}, []),
+}
+
+
+def _installed_bundle():
+    """The driver bundle of the INSTALLED `playwright` package: the dev dependency is always there, and a missing one is a red, never a skip."""
+    try:
+        import playwright
+    except ImportError:
+        pytest.fail("the `playwright` dev dependency is not installed: the protocol validator that the tags are read from cannot be found")
+    path = Path(playwright.__file__).parent / "driver" / "package" / "lib" / "coreBundle.js"
+    if not path.exists():
+        pytest.fail("the installed `playwright` has no driver bundle at %s: the protocol validator that the tags are read from cannot be found" % path)
+    return path.read_text(encoding="utf-8")
+
+
+def _validator_tags():
+    """The keys of `scheme.SerializedValue = tObject({...})` in the bundle: what the node side of stock accepts of a value, read at brace depth 0."""
+    text = _installed_bundle()
+    start = text.find("scheme.SerializedValue = tObject({")
+    assert start >= 0, "the bundle has no `scheme.SerializedValue = tObject({...})`: the validator moved, the test must follow it"
+    body_start = start + len("scheme.SerializedValue = tObject({")
+    depth, keys = 0, []
+    for token in re.finditer(r"[{(\[]|[})\]]|\b(\w+):", text[body_start:]):
+        piece = token.group(0)
+        if piece in "{([":
+            depth += 1
+        elif piece in "})]":
+            if depth == 0:
+                return keys
+            depth -= 1
+        elif depth == 0:
+            keys.append(token.group(1))
+    pytest.fail("the bundle's SerializedValue validator never ends")
+
+
+def test_the_samples_are_the_tags_this_module_handles_and_nothing_else():
+    from invisible_playwright._juggler import _arguments
+    assert set(_SAMPLES) == set(_arguments.VALUE_TAGS), "a tag with no sample here, or a sample of a tag this module does not name"
+
+
+@pytest.mark.parametrize("tag", sorted(_SAMPLES))
+def test_a_value_of_every_tag_reaches_the_page_and_none_is_refused(page, engine, tag):
+    """Known-bad: `ab` (an ArrayBuffer, which the page side of stock decodes) was `Attempting to deserialize unexpected value`."""
+    tagged, guids = _SAMPLES[tag](page)
+    evaluate(page, arg(tagged, *guids))
+    assert len(engine.callers()) == 1, "the call was not made"
+
+
+def test_an_array_buffer_reaches_the_decoder_as_the_client_sent_it(page, engine):
+    evaluate(page, arg({"ab": {"b": "AAEC"}}))
+    assert the_spec(engine)[0] == {"ab": {"b": "AAEC"}}
+
+
+def test_a_node_that_is_no_tag_is_refused_by_name(page, engine):
+    with pytest.raises(ProtocolException, match="Attempting to deserialize unexpected value"):
+        evaluate(page, arg({"zz": 1}))
+    assert not engine.callers()
+
+
+def test_every_tag_the_protocol_validator_accepts_is_a_tag_this_module_handles():
+    """The validator of the installed driver (`scheme.SerializedValue`) lists `n b s v d u bi ta e r a o h id ref`: `id` only marks an array or an object,
+    every other is a value. Its PAGE side (`parseEvaluationResultValue`) decodes one more, `ab`, which the validator does not list and the decoder here
+    embeds. The set this module handles is exactly those: a tag a newer driver adds is red here until it is handled and given a sample above."""
+    from invisible_playwright._juggler import _arguments
+    validator = set(_validator_tags())
+    assert {"n", "b", "s", "v", "d", "u", "bi", "ta", "e", "r", "a", "o", "h", "id", "ref"} <= validator, validator
+    page_side = {"ab"} if '"ab" in value' in _installed_bundle() else set()
+    assert page_side == {"ab"}, "the page side of the driver no longer decodes `ab`"
+    assert set(_arguments.VALUE_TAGS) == (validator - {"id"}) | page_side
