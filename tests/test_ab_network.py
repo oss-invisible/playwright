@@ -1081,7 +1081,7 @@ def test_the_gateway_answers_a_connect_to_the_telemetry_host_itself_with_host_un
 
 def test_a_connect_target_is_outside_the_lab_when_it_is_neither_loopback_nor_a_server_the_lab_runs():
     with ab.Lab(wire=True, host="127.0.0.1") as lab:
-        assert ab.outside_the_lab(lab, TELEMETRY) and ab.outside_the_lab(lab, "34.120.208.123:443") and ab.outside_the_lab(lab, "incoming.telemetry.mozilla.org:80")
+        assert ab.outside_the_lab(lab, TELEMETRY) and ab.outside_the_lab(lab, "162.159.207.1:443") and ab.outside_the_lab(lab, "incoming.telemetry.mozilla.org:80")
         assert not ab.outside_the_lab(lab, "127.0.0.1:%d" % lab.site.port) and not ab.outside_the_lab(lab, "192.0.2.53:443")
         assert not ab.outside_the_lab(lab, "127.0.0.1:%d" % lab.h1.port)
 
@@ -1104,8 +1104,8 @@ def test_the_exit_pings_are_the_connects_to_the_proxy_towards_the_telemetry_host
     red = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), [TELEMETRY] * 2))
     assert red["verdict"] == "red" and any(d["path"].endswith("/idle/exit_pings/counts/" + TELEMETRY) and d["a"] == 3 and d["b"] == 2 for d in red["differences"])
     # a different form: the address instead of the name
-    form = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), ["34.120.208.123:443"] * 3))
-    assert form["verdict"] == "red" and any("/idle/exit_pings/order/0" in d["path"] and d["b"] == "34.120.208.123:443" for d in form["differences"])
+    form = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), ["162.159.207.1:443"] * 3))
+    assert form["verdict"] == "red" and any("/idle/exit_pings/order/0" in d["path"] and d["b"] == "162.159.207.1:443" for d in form["differences"])
     # recorded on one side only
     one_sided = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), [], recorded=False))
     assert one_sided["verdict"] == "red" and any(d["path"].endswith("/idle/exit_pings/recorded") and d["a"] is True and d["b"] is False for d in one_sided["differences"])
@@ -1113,7 +1113,7 @@ def test_the_exit_pings_are_the_connects_to_the_proxy_towards_the_telemetry_host
     both = compare(_with_pings(transcript("a"), [], recorded=False), _with_pings(transcript("b"), [], recorded=False))
     assert both["verdict"] == "green"
     # a ping that did not go to the proxy is red on either side, and when both do it
-    leak = {"witness_tcp": [], "witness_udp": [], "watcher": ["tcp firefox -> 34.120.208.123:443"], "doh_direct": [], "resolver_trap": [], "blind": []}
+    leak = {"witness_tcp": [], "witness_udp": [], "watcher": ["tcp firefox -> 162.159.207.1:443"], "doh_direct": [], "resolver_trap": [], "blind": []}
     direct = compare(_with_pings(transcript("a"), three, direct=leak), _with_pings(transcript("b"), three))
     assert direct["verdict"] == "red" and direct["direct"] and any("(the exit pings)" in d for d in direct["direct"])
     assert compare(_with_pings(transcript("a"), three, direct=leak), _with_pings(transcript("b"), three, direct=leak))["verdict"] == "red"

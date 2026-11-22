@@ -688,7 +688,7 @@ def test_the_uuid_of_the_uninstall_ping_is_not_a_difference_and_the_rest_of_its_
 
 
 def test_a_background_task_of_the_engine_is_a_kind_of_its_own_by_its_command_line():
-    exe = "C:\\Users\\runneradmin\\AppData\\Local\\invisible-playwright\\Cache\\firefox.exe"
+    exe = "D:\\lab\\runner\\AppData\\Local\\invisible-playwright\\Cache\\firefox.exe"
     cmd = exe + " --backgroundtask pingsender https://incoming.telemetry.mozilla.org/submit/telemetry/244041fe/first-shutdown/Firefox/159.0/release/2026?v=4 C:\\x\\ping"
     events = host.parse_audit_events(audit(1, 200, 100, exe, cmd))
     assert host.windows_processes(events, exe)[200]["label"] == "backgroundtask/pingsender"
@@ -824,7 +824,7 @@ def test_the_separate_pingsender_executable_is_red_whatever_the_count():
 def test_what_only_the_pingsender_touches_is_compared_when_it_is_on_both_sides_and_left_out_when_it_is_on_one_side_only():
     imagehlp = "c:\\windows\\system32\\imagehlp.dll"
 
-    def with_surface(fp, n, files=(imagehlp,), net=("backgroundtask/pingsender: connect tcp AF_INET 34.120.1.1:443",)):
+    def with_surface(fp, n, files=(imagehlp,), net=("backgroundtask/pingsender: connect tcp AF_INET 141.101.90.1:443",)):
         fp = with_pingsenders(fp, n) if n else fp
         for seed in fp["seeds"]:
             if n:
@@ -848,7 +848,7 @@ def test_what_only_the_pingsender_touches_is_compared_when_it_is_on_both_sides_a
 
 
 def test_a_pingsender_that_goes_to_the_telemetry_host_direct_is_the_products_behaviour_in_a_session_without_a_proxy_and_is_not_red():
-    ping = ["backgroundtask/pingsender: connect tcp AF_INET 34.120.1.1:443"]
+    ping = ["backgroundtask/pingsender: connect tcp AF_INET 141.101.90.1:443"]
     other = ["backgroundtask/pingsender: connect tcp AF_INET6 [2600:1901::1]:443"]
     a, b = with_pingsenders(footprint(), 3), with_pingsenders(footprint("again"), 3)
     for seed in a["seeds"]:
