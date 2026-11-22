@@ -36,7 +36,31 @@ from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 #: The fewest leaves a comparison holds, per system. A minimal but complete run of ONE seed (one request on each road, tests/test_ab_network.py) holds about 670; a real one holds several times that. A floor of
 #: 500 says "the run saw something on every road" and nothing more: it is raised to a fraction of the measured count once the A/A has measured it.
 FLOOR = {"linux": 500, "win32": 500}
-TIMEOUT_S = 40 * 60
+
+#: The hang guard of the test, sized from what it will run. It is a safety net and never a verdict: the pull request's default timeout of 420 s (`--timeout 420 --timeout-method thread`
+#: of run_e2e.py) killed the xdist worker of the A/A on 5 seeds, on Linux and on Windows (run 44963364060), because the run takes minutes per seed.
+#: Measured (runs 44946411675 and 44960767715, A/A of one seed, two engine runs): 4:00 on Linux and 4:50 on Windows, so 120 s and 145 s per engine run for the first seed, which also
+#: has the two idle launches. The budget allows 240 s for the first seed of an engine run, 150 s for each next one (as slow as a whole first seed on Windows), and 120 s to start: 5 seeds
+#: in an A/A are 30 minutes at most, expected about 15 on Linux and 19 on Windows; with a candidate (three engine runs on every seed) 44 minutes at most.
+SETUP_S, FIRST_SEED_S, NEXT_SEED_S = 120, 240, 150
+
+
+def budget_s(seeds: int, engine_runs: int) -> int:
+    """Seconds the test may take for ``seeds`` seeds in ``engine_runs`` runs of an engine (the A/A is two, with a candidate three)."""
+    return SETUP_S + engine_runs * (FIRST_SEED_S + (seeds - 1) * NEXT_SEED_S)
+
+
+def plan() -> tuple:
+    """(seeds, engine runs) this run of the test will make, from the environment as the test reads it."""
+    seal = os.environ.get("INVISIBLE_SEAL_FILE")
+    if seal and Path(seal).is_file():
+        return len(oracle.default_seeds()), 3
+    return min(len(oracle.default_seeds()), pr_seed_count("AB_NETWORK_PR_SEEDS", 1)), 2
+
+
+BUDGET_S = budget_s(*plan())
+#: The subprocess ends by itself at BUDGET_S and says so; the guard of the worker comes after it.
+TIMEOUT_S = BUDGET_S
 
 
 def _out(tmp_path: Path) -> Path:
@@ -49,6 +73,7 @@ def _out(tmp_path: Path) -> Path:
     return tmp_path / "ab-network"
 
 
+@pytest.mark.timeout(BUDGET_S + 120, method="thread")
 def test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_the_published_engine_puts(firefox_binary, tmp_path):
     seal = os.environ.get("INVISIBLE_SEAL_FILE")
     candidate = bool(seal and Path(seal).is_file())
@@ -59,7 +84,7 @@ def test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_
     if candidate:
         command += ["--candidate", firefox_binary, "--candidate-seal", seal]
     else:
-        command += ["--a-a", "--published-binary", firefox_binary, "--seeds", ",".join(str(s) for s in oracle.default_seeds()[:pr_seed_count("AB_NETWORK_PR_SEEDS", 1)])]
+        command += ["--a-a", "--published-binary", firefox_binary, "--seeds", ",".join(str(s) for s in oracle.default_seeds()[:plan()[0]])]
     done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
     (out / "oracle.log").write_text(done.stdout + "\n--- stderr\n" + done.stderr, encoding="utf-8")
     verdict = [line for line in done.stdout.splitlines() if line.startswith(("DIFF ", "FAIL ", "AB NETWORK", "ERROR "))]

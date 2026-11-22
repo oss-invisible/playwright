@@ -527,11 +527,56 @@ def test_what_a_transport_adds_to_a_request_on_its_own_is_the_connections_in_a_r
     assert ab.fold_wire({"connections": [over_h2("/wire.css")], "quic": []})["requests"][0]["headers"][-1] == ["te", "trailers"], "outside a race the request keeps every header"
 
 
+def test_the_resumed_clienthellos_are_a_set_of_their_own_and_a_resumption_that_differs_is_red():
+    plain = {"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []}
+    one = ab.fold_wire(plain)
+    twice = ab.fold_wire({"connections": plain["connections"] + [_h2(_tls(resumed=True, aead=3), [(3, "/c")]), _h2(_tls(), [(3, "/d")])], "quic": []})
+    assert len(one["resumed_connections"]) == 1 and len(twice["resumed_connections"]) == 1 and len(twice["connections"]) == 1, "the same resumption twice is one fingerprint"
+    assert "pre_shared_key" in one["resumed_connections"][0]["tls"]["extensions"] and "pre_shared_key" not in one["connections"][0]["tls"]["extensions"]
+    assert "identities" not in json.dumps(one["resumed_connections"])
+    more_tickets = copy.deepcopy(plain)
+    more_tickets["connections"][1]["tls"]["extensions"]["pre_shared_key"]["identities"] = 2
+    assert ab.fold_wire(more_tickets) == one, "how many tickets were offered is the pool's"
+    a, b = transcript(), transcript("b")
+    a["seeds"]["11"]["https"], b["seeds"]["11"]["https"] = {"h2": {"wire": one}}, {"h2": {"wire": twice}}
+    other = copy.deepcopy(plain)
+    other["connections"][1]["tls"]["extensions"]["pre_shared_key"]["binder_lengths"] = [32]
+    changed = ab.fold_wire(other)
+    assert changed["resumed_connections"] != one["resumed_connections"] and changed["connections"] == one["connections"]
+    c = transcript("c")
+    c["seeds"]["11"]["https"] = {"h2": {"wire": changed}}
+    red = compare(a, c)
+    assert red["verdict"] == "red" and any("/wire/resumed_connections/0/tls/extensions/pre_shared_key/binder_lengths/0" in d["path"] for d in red["differences"])
+    gone = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [])], "quic": []})
+    assert gone["resumed_connections"] == [] != one["resumed_connections"], "a resumption that no longer happens on a connection that asks is a difference"
+
+
+def test_the_protocols_that_carried_a_request_are_a_set_per_role_and_an_engine_that_drops_or_adds_one_is_red():
+    quic = [_quic(["/wire.css"])]
+    both = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/?v=1")])], "quic": quic}, transport_race=True)
+    split = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/?v=1"), (5, "/wire.css")])], "quic": [_quic([])]}, transport_race=True)
+    many = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/?v=1")])], "quic": [_quic(["/wire.css"]), _quic(["/wire.js"])]}, transport_race=True)
+    assert both["protocols"] == many["protocols"] == ["h2", "h3"] and split["protocols"] == ["h2"], "a QUIC connection that carried no request is not a protocol seen"
+    a, b = transcript(), transcript("b")
+    a["seeds"]["11"]["h3"], b["seeds"]["11"]["h3"] = {"wire": both}, {"wire": many}
+    assert not [d for d in compare(a, b)["differences"] if "/protocols" in d["path"]], "how many requests rode each protocol is not compared"
+    b["seeds"]["11"]["h3"] = {"wire": split}
+    red = compare(a, b)
+    assert red["verdict"] == "red" and {"path": "seeds/11/h3/wire/protocols/1", "a": "h3", "b": ab.MISSING} in red["differences"]
+    h1 = ab.fold_wire({"connections": [{"alpn": "http/1.1", "tls": _tls(), "http1": [{"request_line": "GET / HTTP/1.1", "headers": [["Host", "x"]], "body_length": 0}]}], "quic": []})
+    h2 = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/")])], "quic": []})
+    assert h1["protocols"] == ["h1"] and h2["protocols"] == ["h2"]
+    c = transcript("c")
+    c["seeds"]["11"]["https"], a["seeds"]["11"]["https"] = {"h2": {"wire": h1}}, {"h2": {"wire": h2}}
+    assert any(d["path"] == "seeds/11/https/h2/wire/protocols/0" and d["a"] == "h2" and d["b"] == "h1" for d in compare(a, c)["differences"]), "h1 where the published engine used h2"
+
+
 def test_a_connection_that_carried_no_request_or_resumed_one_is_out_of_the_fingerprints_and_the_requests_it_carried_stay():
     quiet = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [])], "quic": []})
     alone = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")])], "quic": []})
     resumed = ab.fold_wire({"connections": [_h2(_tls(), [(3, "/a")]), _h2(_tls(resumed=True), [(3, "/b")])], "quic": []})
     assert quiet == alone and len(resumed["connections"]) == 1 and [r["pseudo"][":path"] for r in resumed["requests"]] == ["/a", "/b"]
+    assert quiet["resumed_connections"] == [] and len(resumed["resumed_connections"]) == 1
     errors = ab.fold_wire({"connections": [{"alpn": "h2", "tls": _tls(), "error": "ConnectionResetError"}], "quic": []})
     assert errors["errors"] == ["ConnectionResetError"] and errors["connections"] == []
     two = ab.fold_wire({"connections": [_h2(_tls(aead=3), [(3, "/a")]), _h2(_tls(aead=1, cipher="0x1302"), [(3, "/b")])], "quic": []})
@@ -772,6 +817,27 @@ def test_a_whole_synthetic_transcript_of_a_plausible_run_holds_the_leaves_the_fl
     assert by_category["https"] > 100, "the ClientHello alone is a hundred leaves or more"
     assert by_category["journey"] > 17 * 30
     assert total > 600
+
+
+def test_the_hang_guard_of_the_e2e_grows_with_the_seeds_and_the_subprocess_ends_before_the_worker_is_killed(monkeypatch, tmp_path):
+    """Run 44963364060: 5 seeds under the default 420 s killed the xdist worker on Linux and on Windows."""
+    import test_ab_network_e2e as e2e
+
+    assert e2e.budget_s(1, 2) == 600 and e2e.budget_s(5, 2) == 1800 and e2e.budget_s(5, 3) == 2640
+    assert e2e.budget_s(5, 2) > 420 and e2e.budget_s(2, 2) < e2e.budget_s(3, 2)
+    monkeypatch.delenv("INVISIBLE_SEAL_FILE", raising=False)
+    monkeypatch.delenv("AB_NETWORK_PR_SEEDS", raising=False)
+    assert e2e.plan() == (1, 2)
+    monkeypatch.setenv("AB_NETWORK_PR_SEEDS", "5")
+    assert e2e.plan() == (5, 2)
+    monkeypatch.setenv("AB_NETWORK_PR_SEEDS", "99")
+    assert e2e.plan() == (len(ab.default_seeds()), 2), "no more seeds than the set has"
+    seal = tmp_path / "seal.json"
+    seal.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("INVISIBLE_SEAL_FILE", str(seal))
+    assert e2e.plan() == (len(ab.default_seeds()), 3)
+    mark = next(m for m in e2e.test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_the_published_engine_puts.pytestmark if m.name == "timeout")
+    assert mark.args == (e2e.BUDGET_S + 120,) and mark.kwargs == {"method": "thread"} and e2e.TIMEOUT_S == e2e.BUDGET_S
 
 
 def test_the_script_names_the_categories_the_run_writes_and_the_e2e_floor_is_below_a_minimal_run():

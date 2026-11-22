@@ -883,10 +883,11 @@ def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str
     request, in the stage of the first visit in one run and of the second in the other, 212 leaves; Windows: the page's requests split 4 and 1 between HTTP/2 over TCP and HTTP/3 over
     QUIC in one run, 1 and 4 in the other, with the stream numbers, priorities and frame counts that follow, 280 leaves).
 
-    So the summary of a role is: ``connections``, the distinct fingerprints of the connections that carried at least one request and are not resumed (a resumed ClientHello depends on
-    a ticket having arrived first), sorted; ``requests``, every request with how many times it was made, wherever it was made; ``errors``. Not kept: the number of connections, a
-    connection that carried no request, the stream numbers, the frames after the first request. A connection whose ClientHello differs, or a request whose headers differ, is still
-    a difference.
+    So the summary of a role is: ``protocols``, the set of protocols that carried a request (h1, h2, h3), not how many requests each carried: an engine that stops using h3 where the
+    published one did, or starts h1 where it did not, differs; ``connections``, the distinct fingerprints of the connections that carried at least one request, sorted;
+    ``resumed_connections``, the same for the connections whose ClientHello resumes a session (a ``pre_shared_key``), with the number of tickets it offers left out; ``requests``,
+    every request with how many times it was made, wherever it was made; ``errors``. Not kept: the number of connections, a connection that carried no request, the stream numbers,
+    the frames after the first request. A connection whose ClientHello differs, or a request whose headers differ, is still a difference.
 
     ``transport_race`` is for the role whose page may be served over HTTP/2 or HTTP/3 (the Alt-Svc of the first answer makes the browser open QUIC, and which of the next requests
     are already on it is a race): the end of the stream and the priority of an HTTP/2 request are then kept for the requests of the page itself (``/?...``, which always opens the
@@ -894,17 +895,24 @@ def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str
     its connections (``transport_headers``) and not in each request, which is the same request over either (A/A run 44960767715, Windows: ``/wire.css`` with ``te: trailers`` over
     HTTP/2 in one run and with ``alt-used`` before the referer over HTTP/3 in the other)."""
     connections: Dict[str, Dict[str, Any]] = {}
+    resumptions: Dict[str, Dict[str, Any]] = {}
+    protocols: set = set()
     requests: collections.Counter = collections.Counter()
     shapes: Dict[str, Any] = {}
     errors = set()
 
-    def keep(fingerprint: Dict[str, Any], pseudo_orders: set, carried: int, resumed: bool, marks: set = frozenset()) -> None:
-        if carried and not resumed:
-            fingerprint = dict(fingerprint, pseudo_orders=sorted(list(o) for o in pseudo_orders))
-            if transport_race:
-                fingerprint["transport_headers"] = sorted(marks)
-            # the ECH GREASE AEAD is random per connection (ci/ab-network-volatile.json): it does not order the fingerprints
-            connections[json.dumps(_without(fingerprint, "aead"), sort_keys=True)] = fingerprint
+    def keep(fingerprint: Dict[str, Any], pseudo_orders: set, carried: int, resumed: bool, protocol: str, marks: set = frozenset()) -> None:
+        if not carried:
+            return
+        protocols.add(protocol)
+        fingerprint = dict(fingerprint, pseudo_orders=sorted(list(o) for o in pseudo_orders))
+        if transport_race:
+            fingerprint["transport_headers"] = sorted(marks)
+        if resumed:
+            # the number of tickets a resumption offers is the pool's (which ticket was ready); what the ClientHello says around it is the engine's
+            fingerprint["tls"] = _without(fingerprint["tls"], "identities")
+        # the ECH GREASE AEAD is random per connection (ci/ab-network-volatile.json): it does not order the fingerprints
+        (resumptions if resumed else connections)[json.dumps(_without(fingerprint, "aead"), sort_keys=True)] = fingerprint
 
     def regular_headers(headers: List[List[str]], marks: set) -> List[List[str]]:
         """The regular headers of a request; in a race the ones a transport adds on its own (``te: trailers`` on HTTP/2, ``alt-used`` on HTTP/3) are the connection's, not the request's."""
@@ -940,11 +948,11 @@ def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str
                                   "window_updates_before_the_first_request": h2.get("window_updates_before_the_first_request"),
                                   "settings_ack_sent_by_client": h2.get("settings_ack_sent_by_client"),
                                   "priority_frames": sorted(json.dumps(_without(f, "stream"), sort_keys=True) for f in frames)}}
-            keep(fingerprint, orders, len(h2.get("requests") or []), _resumed(c["tls"]), marks)
+            keep(fingerprint, orders, len(h2.get("requests") or []), _resumed(c["tls"]), "h2", marks)
         else:
             for r in c.get("http1") or []:
                 count({"request_line": r["request_line"], "headers": r["headers"], "body_length": r["body_length"]})
-            keep({"transport": "tcp", "alpn": c["alpn"], "tls": c["tls"]}, set(), len(c.get("http1") or []), _resumed(c["tls"]))
+            keep({"transport": "tcp", "alpn": c["alpn"], "tls": c["tls"]}, set(), len(c.get("http1") or []), _resumed(c["tls"]), "h1")
     for q in summary.get("quic") or []:
         orders, marks = set(), set()
         for r in q["requests"]:
@@ -952,8 +960,9 @@ def fold_wire(summary: Dict[str, Any], transport_race: bool = False) -> Dict[str
             regular = regular_headers(r["headers"], marks)
             orders.add(tuple(r["pseudo_order"]))
             count(dict(pseudo=dict(sorted(pseudo.items())), headers=regular))
-        keep({"transport": "quic", "alpn": q["alpn"], "transport_parameters": q["transport_parameters"], "h3_settings": q["h3_settings"]}, orders, len(q["requests"]), False, marks)
-    return {"connections": [connections[k] for k in sorted(connections)], "requests": [dict(shapes[k], count=requests[k]) for k in sorted(requests)], "errors": sorted(errors)}
+        keep({"transport": "quic", "alpn": q["alpn"], "transport_parameters": q["transport_parameters"], "h3_settings": q["h3_settings"]}, orders, len(q["requests"]), False, "h3", marks)
+    return {"protocols": sorted(protocols), "connections": [connections[k] for k in sorted(connections)],
+            "resumed_connections": [resumptions[k] for k in sorted(resumptions)], "requests": [dict(shapes[k], count=requests[k]) for k in sorted(requests)], "errors": sorted(errors)}
 
 
 class Trusting:
