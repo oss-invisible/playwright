@@ -4,12 +4,17 @@
 #
 # The question. `test_two_connections_on_one_page_connect_in_the_time_of_retail` went red once on Windows (open after 9.7 s) while other browsers ran on the machine;
 # alone it is green 200 of 200. Every engine holds an mDNS responder on 0.0.0.0:5353 joined to 224.0.0.251 on 127.0.0.1, so the engines of a machine share one loopback
-# multicast group. If the red appears only when OTHER engines are alive, the shared group is the cause.
+# multicast group. The first run (neighbour engines alive or not) was green, and its probe got no answer from the neighbour, so whether the neighbour's responder is
+# alive on the group was not proven. This run proves it first.
 #
-# What it does. Four jobs on windows-2022, one per number of neighbour engines kept alive while the test runs: 0, 1, 2, 3. A neighbour is an engine with a page that
-# gathered ICE candidates with the mDNS obfuscation active (a host candidate with a .local name) and stays open (scripts/hunt_mdns_neighbours.py, which also proves on
-# the wire that the responder answers for each name). The test then runs 30 rounds, one pytest per round with `-n 0` (the test alone on its own xdist-less process),
-# never stopping at a red, no rerun plugin: the junit and the evidence the test saves on failure (RUNNER_TEMP/invpw-evidence) of each round go to round-K/ of the artifact.
+# What it does. ONE job on windows-2022 with ONE neighbour engine (a page that gathered ICE candidates with the mDNS obfuscation active, a host candidate with a .local
+# name, and stays open: scripts/hunt_mdns_neighbours.py), then the test 10 rounds, one pytest per round with `-n 0`, never stopping at a red, no rerun plugin. The junit and
+# the evidence the test saves on failure (RUNNER_TEMP/invpw-evidence) of each round go to round-K/ of the artifact.
+#   * A passive listener on the group (tests/_mdns_listener.py: it only listens, joined on 127.0.0.1, bound to 5353 with SO_REUSEADDR as the engine does) runs from before
+#     the neighbour starts to after it has closed, and records every packet: time, source address and port, question or response, names.
+#   * Once the neighbour is up, the helper asks for its name in three forms: from a socket with an ephemeral port; from a socket bound to 0.0.0.0:5353 with SO_REUSEADDR
+#     (plain question); the same with the unicast-response bit. For each form the job summary says whether the question was heard on the group and whether the neighbour
+#     answered, and how many packets came from the helper, the neighbour and the test's engines.
 #
 # Triggered ONLY by a push to `hunt/intermittent-68-mdns`: no schedule, no dispatch, no pull request.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -33,16 +38,11 @@ env:
 
 jobs:
   hunt:
-    name: hunt, ${{ matrix.neighbours }} neighbour engines
+    name: hunt, one neighbour engine
     runs-on: windows-2022
-    # 30 rounds of five cold launches, plus the install. The ceiling must never be what stops the hunt before its own time budget does (no new round starts after
-    # 90 minutes of the step and the artifact is still uploaded).
-    timeout-minutes: 130
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        neighbours: [0, 1, 2, 3]
+    # 10 rounds of five cold launches, plus the install and the probe. The ceiling must never be what stops the hunt before its own time budget does (no new round
+    # starts after 45 minutes of the step and the artifact is still uploaded).
+    timeout-minutes: 90
     # TEMP and TMP on D:\a\_temp (the runner's temp folder), as the Windows e2e jobs: the Firefox profiles land in TEMP and on C: they saturate the disk. On the job, not in
     # a step: `runner.temp` is not readable in a job's `env`.
     env:
@@ -72,15 +72,15 @@ jobs:
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
 
-      - name: The neighbours, then the test 30 rounds
+      - name: The neighbour, then the test 10 rounds
         env:
           PYTHONUNBUFFERED: "1"
           INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog.log
           HUNT_NODE: "tests/test_declared_host_network_e2e.py::test_two_connections_on_one_page_connect_in_the_time_of_retail"
-          HUNT_NEIGHBOURS: ${{ matrix.neighbours }}
-          HUNT_ROUNDS: "30"
+          HUNT_NEIGHBOURS: "1"
+          HUNT_ROUNDS: "10"
           # No new round starts after this many seconds of the step: the artifact is uploaded with what the rounds so far found.
-          HUNT_BUDGET_S: "5400"
+          HUNT_BUDGET_S: "2700"
         run: |
           # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before the verdict into a red step.
           set -euo pipefail
@@ -154,15 +154,14 @@ jobs:
           : > "$out/hunt-rounds.md"
           summary() {
             {
-              echo "## $HUNT_NEIGHBOURS neighbour engines kept alive"
+              echo "## $HUNT_NEIGHBOURS neighbour engine kept alive"
               echo ""
               echo "test: \`$HUNT_NODE\`"
               echo ""
-              if [ -s "$out/neighbours/neighbours.json" ]; then
-                echo "neighbour names registered and answered on the wire:"
-                python -c "import json,sys; d=json.load(open(sys.argv[1])); [print('- %s answered=%s' % (n['name'], n['probe']['answered'])) for n in d['neighbours']]" "$out/neighbours/neighbours.json" | tr -d '\r'
-                echo ""
-              fi
+              # What the probe found for each form of the question, and who the packets heard in the whole job came from (the second file exists once the neighbour has closed).
+              for f in probe-summary.md ear-summary.md; do
+                if [ -s "$out/neighbours/$f" ]; then tr -d '\r' < "$out/neighbours/$f"; echo ""; fi
+              done
               echo "rounds planned $HUNT_ROUNDS, run $rounds_run, with a red $rounds_red, that did not run exactly the one test $anomalies"
               echo ""
               echo "| round | result | first line of the failure, or the measure |"
@@ -257,7 +256,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: mdns-hunt-${{ matrix.neighbours }}-neighbours-${{ github.run_id }}-${{ github.run_attempt }}
+          name: mdns-hunt-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/hunt
             ${{ runner.temp }}/neighbours

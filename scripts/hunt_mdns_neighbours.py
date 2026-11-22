@@ -11,13 +11,16 @@ Each neighbour is a child process (the sync Playwright API is one browser per pr
 a data channel, calls setLocalDescription and waits for the gathering to be complete with a host candidate whose address ends with ".local". The
 connection stays open.
 
-HOW IT PROVES A NEIGHBOUR'S NAME IS REGISTERED. Two proofs, both written to DIR/neighbours.json:
+HOW IT PROVES A NEIGHBOUR'S NAME IS REGISTERED AND ANSWERED. Two proofs, written to DIR/neighbours.json and DIR/probe-summary.md:
   1. The page got a candidate carrying the name. The engine registers a name with the responder BEFORE it hands the candidate to the page (one IPC channel, one
      main thread of the parent, one channel to the responder thread), so a candidate with the name is a registered name.
-  2. The responder answers for it on the wire: this script sends an mDNS A question for the name to 224.0.0.251:5353 through 127.0.0.1 and waits for a
-     response with that name in the answer section (heard by `tests/_mdns_listener.MdnsListener`, the test's own ear; its packets are DIR/probe-wire.jsonl).
-     A name that is not answered after the attempts is written `"answered": false` and warned about on stderr; it does not stop the hunt (not answering would be a finding).
-The probe runs once, before "ready N"; its listener is closed before the rounds start, so only engines hold the group during the test.
+  2. The responder answers for it on the wire. A passive listener (`tests/_mdns_listener.MdnsListener`) runs from before the first neighbour until after the last
+     one has closed. Once all neighbours are up this script asks for each name in three forms: (a) a socket with an ephemeral source port, the plain question (QM);
+     (b) a socket bound to 0.0.0.0:5353 with SO_REUSEADDR, multicast interface 127.0.0.1, loop on, the plain question and then the same with the unicast-response
+     (QU) bit set. For each form it records whether the listener heard the question itself on the group, and whether a response with the name came, from where and when.
+     A name that is not answered is written `"answered": false` and reported; it does not stop the hunt (not answering would be a finding).
+At the end DIR/ear-wire.jsonl is every packet the listener heard in the whole job and DIR/ear-summary.md says which came from the helper, the neighbours and the
+test's engines (attributed by content: the listener cannot see a process).
 
 Protocol: "ready N" on stdout when all N neighbours are up and probed. Then it waits until its stdin is closed (or DIR's --stop-file appears: a fallback for a shell
 that cannot close a pipe), closes every neighbour (its stdin closes, the engine is closed by its `with`), and exits 0; non-zero when a neighbour did not
@@ -49,6 +52,7 @@ CLOSE_S = 40
 PROBE_ATTEMPTS = 6
 PROBE_WAIT_S = 1.5
 GROUP = ("224.0.0.251", 5353)
+NL = chr(10)
 
 _NEIGHBOUR_JS = r"""async () => {
   const pc = new RTCPeerConnection();
@@ -145,50 +149,132 @@ def worker(index: int) -> int:
 
 # ------------------------------------------------------------------------------------------------ the question on the wire
 
-def _question(name: str, ident: int) -> bytes:
+#: The three forms of the probe: (key, how the question is sent). `a` is a socket with an ephemeral source port and the plain (QM) question; `b-qm` and `b-qu` come
+#: from a socket bound to 0.0.0.0:5353 with SO_REUSEADDR, as the engine's own, the second with the unicast-response (QU) bit set in the question class.
+FORMS = [
+    ("a", "source port ephemeral, QM", None, 0x0001),
+    ("b-qm", "source 0.0.0.0:5353 (SO_REUSEADDR), QM", 5353, 0x0001),
+    ("b-qu", "source 0.0.0.0:5353 (SO_REUSEADDR), QU bit (class 0x8001)", 5353, 0x8001),
+]
+
+
+def _question(name: str, ident: int, qclass: int = 0x0001) -> bytes:
     labels = b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.rstrip(".").split("."))
-    return struct.pack("!6H", ident, 0, 1, 0, 0, 0) + labels + b"\x00" + struct.pack("!HH", 1, 1)
+    return struct.pack("!6H", ident, 0, 1, 0, 0, 0) + labels + b"\x00" + struct.pack("!HH", 1, qclass)
 
 
-def _probe(names: list[str], out: Path) -> dict:
-    """Ask the group for each name and see whether a responder answers; the answers are heard by the test's own listener."""
-    sys.path.insert(0, str(TESTS))
-    from _mdns_listener import MdnsListener, JOIN_INTERFACE
+def _sender(port):
+    from _mdns_listener import JOIN_INTERFACE
 
-    listener = MdnsListener().start()
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if port:
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sender.bind(("0.0.0.0", port))
     sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(JOIN_INTERFACE))
     sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
     sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-    results = {}
-    try:
+    return sender
+
+
+def _name_of(answer) -> str:
+    return str(answer.get("name", "")).lower().rstrip(".")
+
+
+def _probe(listener, names: list[str]) -> dict:
+    """Ask the group for each name in each form and record, for each, whether the passive listener heard the QUESTION itself and whether a response with the name came
+    (from where, when). The listener runs the whole job; it is only read here."""
+    sys.path.insert(0, str(TESTS))
+    sent, forms = [], {}
+    for form_number, (key, how, port, qclass) in enumerate(FORMS, start=1):
+        per_name = {}
+        try:
+            sender = _sender(port)
+            sender_error = None
+        except OSError as exc:
+            sender, sender_error = None, repr(exc)
         for number, name in enumerate(names):
             wanted = name.lower().rstrip(".")
-            result = {"answered": False, "attempts": 0, "answer": None, "ms": None}
-            started = time.perf_counter()
+            result = {"how": how, "attempts": [], "heard_question": 0, "answered": False, "response": None, "ms": None, "sender_error": sender_error}
+            first_m = None
             for attempt in range(PROBE_ATTEMPTS):
-                result["attempts"] = attempt + 1
+                if sender is None or result["answered"]:
+                    break
+                ident = (form_number << 12) | (number << 6) | attempt
+                m, t = time.perf_counter(), time.time()
+                first_m = m if first_m is None else first_m
                 try:
-                    sender.sendto(_question(name, 0x4800 + number), GROUP)
+                    sender.sendto(_question(name, ident, qclass), GROUP)
                 except OSError as exc:
                     result["send_error"] = repr(exc)
-                until = time.perf_counter() + PROBE_WAIT_S
+                note = {"id": ident, "m": round(m, 6), "t": round(t, 4), "heard_m": None}
+                result["attempts"].append(note)
+                sent.append({"form": key, "name": name, "id": ident})
+                until = m + PROBE_WAIT_S
                 while time.perf_counter() < until and not result["answered"]:
                     for packet in list(listener.packets):
-                        if packet.get("kind") != "response":
-                            continue
-                        for answer in packet.get("answers", []):
-                            if str(answer.get("name", "")).lower().rstrip(".") == wanted:
-                                result.update(answered=True, answer=answer, ms=round((time.perf_counter() - started) * 1000, 1))
+                        if packet.get("kind") == "response" and packet["m"] >= first_m:
+                            for answer in packet.get("answers", []):
+                                if _name_of(answer) == wanted:
+                                    result.update(answered=True, response={"src": packet["src"], "t": packet["t"], "answer": answer},
+                                                  ms=round((packet["m"] - first_m) * 1000, 1))
                     time.sleep(0.05)
-                if result["answered"]:
-                    break
-            results[name] = result
-    finally:
-        sender.close()
-        listener.stop()
-        listener.write(out / "probe-wire.jsonl")
-    return {"listener": listener.summary(), "names": results}
+            time.sleep(0.2)   # the last datagram of an attempt is heard before the count
+            for note in result["attempts"]:
+                note["heard_m"] = next((p["m"] for p in list(listener.packets) if p.get("kind") == "query" and p.get("id") == note["id"]), None)
+            result["heard_question"] = sum(1 for note in result["attempts"] if note["heard_m"] is not None)
+            per_name[name] = result
+        if sender is not None:
+            sender.close()
+        forms[key] = per_name
+    return {"forms": forms, "sent": sent}
+
+
+def _probe_lines(probe: dict) -> list[str]:
+    """What the probe found, plainly, for each form: was the question heard on the group, did the neighbour answer."""
+    lines = ["Probe of the neighbour names, three forms (a question is heard by the passive listener of the whole job, joined on 127.0.0.1 and bound to 5353):", ""]
+    for key, how, _port, _qclass in FORMS:
+        per_name = probe["forms"].get(key, {})
+        sent = sum(len(r["attempts"]) for r in per_name.values())
+        heard = sum(r["heard_question"] for r in per_name.values())
+        answered = [r for r in per_name.values() if r["answered"]]
+        lines.append("- form `%s` (%s): question heard on the group: %s (%d of %d sent); the neighbour answered: %s (%d of %d names)%s"
+                     % (key, how, "YES" if heard else "NO", heard, sent, "YES" if answered else "NO", len(answered), len(per_name),
+                        "".join("; %s after %s ms from %s:%s" % (_name_of(r["response"]["answer"]), r["ms"], r["response"]["src"][0], r["response"]["src"][1])
+                                for r in answered)))
+        for name, r in per_name.items():
+            for extra in ("sender_error", "send_error"):
+                if r.get(extra):
+                    lines.append("  - %s: %s: %s" % (name, extra, r[extra]))
+    return lines
+
+
+def _stamp(t) -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(t)) if t else "-"
+
+
+def _ear_lines(listener, probe: dict, names: list[str]) -> list[str]:
+    """Who the packets heard in the whole job came from. The listener cannot see a process, so a packet is attributed by what it carries: a question with an id the
+    helper sent is the helper's; a response for a name of a neighbour is the neighbour's; the rest (questions and responses for other names) is the test's engines."""
+    helper_ids = {s["id"] for s in probe["sent"]}
+    neighbour_names = {n.lower().rstrip(".") for n in names}
+    classes = {"helper (its probe questions)": [], "neighbour engines (responses for their names)": [], "the test's engines (everything else)": []}
+    for packet in list(listener.packets):
+        if packet.get("kind") == "query" and packet.get("id") in helper_ids:
+            classes["helper (its probe questions)"].append(packet)
+        elif packet.get("kind") == "response" and any(_name_of(a) in neighbour_names for a in packet.get("answers", [])):
+            classes["neighbour engines (responses for their names)"].append(packet)
+        else:
+            classes["the test's engines (everything else)"].append(packet)
+    lines = ["Packets the passive listener heard in the whole job (%d), by whom (attributed by content):" % len(listener.packets), "",
+             "| from | questions | responses | other | source ports | first (UTC) | last (UTC) |", "|---|---|---|---|---|---|---|"]
+    for label, packets in classes.items():
+        ports = sorted({p["src"][1] for p in packets if p.get("src")})
+        lines.append("| %s | %d | %d | %d | %s | %s | %s |" % (
+            label, sum(p.get("kind") == "query" for p in packets), sum(p.get("kind") == "response" for p in packets),
+            sum(p.get("kind") not in ("query", "response") for p in packets), ",".join(map(str, ports)) or "-",
+            _stamp(packets[0]["t"]) if packets else "-", _stamp(packets[-1]["t"]) if packets else "-"))
+    lines += ["", "The listener itself: %s" % json.dumps(listener.status)]
+    return lines
 
 
 # ------------------------------------------------------------------------------------------------ the parent
@@ -220,8 +306,15 @@ def main() -> int:
         parser.error("--neighbours (at least 1) and --out are required")
     args.out.mkdir(parents=True, exist_ok=True)
 
+    sys.path.insert(0, str(TESTS))
+    from _mdns_listener import MdnsListener
+
     children, records = [], []
     failed = 0
+    probe = {"forms": {}, "sent": []}
+    # The passive ear of the whole job, started BEFORE the first neighbour (so every engine's socket is a later one, as in the test) and stopped after the last
+    # neighbour has closed. It only listens.
+    ear = MdnsListener().start()
 
     def close_all() -> None:
         for proc, _ in children:
@@ -259,12 +352,15 @@ def main() -> int:
                     record = json.loads(line[len("WORKER "):])
             records.append(record)
             _say("neighbour %d up: %s (pid %s)" % (index, record["name"], record["pid"]))
-        probe = _probe([r["name"] for r in records], args.out)
+        names = [r["name"] for r in records]
+        probe = _probe(ear, names)
         for record in records:
-            record["probe"] = probe["names"][record["name"]]
-            if not record["probe"]["answered"]:
-                _say("WARNING neighbour %d: nobody answered the question for %s on the wire" % (record["index"], record["name"]))
-        (args.out / "neighbours.json").write_text(json.dumps({"neighbours": records, "listener": probe["listener"]}, indent=1), encoding="utf-8")
+            record["probe"] = {key: per_name[record["name"]] for key, per_name in probe["forms"].items()}
+        lines = _probe_lines(probe)
+        for line in lines:
+            _say(line)
+        (args.out / "neighbours.json").write_text(json.dumps({"neighbours": records, "sent": probe["sent"]}, indent=1), encoding="utf-8")
+        (args.out / "probe-summary.md").write_text(NL.join(lines) + NL, encoding="utf-8")
         print("ready %d" % args.neighbours, flush=True)
 
         closed = threading.Event()
@@ -288,6 +384,13 @@ def main() -> int:
             time.sleep(0.5)
     finally:
         close_all()
+        ear.stop()
+        try:
+            ear.write(args.out / "ear-wire.jsonl")
+            names = [r["name"] for r in records]
+            (args.out / "ear-summary.md").write_text(NL.join(_ear_lines(ear, probe, names)) + NL, encoding="utf-8")
+        except Exception as exc:
+            _say("the ear's record could not be written: %r" % (exc,))
     return 1 if failed else 0
 
 
