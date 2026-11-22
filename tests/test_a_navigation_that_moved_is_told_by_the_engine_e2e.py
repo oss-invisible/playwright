@@ -11,13 +11,20 @@ the trace folder the evidence helper hands the engine.
   127.0.0.1 page lived in. The ``goto`` lands.
 - A ``goto`` back, from localhost to 127.0.0.1, leaves the process of localhost: its origin is not the process the first move left (two sites,
   two processes).
-- A ``goto`` between two pages of 127.0.0.1 switches no process: no line.
+- A ``goto`` between two pages of 127.0.0.1 is told too, though no process changes: with the back/forward cache in the parent a top-level navigation
+  that can enter it replaces the browsing context even on the same site (``IsolationOptionsForNavigation``, ``dom/ipc/ProcessIsolation.cpp``, the
+  block of ``mTryUseBFCache``), so ``MaybeTriggerProcessSwitch`` goes on to ``TriggerProcessSwitch``. The process it left is the one it stays in,
+  and the next such ``goto`` leaves the browsing context the first one created: another id, the same child id.
+- A same-site navigation of an iframe is told by no one: the back/forward cache is for top-level loads only (``!aParentWindow`` in the same
+  condition), the load finds the process of the frame that holds its site (``mReplaceBrowsingContext`` stays false, the remote type is the current
+  one) and ``MaybeTriggerProcessSwitch`` stops at "type is compatible" (``netwerk/ipc/DocumentLoadListener.cpp``), before ``TriggerProcessSwitch``.
 
 On an engine before firefox-69 the hook does not exist: the same ``goto`` lands and the trace holds no such line at all. Not a skip: a required suite
 allows none (scripts/ci_verdict.py), so the test asserts what its engine does, as the tests of `engine_reaches` do.
 
 Known-bad input: an engine that does not tell the decision (firefox-69 with the hook gone) -> the cross-site test finds no line; an engine that
-tells it for every load -> the same-site test finds one.
+tells it for a load that stays (the iframe's) -> the iframe test finds one; an engine that does not replace the browsing context of a same-site top-level
+load -> the same-site test finds the same id twice.
 """
 from __future__ import annotations
 
@@ -27,7 +34,8 @@ import threading
 import pytest
 from _evidence_on_failure import FailureEvidence
 from _navigation_moved_trace import (
-    assert_not_moved,
+    assert_nothing_moved_since,
+    assert_replaced_in_the_same_process,
     moved_lines,
     moved_origin,
     navigation_ids_of,
@@ -43,7 +51,10 @@ def site():
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = b"<!doctype html><html><body><p id=p>" + self.path.encode() + b"</p></body></html>"
+            if self.path.startswith("/withframe"):
+                body = b"<!doctype html><html><body><iframe src='/inner?moved=inner-a'></iframe></body></html>"
+            else:
+                body = b"<!doctype html><html><body><p id=p>" + self.path.encode() + b"</p></body></html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -127,10 +138,33 @@ def test_a_cross_site_goto_is_told_moved_by_the_engine_with_the_process_it_left(
         assert left_127[1] != left_localhost[1], (left_127, left_localhost)
 
 
-def test_a_same_site_goto_is_not_told_moved_by_the_engine(page, site, evidence):
-    one, two = site + "/one?moved=d", site + "/two?moved=e"
+def test_a_same_site_top_level_goto_is_told_moved_in_the_process_it_stays_in_with_a_browsing_context_it_replaces(page, site, engine_reaches, evidence):
+    one, two, three = site + "/one?moved=d", site + "/two?moved=e", site + "/three?moved=f"
     with _on_failure(evidence):
         _go(page, one)
         _go(page, two)
+        _go(page, three)
         lines = read_trace(evidence.trace_dir)
-        assert_not_moved(lines, two)
+        if not engine_reaches("firefox-69"):
+            assert navigation_ids_of(lines, three), "the engine's trace is not on"
+            assert moved_lines(lines) == [], "an engine before firefox-69 has no such hook: %s" % moved_lines(lines)
+            return
+        # `two` left the browsing context of `one`, `three` the one that `two` created: the same process, another browsing context.
+        assert_replaced_in_the_same_process(moved_origin(lines, two), moved_origin(lines, three))
+
+
+def test_a_same_site_navigation_of_an_iframe_is_not_told_moved_by_the_engine(page, site, evidence):
+    # No navigation id names an iframe's load (the registry gives one to the main document's channel only), so the proof is the count of lines:
+    # nothing but the iframe navigates between the two readings.
+    with _on_failure(evidence):
+        _go(page, site + "/withframe?moved=g")
+        page.wait_for_function("() => document.querySelector('iframe').contentDocument.readyState === 'complete'"
+                               " && document.querySelector('iframe').contentWindow.location.search === '?moved=inner-a'", timeout=30_000)
+        lines = read_trace(evidence.trace_dir)
+        assert navigation_ids_of(lines, site + "/withframe?moved=g"), "the engine's trace is not on"
+        already = len(moved_lines(lines))
+        page.evaluate("() => { document.querySelector('iframe').src = '/inner?moved=inner-b'; }")
+        page.wait_for_function("() => document.querySelector('iframe').contentWindow.location.search === '?moved=inner-b'"
+                               " && document.querySelector('iframe').contentDocument.readyState === 'complete'", timeout=30_000)
+        assert page.url == site + "/withframe?moved=g"
+        assert_nothing_moved_since(read_trace(evidence.trace_dir), already)

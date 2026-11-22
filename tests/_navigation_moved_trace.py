@@ -85,9 +85,15 @@ def moved_origin(lines, url) -> tuple:
     return bc, child
 
 
-def assert_not_moved(lines, url) -> None:
-    """The load of ``url`` is in the trace and no ``onNavigationMoved`` line is for it."""
-    ids = navigation_ids_of(lines, url)
-    assert ids, "the trace has no document request for %s: the engine's trace is not on, or the navigation was not seen" % url
-    found = moved_lines(lines, ids)
-    assert not found, "the engine told that %s moved, and it stayed in its process: %s" % (url, found)
+def assert_replaced_in_the_same_process(before, after) -> None:
+    """Two origins, ``(browsingContextId, childId)``, of two loads one after the other of the same top-level frame: the second load left the browsing
+    context the first one created (the parent replaces the browsing context of a top-level navigation that can enter the back/forward cache), in the
+    process the first one left, which is also the process it went on in (same site)."""
+    assert before[1] == after[1], "a same-site load left another process: %s then %s" % (before, after)
+    assert before[0] != after[0], "the browsing context was not replaced: %s then %s" % (before, after)
+
+
+def assert_nothing_moved_since(lines, already) -> None:
+    """``already`` is the number of ``onNavigationMoved`` lines the trace held when the load began: it holds no more."""
+    found = moved_lines(lines)
+    assert len(found) == already, "the engine told that a navigation moved, and none left its process: %s" % found[already:]

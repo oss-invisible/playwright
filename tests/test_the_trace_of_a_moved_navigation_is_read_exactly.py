@@ -11,7 +11,8 @@ import json
 
 import pytest
 from _navigation_moved_trace import (
-    assert_not_moved,
+    assert_nothing_moved_since,
+    assert_replaced_in_the_same_process,
     moved_lines,
     moved_origin,
     navigation_ids_of,
@@ -49,9 +50,8 @@ def test_a_docshell_that_told_the_end_is_the_one_the_load_left():
 
 
 def test_a_dead_trace_proves_nothing():
-    for check in (lambda: moved_origin([], URL), lambda: assert_not_moved([], URL)):
-        with pytest.raises(AssertionError, match="no document request"):
-            check()
+    with pytest.raises(AssertionError, match="no document request"):
+        moved_origin([], URL)
 
 
 def test_no_moved_line_or_two_or_one_of_another_navigation_is_red():
@@ -74,10 +74,19 @@ def test_a_docshell_other_than_the_one_the_load_left_telling_its_end_is_red():
         moved_origin([_request("nav-2"), _moved("nav-2"), told], URL)
 
 
-def test_a_navigation_that_stayed_has_no_moved_line_and_one_that_moved_is_refused():
-    assert_not_moved([_request("nav-2"), _moved("nav-9")], URL)
-    with pytest.raises(AssertionError, match="told that"):
-        assert_not_moved([_request("nav-2"), _moved("nav-2")], URL)
+def test_a_trace_that_gained_no_moved_line_is_the_same_and_one_that_gained_is_refused():
+    assert_nothing_moved_since([_request("nav-2"), _moved("nav-9")], 1)
+    assert_nothing_moved_since([], 0)
+    with pytest.raises(AssertionError, match="none left its process"):
+        assert_nothing_moved_since([_request("nav-2"), _moved("nav-2")], 0)
+
+
+def test_a_same_site_replacement_keeps_the_process_and_changes_the_browsing_context():
+    assert_replaced_in_the_same_process((7, 5), (9, 5))
+    with pytest.raises(AssertionError, match="another process"):
+        assert_replaced_in_the_same_process((7, 5), (9, 6))
+    with pytest.raises(AssertionError, match="not replaced"):
+        assert_replaced_in_the_same_process((7, 5), (7, 5))
 
 
 def test_the_reader_takes_every_file_and_leaves_out_a_line_not_whole(tmp_path):
