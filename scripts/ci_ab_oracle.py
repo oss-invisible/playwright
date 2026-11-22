@@ -39,6 +39,13 @@ exit 2 and the A/B is not run. Without a candidate (a pull request: the engine u
 the published engine. Exit codes: 0 green, 1 red (a finding), 2 broken control or a run that could not run.
 --limit N visits only the first N seeds of the set (the A/A of a pull request, which has a time budget per test).
 
+THE SECOND LAUNCH. The visit of seed 0 (RELAUNCH_SEED) is also launched twice on ONE profile folder (the wrapper's persistent context, the profile a user
+keeps between runs): the dump keeps the items of the second launch in that visit under the prefix `relaunch.`, next to the visit's own items (a fresh
+profile), so the retail comparison of the host gate is never touched. They are compared apart: the visit must have them on both sides, and as many as the
+floor (they are not counted in the visit's own leaves, so a page that dumped less cannot hide behind them). The A/A and the A/B hold them to equality like the rest.
+
+    python ci_ab_oracle.py touched BASE_SHA     (prints touched=true|false: does a pull request change a file of this oracle; e2e.yml's final-set job reads it)
+
 Writes, in --out: dump-<N>.json and dump-<N>-again.json (the published engine's items, twice), diff-a-a.json (the A/A),
 and with a candidate dump-candidate.json and diff.json (the verdict, the compared leaves per visit, every difference).
 """
@@ -72,6 +79,9 @@ MIN_LEAVES = {1.0: 16439, 1.5: 16439}
 #: or the one that reaches every value of every dimension the core declares.
 SEED_SETS = ("candidate", "final")
 SEED_SET = "candidate"
+#: The seed whose visit is also launched twice on one profile folder, and the prefix its second launch's leaves have (scripts/ci_host_gate.py holds it).
+RELAUNCH_SEED = 0
+RELAUNCH = gate.RELAUNCH
 #: A value in diff.json longer than this is replaced by its length and its sha256 (the full value is in the dumps).
 CLIP = 400
 #: How many differences one run prints; diff.json has all of them.
@@ -128,24 +138,43 @@ def select_visits(seed_set: str = SEED_SET, shard: str | None = None, path: Path
     return mine
 
 
+def relaunch_visits(visits) -> tuple:
+    """The visits (dpr, seed) that are launched twice on one profile folder: the ones of RELAUNCH_SEED."""
+    return tuple(key for key in visits if key[1] == RELAUNCH_SEED)
+
+
+def _bare(leaf: str) -> str:
+    """The leaf without the prefix of the second launch: what exceptions.json names."""
+    return leaf[len(RELAUNCH):] if leaf.startswith(RELAUNCH) else leaf
+
+
 def comparable(items: dict) -> dict:
-    """The leaves of one visit that are held to equality: everything but diag."""
-    return {k: v for k, v in gate.leaves(items).items() if not gate.is_diag(k)}
+    """The leaves of one visit that are held to equality: everything but diag (a second launch's leaves keep their prefix)."""
+    return {k: v for k, v in gate.leaves(items).items() if not gate.is_diag(_bare(k))}
+
+
+def split_launches(leaves: dict) -> tuple:
+    """(the leaves of the visit on a fresh profile, the leaves of the second launch)."""
+    first = {k: v for k, v in leaves.items() if not k.startswith(RELAUNCH)}
+    return first, {k: v for k, v in leaves.items() if k.startswith(RELAUNCH)}
 
 
 def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None,
-                   expected: tuple | None = None) -> dict:
+                   expected: tuple | None = None, relaunch: tuple | None = None) -> dict:
     """a and b map (dpr, seed) to the items of that visit (as the dump returns them).
 
     Returns the report: {"verdict": "green"|"red", "problems": [str], "differences":
     [{"seed", "dpr", "leaf", "a", "b", "what"}], "compared": {visit: leaves}, "excused": n}.
     `noise` is the list of entries of exceptions.json's "noise". `min_leaves` maps a dpr to the
     fewest leaves a visit of that dpr may compare; `expected` is the visits both sides must have
-    (default: every seed at every DPR of the host gate)."""
+    (default: every seed at every DPR of the host gate). `relaunch` is the visits that were launched twice on one profile (default: those of RELAUNCH_SEED among the expected ones): each side must have the
+    second launch's leaves (prefix `relaunch.`) in them, as many as the floor, counted apart (report["relaunch"]), and a side must not have them in a visit that
+    was not asked to."""
     min_leaves = MIN_LEAVES if min_leaves is None else min_leaves
     if expected is None:
         expected = tuple((dpr, seed) for dpr in gate.DPRS for seed in gate.SEEDS)
-    problems, differences, compared, excused = [], [], {}, 0
+    relaunch = relaunch_visits(expected) if relaunch is None else relaunch
+    problems, differences, compared, excused, relaunched = [], [], {}, 0, {}
     for side, visits in (("A", a), ("B", b)):
         gone = [visit_name(*k) for k in expected if k not in visits]
         if gone:
@@ -158,25 +187,35 @@ def compare_visits(a: dict, b: dict, noise: list, min_leaves: dict | None = None
             continue
         dpr, seed = key
         la, lb = comparable(a[key]), comparable(b[key])
-        count = 0
+        count, again = 0, 0
+        floor = min_leaves.get(dpr, min(min_leaves.values(), default=0))
         for leaf in sorted(set(la) | set(lb)):
-            if gate.matching(noise, leaf):
+            if gate.matching(noise, _bare(leaf)):
                 excused += 1
                 continue
-            count += 1
+            second = leaf.startswith(RELAUNCH)
+            count, again = count + (not second), again + second
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
             if va != vb:
                 differences.append({"seed": seed, "dpr": dpr, "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "what": gate.describe(va, vb)})
         compared[visit_name(dpr, seed)] = count
-        floor = min_leaves.get(dpr, min(min_leaves.values(), default=0))
         if count < floor:
             problems.append("%s compared %d leaves, fewer than the %d of the host gate's reference: "
                             "the page dumped less than it should" % (visit_name(dpr, seed), count, floor))
+        for side, leaves_of in (("A", la), ("B", lb)):
+            has = len(split_launches(leaves_of)[1])
+            if key in relaunch and has < floor:
+                problems.append("side %s: the second launch of %s on a reused profile has %d leaves under %s, fewer than the %d of the host gate's "
+                                "reference: it did not run, or the page dumped less than it should" % (side, visit_name(dpr, seed), has, RELAUNCH, floor))
+            if key not in relaunch and has:
+                problems.append("side %s has the second launch of %s on a reused profile, which was not asked for" % (side, visit_name(dpr, seed)))
+        if key in relaunch:
+            relaunched[visit_name(dpr, seed)] = again
     for d in differences:
         problems.append("seed %d dpr %s %s: %s" % (d["seed"], d["dpr"], d["leaf"], d["what"]))
     return {"verdict": "red" if problems else "green", "problems": problems, "differences": differences,
-            "compared": compared, "excused": excused}
+            "compared": compared, "relaunch": relaunched, "excused": excused}
 
 
 # -
@@ -202,8 +241,9 @@ def unpack(document: dict) -> dict:
     return {(v["dpr"], v["seed"]): v["items"] for v in document["visits"]}
 
 
-def judge(published: dict, candidate: dict, noise: list, extra_problems=(), expected: tuple | None = None) -> dict:
-    report = compare_visits(published, candidate, noise, expected=expected)
+def judge(published: dict, candidate: dict, noise: list, extra_problems=(), expected: tuple | None = None,
+          relaunch: tuple | None = None) -> dict:
+    report = compare_visits(published, candidate, noise, expected=expected, relaunch=relaunch)
     if extra_problems:
         report["problems"] = list(extra_problems) + report["problems"]
         report["verdict"] = "red"
@@ -219,6 +259,8 @@ def print_report(report: dict, published: str, other: str = CANDIDATE, title: st
     print("compared %d visits, leaves per visit: %s; %d leaves excused as noise"
           % (len(report["compared"]), ", ".join("%s %d" % kv for kv in sorted(report["compared"].items())) or "none",
              report["excused"]))
+    if report.get("relaunch"):
+        print("second launch on a reused profile, leaves per visit: %s" % ", ".join("%s %d" % kv for kv in sorted(report["relaunch"].items())))
     for d in report["differences"][:PRINT_LIMIT]:
         print("DIFF seed %d dpr %s leaf %s: %s %s | %s %s" % (d["seed"], d["dpr"], d["leaf"], published,
                                                               json.dumps(d["a"], sort_keys=True)[:160],
@@ -297,6 +339,8 @@ def run_dump(binary: str, seal: Path | None, leg: str, out: Path, visits: list |
         env.pop(name, None)
     cmd = [sys.executable, str(Path(gate.__file__)), "dump", binary, "--leg", leg, "--out", str(out)]
     if visits is not None:
+        if relaunch_visits(visits):
+            cmd += ["--relaunch-seed", str(RELAUNCH_SEED)]
         cmd += ["--no-pin"] + [a for dpr, seed in visits for a in ("--visit", "%d:%s" % (seed, dpr))]
     with tempfile.TemporaryDirectory(prefix="ab-oracle-cache-") as cache:
         return subprocess.run(cmd, env=own_cache_env(env, cache), timeout=DUMP_TIMEOUT_S).returncode
@@ -425,6 +469,13 @@ def recompare(directory: Path, engine_tag: str, visits: list | None = None, a_a:
     return 0 if report["verdict"] == "green" else 1
 
 
+def touched(changed) -> bool:
+    """Does a change to `changed` (paths of a pull request) touch a file of this oracle (scripts/ci_ab_pr_seeds.py holds the list)?"""
+    import ci_ab_pr_seeds as pr
+
+    return bool(pr.touches(changed, pr.ORACLES["AB_ORACLE_PR_SEEDS"][2]))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -441,6 +492,8 @@ def main(argv=None) -> int:
     r.add_argument("--limit", type=int, help="visit only the first N seeds of the set (the A/A of a pull request)")
     r.add_argument("--published-binary", type=Path, help="use this binary for the published engine instead of fetching it")
     r.add_argument("--published-seal", type=Path, help="with --published-binary: the seal of that engine")
+    t = sub.add_parser("touched", help="touched=true|false: does the pull request (BASE_SHA..HEAD) change a file of this oracle")
+    t.add_argument("base")
     c = sub.add_parser("compare")
     c.add_argument("directory", type=Path)
     c.add_argument("--engine-tag", default=ENGINE_TAG)
@@ -449,6 +502,12 @@ def main(argv=None) -> int:
     c.add_argument("--limit", type=int)
     c.add_argument("--a-a", action="store_true", help="compare the two dumps of the published engine (the control)")
     args = ap.parse_args(argv)
+    if args.cmd == "touched":
+        import ci_ab_pr_seeds as pr
+
+        sys.stdout.reconfigure(newline="\n")  # the line goes to $GITHUB_OUTPUT: a carriage return would be part of the value
+        print("touched=%s" % ("true" if touched(pr.changed_files(args.base)) else "false"))
+        return 0
     if args.cmd == "compare":
         return recompare(args.directory, args.engine_tag, select_visits(args.seed_set, args.shard, limit=args.limit), args.a_a)
     if args.published_seal and not args.published_binary:
