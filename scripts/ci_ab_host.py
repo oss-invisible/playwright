@@ -480,6 +480,12 @@ def pingsender_problems(fp: dict) -> list:
     return out
 
 
+def privileged_problems(fp: dict) -> list:
+    """More than one preloaded about:newtab process in a launch (PRIVILEGED_REASON)."""
+    n = fp.get("kinds", {}).get(PRIVILEGED, 0)
+    return ["%d %s processes: the preloaded about:newtab is absent or present, never more than one (%s)" % (n, PRIVILEGED, PRIVILEGED_REASON)] if n > 1 else []
+
+
 def pingsender_surface(fp: dict) -> tuple:
     """`(paths only the pingsender kind touched, its destinations)` of a launch: a destination is `<kind>: connect public, telemetry` (or `send`), whatever the
     address and the port: the telemetry host is the third party's."""
@@ -501,24 +507,58 @@ def _bare_summary(bare: dict | None) -> dict | None:
             "cores": core.get("cores"), "core_pattern": core.get("core_pattern")}
 
 
-#: The system modules of Windows: a path under the system folder (a library, its resource file, a security catalog read when it is loaded). Which of them a launch
-#: opens follows the system (a catalog lookup, a lazily loaded library of a system DLL, a resource of a module a shell call loaded), so they are compared as a SET over
-#: the union of the measured seeds of a side, not seed by seed: a module that is in a seed of each side is the same module. A module that only one side has in any seed is
-#: still a difference, whatever loaded it; the shortcut inventory is its own rule (absent or complete).
-SYSTEM_PREFIX = "file.c:" + chr(92) + "windows" + chr(92)
-SYSTEM_REASON = ("which system modules a launch opens follows the system (catalog lookups, libraries loaded lazily by system DLLs): compared as a set over the union of the "
-                 "measured seeds of a side")
+#: THE SYSTEM MODULES OF WINDOWS: the paths under System32, SysWOW64 and WinSxS (the security catalogs are under System32 catroot) that are not in the package. They are
+#: loaded by the Windows loader on behalf of system DLLs (a catalog lookup when a library is loaded, a library a system DLL loads lazily, the resource file of a module), and no
+#: page reads them: which of them a launch opens follows the system and its timing, not the engine. They are compared as a set per PATH over the union of the launches of a
+#: run that are compared (the measured seeds and the warm-up), never seed by seed:
+#:   * in the A/B, red only a module the CANDIDATE opened that NO launch of the 68 opened, in either run of the 68 (the published engine twice, warm-ups included); a module
+#:     the candidate lacks is not red (printed as `lacking`);
+#:   * in the A/A, a module of this class that only one run has is `rare`: printed with its count, and the control is red only if the rare ones of a run are more than RARE_LIMIT
+#:     paths (the class is growing and must be looked at).
+#: Everything outside these folders stays strict, and the shortcut inventory is its own rule (absent or complete).
+SYSTEM_FOLDERS = tuple("c:" + chr(92) + "windows" + chr(92) + name + chr(92) for name in ("system32", "syswow64", "winsxs"))
+SYSTEM_PREFIX = tuple("file." + f for f in SYSTEM_FOLDERS)
+RARE_LIMIT = 5
+SYSTEM_REASON = ("loaded by the Windows loader on behalf of system DLLs, and no page reads them: compared as a set per path over the union of all the launches of a run; in the "
+                 "A/B red only a module the candidate opened that no launch of the 68 opened; in the A/A the ones only one run has are rare, red above %d" % RARE_LIMIT)
 
 
-def system_class_differences(per_seed_a: dict, per_seed_b: dict, by_a: dict, by_b: dict) -> list:
-    """The differences of the system modules as a set over the union of the seeds (`per_seed_*`: {seed: {leaf}}): `[{leaf, a, b, by}]`, seed `all`."""
-    ua = set().union(*per_seed_a.values()) if per_seed_a else set()
-    ub = set().union(*per_seed_b.values()) if per_seed_b else set()
-    out = []
-    for leaf in sorted(ua ^ ub):
-        out.append({"seed": "all", "category": "file", "leaf": leaf, "a": 1 if leaf in ua else MISSING, "b": 1 if leaf in ub else MISSING,
-                    "by": {"A": sorted(by_a.get(leaf, [])), "B": sorted(by_b.get(leaf, []))}, "calls": {"A": [], "B": []}})
+def _launches(fp: dict) -> list:
+    return list(fp.get("seeds", [])) + [fp.get("warmup") or {}]
+
+
+def system_paths(fp: dict, with_inventory: bool = True) -> set:
+    """The system modules (SYSTEM_FOLDERS) any launch of a footprint opened: the measured seeds and the warm-up. The idle and the bare launch are not in it: they run 120 s,
+    in which the parent runs Mozilla's idle tasks (the maintenance at 57 s, the shell code), and they are evidence, not compared (run 44993377458: 19 of the 21 modules only
+    run A had were theirs; with the seeds and the warm-up it is 2). Without `with_inventory` the ones a
+    launch opened as part of the shortcut inventory (its own rule: absent or complete, `INVENTORY_MARKER`) are left out."""
+    out = set()
+    for launch in _launches(fp):
+        skip = set() if with_inventory else set(launch.get("inventory") or [])
+        out.update(p for p in launch.get("files", []) if p.startswith(SYSTEM_FOLDERS) and p not in skip)
     return out
+
+
+def system_class(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
+    """`(differences, problems, report)` of the system modules of two footprints: see SYSTEM_REASON. `also_68` are the other footprints of the 68 in an A/B."""
+    ua, ub = system_paths(a, False), system_paths(b, False)
+    differences, problems = [], []
+    if a_a:
+        rare = {"A": sorted(ua - ub), "B": sorted(ub - ua)}
+        for side in ("A", "B"):
+            if len(rare[side]) > RARE_LIMIT:
+                problems.append("the system modules only run %s has are %d, more than %d: the class is growing (%s)" % (side, len(rare[side]), RARE_LIMIT, rare[side][:3]))
+        return differences, problems, {"mode": "a-a", "rare": rare, "counts": {k: len(v) for k, v in rare.items()}, "limit": RARE_LIMIT, "reason": SYSTEM_REASON}
+    known = set(ua).union(*[system_paths(x, False) for x in also_68])
+    for path in sorted(ub - known):
+        differences.append({"seed": "all", "category": "file", "leaf": "file." + path, "a": MISSING, "b": 1, "by": {"A": [], "B": []}, "calls": {"A": [], "B": []}})
+    return differences, problems, {"mode": "a-b", "candidate_only": sorted(ub - known), "lacking": sorted(known - ub)[:50], "lacking_count": len(known - ub), "reason": SYSTEM_REASON}
+
+
+PRIVILEGED = "Privileged Cont"
+PRIVILEGED_REASON = ("the preloaded about:newtab (remote type privilegedabout, NewTabPagePreloading.sys.mjs:96 `maybeCreatePreloadedBrowser`, browser.newtab.preload true, "
+                     "firefox.js:1952) is created once the window is idle: whether a launch has it depends on the idle time after startup, so per launch it is absent or present, "
+                     "and more than one is red")
 
 
 def _idle_summary(idle: dict | None) -> dict | None:
@@ -1302,6 +1342,8 @@ def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
     destination of a process of that kind (`network_events`)."""
     out = {}
     for kind, n in seed_footprint.get("kinds", {}).items():
+        if kind == PRIVILEGED:
+            continue  # absent or present per launch (PRIVILEGED_REASON): `privileged_problems`
         if kind == PINGSENDER_KIND or (kind.endswith("<-pingsender") and not with_pingsender):
             continue  # 0 or 3 of them, with their form (`pingsender_problems`), and what they spawned: there when they are
         out["proc." + kind] = 1 if is_tab(kind) and n else n
@@ -1438,7 +1480,7 @@ def stock_control_problems(stock: dict) -> list:
 
 
 def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, platform: str | None = None,
-          floors: dict | None = None) -> dict:
+          floors: dict | None = None, also_68: list | None = None) -> dict:
     """The verdict on two footprints (the document `run` writes). `expected` is the declared differences, applied only when `a_a` is false.
     Returns {"verdict", "problems", "differences", "declared", "ours", "tab", "leaves": {seed: {category: n}}, "mode"}: nothing is excused."""
     floors = FLOORS if floors is None else floors
@@ -1452,7 +1494,6 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             problems.append("side %s: %s" % (side, message))
     if sorted(seeds_a) != sorted(seeds_b):
         problems.append("the two footprints have different seeds: A %s, B %s" % (sorted(seeds_a), sorted(seeds_b)))
-    sys_a, sys_b, sys_by_a, sys_by_b = {}, {}, {}, {}
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         both = bool(seeds_a[seed].get("kinds", {}).get(PINGSENDER_KIND)) and bool(seeds_b[seed].get("kinds", {}).get(PINGSENDER_KIND))
         la, lb = leaves_of(seeds_a[seed], both), leaves_of(seeds_b[seed], both)
@@ -1466,7 +1507,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             for path in inv_b - set(seeds_a[seed].get("files", [])):
                 lb.pop("file." + path, None)
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
-            for message in fp.get("problems", []) + pingsender_problems(fp):
+            for message in fp.get("problems", []) + pingsender_problems(fp) + privileged_problems(fp):
                 problems.append("seed %s side %s: %s" % (seed, side, message))
         per = {c: 0 for c in CATEGORIES}
         for leaf in set(la) | set(lb):
@@ -1479,11 +1520,8 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                     problems.append("seed %s side %s has %d %s leaves, fewer than the floor of %d: the run was not seen"
                                     % (seed, side, have[c], c, floor))
         if os_name == "windows":
-            for leaves, bucket, fp, who in ((la, sys_a, seeds_a[seed], sys_by_a), (lb, sys_b, seeds_b[seed], sys_by_b)):
-                moved = {k for k in leaves if k.startswith(SYSTEM_PREFIX)}
-                bucket[seed] = moved
-                for k in moved:
-                    who.setdefault(k, set()).update(_by(fp, k))
+            for leaves in (la, lb):
+                for k in [k for k in leaves if k.startswith(SYSTEM_PREFIX)]:
                     del leaves[k]
         for leaf in sorted(set(la) | set(lb)):
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
@@ -1491,7 +1529,11 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                 differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)},
                                     "calls": {"A": _calls(seeds_a[seed], leaf), "B": _calls(seeds_b[seed], leaf)}})
-    differences += system_class_differences(sys_a, sys_b, sys_by_a, sys_by_b)
+    system = None
+    if os_name == "windows":
+        more, found, system = system_class(a, b, a_a, also_68 or ())
+        differences += more
+        problems += found
     if os_name == "windows" and not a_a:
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
             problems += geolocation_problems(fp, where)
@@ -1534,7 +1576,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                 "net": sorted(set(warm["A"].get("net", [])) & set(warm["B"].get("net", [])))}
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
-            "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))},
+            "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))}, "system_modules": system,
             "bare": {side: _bare_summary((fp.get("bare") or {}).get("bare")) for side, fp in (("A", a), ("B", b))},
             "shortcuts": {side: _shortcuts_summary(((fp.get("idle") or {}).get("idle") or {}).get("shortcut_changes")) for side, fp in (("A", a), ("B", b))},
             "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
@@ -1546,6 +1588,13 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
     for d in report["differences"][:200]:
         print("DIFF seed %s %s: %s %s | %s %s%s" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160],
                                                     b_name, json.dumps(d["b"], sort_keys=True)[:160], _by_text(d)))
+    system = report.get("system_modules")
+    if system and system["mode"] == "a-a":
+        for side, name in (("A", a_name), ("B", b_name)):
+            if system["rare"][side]:
+                print("RARE system modules only %s has: %d (red above %d): %s" % (name, len(system["rare"][side]), system["limit"], json.dumps(system["rare"][side][:20])))
+    elif system:
+        print("SYSTEM modules the 68 has and the candidate lacks (not red): %d; the candidate has alone: %d" % (system["lacking_count"], len(system["candidate_only"])))
     for side, name in (("A", a_name), ("B", b_name)):
         warm = (report.get("warmup") or {}).get(side)
         if warm:
@@ -1814,18 +1863,21 @@ def crash_report_dirs(profile_dir, windows: bool) -> list:
 
 
 def scan_crash_files(dirs, seen: dict) -> None:
-    """Adds to `seen` ({path: {"name", "dir", "size", "content"}}) every `.dmp` and `.extra` of `dirs` it has not seen: a `.extra` is read at once, as the
-    profile is deleted when the launch ends."""
+    """Adds to `seen` ({path: {"name", "dir", "size", "content"}}) every `.dmp` and `.extra` of `dirs`: a `.extra` is read at once, as the profile is deleted when the
+    launch ends, and again while its size keeps changing (a file seen half written)."""
     for folder in dirs:
         try:
             entries = list(Path(folder).iterdir())
         except OSError:
             continue
         for entry in entries:
-            if entry.suffix not in (".dmp", ".extra") or str(entry) in seen:
+            if entry.suffix not in (".dmp", ".extra"):
                 continue
             try:
-                item = {"name": entry.name, "dir": str(entry.parent), "size": entry.stat().st_size}
+                size = entry.stat().st_size
+                if str(entry) in seen and seen[str(entry)]["size"] == size:
+                    continue
+                item = {"name": entry.name, "dir": str(entry.parent), "size": size}
                 if entry.suffix == ".extra":
                     item["content"] = entry.read_text(encoding="utf-8", errors="replace")[:20000]
             except OSError:
@@ -2236,7 +2288,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             if stock is None:
                 return 2
         expected = load_expected(expected_file)
-        report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False)
+        report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False, also_68=[again])
         write_json(out / "diff.json", report)
         print("--- A/B: %s against the candidate" % engine_tag)
         print_report(report, engine_tag, oracle.CANDIDATE)

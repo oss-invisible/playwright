@@ -1552,7 +1552,7 @@ def test_a_class_that_only_one_side_reaches_or_another_port_or_another_kind_is_r
 
 INV = ["c:\\programdata\\microsoft\\windows\\start menu\\programs\\desktop.ini", "d:\\users\\public\\desktop\\desktop.ini",
        "d:\\lab\\runner\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
-       "c:\\windows\\system32\\windows.fileexplorer.common.dll", "c:\\windows\\system32\\en-us\\urlmon.dll.mui"]
+       "c:\\windows\\immersivecontrolpanel\\resources.pri", "c:\\windows\\systemapps\\microsoft.windows.sechealthui_cw5n1h2txyewy\\resources.pri"]
 
 
 def with_inventory(fp, paths=INV, present=True):
@@ -1643,9 +1643,11 @@ def test_the_crash_files_are_read_when_they_appear_a_dmp_by_its_name_and_an_extr
     files = sorted(seen.values(), key=lambda f: f["name"])
     assert [f["name"] for f in files] == ["a1b2.dmp", "a1b2.extra"] and files[0]["size"] == 104 and "content" not in files[0]
     assert "MozCrashReason" in files[1]["content"] and "ShutdownProgress" in files[1]["content"]
-    (folder / "a1b2.extra").write_text("changed", encoding="utf-8")
     host.scan_crash_files([folder], seen)
-    assert "MozCrashReason" in seen[str(folder / "a1b2.extra")]["content"], "a file is read once, when it appears"
+    assert "MozCrashReason" in seen[str(folder / "a1b2.extra")]["content"], "a file that did not change is not read again"
+    (folder / "a1b2.extra").write_text('{"MozCrashReason": "later", "more": "a file seen half written is read again when its size changes"}', encoding="utf-8")
+    host.scan_crash_files([folder], seen)
+    assert "later" in seen[str(folder / "a1b2.extra")]["content"]
 
 
 def test_the_watcher_keeps_what_it_read_though_the_launch_deletes_its_profile_afterwards(tmp_path):
@@ -1821,50 +1823,107 @@ def test_a_launch_that_left_nothing_says_so_and_the_report_carries_the_summary_l
 
 
 # -
-# The system modules of Windows: a set over the union of the measured seeds of a side.
+# The system modules of Windows: a set per path over the union of all the launches of a run.
 
 SYS_A = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "wevtapi.dll"
 SYS_B = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "imagehlp.dll"
+OUTSIDE = "c:" + chr(92) + "windows" + chr(92) + "systemapps" + chr(92) + "x" + chr(92) + "resources.pri"
 
 
-def with_system(fp, per_seed):
+def with_system(fp, per_launch):
+    """`per_launch`: {seed or "warmup"/"idle": [paths]}: the paths added to that launch's files."""
     fp = copy.deepcopy(fp)
-    for seed in fp["seeds"]:
-        add = per_seed.get(seed["seed"], [])
-        seed["files"] = sorted(set(seed["files"]) | set(add))
-        seed["touched_by"] = {p: ["tab/isForBrowser"] for p in add}
+    for key in ("warmup", "idle", "bare"):
+        if key in per_launch and not fp.get(key):
+            fp[key] = seed_footprint(11)
+    launches = {s["seed"]: s for s in fp["seeds"]}
+    launches.update({k: fp[k] for k in ("warmup", "idle", "bare") if fp.get(k)})
+    for key, add in per_launch.items():
+        launch = launches[key]
+        launch["files"] = sorted(set(launch["files"]) | set(add))
+        launch["touched_by"] = dict(launch.get("touched_by") or {}, **{p: ["tab/isForBrowser"] for p in add})
     return fp
 
 
-def test_a_system_module_that_is_in_a_seed_of_each_side_is_the_same_module_whatever_the_seed():
-    a = with_system(footprint(platform="win32"), {11: [SYS_B]})
-    b = with_system(footprint("again", platform="win32"), {12: [SYS_B]})
+def win(engine="firefox-68", **kw):
+    return footprint(engine, platform="win32", **kw)
+
+
+def test_a_system_module_in_a_launch_of_each_run_is_the_same_module_and_a_rare_one_is_printed_not_red(capsys):
+    a = with_system(win(), {11: [SYS_B]})
+    b = with_system(win("again"), {"warmup": [SYS_B], 12: [SYS_A]})
     report = judge(a, b, a_a=True)
     assert report["verdict"] == "green", report["problems"]
-    assert "set over the union" in host.SYSTEM_REASON
+    assert report["system_modules"]["rare"] == {"A": [], "B": [SYS_A]} and report["system_modules"]["counts"] == {"A": 0, "B": 1}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "RARE system modules only firefox-68 again has: 1 (red above 5)" in capsys.readouterr().out
+    assert "no page reads them" in host.SYSTEM_REASON and "Windows loader" in host.SYSTEM_REASON
 
 
-def test_a_system_module_only_one_side_has_in_any_seed_is_still_red_and_names_who_loaded_it():
-    a = with_system(footprint(platform="win32"), {11: [SYS_A], 12: [SYS_B]})
-    b = with_system(footprint("again", platform="win32"), {12: [SYS_B]})
-    report = judge(a, b, a_a=True)
-    assert report["verdict"] == "red"
-    assert [(d["seed"], d["leaf"], d["a"], d["b"], d["by"]) for d in report["differences"]] == [("all", "file." + SYS_A, 1, host.MISSING, {"A": ["tab/isForBrowser"], "B": []})]
-    assert any("seed all file." in p and "(by A: tab/isForBrowser | B: -)" in p for p in report["problems"])
+def test_six_rare_system_modules_in_an_a_a_run_are_red_and_five_are_not():
+    many = ["c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "rare%d.dll" % i for i in range(6)]
+    assert judge(with_system(win(), {11: many}), win("again"), a_a=True)["verdict"] == "red"
+    report = judge(with_system(win(), {11: many}), win("again"), a_a=True)
+    assert any("the system modules only run A has are 6, more than 5: the class is growing" in p for p in report["problems"])
+    assert judge(with_system(win(), {11: many[:5]}), win("again"), a_a=True)["verdict"] == "green"
+    assert judge(win(), with_system(win("again"), {"warmup": many}), a_a=True)["verdict"] == "red", "either run, the warm-up included"
+    long_launches = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many, "bare": many}), a_a=True)
+    assert long_launches["verdict"] == "green", long_launches["problems"]  # the long launches are evidence, not in the class
 
 
-def test_a_module_outside_the_system_folder_and_every_module_on_linux_is_compared_seed_by_seed():
-    other = "c:" + chr(92) + "program files" + chr(92) + "vendor" + chr(92) + "hook.dll"
-    a = with_system(footprint(platform="win32"), {11: [other]})
-    b = with_system(footprint("again", platform="win32"), {12: [other]})
-    assert {d["seed"] for d in judge(a, b, a_a=True)["differences"]} == {11, 12}
+def test_in_an_ab_a_system_module_only_the_candidate_opened_is_red_and_one_the_candidate_lacks_is_green():
+    published = with_system(win(), {11: [SYS_A]})
+    again = with_system(win("again"), {12: [SYS_B]})
+    candidate = with_system(win("candidate"), {11: [SYS_B]})
+    green = judge(published, candidate, expected=[], also_68=[again])
+    assert green["verdict"] == "green", green["problems"]
+    assert green["system_modules"]["lacking"] == [SYS_A] and green["system_modules"]["candidate_only"] == []
+    new = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "dnsapi.dll"
+    red = judge(published, with_system(win("candidate"), {11: [SYS_B, new]}), expected=[], also_68=[again])
+    assert red["verdict"] == "red" and [d["leaf"] for d in red["differences"]] == ["file." + new]
+    assert judge(win(), with_system(win("candidate"), {"warmup": [new]}), expected=[])["verdict"] == "red", "a module the candidate opened in a warm-up counts"
+    assert judge(with_system(win(), {"warmup": [new]}), with_system(win("candidate"), {11: [new]}), expected=[])["verdict"] == "green", "a 68 warm-up opened it too"
+
+
+def test_the_system_class_is_system32_syswow64_and_winsxs_and_everything_else_stays_strict_seed_by_seed():
+    for folder in ("syswow64", "winsxs"):
+        path = "c:" + chr(92) + "windows" + chr(92) + folder + chr(92) + "x.dll"
+        assert judge(with_system(win(), {11: [path]}), win("again"), a_a=True)["verdict"] == "green"
+    for other in (OUTSIDE, "c:" + chr(92) + "program files" + chr(92) + "vendor" + chr(92) + "hook.dll"):
+        report = judge(with_system(win(), {11: [other]}), win("again"), a_a=True)
+        assert report["verdict"] == "red" and {d["seed"] for d in report["differences"]} == {11}, other
     lin = "/usr/lib/libx.so"
-    la, lb = with_system(footprint(), {11: [lin]}), with_system(footprint("again"), {12: [lin]})
-    assert {d["seed"] for d in judge(la, lb, a_a=True)["differences"]} == {11, 12}
+    assert judge(with_system(footprint(), {11: [lin]}), footprint("again"), a_a=True)["system_modules"] is None
+    assert {d["seed"] for d in judge(with_system(footprint(), {11: [lin]}), footprint("again"), a_a=True)["differences"]} == {11}
 
 
-def test_the_system_class_does_not_hide_a_module_the_candidate_alone_loads_in_every_seed():
-    a = footprint(platform="win32")
-    b = with_system(footprint("candidate", platform="win32"), {11: [SYS_A], 12: [SYS_A]})
-    report = judge(a, b, a_a=True)
-    assert [d["leaf"] for d in report["differences"]] == ["file." + SYS_A] and report["verdict"] == "red"
+def test_the_ab_passes_the_other_run_of_the_68_to_the_judge(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub", None))
+    docs = {"footprint-68.json": win(), "footprint-68-again.json": win("again"), "footprint-candidate.json": win("candidate")}
+
+    def fake_run(exe, seal, leg, out, label, seeds):
+        name = {"firefox-68": "footprint-68.json", "firefox-68 again": "footprint-68-again.json", "candidate": "footprint-candidate.json"}[label]
+        host.write_json(tmp_path / "o" / name, docs[name])
+        return 0
+
+    monkeypatch.setattr(host, "run_subprocess", fake_run)
+    monkeypatch.setattr(host, "FLOORS", SMALL)
+    monkeypatch.setattr(host, "run_stock_control", lambda leg, out: {"stock": True})
+    real = host.judge
+    monkeypatch.setattr(host, "judge", lambda a, b, **kw: seen.update(kw) or real(a, b, **kw))
+    host.ab("cand", Path("seal"), "win-x86_64", tmp_path / "o", "firefox-68", [11, 12])
+    assert seen["also_68"][0]["engine"] == "again"
+
+
+# -
+# The preloaded about:newtab: absent or present per launch.
+
+def test_the_preloaded_newtab_process_is_absent_or_present_per_launch_never_more_than_one_and_never_compared_between_sides():
+    one = footprint(kinds=dict(KINDS, **{"Privileged Cont": 1}))
+    assert judge(one, footprint("again"), a_a=True)["verdict"] == "green", "present on one side only"
+    assert judge(one, copy.deepcopy(one), a_a=True)["verdict"] == "green"
+    two = footprint(kinds=dict(KINDS, **{"Privileged Cont": 2}))
+    report = judge(two, footprint("again"), a_a=True)
+    assert report["verdict"] == "red" and any("2 Privileged Cont processes: the preloaded about:newtab is absent or present, never more than one" in p for p in report["problems"])
+    assert "NewTabPagePreloading.sys.mjs:96" in host.PRIVILEGED_REASON and "firefox.js:1952" in host.PRIVILEGED_REASON and "idle time" in host.PRIVILEGED_REASON
