@@ -1,0 +1,89 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>ab</title>
+<body>
+<script>
+// The A/B oracle's visit of the surfaces a plain read of the top window does not reach: every realm and every kind of window a page can make
+// reads the same subset (realm.js), and the server says which Accept-Language it saw for each kind of request. The page is served from
+// http://127.0.0.1 (a secure context: service workers and the audio worklet need one); `?ctx=` names the context it runs in.
+// What it records goes to window.__abResult; the title says when it is done. A step that does not answer says 'timeout: <step>' after its own
+// budget, never silence, so that the two engines of an A/B compare the same leaves.
+document.write('<script src="/ab/realm.js' + location.search + '"><\/script>');
+</script>
+<script>
+(async () => {
+const Q = new URLSearchParams(location.search), CTX = Q.get('ctx') || 'none', ID = '?ctx=' + encodeURIComponent(CTX);
+const errs = e => 'ERR ' + ((e && e.name) || '') + ': ' + ((e && e.message) || String(e));
+const within = (p, ms, what) => Promise.race([p, new Promise(res => setTimeout(() => res('timeout: ' + what), ms))]);
+const step = async (R, k, f, ms = 15000) => { try { R[k] = await within(Promise.resolve().then(f), ms, k); } catch (e) { R[k] = errs(e); } };
+const waiting = {};
+addEventListener('message', e => { const m = e.data; if (m && typeof m.id === 'string' && waiting[m.id]) { waiting[m.id](Object.assign({origin: e.origin}, m.data)); delete waiting[m.id]; } });
+const popups = [];
+const pop = (id, name, features) => new Promise(res => {
+  waiting[id] = res;
+  const url = '/ab/opened.html' + ID + '&id=' + id;
+  const w = features === undefined ? window.open(url, name) : window.open(url, name, features);
+  if (w) popups.push(w); else res('blocked');
+});
+
+addEventListener('pageshow', async e => {
+  let n = 1;
+  try { n = (Number(sessionStorage.getItem('abPs')) || 0) + 1; sessionStorage.setItem('abPs', String(n)); } catch (x) {}
+  let data; try { data = JSON.parse(JSON.stringify(await abRealm())); } catch (x) { data = errs(x); }
+  window.__abBf = {n, persisted: e.persisted, data};
+});
+
+let done = false;
+try { done = sessionStorage.getItem('abDone') === '1'; } catch (x) {}
+if (done) { document.title = 'ab-done'; return; }
+
+const R = {};
+await step(R, 'top', () => abRealm());
+await step(R, 'iframe_cross', () => new Promise(res => {
+  waiting.cross = res;
+  const f = document.createElement('iframe'); f.src = 'http://localhost:' + location.port + '/ab/frame.html' + ID + '&id=cross'; document.body.appendChild(f); }));
+await step(R, 'iframe_srcdoc', () => new Promise((res, rej) => {
+  const f = document.createElement('iframe');
+  f.srcdoc = '<!doctype html><script src="/ab/realm.js' + ID + '"><\/script>';
+  f.onload = async () => { try { res(await f.contentWindow.abRealm()); } catch (e) { rej(e); } };
+  document.body.appendChild(f); }));
+await step(R, 'worker', () => new Promise((res, rej) => {
+  const w = new Worker('/ab/worker.js' + ID); w.onmessage = e => { res(e.data); w.terminate(); }; w.onerror = () => { rej(new Error('worker error')); w.terminate(); }; w.postMessage('go'); }));
+await step(R, 'shared_worker', () => new Promise((res, rej) => {
+  const w = new SharedWorker('/ab/shared.js' + ID); w.port.onmessage = e => res(e.data); w.onerror = () => rej(new Error('shared worker error')); w.port.postMessage('go'); }));
+await step(R, 'service_worker', async () => {
+  if (!navigator.serviceWorker) return 'absent';
+  const reg = await navigator.serviceWorker.register('/ab/sw.js' + ID, {scope: '/ab/'});
+  try {
+    await navigator.serviceWorker.ready;
+    const f = document.createElement('iframe'), loaded = new Promise(r => { f.onload = r; });
+    f.src = '/ab/controlled.html' + ID; document.body.appendChild(f); await loaded;
+    const el = f.contentDocument.getElementById('sw');
+    return el ? JSON.parse(el.textContent) : 'the worker did not answer the navigation';
+  } finally { try { await reg.unregister(); } catch (e) {} }
+}, 20000);
+await step(R, 'audio_worklet', async () => {
+  const ac = new AudioContext();
+  try {
+    await ac.audioWorklet.addModule('/ab/realm.js' + ID);
+    const node = new AudioWorkletNode(ac, 'ab-probe');
+    const got = new Promise(res => { node.port.onmessage = e => res(e.data); });
+    ac.resume().catch(() => {});
+    return await got;
+  } finally { try { await ac.close(); } catch (e) {} }
+}, 8000);
+await step(R, 'popup_plain', () => pop('plain', 'abPlain'));
+await step(R, 'popup_features', () => pop('features', 'abFeatures', 'popup,width=500,height=420,left=40,top=30'));
+for (const w of popups) { try { w.close(); } catch (e) {} }
+// two more kinds of request, so that the server has seen a fetch and an image next to the documents, scripts and workers
+await step(R, 'requests', async () => {
+  await fetch('/ab/probe' + ID + '&k=fetch');
+  await new Promise(res => { const i = new Image(); i.onload = i.onerror = res; i.src = '/ab/probe' + ID + '&k=image'; });
+  return 'made'; }, 5000);
+await step(R, 'accept_language', async () => (await fetch('/ab/seen' + ID)).json(), 5000);
+
+window.__abResult = JSON.parse(JSON.stringify(R));
+try { sessionStorage.setItem('abDone', '1'); } catch (e) {}
+document.title = 'ab-done';
+})();
+</script>
