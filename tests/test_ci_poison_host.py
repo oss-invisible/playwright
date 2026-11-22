@@ -26,7 +26,8 @@ OURS = {"timezone": "Asia/Bangkok", "offsets": [-420, -420], "language": "en-US"
         "date_full": "Thursday, January 15, 2026", "number": "1,234,567.891", "dark": False, "canary_check": True,
         "canary": {"with": [100, 100], "without": [100, 100], "present": False}, "generic": [30.5, 41.0, 52.0],
         "audio": {"sampleRate": 48000, "maxChannelCount": 2}}
-STOCK = {"timezone": "America/Bogota", "offsets": [300, 300], "language": "en-US", "languages": ["en-US", "en"], "intl_locale": "en-US",
+STOCK = {"timezone": "America/Bogota", "offsets": [300, 300], "language": "en-US", "languages": ["en-US", "en"], "intl_locale": "ja-JP",
+         "date_full": "2026\u5e741\u670815\u65e5\u6728\u66dc\u65e5", "number": "1,234,567.891",
          "dark": True, "canary_check": True, "canary": {"with": [180, 180], "without": [100, 100], "present": True},
          "generic": [216.0, 216.0, 216.0], "audio": {"sampleRate": 96000, "maxChannelCount": 6}}
 
@@ -162,6 +163,7 @@ def test_stock_firefox_that_read_the_poison_is_a_sound_control():
     ({"audio": {"sampleRate": 48000, "maxChannelCount": 2}}, "audio"),
     ({"generic": [30.5, 216.0, 216.0]}, "generic"),
     ({"generic": None}, "generic"),
+    ({"intl_locale": "en-US", "date_full": "Thursday, January 15, 2026"}, "language"),
 ])
 def test_a_poison_that_stock_firefox_did_not_read_is_a_broken_control(change, requirement):
     failures = poison.control_failures(dict(STOCK, **change), "linux")
@@ -176,9 +178,12 @@ def test_a_control_that_returned_nothing_is_broken():
     assert poison.control_failures(None, "linux")[0][0] == "probe"
 
 
-def test_the_language_is_reported_and_not_required_and_says_whether_stock_read_japanese():
-    assert "language" not in poison.REQUIRED
-    assert poison.language_reads(STOCK)["japanese"] is False
+def test_the_control_requires_that_stock_read_a_japanese_language_wherever_it_shows():
+    assert "language" in poison.REQUIRED
+    assert poison.language_reads(dict(STOCK, intl_locale="en-US", date_full="x"))["japanese"] is False
+    assert poison.language_reads(STOCK)["japanese"] is True
+    # the language of navigator may stay en-US (the build's own): a Japanese format is the language of the machine, read
+    assert poison.control_failures(dict(STOCK, language="en-US"), "windows") == []
     assert poison.language_reads(dict(STOCK, language="ja-JP"))["japanese"] is True
     assert poison.language_reads(dict(STOCK, date_full="2026年1月15日"))["japanese"] is True
 
@@ -549,3 +554,79 @@ def test_the_clean_dump_is_the_published_engine_dumped_on_this_machine_and_judge
 def test_the_e2e_writes_the_dependence_before_it_asserts_anything_on_a_poisoned_host():
     source = (ROOT / "tests" / "test_ab_oracle_e2e.py").read_text(encoding="utf-8")
     assert source.index("poison.write_dependence(") < source.index("poison.verify_here(") < source.index("poison.dump_findings(")
+
+
+# -
+# Windows keeps 'ja' for the language list that was set from 'ja-JP': the verify reads what the OS reports, and holds it to what the apply recorded.
+
+def windows_answers(font, **override):
+    answers = {"tzutil /g": poison.WINDOWS_ZONE, "(Get-Culture).Name": "ja-JP", "Get-WinUserLanguageList": "ja",
+               "AppsUseLightTheme": "0", "SystemUsesLightTheme": "0", "Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows NT": str(font)}
+    answers.update(override)
+    return Fake(answers)
+
+
+def test_windows_apply_records_what_the_system_reports_for_the_poison(tmp_path, no_session):
+    font = tmp_path / poison.FONT_FILE
+    state = poison.apply_windows(windows_answers(font), font_dir=tmp_path)
+    assert state["after"]["languages"] == "ja" and state["after"]["culture"] == "ja-JP"
+    assert state["after"]["theme"] == {"AppsUseLightTheme": "0", "SystemUsesLightTheme": "0"} and state["after"]["timezone"] == poison.WINDOWS_ZONE
+
+
+@pytest.mark.parametrize("stored", ["ja", "ja-JP", "ja_JP", "JA"])
+def test_a_japanese_language_list_is_in_force_whatever_form_the_system_keeps_it_in(tmp_path, stored):
+    font = tmp_path / poison.FONT_FILE
+    font.write_bytes(poison.canary_font())
+    state = {"font": str(font), "after": {"culture": "ja-JP", "languages": stored}}
+    assert poison.verify_windows(windows_answers(font, **{"Get-WinUserLanguageList": stored}), state) == []
+
+
+@pytest.mark.parametrize("culture, languages", [("en-US", "ja"), ("ja-JP", "en-US"), ("ja-JP", "en-US,ja"), ("it-IT", "it-IT")])
+def test_a_list_or_a_culture_that_is_not_japanese_is_not_in_force_whatever_was_recorded(tmp_path, culture, languages):
+    font = tmp_path / poison.FONT_FILE
+    font.write_bytes(poison.canary_font())
+    state = {"font": str(font), "after": {"culture": culture, "languages": languages}}
+    problems = poison.verify_windows(windows_answers(font, **{"(Get-Culture).Name": culture, "Get-WinUserLanguageList": languages}), state)
+    assert any("not Japanese" in p for p in problems), problems
+
+
+def test_what_the_system_reports_later_must_be_what_it_reported_at_the_apply(tmp_path):
+    font = tmp_path / poison.FONT_FILE
+    font.write_bytes(poison.canary_font())
+    state = {"font": str(font), "after": {"culture": "ja-JP", "languages": "ja"}}
+    problems = poison.verify_windows(windows_answers(font, **{"Get-WinUserLanguageList": "ja-JP"}), state)
+    assert len(problems) == 1 and "recorded 'ja'" in problems[0]
+
+
+def test_a_failed_apply_still_tells_the_later_steps_where_the_state_is_so_that_the_undo_runs(tmp_path, monkeypatch):
+    target = tmp_path / "github_env"
+    state_file = tmp_path / "state.json"
+    monkeypatch.setenv("GITHUB_ENV", str(target))
+    monkeypatch.setattr(poison, "system_name", lambda: "windows")
+    monkeypatch.setattr(poison, "apply_windows", lambda run: {"system": "windows", "font": "f", "theme": {}})
+    monkeypatch.setattr(poison, "verify_windows", lambda run, state: ["the first user language is 'en-US', which is not Japanese"])
+    assert poison.apply(state_file) == 2
+    written = target.read_text(encoding="utf-8")
+    assert "AB_ORACLE_POISON_STATE=%s\n" % state_file.resolve() in written and "AB_ORACLE_POISON=1" not in written
+
+
+# -
+# The control follows the system, and the page and the realm keep what two launches of one engine agree on.
+
+def test_the_control_follows_the_system_scheme_not_playwright_s_light_default():
+    source = (ROOT / "scripts" / "ci_poison_host.py").read_text(encoding="utf-8")
+    assert 'browser.new_context(color_scheme="no-override")' in source
+
+
+def test_the_canary_is_present_when_a_text_measures_its_own_width_not_when_it_differs_from_a_generic_family():
+    page = (ROOT / "scripts" / "host_gate" / "host_gate_page.html").read_text(encoding="utf-8")
+    assert "out.present = out.with.some(w => Math.abs(w - 216) < 1)" in page
+    assert poison.CANARY_TEXT_WIDTH == 216.0
+    # on Linux the user's fonts.conf makes the generic families the canary: the old test ('differs from the fallback') read false there
+
+
+def test_the_realm_hashes_a_png_without_its_per_launch_chunk_and_the_site_without_its_port():
+    realm = (ROOT / "scripts" / "host_gate" / "ab" / "realm.js").read_text(encoding="utf-8")
+    assert "t !== 'deBG'" in realm and "toDataURL: dataUrlHash(c.toDataURL())" in realm and "png: pngHash(" in realm and "textHash" not in realm
+    surfaces = (ROOT / "scripts" / "host_gate" / "ab" / "surfaces.html").read_text(encoding="utf-8")
+    assert "e.origin.replace(/:\\d+$/, ':<port>')" in surfaces
