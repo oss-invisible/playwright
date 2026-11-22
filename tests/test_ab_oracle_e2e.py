@@ -103,6 +103,7 @@ def _check_ab_visit_and_poison(out: Path, candidate: bool) -> None:
     assert control["status"] != "too_few", control["line"] + " (the sample: %s)" % control.get("sample")
     if os.environ.get(poison.SWITCH) != "1":
         return
+    poison.write_dependence(out, Path(os.environ["GITHUB_STEP_SUMMARY"]) if os.environ.get("GITHUB_STEP_SUMMARY") else None)  # a finding, never a verdict
     not_in_force = poison.verify_here(expect_env=True)
     assert not not_in_force, "the host is not poisoned, the oracle ran on a clean machine:\n" + "\n".join(not_in_force)
     control_file = out / "poison-control.json"

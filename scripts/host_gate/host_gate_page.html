@@ -305,6 +305,13 @@ const abPoisonProbe = async () => {
     const width = fam => { const e = document.createElement('span'); e.style.cssText = 'font:12px ' + fam; e.textContent = 'mmmmmmmmmmmm'; box.appendChild(e); const w = e.getBoundingClientRect().width; e.remove(); return w; };
     const out = {with: [width('ZZHostCanary, monospace'), width('ZZHostCanary, serif')], without: [width('monospace'), width('serif')]};
     box.remove(); out.present = out.with[0] !== out.without[0] || out.with[1] !== out.without[1]; return out; });
+  // the width of a text in each generic family: a host whose fontconfig prefers a user font for them answers that font's width
+  f('generic', () => {
+    const box = document.createElement('div'); box.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;white-space:nowrap';
+    document.documentElement.appendChild(box);
+    const out = ['sans-serif', 'serif', 'monospace'].map(fam => { const e = document.createElement('span'); e.style.cssText = 'font:12px ' + fam; e.textContent = 'mmmmmmmmmmmm';
+      box.appendChild(e); const w = e.getBoundingClientRect().width; e.remove(); return w; });
+    box.remove(); return out; });
   try { const c = new AudioContext(); o.audio = {sampleRate: c.sampleRate, maxChannelCount: c.destination.maxChannelCount}; try { c.close(); } catch (e) {} }
   catch (e) { o.audio = 'ERR ' + ((e && e.name) || ''); }
   return o;
