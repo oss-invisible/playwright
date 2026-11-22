@@ -14,10 +14,12 @@
   },
   "firefox-69": {
     "carries": [
-      "the engine tells the client when the parent moves a navigation to another process (onNavigationMoved, with the BrowsingContext and the child id of the process left)"
+      "the engine tells the client when the parent moves a navigation to another process (onNavigationMoved, with the BrowsingContext and the child id of the process left)",
+      "generate mode of the security state does not start Glean at shutdown (telemetry.fog.init_on_shutdown is false)"
     ],
     "files": {
-      "tests/test_a_navigation_that_moved_is_told_by_the_engine_e2e.py": "the engine tells the client when the parent moves a navigation to another process (onNavigationMoved, with the BrowsingContext and child id of the process left); on an older engine the trace holds no such line"
+      "tests/test_a_navigation_that_moved_is_told_by_the_engine_e2e.py": "the engine tells the client when the parent moves a navigation to another process (onNavigationMoved, with the BrowsingContext and child id of the process left); on an older engine the trace holds no such line",
+      "tests/test_security_state_engine_e2e.py": "generate mode does not start Glean at shutdown"
     }
   }
 }

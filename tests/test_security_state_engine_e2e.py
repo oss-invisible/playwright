@@ -265,7 +265,7 @@ def _a_ready_directory_with(root, name, *, state):
     return directory
 
 
-def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_path_factory):
+def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_path_factory, engine_reaches):
     files = inputs
     work = tmp_path_factory.mktemp("generate")
     profile = work / "profile"
@@ -277,6 +277,13 @@ def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_pat
         save_what_the_failed_generation_left(profile, output, code, why, evidence_folder("security-state-generate", work))
     said = (profile / RESULT_NAME).read_bytes().decode("utf-8") if (profile / RESULT_NAME).is_file() else "no %s" % RESULT_NAME
     assert code == 0, "the engine in generate mode %s (exit code %r); its result: %s" % (why or "exited", code, said)
+
+    # Glean started inside the shutdown raced Mozilla's own close of its database (exit -11): firefox-69 never starts it in this mode, so its profile has no glean folder.
+    glean = profile / "datareporting" / "glean"
+    if engine_reaches("firefox-69"):
+        assert not glean.exists(), "generate mode started Glean: %s is in the profile (%s)" % (glean, sorted(p.relative_to(glean).as_posix() for p in glean.rglob("*") if p.is_file()))
+    else:
+        assert glean.is_dir(), "firefox-68 starts Glean at the shutdown of generate mode: %s is not in the profile" % glean
 
     result = json.loads((profile / RESULT_NAME).read_bytes().decode("utf-8"))
     assert set(result) == {"format", "ok", "error", "engine", "collections", "crlite_filter_hashes"}, sorted(result)
