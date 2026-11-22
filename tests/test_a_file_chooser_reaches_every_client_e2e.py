@@ -30,7 +30,9 @@ Not a test of a fix: this is the evidence. On GitHub the red tests name the path
 """
 from __future__ import annotations
 
+import base64
 import importlib
+import os
 
 import pytest
 
@@ -44,6 +46,18 @@ FILE_BYTES = b"hello chooser"
 PAGE = "<!doctype html><title>t</title><input type=file>"
 READ = "() => { const f = document.querySelector('input').files; return f.length ? [f[0].name, f[0].size] : null; }"
 FRESH_PAGES = 5
+MANY = "<!doctype html><title>t</title><input type=file multiple>"
+#: What a page reads of each file: the name, the size, `lastModified` and the bytes (base64), the four things a site can compare with what the user picked.
+READ_ALL = """async () => {
+  const out = [];
+  for (const f of document.querySelector('input').files) {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    out.push({name: f.name, size: f.size, lastModified: f.lastModified, base64: btoa(binary)});
+  }
+  return out;
+}"""
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -112,7 +126,10 @@ def _chooser_after(page, click, where):
 def _chooser_by_handler(page, click, where):
     """The `page.on("filechooser")` form: the handler is registered, then the click, then a wait on the condition."""
     heard = []
-    page.on("filechooser", heard.append)
+
+    def on_chooser(chooser):     # a Python function: the client wraps the handler it is given, and a bound `list.append` has nowhere to hold the wrapper
+        heard.append(chooser)
+    page.on("filechooser", on_chooser)
     click()
     if not wait_until(lambda: heard, DEADLINE_MS // 1000, lambda: page.wait_for_timeout(100)):
         _lost("%s, handler form" % where)
@@ -234,3 +251,27 @@ def test_7b_in_process_a_fresh_page_hears_its_chooser_on_the_first_click(in_proc
         context = in_process_browser.new_context()
         return context, context.new_page()
     _every_fresh_page_gets_its_chooser(new_page, "in process")
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------
+#  8. What the page reads of a file that came over the stream: all of it, exactly.
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------
+def test_8_served_with_a_stock_client_a_streamed_file_reaches_the_page_with_its_name_size_mtime_and_bytes(stock_browser, tmp_path):
+    """Two files over `createTempFiles`, each with an mtime set by the test: the page must read exactly what the client had on its disk - the name, the size, the
+    `lastModified` to the millisecond and every byte. The first is bigger than a chunk of the client's copy (64 KiB on Linux), so it travels in several `write`s."""
+    big, small = tmp_path / "alpha.bin", tmp_path / "beta.txt"
+    big_bytes = bytes(range(256)) * 800 + b"\x00\xff" * 37          # 204,874 bytes, every value, not a multiple of a chunk
+    small_bytes = bytes.fromhex("636166c3a920e29c932073747265616d0a")          # "caf", e-acute, a check mark, "stream" and a newline: UTF-8 that is not ASCII
+    big.write_bytes(big_bytes)
+    small.write_bytes(small_bytes)
+    big_ms, small_ms = 1_600_000_123_456, 1_650_000_654_321
+    os.utime(big, ns=(big_ms * 1_000_000, big_ms * 1_000_000))
+    os.utime(small, ns=(small_ms * 1_000_000, small_ms * 1_000_000))
+    page = stock_browser.new_context().new_page()
+    page.set_content(MANY)
+    chooser = _chooser_after(page, lambda: page.click("input"), "served + stock client, two streamed files")
+    _upload(chooser, [str(big), str(small)], "served + stock client, two paths: createTempFiles + streams")
+    read = page.evaluate(READ_ALL)
+    seen = [(f["name"], f["size"], f["lastModified"]) for f in read]
+    assert seen == [("alpha.bin", len(big_bytes), big_ms), ("beta.txt", len(small_bytes), small_ms)], "the page read %r" % (seen,)
+    assert [base64.b64decode(f["base64"]) for f in read] == [big_bytes, small_bytes], "the bytes the page read are not the bytes of the file"
