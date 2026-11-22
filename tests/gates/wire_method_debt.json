@@ -13,6 +13,7 @@
   {"channel": "Worker", "method": "updateSubscription", "reason": "The server never creates a Worker object (no dispatcher with that TYPE): the console subscription of a worker cannot be reached."}
  ],
  "partial": [
+  {"channel": "BrowserContext", "method": "createTempFiles", "detail": "two items with one name", "witness": "two files of one upload have the same name", "reason": "A wanted divergence: stock writes both items into one file of the call's folder, so the input would read one of them twice; refused with a clear error instead."},
   {"channel": "BrowserContext", "method": "setStorageState", "detail": "per-origin localStorage", "witness": "set_storage_state() with per-origin localStorage is not", "reason": "Only the cookies of a storage state are restored; a state with origins is refused rather than half restored."},
   {"channel": "Frame", "method": "expect", "detail": "to.have.property with an object", "witness": "expect('to.have.property') with an object, an array or a date", "reason": "The page's value is read from the utility world, in another realm than the expected value, so a structured comparison would always say it differs: refused; primitives are compared."},
   {"channel": "Frame", "method": "expect", "detail": "to.match.aria", "witness": "expect('to.match.aria') is not implemented yet", "reason": "The expected template is YAML that Playwright's server parses into a tree and this server has no parser: _expect_probe refuses it by name."}
