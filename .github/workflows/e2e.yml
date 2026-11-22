@@ -145,6 +145,18 @@ jobs:
         shell: bash
         run: python scripts/ci_lab_geoip.py build
 
+      # EVIDENCE ONLY, never red: who writes the caches of fontconfig on this runner. A red of the fontconfig e2e found a valid cache of the bundle in
+      # ~/.fontconfig written by an earlier launch (which one is unknown). Before the first test: what is in the three folders and when it was written; after each
+      # e2e module tests/conftest.py writes the lines [fontconfig-caches] (tests/_fontconfig_caches.py), and the failure of that test lists the folders again.
+      - name: The fontconfig caches of the runner, before the first test (evidence only)
+        continue-on-error: true
+        run: |
+          for d in "$HOME/.fontconfig" "$HOME/.cache/fontconfig" /var/cache/fontconfig; do
+            echo "== $d"
+            ls -la --time-style=full-iso "$d" 2>&1 || true
+          done
+          true
+
       # test_release_e2e.py and test_upgrade_e2e.py (pip, uv, PyPI, the GitHub release) are NOT in this run or in the Windows legs below: tests/conftest.py leaves
       # them out of every run that does not name their file, and user-install.yml (the round after the publication) names it. tests/_post_publication.py.
       - name: Run the full e2e suite under a virtual display, without the root ones

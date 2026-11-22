@@ -81,6 +81,7 @@ from pathlib import Path
 
 import pytest
 
+from _fontconfig_caches import listing_text
 from _waits import wait_until
 from test_a_screenshot_draws_the_text_of_the_bundled_fonts_as_the_content_does_e2e import EVIDENCE_FOLDER, FAMILIES
 from _strace_stand_in import (
@@ -474,10 +475,11 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
     assert cold["bundle_cache_written"], (
         "the cold launch wrote no cache of the bundle under XDG_CACHE_HOME=%s (there: %s; the names of a cache of the bundle: %s). "
         "XDG_CACHE_HOME in the parent's environment: %s. Cache of the bundle opened by the parent before a page, in any folder: %s. "
-        "What fontconfig printed about the folder of the bundle (FC_DEBUG=16): %s. The window: %s. Nothing for a warm launch to read."
+        "What fontconfig printed about the folder of the bundle (FC_DEBUG=16): %s. The window: %s. Nothing for a warm launch to read. "
+        "Caches of fontconfig on the runner now (who wrote them: the lines [fontconfig-caches] of this run): %s."
         % (xdg, [f["name"] for f in cold_cache] or "nothing", cold["bundle_cache_names"], cold["parent_environ_xdg_cache_home"],
            cold["bundle_cache_read_anywhere_at_startup"] or "none", cold["fc_debug_about_the_bundle"] or "nothing (or FC_DEBUG not saved)",
-           cold["startup"]))
+           cold["startup"], listing_text()))
     assert not cold["font_files_not_opened_at_startup"] and cold["bundle_font_files"], (
         "the parent of the cold launch did not open every font file of <GRE>/fonts (%d of %d) before a page was opened: the window does "
         "not see the scan; the test cannot judge. Not opened: %s"
@@ -485,7 +487,7 @@ def test_the_warm_parent_reads_the_bundle_from_fontconfig_cache_and_does_not_sca
 
     scanned_again = not warm["font_files_not_opened_at_startup"]
     assert not scanned_again and warm["cache_files_read_at_startup"], (
-        "the warm parent %s. Cold: %s. Warm: %s. Cache under %s: cold %s, warm %s."
+        "the warm parent %s. Cold: %s. Warm: %s. Cache under %s: cold %s, warm %s. Caches of fontconfig on the runner now: %s."
         % ("opened every one of the %d font files of <GRE>/fonts before a page: it scanned the folder again"
            % warm["bundle_font_files"] if scanned_again else "read no *.cache-* file of fontconfig at its start",
-           result["cold"]["startup"], result["warm"]["startup"], xdg / "fontconfig", cold_cache, warm["fontconfig_cache"]))
+           result["cold"]["startup"], result["warm"]["startup"], xdg / "fontconfig", cold_cache, warm["fontconfig_cache"], listing_text()))

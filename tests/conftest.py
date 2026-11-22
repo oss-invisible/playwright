@@ -218,6 +218,22 @@ def _a_unit_test_does_not_depend_on_the_seal_of_whoever_runs_it(request, monkeyp
     yield
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _the_fontconfig_caches_of_the_runner_are_listed(request):
+    """EVIDENCE ONLY (tests/_fontconfig_caches.py): after each e2e module on Linux, one line per file of ``~/.fontconfig``, ``~/.cache/fontconfig`` and
+    ``/var/cache/fontconfig`` that is new, changed or gone (``[fontconfig-caches] after <module>: ...``), so that a cache of the bundle found in the runner's home says
+    which module wrote it. It never changes an outcome: every error inside it is a line, and the fixture yields once."""
+    import _fontconfig_caches
+
+    try:
+        active = sys.platform.startswith("linux") and any(
+            item.get_closest_marker("e2e") is not None for item in request.session.items if getattr(item, "module", None) is request.module)
+        emit = _fontconfig_caches.emitter(request.config)
+    except Exception:
+        active, emit = False, None
+    yield from _fontconfig_caches.around_a_module(request.module.__name__, active, emit=emit)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _the_lab_declares_the_exit(request, tmp_path_factory):
     """Where an e2e launch leaves from is DECLARED, not asked of three services of the internet.
