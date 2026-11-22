@@ -381,14 +381,27 @@ def request_summary(requests: List[Dict[str, Any]], norm: Normalizer) -> Dict[st
     return dict(sorted(out.items()))
 
 
-def connect_summary(targets: List[str], norm: Normalizer) -> Dict[str, Any]:
-    """The CONNECTs of one phase: the targets in the order they first appeared, and how many of each."""
+def _openers(targets: List[str], openers: Optional[List[Optional[str]]]) -> Dict[str, List[str]]:
+    """``{target: the distinct openers, sorted}`` for the entries whose opener is known (``openers[i]`` is who opened ``targets[i]``, None when it was not looked for)."""
+    found: Dict[str, set] = collections.defaultdict(set)
+    for target, opener in zip(targets, openers or []):
+        if opener is not None:
+            found[target].add(opener)
+    return {t: sorted(found[t]) for t in sorted(found)}
+
+
+def connect_summary(targets: List[str], norm: Normalizer, openers: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
+    """The CONNECTs of one phase: the targets in the order they first appeared, and how many of each; and, in the stages where the lab looked, who opened them (``openers``)."""
     ordered = [norm.text(t) for t in targets]
     counts = collections.Counter(ordered)
-    return {"order": list(dict.fromkeys(ordered)), "counts": dict(sorted(counts.items()))}
+    out: Dict[str, Any] = {"order": list(dict.fromkeys(ordered)), "counts": dict(sorted(counts.items()))}
+    who = _openers(ordered, openers)
+    if who:
+        out["openers"] = who
+    return out
 
 
-def dns_summary(queries: List[Tuple[str, int, str]]) -> Dict[str, Any]:
+def dns_summary(queries: List[Tuple[str, int, str]], openers: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
     """The DoH questions of one phase: the names in the order they were first asked, and the types asked of each (the order of A, AAAA and HTTPS of one lookup
     is a race of the resolver)."""
     types: Dict[str, set] = collections.defaultdict(set)
@@ -397,7 +410,11 @@ def dns_summary(queries: List[Tuple[str, int, str]]) -> Dict[str, Any]:
         if name not in types:
             order.append(name)
         types[name].add(qtype)
-    return {"order": order, "types": {n: sorted(types[n]) for n in sorted(types)}}
+    out: Dict[str, Any] = {"order": order, "types": {n: sorted(types[n]) for n in sorted(types)}}
+    who = _openers([q[0] for q in queries], openers)
+    if who:
+        out["openers"] = who
+    return out
 
 
 def udp_summary(events: List[Dict[str, Any]], norm: Normalizer) -> Dict[str, Any]:
@@ -411,7 +428,11 @@ def udp_summary(events: List[Dict[str, Any]], norm: Normalizer) -> Dict[str, Any
             order.append(target)
         kinds[target].add(e["message"])
         counts[target] += 1
-    return {"order": order, "messages": {t: sorted(kinds[t]) for t in sorted(kinds)}, "counts": dict(sorted(counts.items()))}
+    out: Dict[str, Any] = {"order": order, "messages": {t: sorted(kinds[t]) for t in sorted(kinds)}, "counts": dict(sorted(counts.items()))}
+    who = _openers([norm.text(e["target"]) for e in events], [e.get("opener") for e in events])
+    if who:
+        out["openers"] = who
+    return out
 
 
 _CANDIDATE = re.compile(r"^(?:a=)?candidate:\S+ (\d+) (\w+) (\d+) (\S+) (\d+) typ (\w+)(.*)$")
@@ -643,10 +664,48 @@ def make_lab_classes() -> Tuple[type, type, type]:
             self.reroute: Dict[int, int] = {}
             self.allowed_tcp: set = set()
             self.udp_allowed: set = set()
+            #: The stages in which the lab looks who opened a connection (``Lab(attribute_in=...)``), and what it found: by the index of the control connection (what the DoH
+            #: says carried a question), and by the index of the association (what a datagram came on).
+            self.attribute_in: Tuple[str, ...] = ()
+            self._openers: Dict[int, str] = {}
+            self._association_openers: Dict[int, str] = {}
+            self.opener_lookup: Callable[..., str] = self._look_up_opener
             super().__init__("lab", doh, udp="relay", tcp_exit=exit_ip, udp_exit=exit_ip, relay_host=host, exit_host=host)
 
+        def _attributing(self) -> bool:
+            phase = self.rec.phase
+            return any(phase == p or phase.startswith(p + ".") for p in self.attribute_in)
+
+        def _look_up_opener(self, c: socket.socket) -> str:
+            try:
+                return classify_pid(pid_of_client(c.getpeername()[1], self.port))
+            except OSError:
+                return "unknown"
+
+        def opener_of_connection(self, index: Optional[int]) -> Optional[str]:
+            """Who opened the control connection ``index`` (None when the lab did not look at it)."""
+            return self._openers.get(index) if index is not None else None
+
+        def _note_opener(self, c: socket.socket) -> Optional[str]:
+            if not self._attributing():
+                return None
+            opener = self.opener_lookup(c)
+            index = getattr(self._local, "index", None)
+            if index is not None:
+                self._openers[index] = opener
+            return opener
+
+        def _associate(self, c: socket.socket) -> None:
+            self._local.opener = self._note_opener(c)
+            super()._associate(c)
+
+        def _request(self, kind: str, detail: str) -> None:
+            super()._request(kind, detail)
+            if kind == "associate" and detail.startswith("association #") and getattr(self._local, "opener", None) is not None:
+                self._association_openers[int(detail.split("#")[1])] = self._local.opener
+
         def _connect(self, c: socket.socket, host: str, port: int) -> None:
-            self.rec.event("connect", target="%s:%d" % (host, port))
+            self.rec.event("connect", target="%s:%d" % (host, port), opener=self._note_opener(c))
             special = (host, port) in ds.DOH_TARGETS or (host, port) in (WHOAMI4, WHOAMI6, (WEB_NAME, 80)) or host.lower() in self.whoami_names
             if special or not (ds.is_loopback(host) or (host, port) in self.allowed_tcp):
                 super()._connect(c, host, port)
@@ -667,7 +726,8 @@ def make_lab_classes() -> Tuple[type, type, type]:
                 upstream.close()
 
         def _route(self, host: str, dport: int, atyp: int, payload: bytes, out_port: int, answer: Any) -> Any:
-            self.rec.event("udp", target="%s:%d" % (host, dport), message=message_kind(payload))
+            association = getattr(self._dgram, "index", None)
+            self.rec.event("udp", target="%s:%d" % (host, dport), message=message_kind(payload), opener=self._association_openers.get(association) if association is not None else None)
             if atyp == 1 and (host, dport) == (TURN_IP, TURN_PORT):
                 return self.turn.address, (host, dport)
             if (host, dport) in ((STUN_NAME, STUN_PORT), (STUN_NUMBER, STUN_PORT), (MEASURE_NUMBER, STUN_PORT)):
@@ -775,6 +835,59 @@ def lab_prefs() -> Dict[str, Any]:
             "network.http.http3.disable_when_third_party_roots_found": False}
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------
+#  Who opens a connection of the lab: the Python of the core and the wrapper (this process), or a process of the engine
+# ---------------------------------------------------------------------------------------------------------------------------------
+def browser_kind(cmd: List[str]) -> str:
+    """What an engine process is, from its command line: ``parent``, the kind of a ``-contentproc`` (the last argument: ``socket``, ``tab``, ``rdd``, ``utility``...), or
+    ``backgroundtask:<name>`` (the pingsender of the shutdown)."""
+    if "--backgroundtask" in cmd or "-backgroundtask" in cmd:
+        flag = "--backgroundtask" if "--backgroundtask" in cmd else "-backgroundtask"
+        i = cmd.index(flag)
+        return "backgroundtask:" + (cmd[i + 1] if i + 1 < len(cmd) else "?")
+    if "-contentproc" in cmd:
+        return cmd[-1].strip('"').lower() if cmd else "?"
+    return "parent"
+
+
+def classify_pid(pid: Optional[int], python_pid: Optional[int] = None, process: Optional[Callable[[int], Any]] = None) -> str:
+    """``core`` for the Python process that runs the lab (it is the one that imports the core and the wrapper, and makes the core's own requests at launch), ``browser:<kind>`` for
+    a process of the engine, ``other:<name>`` for anything else, ``unknown`` when the process was not found."""
+    if pid is None:
+        return "unknown"
+    if pid == (os.getpid() if python_pid is None else python_pid):
+        return "core"
+    try:
+        if process is None:
+            import psutil
+
+            process = psutil.Process
+        proc = process(pid)
+        name = os.path.splitext(proc.name().lower())[0]
+        if name.startswith(("firefox", "invisible")):
+            return "browser:" + browser_kind([str(a) for a in proc.cmdline()])
+        return "other:" + name
+    except Exception:  # noqa: BLE001 - a process that is gone, or one that may not be read
+        return "unknown"
+
+
+def pid_of_client(source_port: int, gateway_port: int, connections: Optional[Callable[[], list]] = None) -> Optional[int]:
+    """The pid that owns the client end of a connection to the gateway: the TCP connection whose local port is ``source_port`` (what the gateway sees as the port of its client)
+    and whose remote port is the gateway's. Linux and Windows both give it with ``psutil.net_connections``; it exists as long as the connection does, and the gateway looks at
+    it while it is serving the handshake."""
+    if connections is None:
+        import psutil
+
+        connections = lambda: psutil.net_connections("tcp")  # noqa: E731
+    try:
+        for c in connections():
+            if c.laddr and c.raddr and c.laddr.port == source_port and c.raddr.port == gateway_port:
+                return c.pid
+    except Exception:  # noqa: BLE001 - a table that cannot be read says nothing
+        return None
+    return None
+
+
 class PortCollision(RuntimeError):
     """Two servers of one lab got the same port number (on different addresses, which the system allows)."""
 
@@ -795,7 +908,7 @@ class Lab:
     """Everything the lab is, for ONE launch of the browser: the fake DoH, the gateway, the witness, the servers that write down what they are sent, and the
     recorder that says which stage of the run each thing belongs to. ``journey`` adds the P4 site behind its tees, ``wire`` the HTTPS and HTTP/3 servers."""
 
-    def __init__(self, *, journey: bool = False, wire: bool = False, host: Optional[str] = None) -> None:
+    def __init__(self, *, journey: bool = False, wire: bool = False, host: Optional[str] = None, attribute_in: Tuple[str, ...] = ("launch",)) -> None:
         from _doh_servers import FakeDoh
         from _lab_egress import LAB_EGRESS_IP
         from _witness import Witness
@@ -818,12 +931,14 @@ class Lab:
         self.doh = FakeDoh(zone)
         self._closers.append(self.doh.close)
         self.rec.attach("doh", self.doh.queries)
+        self.rec.attach("doh_connections", self.doh.question_connections)
         self.witness = Witness(self.host)
         self._closers.append(self.witness.close)
         self._claim(self.witness.port, "witness")
         self.turn = turn_class(self.host)
         self._closers.append(self.turn.close)
         self.gateway = gateway_class(self.rec, self.doh, self.turn, self.host, self.exit_ip)
+        self.gateway.attribute_in = attribute_in
         self._closers.append(self.gateway.close)
         self.site = page_class("http://%s:%d/c.png" % (self.host, self.witness.port))
         self._closers.append(self.site.close)
@@ -905,11 +1020,27 @@ def guarded(fn: Callable[[], Any]) -> Any:
         return {"error": _first_line(exc)}
 
 
-def phase_data(lab: Lab, phase: str) -> Dict[str, Any]:
-    """What the lab saw in a stage and the stages under it: the CONNECTs, the DoH questions, the datagrams, the HTTP requests of the tees."""
+def phase_data(lab: Lab, phase: str, skip_connects: Callable[[str], bool] = lambda target: False) -> Dict[str, Any]:
+    """What the lab saw in a stage and the stages under it: the CONNECTs, the DoH questions, the datagrams, the HTTP requests of the tees. Where the lab looked who opened an entry
+    (``Lab(attribute_in=...)``), each summary says so: ``openers``. ``skip_connects`` leaves out the CONNECTs it is true of."""
     queries = [(q.name, q.qtype, q.via) for q in lab.rec.slice("doh", phase)]
-    return {"connects": connect_summary([e["target"] for e in lab.rec.of(phase, "connect")], lab.norm), "dns": dns_summary(queries),
+    gateway = getattr(lab, "gateway", None)
+    attributing = bool(gateway is not None and gateway.attribute_in)
+    asked_on = [c[2] for c in lab.rec.slice("doh_connections", phase)] if attributing else []
+    connects = [e for e in lab.rec.of(phase, "connect") if not skip_connects(e["target"])]
+    return {"connects": connect_summary([e["target"] for e in connects], lab.norm, [e.get("opener") for e in connects]),
+            "dns": dns_summary(queries, [gateway.opener_of_connection(i) for i in asked_on] if attributing else None),
             "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm), "requests": request_summary(lab.rec.of(phase, "http"), lab.norm)}
+
+
+def launch_data(lab: Lab) -> Dict[str, Any]:
+    """The launch stage (everything before the first page of the walk): the CONNECTs and the DNS questions with the process that opened each, the datagrams and the requests.
+    The CONNECTs to the DoH road are not in it: the engine opens one at start-up, and it lands in this stage or in the first step of the journey (A/A run 44960767715, Windows);
+    they are counted with the journey's (:func:`journey_data`)."""
+    import _doh_servers as ds
+
+    doh = {"%s:%d" % target for target in ds.DOH_TARGETS}
+    return phase_data(lab, "launch", skip_connects=lambda target: target in doh)
 
 
 def step_data(lab: Lab, phase: str) -> Dict[str, Any]:
@@ -1236,7 +1367,7 @@ def run_main(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
             if trap is not None:
                 trap.__exit__(None, None, None)
         out["lab"] = {"direct": direct_report(lab, watcher, trap), "resolver_trap_ran": trap is not None,
-                      "launch": lab.norm.walk(step_data(lab, "launch"))}
+                      "launch": lab.norm.walk(launch_data(lab))}
     return out
 
 
@@ -1252,8 +1383,9 @@ def run_idle(binary: str, seed: int, condition: str, patch: Any) -> Dict[str, An
     """A launch with no action, ended at an event the lab drives (see IDLE in the docstring of this file): ``c1`` at the first round trip of a sentinel, ``c2`` when two
     rounds in a row leave what is not the sentinel unchanged."""
     out: Dict[str, Any] = {}
-    with open_lab() as lab:
+    with open_lab(attribute_in=("launch", "idle", "sentinel")) as lab:
         with launch(binary, seed, lab, patch) as browser:
+            out["launch"] = lab.norm.walk(launch_data(lab))      # who asks what while the browser starts: the STUN Binding at launch is the core's measurement, not the browser's
             lab.rec.set_phase("idle")
             page = browser.new_context(ignore_https_errors=True).new_page()
             lab.rec.set_phase("sentinel.0")
@@ -1316,10 +1448,10 @@ def outside_the_lab(lab: Lab, target: str) -> bool:
     return not (ds.is_loopback(host) or known)
 
 
-def exit_pings_summary(targets: List[str], recorded: bool, norm: Normalizer) -> Dict[str, Any]:
+def exit_pings_summary(targets: List[str], recorded: bool, norm: Normalizer, openers: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
     """What the shutdown of an idle launch sent out of the lab: ``recorded`` (the pref was written, so the engine may send), and the CONNECTs towards names outside the lab, in the
     form the proxy was asked them (a name, or an address), how many of each, and in the order they were first asked."""
-    return dict(connect_summary(targets, norm), recorded=recorded)
+    return dict(connect_summary(targets, norm, openers), recorded=recorded)
 
 
 def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
@@ -1329,7 +1461,7 @@ def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
     connection from the browser or from its pingsender that did not go to the proxy is in ``direct``, which is red on either side."""
     from _leaks import Watcher
 
-    with open_lab() as lab:
+    with open_lab(attribute_in=("exit",)) as lab:
         trap = start_trap()
         watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
         recorded = False
@@ -1345,8 +1477,8 @@ def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
             watcher.stop()
             if trap is not None:
                 trap.__exit__(None, None, None)
-        targets = [e["target"] for e in lab.rec.of("exit", "connect") if outside_the_lab(lab, e["target"])]
-        out = exit_pings_summary(targets, recorded, lab.norm)
+        pings = [e for e in lab.rec.of("exit", "connect") if outside_the_lab(lab, e["target"])]
+        out = exit_pings_summary([e["target"] for e in pings], recorded, lab.norm, [e.get("opener") for e in pings])
         out["direct"] = direct_report(lab, watcher, trap)
         return out
 

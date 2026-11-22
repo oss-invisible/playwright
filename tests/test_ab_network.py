@@ -1193,6 +1193,134 @@ def test_the_idle_category_of_the_first_seed_holds_the_exit_pings(monkeypatch):
     assert "idle" not in ab.walk_seed("ff", 12, False, object())
 
 
+def test_an_engine_process_is_named_by_its_kind_and_the_python_that_runs_the_lab_is_the_core():
+    assert ab.browser_kind(["firefox", "-no-remote", "-profile", "/p", "-juggler-pipe"]) == "parent"
+    assert ab.browser_kind(["firefox", "-contentproc", "-prefsHandle", "0:1", "socket"]) == "socket"
+    assert ab.browser_kind(["firefox", "-contentproc", "-isForBrowser", '"Tab"']) == "tab"
+    assert ab.browser_kind(["firefox", "--backgroundtask", "pingsender", "https://incoming.telemetry.mozilla.org/x"]) == "backgroundtask:pingsender"
+
+    class Proc:
+        def __init__(self, name, cmd):
+            self.n, self.c = name, cmd
+
+        def name(self):
+            return self.n
+
+        def cmdline(self):
+            return self.c
+
+    table = {10: Proc("python.exe", ["python"]), 20: Proc("firefox.exe", ["firefox", "-contentproc", "socket"]), 30: Proc("firefox", ["firefox", "--backgroundtask", "pingsender"]), 40: Proc("node", ["node"])}
+
+    def process(pid):
+        if pid not in table:
+            raise LookupError("gone")
+        return table[pid]
+
+    assert ab.classify_pid(10, python_pid=10, process=process) == "core"
+    assert ab.classify_pid(20, python_pid=10, process=process) == "browser:socket"
+    assert ab.classify_pid(30, python_pid=10, process=process) == "browser:backgroundtask:pingsender"
+    assert ab.classify_pid(40, python_pid=10, process=process) == "other:node"
+    assert ab.classify_pid(99, python_pid=10, process=process) == "unknown" and ab.classify_pid(None, python_pid=10) == "unknown"
+
+
+def test_the_owner_of_a_client_socket_is_found_by_the_port_the_gateway_sees_and_the_port_of_the_gateway():
+    from types import SimpleNamespace as NS
+
+    rows = [NS(laddr=NS(port=5000), raddr=NS(port=7777), pid=111),         # the client end of a connection to the gateway
+            NS(laddr=NS(port=7777), raddr=NS(port=5000), pid=222),         # the gateway's own end of it: not the opener
+            NS(laddr=NS(port=5000), raddr=NS(port=443), pid=333),          # another connection that happens to use the same local port
+            NS(laddr=(), raddr=(), pid=None)]
+    assert ab.pid_of_client(5000, 7777, connections=lambda: rows) == 111
+    assert ab.pid_of_client(5001, 7777, connections=lambda: rows) is None
+
+    def broken():
+        raise PermissionError("not allowed")
+
+    assert ab.pid_of_client(5000, 7777, connections=broken) is None
+
+
+def test_the_gateway_says_who_opened_a_connect_and_a_datagram_of_the_launch_stage_and_leaves_the_other_stages_alone():
+    """This test process is the Python of the core: it opens the connections of the test, so the opener must read ``core``; a datagram carries the opener of its association."""
+    from _socks_servers import MEASURE_NUMBER, STUN_PORT
+
+    with ab.Lab(host="127.0.0.1") as lab:
+        assert lab.gateway.attribute_in == ("launch",) and lab.rec.phase == "launch"
+        sock, code = _socks_connect(lab.gateway.port, "192.0.2.77", 8080)          # refused, but written down with its opener
+        sock.close()
+        sock, code = _socks_connect_name(lab.gateway.port, "incoming.telemetry.mozilla.org", 443)
+        sock.close()
+        # a UDP association of this process, and one STUN Binding to the measurement server of the lab
+        control = socket.create_connection(("127.0.0.1", lab.gateway.port), timeout=30)
+        control.sendall(b"\x05\x01\x00")
+        assert control.recv(2) == b"\x05\x00"
+        control.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        reply = b""
+        while len(reply) < 10:
+            reply += control.recv(10 - len(reply))
+        assert reply[1] == 0
+        relay = (socket.inet_ntoa(reply[4:8]), struct.unpack("!H", reply[8:10])[0])
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        binding = b"\x00\x01\x00\x00\x21\x12\xa4\x42" + b"\x07" * 12
+        udp.sendto(b"\x00\x00\x00\x01" + socket.inet_aton(MEASURE_NUMBER) + struct.pack("!H", STUN_PORT) + binding, relay)
+        deadline = time.monotonic() + 30
+        while not lab.rec.of("launch", "udp") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        udp.close()
+        control.close()
+        connects = lab.rec.of("launch", "connect")
+        assert [(e["target"], e["opener"]) for e in connects] == [("192.0.2.77:8080", "core"), ("incoming.telemetry.mozilla.org:443", "core")]
+        (datagram,) = lab.rec.of("launch", "udp")
+        assert datagram["target"] == "%s:%d" % (MEASURE_NUMBER, STUN_PORT) and datagram["message"] == "stun-0x0001" and datagram["opener"] == "core"
+        data = ab.launch_data(lab)
+        assert data["connects"]["openers"] == {"192.0.2.77:8080": ["core"], "incoming.telemetry.mozilla.org:443": ["core"]}
+        assert data["udp"]["openers"] == {"%s:%d" % (MEASURE_NUMBER, STUN_PORT): ["core"]}
+        # another stage: nothing is looked up, and the summaries have no openers
+        lab.rec.set_phase("journey.01")
+        sock, code = _socks_connect(lab.gateway.port, "192.0.2.78", 8080)
+        sock.close()
+        (later,) = lab.rec.of("journey.01", "connect")
+        assert later["opener"] is None and "openers" not in ab.phase_data(lab, "journey.01")["connects"]
+
+
+def test_the_dns_questions_of_a_stage_say_who_asked_by_the_connection_that_carried_them():
+    from _doh_servers import DohQuery
+
+    with ab.Lab(host="127.0.0.1") as lab:
+        lab.gateway._openers[3] = "browser:socket"
+        lab.gateway._openers[4] = "core"
+        lab.doh.queries.append(DohQuery("journey-a.test", 1, "lab"))
+        lab.doh.question_connections.append(("journey-a.test", 1, 3))
+        lab.doh.queries.append(DohQuery("geo.example", 1, "lab"))
+        lab.doh.question_connections.append(("geo.example", 1, 4))
+        assert ab.phase_data(lab, "launch")["dns"] == {"order": ["journey-a.test", "geo.example"], "types": {"geo.example": [1], "journey-a.test": [1]},
+                                                       "openers": {"geo.example": ["core"], "journey-a.test": ["browser:socket"]}}
+
+
+def _with_launch(t, connects=(), udp=None):
+    for seed in t["seeds"].values():
+        seed["lab"]["launch"] = {"connects": ab.connect_summary([c for c, _o in connects], ab.Normalizer({}), [o for _c, o in connects]),
+                                 "udp": {"order": ["198.51.100.6:19302"], "messages": {"198.51.100.6:19302": ["stun-0x0001"]}, "counts": {"198.51.100.6:19302": 1},
+                                         "openers": {"198.51.100.6:19302": [udp or "core"]}}}
+    return t
+
+
+def test_a_connect_of_the_launch_stage_on_one_side_only_is_red_and_names_who_opened_it():
+    one = [("203.0.113.9:443", "core")]
+    green = compare(_with_launch(transcript("a"), one), _with_launch(transcript("b"), one))
+    assert green["verdict"] == "green"
+    red = compare(_with_launch(transcript("a"), one), _with_launch(transcript("b"), []))
+    assert red["verdict"] == "red"
+    paths = {d["path"]: (d["a"], d["b"]) for d in red["differences"]}
+    assert paths["seeds/11/lab/launch/connects/openers/203.0.113.9:443/0"] == ("core", ab.MISSING), "the difference names the opener"
+    assert paths["seeds/11/lab/launch/connects/order/0"] == ("203.0.113.9:443", ab.MISSING)
+    # the same destination opened by another process is a difference too
+    other = compare(_with_launch(transcript("a"), one), _with_launch(transcript("b"), [("203.0.113.9:443", "browser:socket")]))
+    assert other["verdict"] == "red" and {(d["a"], d["b"]) for d in other["differences"]} == {("core", "browser:socket")}
+    # and so is the STUN Binding of the launch coming from the browser where the published engine's core sent it
+    stun = compare(_with_launch(transcript("a")), _with_launch(transcript("b"), udp="browser:parent"))
+    assert stun["verdict"] == "red" and any(d["path"].endswith("/lab/launch/udp/openers/198.51.100.6:19302/0") and d["b"] == "browser:parent" for d in stun["differences"])
+
+
 def test_the_script_names_the_categories_the_run_writes_and_the_e2e_floor_is_below_a_minimal_run():
     assert ab.CATEGORIES == ("journey", "https", "h3", "webrtc", "idle", "lab")
     import test_ab_network_e2e as e2e
