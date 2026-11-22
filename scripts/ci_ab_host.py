@@ -127,9 +127,13 @@ def _base(path: str) -> str:
 
 def label_of_exec(path: str, argv: list, real: str) -> str:
     """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), else the
-    program's name (lower case)."""
+    program's name (lower case); a background task of the engine (`firefox.exe --backgroundtask pingsender ...`) is `backgroundtask/<name>`."""
     if "-contentproc" in argv:
         return kind_of(argv)  # whatever path it was started by (the binary, /proc/self/exe)
+    for flag in ("--backgroundtask", "-backgroundtask"):
+        if flag in argv:
+            i = argv.index(flag)
+            return "backgroundtask/%s" % (argv[i + 1].lower() if i + 1 < len(argv) else "?")
     if any(a.lstrip("-") == "glxtest" for a in argv[1:]) or _base(argv[0] if argv else "").lower() == "glxtest":
         return "glxtest"
     if path == real or _base(path).lower() == _base(real).lower():
@@ -143,11 +147,14 @@ def label_of_exec(path: str, argv: list, real: str) -> str:
 class Context:
     """What the classifier needs to know about the machine and the run: `platform` ("win32" or "linux"), `app` (the engine's package
     folders: the link and the real one), `temp` (the run's temp root and the work folders under it: the profile and the temp dirs of the
-    launch), `cache` (the folders the oracle made the cache of the run in) and, on Windows, `devices` ({`\\device\\harddiskvolume3`: `c:`})."""
+    launch), `cache` (the folders the oracle made the cache of the run in) and, on Windows, `devices` ({`\\device\\harddiskvolume3`: `c:`}) and
+    `aliases` ([(short, long)] prefixes: the 8.3 spelling of a folder and its long one, `c:\\lab\\labrun~1` and `c:\\lab\\labrunner`: the runner's
+    TEMP is spelled the short way and the engine opens the same folder under both spellings, so every path and every root is put in the long one)."""
 
-    def __init__(self, platform: str, app=(), temp=(), cache=(), devices: dict | None = None) -> None:
+    def __init__(self, platform: str, app=(), temp=(), cache=(), devices: dict | None = None, aliases=()) -> None:
         self.platform = platform
         self.windows = platform == "win32"
+        self.aliases = [(a.replace("/", "\\").rstrip("\\").lower(), b.replace("/", "\\").rstrip("\\").lower()) for a, b in aliases if a and b]
         self.app = [self._key(p) for p in app if p]
         self.temp = [self._key(p) for p in temp if p]
         self.cache = [self._key(p) for p in cache if p]
@@ -155,8 +162,15 @@ class Context:
 
     def _key(self, path: str) -> str:
         if self.windows:
-            return path.replace("/", "\\").rstrip("\\").lower()
+            return self.long_form(path.replace("/", "\\").rstrip("\\").lower())
         return path.rstrip("/")
+
+    def long_form(self, low: str) -> str:
+        """`low` (a lower case Windows path) with the 8.3 spelling of a folder in `aliases` replaced by the long one."""
+        for short, long in self.aliases:
+            if low == short or low.startswith(short + "\\"):
+                return long + low[len(short):]
+        return low
 
     def under(self, path: str, root: str) -> str | None:
         """The part of `path` below `root` (with `/`), or None."""
@@ -181,6 +195,9 @@ _NT_VOLUME = re.compile(r"^\\device\\harddiskvolume\d+", re.I)
 _NT_PIPE = re.compile(r"^\\(device\\namedpipe|\\\.\\pipe|pipe)\\", re.I)
 _OWN_PIPE = re.compile(r"(gecko|mozilla|firefox|chrome\.\d)", re.I)
 _PROC_NUMBER = re.compile(r"(?<=/)\d+(?=/|$)")
+#: The engine writes `C:\ProgramData\Mozilla-<install id>\uninstall_ping_<install hash>_<uuid>.json` (and `.json.tmp`) once per launch: a host path whose
+#: name carries the uuid of the ping. The folder and the name are compared, the random part is not.
+_UNINSTALL_PING = re.compile(r"(\\uninstall_ping_[0-9a-f]+_)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.json(?:\.tmp)?)$")
 
 
 def classify(path: str, ctx: Context) -> tuple | None:
@@ -215,13 +232,14 @@ def _classify_windows(path: str, ctx: Context):
     vol = _NT_VOLUME.match(low)
     if vol and vol.group(0) in ctx.devices:
         low = ctx.devices[vol.group(0)] + low[len(vol.group(0)):]
+    low = ctx.long_form(low)
     pipe = _NT_PIPE.match(low)
     if pipe:
         return ("ipc", low) if _OWN_PIPE.search(low) else ("host", low)
     own = ctx.own(low)
     if own:
         return own
-    return "host", low.rstrip("\\") or low
+    return "host", _UNINSTALL_PING.sub(r"\1<uuid>\2", low.rstrip("\\") or low)
 
 
 def classify_paths(paths, ctx: Context) -> tuple:
@@ -528,6 +546,7 @@ class WindowsTrace:
         self.session = False
 
     def _canary(self, which: str) -> str:
+        """A file of the oracle's own, written and read now: the session must have a Create event of it."""
         path = self.work / ("canary-%s-%s" % (which, self.name))
         path.write_text(which, encoding="utf-8")
         path.read_text(encoding="utf-8")
@@ -544,7 +563,11 @@ class WindowsTrace:
         _tool(["logman", "create", "trace", self.name, "-p", FILE_PROVIDER, FILE_CREATE_KEYWORD, "0xff", "-o", str(self.etl), "-ets",
                "-bs", "1024", "-nb", "64", "256"])
         self.session = True
-        self._start_canary = self._canary("start")
+        # The provider is enabled a moment after the session exists (the first canary of the first launch of run 44963364060 was not seen): the canaries are written
+        # with a round trip to the session between them, and it is the LAST one, written just before the launch, that must be in the trace.
+        for n in (1, 2, 3):
+            _tool(["logman", "query", self.name, "-ets"])
+            self._start_canary = self._canary("start%d" % n)
 
     def _registry_value(self):
         try:
@@ -574,7 +597,7 @@ class WindowsTrace:
         seen, events = etw_files(self.xml, pids)
         problems = []
         mine = {name for pid, name in seen if pid == os.getpid()}
-        for label, canary in (("first", self._start_canary), ("last", end_canary)):
+        for label, canary in (("last start", self._start_canary), ("end", end_canary)):
             if not any(m.lower().endswith(os.path.basename(canary).lower()) for m in mine):
                 problems.append("the file trace did not see the %s canary file of the oracle (%s): the session was not recording" % (label, os.path.basename(canary)))
         lost = re.search(r"(?i)events?\s+lost\D{0,20}(\d+)", summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else "")
@@ -607,6 +630,24 @@ class WindowsTrace:
         except TraceError:
             pass
         self.before = None
+
+
+def windows_aliases(folders) -> list:
+    """[(short, long)] for the folders whose 8.3 spelling differs from the long one (GetShortPathNameW / GetLongPathNameW; Windows only)."""
+    import ctypes
+
+    out, seen = [], set()
+    buf = ctypes.create_unicode_buffer(32768)
+    for folder in folders:
+        if not folder or not os.path.isdir(folder):
+            continue
+        long = buf.value if ctypes.windll.kernel32.GetLongPathNameW(folder, buf, 32768) else folder
+        short = buf.value if ctypes.windll.kernel32.GetShortPathNameW(long, buf, 32768) else long
+        for a, b in ((short, long), (folder, long)):
+            if a.lower() != b.lower() and (a.lower(), b.lower()) not in seen:
+                seen.add((a.lower(), b.lower()))
+                out.append((a, b))
+    return out
 
 
 def windows_device_map() -> dict:
@@ -778,7 +819,8 @@ def _context(binary: str, windows: bool, work: Path) -> Context:
     app = {os.path.dirname(real), os.path.dirname(os.path.abspath(binary))}
     temp = {tempfile.gettempdir(), str(work)}
     if windows:
-        return Context("win32", app=app, temp=temp, devices=windows_device_map())
+        folders = [*app, *temp, os.path.expanduser("~"), *(os.environ.get(v, "") for v in ("USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "ProgramData", "SystemRoot"))]
+        return Context("win32", app=app, temp=temp, devices=windows_device_map(), aliases=windows_aliases(folders))
     return Context("linux", app=app, temp=temp, cache={os.environ.get("XDG_CACHE_HOME", "")})
 
 
@@ -885,7 +927,14 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         if not got["exited"]["exited"]:
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         detail = sorted(({"label": p["label"], "cmd": p["cmd"][:300]} for p in procs.values()), key=lambda d: (d["label"], d["cmd"]))
+        by = collections.defaultdict(set)
+        for pid, name in got["files"]:
+            c = classify(name, ctx)
+            if c and c[0] == "host" and pid in procs:
+                by[c[1]].add(procs[pid]["label"])
+        touched_by = {path: sorted(kinds) for path, kinds in sorted(by.items())}
     else:
+        touched_by = None
         procs = spawned_processes(_read_lines(log), real)
         raw = touched_paths(_read_lines(log))
         info, problems = {"source": "strace", "exited": True}, []
@@ -894,8 +943,10 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     host, ours = classify_paths(raw, ctx)
     kinds = dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
     info.update({"processes": len(procs), "paths": len(raw)})
-    return {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems,
-            "processes": detail}
+    out = {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail}
+    if touched_by is not None:
+        out["touched_by"] = touched_by  # evidence, not compared: which kinds of process opened each host path
+    return out
 
 
 def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:

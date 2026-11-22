@@ -625,7 +625,7 @@ def test_the_windows_trace_turns_the_audit_on_before_the_session_and_puts_the_ma
 def test_the_windows_trace_is_red_when_its_session_did_not_see_its_own_canary(tmp_path, monkeypatch):
     trace, _fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start",))
     got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
-    assert len(got["problems"]) == 1 and "last canary" in got["problems"][0] and "was not recording" in got["problems"][0]
+    assert len(got["problems"]) == 1 and "end canary" in got["problems"][0] and "was not recording" in got["problems"][0]
 
 
 def test_the_windows_trace_is_red_for_a_process_it_has_no_file_of(tmp_path, monkeypatch):
@@ -641,3 +641,66 @@ def test_a_windows_tool_that_fails_says_so_and_is_not_an_empty_trace(tmp_path, m
     monkeypatch.setattr(host, "_tool", refuse)
     with pytest.raises(host.TraceError, match="Access is denied"):
         host.WindowsTrace(tmp_path).start()
+
+
+# -
+# The spellings of run 44963364060 (Windows): the runner's TEMP is the 8.3 one, the engine opens the same folder under both spellings.
+
+RUNNER = host.Context("win32", app=["C:\\Lab\\labrunner\\AppData\\Local\\invisible-playwright\\invisible-playwright\\Cache\\firefox-68_159.0_20261121043125"],
+                      temp=["C:\\Lab\\LABRUN~1\\AppData\\Local\\Temp\\ab-host-tmp-hut170cg", "C:\\Lab\\LABRUN~1\\AppData\\Local\\Temp\\ab-host-tmp-hut170cg\\ab-host-x\\seed0"],
+                      devices={"\\Device\\HarddiskVolume3": "C:"}, aliases=[("C:\\Lab\\LABRUN~1", "C:\\Lab\\labrunner")])
+
+
+@pytest.mark.parametrize("path", [
+    "c:\\lab\\labrunner\\appdata\\local\\temp\\ab-host-tmp-hut170cg\\invisible_profile_8704_tdb3g1yy\\breach-alerts.db",
+    "C:\\Lab\\LABRUN~1\\AppData\\Local\\Temp\\ab-host-tmp-hut170cg\\invisible_profile_8704_tdb3g1yy\\breach-alerts.db-wal",
+    "\\Device\\HarddiskVolume3\\Lab\\LABRUN~1\\AppData\\Local\\Temp\\ab-host-tmp-hut170cg\\invisible_profile_8704_tdb3g1yy\\extension-store\\data.safe.bin",
+    "\\??\\c:\\lab\\labrunner\\appdata\\local\\temp\\ab-host-tmp-hut170cg\\invisible_profile_8704_tdb3g1yy\\extension-store",
+])
+def test_a_path_of_the_launchs_temp_dir_is_ours_whatever_its_spelling(path):
+    assert host.classify(path, RUNNER)[0] == "profile"
+
+
+def test_the_package_is_ours_in_either_spelling_and_a_neighbour_of_the_temp_root_is_not():
+    assert host.classify("C:\\Lab\\LABRUN~1\\AppData\\Local\\invisible-playwright\\invisible-playwright\\Cache\\firefox-68_159.0_20261121043125\\xul.dll", RUNNER) == ("package", "xul.dll")
+    assert host.classify("c:\\lab\\labrunner\\appdata\\local\\temp\\ab-host-tmp-n4yegll6\\x", RUNNER)[0] == "host"
+    assert host.classify("C:\\Lab\\LABRUN~1\\AppData\\Local\\Temp\\other.tmp", RUNNER) == ("host", "c:\\lab\\labrunner\\appdata\\local\\temp\\other.tmp")
+
+
+def test_a_host_path_has_one_spelling_for_the_two_runs():
+    assert host.classify_paths(["C:\\Lab\\LABRUN~1\\.gitconfig", "c:\\lab\\labrunner\\.gitconfig"], RUNNER) == (["c:\\lab\\labrunner\\.gitconfig"], {})
+
+
+def test_the_uuid_of_the_uninstall_ping_is_not_a_difference_and_the_rest_of_its_path_is():
+    one = "C:\\ProgramData\\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\\uninstall_ping_f8a3fe26202962af_6f9b4c24-2bcc-4463-9445-c996a5d02c39.json"
+    two = "C:\\ProgramData\\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\\uninstall_ping_f8a3fe26202962af_90e83a0f-ee9e-43c6-9c48-ad33753d3a60.json.tmp"
+    got = host.classify_paths([one, two, one + ".tmp"], RUNNER)[0]
+    assert got == ["c:\\programdata\\mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\\uninstall_ping_f8a3fe26202962af_<uuid>.json",
+                   "c:\\programdata\\mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\\uninstall_ping_f8a3fe26202962af_<uuid>.json.tmp"]
+    other_machine = one.replace("f8a3fe26202962af", "0000000000000000")
+    assert host.classify_paths([other_machine], RUNNER)[0][0].endswith("uninstall_ping_0000000000000000_<uuid>.json"), "the install hash stays in the name"
+    a, b = footprint(platform="win32", files=got), footprint("again", platform="win32", files=got)
+    assert judge(a, b, a_a=True, floors={"proc": 2, "file": 1})["verdict"] == "green"
+    kept = host.classify("C:\\ProgramData\\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\\other_6f9b4c24-2bcc-4463-9445-c996a5d02c39.json", RUNNER)[1]
+    assert kept.endswith("6f9b4c24-2bcc-4463-9445-c996a5d02c39.json"), "only the name of the ping is normalized"
+
+
+def test_a_background_task_of_the_engine_is_a_kind_of_its_own_by_its_command_line():
+    exe = "C:\\Lab\\labrunner\\AppData\\Local\\invisible-playwright\\Cache\\firefox.exe"
+    cmd = exe + " --backgroundtask pingsender https://incoming.telemetry.mozilla.org/submit/telemetry/244041fe/first-shutdown/Firefox/159.0/release/2026?v=4 C:\\x\\ping"
+    events = host.parse_audit_events(audit(1, 200, 100, exe, cmd))
+    assert host.windows_processes(events, exe)[200]["label"] == "backgroundtask/pingsender"
+    assert host.label_of_exec("/e/firefox/firefox", ["/e/firefox/firefox", "--backgroundtask", "uninstall"], REAL) == "backgroundtask/uninstall"
+    a = footprint(platform="win32", kinds=dict(KINDS, **{"backgroundtask/pingsender": 3}))
+    report = judge(a, footprint("again", platform="win32"), a_a=True)
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc.backgroundtask/pingsender"}
+
+
+def test_the_session_is_recording_when_the_last_start_canary_is_in_the_trace_even_if_the_first_ones_are_not(tmp_path, monkeypatch):
+    trace, fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start3", "end"))
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+    assert got["problems"] == []
+    assert sum(1 for c in fake.calls if c[:2] == ["logman", "query"]) == 3, "a round trip to the session before each canary"
+    trace, _fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start1", "start2", "end"))
+    problems = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"]
+    assert len(problems) == 1 and "last start canary" in problems[0]
