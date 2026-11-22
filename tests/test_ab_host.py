@@ -1579,9 +1579,9 @@ def test_an_inventory_that_is_not_complete_on_both_sides_is_red_and_so_is_a_path
     report = judge(with_inventory(footprint(platform="win32")), short, a_a=True)
     assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file." + p for p in INV[3:]}
     extra = with_inventory(footprint(platform="win32"))
-    extra["seeds"][0]["files"] = extra["seeds"][0]["files"] + ["c:\\users\\runneradmin\\.ssh\\config"]
+    extra["seeds"][0]["files"] = extra["seeds"][0]["files"] + ["d:\\lab\\runner\\.ssh\\config"]
     other = judge(extra, footprint("again", platform="win32"), a_a=True)
-    assert other["verdict"] == "red" and {d["leaf"] for d in other["differences"]} == {"file.c:\\users\\runneradmin\\.ssh\\config"}, "only the inventory's own paths are left out"
+    assert other["verdict"] == "red" and {d["leaf"] for d in other["differences"]} == {"file.d:\\lab\\runner\\.ssh\\config"}, "only the inventory's own paths are left out"
     known = with_inventory(footprint(platform="win32"), INV + [FILES[0]])
     assert judge(known, footprint("again", platform="win32"), a_a=True)["verdict"] == "green", "a path of the inventory window that the other side has too is not left out of its side"
 
