@@ -547,32 +547,79 @@ def system_paths(fp: dict, layers=("measured", "long"), with_inventory: bool = T
     return out
 
 
+BS = chr(92)
+CATROOT = BS + "catroot" + BS
+
+
+def is_catalog(path: str) -> bool:
+    """A security catalog under `catroot`: Windows' signature verification reads it when a library is loaded, the engine does not choose it."""
+    return CATROOT in path and path.endswith(".cat")
+
+
+def mui_dll(path: str) -> str | None:
+    """The library a resource file belongs to (`...\\system32\\en-us\\x.dll.mui` is `...\\system32\\x.dll`), None for a path that is not one."""
+    if not path.endswith(".mui"):
+        return None
+    folder, _sep, name = path.rpartition(BS)
+    parent, _sep2, language = folder.rpartition(BS)
+    return parent + BS + name[:-4] if re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})*", language) and parent else None
+
+
+def classify_rare(paths, seen: set) -> dict:
+    """Splits the modules of a layer that only one run has: `counted` (what the cap counts: every module that is not excused, orphan resource files included), `mui` (a
+    resource file whose library is among the modules `seen` in that run: the library carries the count), `cat` (a security catalog under catroot) and `orphans` (the
+    resource files whose library was never seen: they are in `counted`)."""
+    out = {"counted": [], "mui": [], "cat": [], "orphans": []}
+    for path in sorted(paths):
+        dll = mui_dll(path)
+        if is_catalog(path):
+            out["cat"].append(path)
+        elif dll is not None and dll in seen:
+            out["mui"].append(path)
+        else:
+            out["counted"].append(path)
+            if dll is not None:
+                out["orphans"].append(path)
+    return out
+
+
 def system_class(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
     """`(differences, problems, report)` of the system modules of two footprints: see SYSTEM_REASON. `also_68` are the other footprints of the 68 in an A/B.
 
     A/A: a module only one run has is rare, counted in two layers with their own caps: the measured launches (RARE_LIMIT) and the long ones (RARE_LIMIT_LONG, what only a
-    long launch of the run opened). A module the other run has in ANY launch is not rare. A/B: red only a module any launch of the candidate opened that no launch of either 68
-    run opened."""
+    long launch of the run opened). A module the other run has in ANY launch is not rare. The cap counts every rare module but two kinds that are not the engine's choice,
+    both listed and counted in the report, never silent (`classify_rare`): a resource file (`.mui`) whose library is among the modules seen in that run, since the library
+    carries the count, and a security catalog under `catroot`. An orphan `.mui` (its library never seen) counts. A/B: red only a module any launch of the candidate opened
+    that no launch of either 68 run opened, with the same two kinds left out of the red (a new library shows through the library itself); the ones each side opened are
+    listed per run."""
     differences, problems = [], []
     if a_a:
-        rare = {"measured": {}, "long": {}}
+        rare, excused = {"measured": {}, "long": {}}, {"measured": {}, "long": {}}
         for side, x, y in (("A", a, b), ("B", b, a)):
             other = system_paths(y, with_inventory=False)
+            seen = system_paths(x)
             measured = system_paths(x, ("measured",), False)
-            rare["measured"][side] = sorted(measured - other)
-            rare["long"][side] = sorted(system_paths(x, ("long",), False) - measured - other)
+            for layer, paths in (("measured", measured - other), ("long", system_paths(x, ("long",), False) - measured - other)):
+                split = classify_rare(paths, seen)
+                rare[layer][side], excused[layer][side] = split["counted"], split
         for layer, limit in (("measured", RARE_LIMIT), ("long", RARE_LIMIT_LONG)):
             for side in ("A", "B"):
                 if len(rare[layer][side]) > limit:
                     problems.append("the system modules only run %s has in its %s launches are %d, more than %d: the class is growing (%s)"
                                     % (side, layer, len(rare[layer][side]), limit, rare[layer][side][:3]))
-        counts = {layer: {k: len(v) for k, v in rare[layer].items()} for layer in rare}
-        return differences, problems, {"mode": "a-a", "rare": rare, "counts": counts, "limits": {"measured": RARE_LIMIT, "long": RARE_LIMIT_LONG}, "reason": SYSTEM_REASON}
+        counts = {layer: {side: {"counted": len(excused[layer][side]["counted"]), "mui_excused": len(excused[layer][side]["mui"]),
+                                 "cat_excused": len(excused[layer][side]["cat"]), "orphans": len(excused[layer][side]["orphans"])}
+                          for side in ("A", "B")} for layer in rare}
+        return differences, problems, {"mode": "a-a", "rare": rare, "excused": excused, "counts": counts, "limits": {"measured": RARE_LIMIT, "long": RARE_LIMIT_LONG},
+                                       "reason": SYSTEM_REASON}
     known = set(system_paths(a, with_inventory=False)).union(*[system_paths(x, with_inventory=False) for x in also_68])
     mine = system_paths(b, with_inventory=False)
-    for path in sorted(mine - known):
+    split = classify_rare(mine - known, system_paths(b))
+    for path in split["counted"]:
         differences.append({"seed": "all", "category": "file", "leaf": "file." + path, "a": MISSING, "b": 1, "by": {"A": [], "B": []}, "calls": {"A": [], "B": []}})
-    return differences, problems, {"mode": "a-b", "candidate_only": sorted(mine - known), "lacking": sorted(known - mine)[:50], "lacking_count": len(known - mine), "reason": SYSTEM_REASON}
+    listed = {"68": [p for p in sorted(known) if mui_dll(p) or is_catalog(p)], "candidate": [p for p in sorted(mine) if mui_dll(p) or is_catalog(p)]}
+    return differences, problems, {"mode": "a-b", "candidate_only": split["counted"], "excused_candidate_only": {"mui": split["mui"], "cat": split["cat"]}, "orphans": split["orphans"],
+                                   "listed_mui_and_cat": listed, "lacking": sorted(known - mine)[:50], "lacking_count": len(known - mine), "reason": SYSTEM_REASON}
 
 
 PRIVILEGED = "Privileged Cont"
@@ -1612,11 +1659,15 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
     if system and system["mode"] == "a-a":
         for side, name in (("A", a_name), ("B", b_name)):
             for layer in ("measured", "long"):
-                if system["rare"][layer][side]:
-                    print("RARE system modules only %s has in its %s launches: %d (red above %d): %s" % (
-                        name, layer, len(system["rare"][layer][side]), system["limits"][layer], json.dumps(system["rare"][layer][side][:20])))
+                c = system["counts"][layer][side]
+                print("RARE system modules only %s has in its %s launches: %d counted (red above %d), %d .mui excused with their library, %d .cat excused, %d orphan .mui%s" % (
+                    name, layer, c["counted"], system["limits"][layer], c["mui_excused"], c["cat_excused"], c["orphans"],
+                    (": " + json.dumps(system["rare"][layer][side][:20])) if system["rare"][layer][side] else ""))
     elif system:
-        print("SYSTEM modules the 68 has and the candidate lacks (not red): %d; the candidate has alone: %d" % (system["lacking_count"], len(system["candidate_only"])))
+        print("SYSTEM modules the 68 has and the candidate lacks (not red): %d; the candidate has alone: %d counted, %d .mui excused, %d .cat excused, %d orphan .mui; .mui and .cat "
+              "opened: 68 %d, candidate %d" % (system["lacking_count"], len(system["candidate_only"]), len(system["excused_candidate_only"]["mui"]),
+                                                len(system["excused_candidate_only"]["cat"]), len(system["orphans"]), len(system["listed_mui_and_cat"]["68"]),
+                                                len(system["listed_mui_and_cat"]["candidate"])))
     for side, name in (("A", a_name), ("B", b_name)):
         warm = (report.get("warmup") or {}).get(side)
         if warm:

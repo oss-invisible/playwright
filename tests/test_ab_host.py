@@ -1871,9 +1871,9 @@ def test_a_system_module_in_a_launch_of_each_run_is_the_same_module_and_a_rare_o
     b = with_system(win("again"), {"warmup": [SYS_B], 12: [SYS_A]})
     report = judge(a, b, a_a=True)
     assert report["verdict"] == "green", report["problems"]
-    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": [SYS_A]} and report["system_modules"]["counts"]["measured"] == {"A": 0, "B": 1}
+    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": [SYS_A]} and report["system_modules"]["counts"]["measured"]["B"]["counted"] == 1 and report["system_modules"]["counts"]["measured"]["A"]["counted"] == 0
     host.print_report(report, "firefox-68", "firefox-68 again")
-    assert "RARE system modules only firefox-68 again has in its measured launches: 1 (red above 5)" in capsys.readouterr().out
+    assert "RARE system modules only firefox-68 again has in its measured launches: 1 counted (red above 5), 0 .mui excused with their library, 0 .cat excused, 0 orphan .mui" in capsys.readouterr().out
     assert "no page reads them" in host.SYSTEM_REASON and "Windows loader" in host.SYSTEM_REASON
 
 
@@ -1890,14 +1890,14 @@ def test_the_rare_modules_of_the_long_launches_are_counted_apart_with_a_cap_of_t
     many = ["c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "long%d.dll" % i for i in range(31)]
     ok = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many[:30], "bare": []}), a_a=True)
     assert ok["verdict"] == "green", ok["problems"]
-    assert ok["system_modules"]["counts"] == {"measured": {"A": 0, "B": 0}, "long": {"A": 0, "B": 30}} and ok["system_modules"]["limits"] == {"measured": 5, "long": 30}
+    assert [ok["system_modules"]["counts"][l][side]["counted"] for l in ("measured", "long") for side in "AB"] == [0, 0, 0, 30] and ok["system_modules"]["limits"] == {"measured": 5, "long": 30}
     red = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many, "bare": []}), a_a=True)
     assert red["verdict"] == "red" and any("only run B has in its long launches are 31, more than 30" in p for p in red["problems"])
     seven = many[:7]
     measured = judge(with_system(win(), {"idle": []}), with_system(win("again"), {11: seven}), a_a=True)
     assert measured["verdict"] == "red", "the measured launches keep the cap of 5"
     in_both = judge(with_system(win(), {"idle": many}), with_system(win("again"), {11: many, "idle": []}), a_a=True)
-    assert in_both["verdict"] == "green" and in_both["system_modules"]["counts"]["long"] == {"A": 0, "B": 0}, "a module the other run has in any launch is not rare"
+    assert in_both["verdict"] == "green" and in_both["system_modules"]["counts"]["long"]["B"]["counted"] == 0, "a module the other run has in any launch is not rare"
 
 
 def test_in_an_ab_a_system_module_only_the_candidate_opened_is_red_and_one_the_candidate_lacks_is_green():
@@ -1962,3 +1962,77 @@ def test_the_preloaded_newtab_process_is_absent_or_present_per_launch_never_more
     report = judge(two, footprint("again"), a_a=True)
     assert report["verdict"] == "red" and any("2 Privileged Cont processes: the preloaded about:newtab is absent or present, never more than one" in p for p in report["problems"])
     assert "NewTabPagePreloading.sys.mjs:96" in host.PRIVILEGED_REASON and "firefox.js:1952" in host.PRIVILEGED_REASON and "idle time" in host.PRIVILEGED_REASON
+
+
+# -
+# What the cap does not count: a resource file whose library is seen, and a security catalog (both counted and printed, never silent).
+
+DIR32 = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92)
+CATDIR = DIR32 + "catroot" + chr(92) + "{f750e6c3-38ee-11d1-85e5-00c04fc295ee}" + chr(92)
+
+
+def dll(name):
+    return DIR32 + name + ".dll"
+
+
+def mui(name):
+    return DIR32 + "en-us" + chr(92) + name + ".dll.mui"
+
+
+def test_a_resource_file_is_counted_by_its_library_and_an_orphan_one_counts_itself():
+    assert host.mui_dll(mui("avrt")) == dll("avrt") and host.mui_dll(DIR32 + "fr-fr" + chr(92) + "x.dll.mui") == dll("x") and host.mui_dll(dll("x")) is None
+    assert host.mui_dll(DIR32 + "drivers" + chr(92) + "x.sys.mui") is None, "a folder that is not a language is not one"
+    seen = {dll("avrt")}
+    split = host.classify_rare([mui("avrt"), mui("orphan"), dll("wevtapi")], seen)
+    assert split == {"counted": [mui("orphan"), dll("wevtapi")], "mui": [mui("avrt")], "cat": [], "orphans": [mui("orphan")]}
+
+
+def test_a_catalog_under_catroot_is_not_counted_and_one_outside_catroot_is():
+    inside, outside = CATDIR + "package~1.cat", DIR32 + "package~1.cat"
+    assert host.is_catalog(inside) and not host.is_catalog(outside) and not host.is_catalog(CATDIR + "x.dll")
+    split = host.classify_rare([inside, outside], set())
+    assert split["cat"] == [inside] and split["counted"] == [outside]
+
+
+def test_in_an_a_a_the_resource_files_with_their_library_and_the_catalogs_do_not_count_toward_the_cap_and_are_printed(capsys):
+    muis = [mui("m%d" % i) for i in range(15)]
+    libs = [dll("m%d" % i) for i in range(15)]
+    cats = [CATDIR + "package%d~1.cat" % i for i in range(6)]
+    a = with_system(win(), {11: muis + libs + cats})
+    b = with_system(win("again"), {11: libs})
+    report = judge(a, b, a_a=True)
+    counts = report["system_modules"]["counts"]["measured"]["A"]
+    assert report["verdict"] == "green", report["problems"]
+    assert counts == {"counted": 0, "mui_excused": 15, "cat_excused": 6, "orphans": 0}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "firefox-68 has in its measured launches: 0 counted (red above 5), 15 .mui excused with their library, 6 .cat excused, 0 orphan .mui" in capsys.readouterr().out
+
+
+def test_orphan_resource_files_and_libraries_keep_the_cap_and_six_rare_libraries_stay_red():
+    orphans = [mui("o%d" % i) for i in range(6)]
+    red = judge(with_system(win(), {11: orphans}), win("again"), a_a=True)
+    assert red["verdict"] == "red" and red["system_modules"]["counts"]["measured"]["A"]["orphans"] == 6
+    libs = [dll("r%d" % i) for i in range(6)]
+    assert judge(with_system(win(), {11: libs + [mui("r0")]}), win("again"), a_a=True)["verdict"] == "red"
+    five = judge(with_system(win(), {11: libs[:5] + [mui("r0"), CATDIR + "c.cat"]}), win("again"), a_a=True)
+    assert five["verdict"] == "green" and five["system_modules"]["counts"]["measured"]["A"]["counted"] == 5, "the cap is not raised"
+    assert host.RARE_LIMIT == 5 and host.RARE_LIMIT_LONG == 30
+
+
+def test_the_library_is_looked_for_in_the_run_that_has_the_resource_file_both_layers_included():
+    a = with_system(win(), {11: [mui("w")], "idle": [dll("w")]})
+    report = judge(with_system(a, {"bare": []}), with_system(win("again"), {"idle": []}), a_a=True)
+    assert report["system_modules"]["counts"]["measured"]["A"]["mui_excused"] == 1, "its library was opened by a long launch of the same run: seen in that run"
+
+
+def test_in_an_ab_the_excused_files_stay_listed_per_run_and_a_new_library_shows_through_itself():
+    published = with_system(win(), {11: [dll("old"), mui("old"), CATDIR + "old.cat"]})
+    new = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "newlib.dll"
+    candidate = with_system(win("candidate"), {11: [dll("old"), mui("old"), mui("newlib"), CATDIR + "new.cat", new]})
+    report = judge(published, candidate, expected=[])
+    assert [d["leaf"] for d in report["differences"]] == ["file." + new], "the new library is red; its resource file and the new catalog are not red on their own"
+    system = report["system_modules"]
+    assert system["excused_candidate_only"] == {"mui": [mui("newlib")], "cat": [CATDIR + "new.cat"]} and system["orphans"] == []
+    assert mui("old") in system["listed_mui_and_cat"]["68"] and CATDIR + "old.cat" in system["listed_mui_and_cat"]["68"] and mui("newlib") in system["listed_mui_and_cat"]["candidate"]
+    orphan = judge(published, with_system(win("candidate"), {11: [dll("old"), mui("lonely")]}), expected=[])
+    assert [d["leaf"] for d in orphan["differences"]] == ["file." + mui("lonely")] and orphan["system_modules"]["orphans"] == [mui("lonely")]
