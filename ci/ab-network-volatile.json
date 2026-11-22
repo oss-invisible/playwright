@@ -1,0 +1,38 @@
+{
+  "format": "ab-network-volatile/1",
+  "about": "The leaves of the network transcript that differ between two runs of ONE engine (the A/A of scripts/ci_ab_network.py). Each entry: `pattern` (fnmatch over the leaf path seeds/<seed>/<category>/...), `reason` (why that leaf is noise), `aa_run` (the A/A run that proved it). Born from the evidence of the A/A, never written ahead of it. It may only shrink: an entry that matches no leaf of a run is red as stale.",
+  "entries": [
+    {
+      "pattern": "seeds/*/journey/connects/counts/*",
+      "reason": "How many TCP connections the browser opens to each destination of the journey (the DoH, the two origins) is the connection pool's: parallel and speculative connections, keep-alive connections that close and reopen, DoH connections. The CONNECTs of the launch stage are counted with the journey ones (the DoH connection at start-up lands in either). The set of destinations and the order they were first reached stay compared (journey/connects/order). Totals of the two runs: Linux DoH 226 and 225, origin A 14 and 13, origin O 20 and 12; Windows DoH 222 and 230, A 23 and 15, O 22 and 14.",
+      "aa_run": "44946411675 (linux, windows)"
+    },
+    {
+      "pattern": "seeds/*/webrtc/connects/counts/*",
+      "reason": "The connections to the DoH during the WebRTC page: 14 and 25 between the two Windows runs. Same pool; the destinations of the page (webrtc/connects/order) stay compared.",
+      "aa_run": "44946411675 (windows)"
+    },
+    {
+      "pattern": "seeds/*/https/*/wire/resumed_connections",
+      "optional": true,
+      "reason": "Whether a connection that resumes a session carried a request at all follows the ticket and the pool: an origin had one in a run and none in the other (seed 2 and seed 4 on Linux, h1: 108 leaves each), so what is under it is compared where both runs have a resumption and excused where only one has. The fresh connections (wire/connections) and the protocols stay compared always.",
+      "aa_run": "44982522362 (linux)"
+    },
+    {
+      "pattern": "seeds/*/h3/wire/resumed_connections",
+      "optional": true,
+      "reason": "The same for the HTTP/3 site's resumed connection.",
+      "aa_run": "44982522362 (linux)"
+    },
+    {
+      "pattern": "seeds/*/https/*/wire/*connections/*/tls/extensions/encrypted_client_hello/aead",
+      "reason": "The engine sends an ECH extension with no real configuration (GREASE) and picks its AEAD at random for each ClientHello it builds, whether the handshake is fresh or resumed: NSS security/nss/lib/ssl/tls13ech.c:2257, `aead = (rawData->data[0] & 1) ? HpkeAeadAes128Gcm : HpkeAeadChaCha20Poly1305;` where rawData is HKDF output of a freshly generated key (tls13_MaybeGreaseEch, called from ssl3con.c:5888 for every ClientHello that has no real ECH, with or without a pre_shared_key). 1 (AES-128-GCM) or 3 (ChaCha20-Poly1305): Windows h2 first connection 1 then 3, h1 3 then 1, both values inside one run; resumed h1 connections 3 and 1 (seeds 2 and 4 on Windows, seed 63 on Linux). The rest of the extension (type, kdf, enc and payload lengths) stays compared.",
+      "aa_run": "44946411675 and 44982522362 (linux, windows)"
+    },
+    {
+      "pattern": "seeds/*/h3/wire/*connections/*/tls/extensions/encrypted_client_hello/aead",
+      "reason": "The same ECH GREASE draw (tls13ech.c:2257) on the TLS connection of the HTTP/3 site (the HTTP/2 connection that opens before QUIC): 1 in one run and 3 in the other, on Linux and on Windows.",
+      "aa_run": "44946411675 and 44982522362 (linux, windows)"
+    }
+  ]
+}

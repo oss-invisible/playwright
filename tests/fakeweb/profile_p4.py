@@ -22,6 +22,22 @@ from fakeweb import journey_site
 BLOCKED = ("image", "media")
 TIMEOUT_MS = 15000
 FIELDS = ["ok", "url", "title", "marker", "cookies", "history_length", "pages", "idle"]
+#: Seconds the walk waits for the requests a closed tab sends as it leaves: a safety net so that a request that never comes does not block it (the lab then sees it missing).
+LEAVING_FAILSAFE_S = 15.0
+
+
+def pagehide_requests():
+    """How many requests fired from a `pagehide` handler (`/beacon?t=pagehide`) the site has logged so far."""
+    with journey_site.STATE.lock:
+        return sum(1 for e in journey_site.STATE.events if e["path"] == "/beacon" and e["id"] == "pagehide")
+
+
+def wait_for_pagehide_requests(at_least, failsafe=LEAVING_FAILSAFE_S):
+    """Returns when the site has logged `at_least` of them (the event the walk waits for), or after the failsafe. True when they came."""
+    end = time.monotonic() + failsafe
+    while pagehide_requests() < at_least and time.monotonic() < end:
+        time.sleep(0.05)
+    return pagehide_requests() >= at_least
 
 
 def install_route(context):
@@ -257,8 +273,16 @@ class Journey:
         if "Partner" not in tab.inner_text("#marker"):
             raise AssertionError("unexpected marker in the new tab")
 
+        noisy = "noise=0" not in tab.url
+
         def cleanup():
+            before = pagehide_requests()
             tab.close()
+            if noisy:
+                # The closed tab's pagehide sends two requests (a beacon and a keep-alive POST) that reach the server after close() has returned. The walk goes on to the
+                # next step when the server has both, so they are the requests of THIS step: with no wait they landed in the next step in most walks and in this one in
+                # some (A/A run 44982522362, Windows seed 6). An event, not a delay.
+                wait_for_pagehide_requests(before + 2)
             self.extra["pages_after_close"] = len(self.ctx.pages)
 
         return tab, cleanup

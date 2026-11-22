@@ -429,6 +429,8 @@ class Gateway:
         #: Every datagram the relay carried out, as (host as sent, port, index in ``associations`` of the association it came
         #: on, seconds from t0): which association carried a datagram, not only when it left.
         self.datagram_via: List[Tuple[str, int, int, float]] = []
+        #: The association of the datagram that ``_route`` is routing, for the thread that routes it (``_route`` is called by the thread of the association).
+        self._dgram = threading.local()
         #: Every datagram the relay carried out, as (host, port, payload).
         self.datagrams: List[Tuple[str, int, bytes]] = []
         #: The local port of the socket each granted association sends from: what a server behind the gateway sees as the port
@@ -774,6 +776,7 @@ class Gateway:
                     self.datagrams.append((host, dport, payload))
                     self.datagram_log.append((host, dport, atyp, time.monotonic() - self.t0))
                     self.datagram_via.append((host, dport, index, time.monotonic() - self.t0))
+                    self._dgram.index = index
                     routed = self._route(host, dport, atyp, payload, out_port, answer)
                     if routed is None:
                         continue

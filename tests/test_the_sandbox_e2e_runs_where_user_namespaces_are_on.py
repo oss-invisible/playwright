@@ -96,7 +96,7 @@ def test_the_workflow_as_it_was_is_refused():
 
 
 def test_the_current_workflow_without_the_exclusion_is_refused():
-    text = WORKFLOW.read_text(encoding="utf-8").replace("for f in $ROOT_FILES $SANDBOX_FILES;", "for f in $ROOT_FILES;")
+    text = WORKFLOW.read_text(encoding="utf-8").replace("for f in $ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES;", "for f in $ROOT_FILES $OWN_JOB_FILES;")
     assert any("does not ignore" in p for p in problems(text))
 
 
