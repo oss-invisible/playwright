@@ -327,7 +327,7 @@ def write_dependence(out: Path, summary: Path | None = None) -> dict | None:
 #: Each requirement of the control, with what it means. Language is reported and not required: Playwright's Firefox is an en-US build, which
 #: takes its language from its own locale, not from the machine; the control prints what it read, and the requirement is one line away
 #: (REQUIRED) once a run has shown that stock reads it.
-REQUIRED = ("timezone", "dark", "canary", "audio", "generic")
+REQUIRED = ("timezone", "dark", "canary", "audio", "generic", "language")
 
 
 def control_failures(probe, system: str) -> list:
@@ -337,6 +337,8 @@ def control_failures(probe, system: str) -> list:
     out = []
     if probe.get("offsets") != LIMA_OFFSETS:
         out.append(("timezone", "stock Firefox read the offsets %s, not Lima's %s" % (json.dumps(probe.get("offsets")), LIMA_OFFSETS)))
+    if not language_reads(probe)["japanese"]:
+        out.append(("language", "stock Firefox read no Japanese language, date or number format: %s" % json.dumps(language_reads(probe)["reads"], ensure_ascii=False)))
     if probe.get("dark") is not True:
         out.append(("dark", "stock Firefox read prefers-color-scheme dark = %s" % json.dumps(probe.get("dark"))))
     canary = probe.get("canary")
@@ -377,7 +379,8 @@ def control(out: Path, headless: bool = False) -> int:
         with sync_playwright() as p:
             browser = p.firefox.launch(headless=headless, firefox_user_prefs={"intl.regional_prefs.use_os_locales": True})
             try:
-                page = browser.new_context().new_page()
+                # Playwright's default is a LIGHT scheme (an emulation): the control must follow the system, as a user's browser does
+                page = browser.new_context(color_scheme="no-override").new_page()
                 page.goto("about:blank")
                 probe = page.evaluate("(async () => {%s; return await abPoisonProbe(); })()" % probe_source())
             finally:
@@ -466,7 +469,22 @@ def apply_windows(run: Run = _run, font_dir: Path | None = None) -> dict:
     _ok(run, ps("New-ItemProperty -Path '%s' -Name '%s' -Value '%s' -PropertyType String -Force | Out-Null" % (FONTS_KEY, FONT_VALUE, font)),
         "register the canary font")
     _announce_font(str(font))
+    state["after"] = windows_reads(run)
     return state
+
+
+def primary_language(tag: str) -> str:
+    """The language of a tag, whatever its form: 'ja', 'ja-JP' and 'ja_JP' are Japanese."""
+    return re.split(r"[-_]", (tag or "").strip(), maxsplit=1)[0].lower()
+
+
+def windows_reads(run: Run = _run) -> dict:
+    """What this Windows machine reports about the poison, in the form it reports it (Windows keeps the tag 'ja' for the list that was set from
+    'ja-JP'): the apply records it and verify holds the machine to it later, besides the semantic check that it is Japanese."""
+    return {"timezone": _try(run, ["tzutil", "/g"]),
+            "culture": _try(run, ps("(Get-Culture).Name")),
+            "languages": _try(run, ps("(Get-WinUserLanguageList | ForEach-Object { $_.LanguageTag }) -join ','")),
+            "theme": {n: _try(run, _reg_get(n)) for n in ("AppsUseLightTheme", "SystemUsesLightTheme")}}
 
 
 def _announce_font(path: str) -> None:
@@ -513,12 +531,14 @@ def verify_windows(run: Run = _run, state: dict | None = None) -> list:
     tz = _try(run, ["tzutil", "/g"])
     if tz != WINDOWS_ZONE:
         problems.append("time zone is %r, not %r" % (tz, WINDOWS_ZONE))
-    culture = _try(run, ps("(Get-Culture).Name"))
-    if culture != CULTURE:
-        problems.append("culture is %r, not %r" % (culture, CULTURE))
-    langs = _try(run, ps("(Get-WinUserLanguageList | ForEach-Object { $_.LanguageTag }) -join ','")).split(",")
-    if langs[0] != CULTURE:
-        problems.append("the first user language is %r, not %r" % (langs[0], CULTURE))
+    reads = windows_reads(run)
+    recorded = (state or {}).get("after") or {}
+    for what, value in (("culture", reads["culture"]), ("first user language", reads["languages"].split(",")[0])):
+        if primary_language(value) != primary_language(CULTURE):
+            problems.append("the %s is %r, which is not Japanese" % (what, value))
+    for key, what in (("culture", "culture"), ("languages", "user language list")):
+        if recorded.get(key) and reads[key] != recorded[key]:
+            problems.append("the %s is %r, the apply recorded %r" % (what, reads[key], recorded[key]))
     for name in ("AppsUseLightTheme", "SystemUsesLightTheme"):
         value = _try(run, _reg_get(name))
         if value != "0":
@@ -670,12 +690,15 @@ def apply(state_file: Path | None, audio: bool = True, run: Run = _run) -> int:
     if state_file:
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps(state, sort_keys=True, indent=1), encoding="utf-8")
+    target = os.environ.get("GITHUB_ENV")
+    if target and state_file:  # what was changed must be undoable even when it is not in force: the undo step reads this
+        with open(target, "a", encoding="utf-8", newline="\n") as f:
+            f.write(github_env_lines({STATE_SWITCH: str(state_file.resolve())}))
     problems = verify_windows(run, state) if system == "windows" else verify_linux(run, state, audio=state["audio"])
     for p in problems:
         print("POISON NOT IN FORCE: " + p)
     if problems:
         return 2
-    target = os.environ.get("GITHUB_ENV")
     env = dict(state.get("env", {}), **{SWITCH: "1"})
     if state_file:
         env[STATE_SWITCH] = str(state_file.resolve())

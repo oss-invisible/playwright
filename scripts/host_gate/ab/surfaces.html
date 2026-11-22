@@ -17,7 +17,7 @@ const errs = e => 'ERR ' + ((e && e.name) || '') + ': ' + ((e && e.message) || S
 const within = (p, ms, what) => Promise.race([p, new Promise(res => setTimeout(() => res('timeout: ' + what), ms))]);
 const step = async (R, k, f, ms = 15000) => { try { R[k] = await within(Promise.resolve().then(f), ms, k); } catch (e) { R[k] = errs(e); } };
 const waiting = {};
-addEventListener('message', e => { const m = e.data; if (m && typeof m.id === 'string' && waiting[m.id]) { waiting[m.id](Object.assign({origin: e.origin}, m.data)); delete waiting[m.id]; } });
+addEventListener('message', e => { const m = e.data; if (m && typeof m.id === 'string' && waiting[m.id]) { waiting[m.id](Object.assign({origin: e.origin.replace(/:\d+$/, ':<port>')}, m.data)); delete waiting[m.id]; } });
 const popups = [];
 const pop = (id, name, features) => new Promise(res => {
   waiting[id] = res;

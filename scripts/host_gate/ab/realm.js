@@ -9,7 +9,18 @@
     for (let i = 0; i < u8.length; i++) { a = Math.imul(a ^ u8[i], 0x01000193) >>> 0; b = Math.imul(b ^ u8[i], 0x5bd1e995) >>> 0; b ^= b >>> 13; }
     return u8.length + ':' + a.toString(16) + b.toString(16);
   };
-  const textHash = s => { const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 255; return bytesHash(u); };
+  // A PNG of Firefox carries a per-launch "deBG" chunk (the host gate's noise.png_deBG): the bytes are hashed without it, so that two launches of one engine agree.
+  const pngHash = u8 => {
+    const keep = [u8.subarray(0, 8)];
+    for (let i = 8; i + 12 <= u8.length;) {
+      const n = (u8[i] << 24 | u8[i + 1] << 16 | u8[i + 2] << 8 | u8[i + 3]) >>> 0, t = String.fromCharCode(u8[i + 4], u8[i + 5], u8[i + 6], u8[i + 7]);
+      if (t !== 'deBG') keep.push(u8.subarray(i, i + 12 + n));
+      i += 12 + n;
+    }
+    const out = new Uint8Array(keep.reduce((a, x) => a + x.length, 0)); let o = 0; for (const k of keep) { out.set(k, o); o += k.length; }
+    return bytesHash(out);
+  };
+  const dataUrlHash = url => pngHash(Uint8Array.from(atob(url.split(',')[1]), ch => ch.charCodeAt(0)));
   const TEXT = 'Hamburgefonstiv 0123 ZZ';
   const draw = g => {
     g.fillStyle = '#fff'; g.fillRect(0, 0, 160, 40); g.fillStyle = '#036'; g.font = '16px sans-serif'; g.fillText(TEXT, 4, 16);
@@ -57,7 +68,7 @@
     if (root.document && root.document.createElement) {
       await ta('canvas', async () => {
         const c = root.document.createElement('canvas'); c.width = 160; c.height = 40; const g = c.getContext('2d'); draw(g);
-        return {toDataURL: textHash(c.toDataURL()), measure: measure(g)};
+        return {toDataURL: dataUrlHash(c.toDataURL()), pixels: bytesHash(g.getImageData(0, 0, 160, 40).data), measure: measure(g)};
       });
       await ta('webgl', async () => { const c = root.document.createElement('canvas'); c.width = 32; c.height = 32; return scene(c); });
     } else { o.canvas = 'absent'; }
@@ -65,7 +76,7 @@
       await ta('offscreen', async () => {
         const c = new root.OffscreenCanvas(160, 40), g = c.getContext('2d'); draw(g);
         const m = measure(g), blob = await c.convertToBlob();
-        return {measure: m, png: bytesHash(new Uint8Array(await blob.arrayBuffer()))};
+        return {measure: m, png: pngHash(new Uint8Array(await blob.arrayBuffer()))};
       });
       await ta('offscreen_webgl', async () => scene(new root.OffscreenCanvas(32, 32)));
     } else { o.offscreen = 'absent'; }
