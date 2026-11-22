@@ -56,6 +56,9 @@ SINK, SINK_RATE, SINK_CHANNELS = "hostcanary", 96000, 6
 SINK_MAP = "front-left,front-right,front-center,lfe,rear-left,rear-right"
 #: The variables a Linux poison puts in the environment of the later steps ($GITHUB_ENV), and the one that says it is on.
 LINUX_ENV = {"TZ": IANA_ZONE, "LANG": LINUX_LANG, "LANGUAGE": "ja", "GTK_THEME": GTK_THEME}
+#: A text of 12 'm' at 12px in the canary: 12 boxes of 1.5 em. A generic family that measures this is the canary.
+CANARY_TEXT_WIDTH = 216.0
+GENERICS = ("sans-serif", "serif", "monospace")
 SWITCH = "AB_ORACLE_POISON"
 #: The variable that names the file `apply` wrote its undo state to.
 STATE_SWITCH = "AB_ORACLE_POISON_STATE"
@@ -181,6 +184,10 @@ def declared(seed: int, reference=None, dpr: float = 1.0) -> dict:
             "sample_rate": prefs[personas.P + "audio.sample_rate"], "max_channels": prefs[personas.P + "audio.max_channel_count"]}
 
 
+def _is_canary_width(width) -> bool:
+    return isinstance(width, (int, float)) and abs(width - CANARY_TEXT_WIDTH) < 0.5
+
+
 def findings(probe, want: dict) -> list:
     """What an engine's `ab.poison` leaves say about the host, against `want` (declared()): every line is a value that is the machine's
     (or that is not what the persona declares), empty when the page read none of the poison. A page that dumped no probe is a finding too:
@@ -208,6 +215,12 @@ def findings(probe, want: dict) -> list:
     elif canary["present"]:
         out.append("canary font: a page measures the user-installed family %s (its text is %s wide, a fallback's %s)"
                    % (FAMILY, json.dumps(canary.get("with")), json.dumps(canary.get("without"))))
+    generic = probe.get("generic")
+    if not isinstance(generic, list) or len(generic) != len(GENERICS):
+        out.append("generic families: the probe did not measure them: %s" % json.dumps(generic))
+    else:
+        out += ["generic family %s: a page measures %s wide, the canary's width: the host's fontconfig chose it" % (g, w)
+                for g, w in zip(GENERICS, generic) if _is_canary_width(w)]
     audio = probe.get("audio")
     if not isinstance(audio, dict):
         out.append("audio: the probe did not read the audio context: %s" % json.dumps(audio))
@@ -229,12 +242,92 @@ def dump_findings(dump: dict, wants: Callable = declared) -> list:
 
 
 # -
+# The by-product: what the published engine reads from the host that the poison changes.
+#
+# The same job dumps the published engine on the CLEAN runner (before the poison is applied) and, in the oracle's own run, on the POISONED one,
+# the same seeds. Every leaf that differs is a host dependency the published engine ALREADY has: not a failure of the candidate and never red,
+# a finding, kept in a file of its own and summarised in the job's summary.
+
+CLEAN_FILE = "poison-clean-68.json"
+DEPENDENCE_FILE = "poison-host-dependence-68.json"
+DEPENDENCE_FORMAT = "poison-host-dependence/1"
+CLIP = 300
+
+
+def _clip(value):
+    text = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return value if len(text) <= CLIP else {"clipped": text[:CLIP], "len": len(text)}
+
+
+def host_dependence(clean: dict, poisoned: dict) -> dict:
+    """The leaves of the published engine that differ between its dump on the clean runner and on the poisoned one (both packed dumps,
+    ci_ab_oracle.pack), over the visits both have: {"visits", "missing", "leaves_compared", "differences": [{seed, dpr, leaf, clean, poisoned}]}."""
+    import ci_host_gate as gate
+
+    def by_visit(dump):
+        return {(v["dpr"], v["seed"]): {k: x for k, x in gate.leaves(v["items"]).items() if not gate.is_diag(k)} for v in dump.get("visits", [])}
+
+    a, b = by_visit(clean), by_visit(poisoned)
+    both = sorted(set(a) & set(b), key=lambda k: (k[1], k[0]))
+    differences, compared = [], 0
+    for dpr, seed in both:
+        for leaf in sorted(set(a[(dpr, seed)]) | set(b[(dpr, seed)])):
+            compared += 1
+            x, y = a[(dpr, seed)].get(leaf, "<missing>"), b[(dpr, seed)].get(leaf, "<missing>")
+            if x != y:
+                differences.append({"seed": seed, "dpr": dpr, "leaf": leaf, "clean": _clip(x), "poisoned": _clip(y)})
+    return {"format": DEPENDENCE_FORMAT, "visits": ["seed %d dpr %s" % (s, d) for d, s in both],
+            "missing": ["seed %d dpr %s" % (s, d) for d, s in sorted(set(a) ^ set(b), key=lambda k: (k[1], k[0]))],
+            "leaves_compared": compared, "differences": differences}
+
+
+def dependence_markdown(report: dict | None) -> str:
+    """The summary section of the job: the count, the leaves by family and the first few with both values."""
+    lines = ["### Host dependencies of the published engine (clean runner against poisoned runner)", ""]
+    if report is None:
+        return "\n".join(lines + ["No dump of the published engine on the clean runner: the step before the poison did not write one, "
+                                  "so the by-product is not available in this run.", ""])
+    diffs = report["differences"]
+    lines.append("%d of %d leaves differ over %d visits (%s). Each is a value the engine read from the host that the poison changed: "
+                 "a finding about the published engine, not a failure of the candidate." % (len(diffs), report["leaves_compared"], len(report["visits"]),
+                                                                                           ", ".join(report["visits"]) or "none"))
+    if report["missing"]:
+        lines.append("Visits that only one of the two dumps has: %s." % ", ".join(report["missing"]))
+    families = {}
+    for d in diffs:
+        families[".".join(d["leaf"].split(".")[:2])] = families.get(".".join(d["leaf"].split(".")[:2]), 0) + 1
+    if families:
+        lines += ["", "| family | leaves |", "|---|---|"] + ["| %s | %d |" % kv for kv in sorted(families.items(), key=lambda kv: (-kv[1], kv[0]))[:30]]
+        lines += ["", "| seed | leaf | clean | poisoned |", "|---|---|---|---|"]
+        for d in diffs[:40]:
+            lines.append("| %s | %s | %s | %s |" % (d["seed"], d["leaf"], json.dumps(d["clean"], ensure_ascii=False)[:80].replace("|", "/"),
+                                                     json.dumps(d["poisoned"], ensure_ascii=False)[:80].replace("|", "/")))
+    return "\n".join(lines + [""])
+
+
+def write_dependence(out: Path, summary: Path | None = None) -> dict | None:
+    """Write DEPENDENCE_FILE in `out` from CLEAN_FILE and dump-68.json there, and the markdown to `summary` (the job's $GITHUB_STEP_SUMMARY).
+    Returns the report, or None when there is no clean dump. Never a verdict."""
+    clean, poisoned = out / CLEAN_FILE, out / "dump-68.json"
+    report = None
+    if clean.is_file() and poisoned.is_file():
+        report = host_dependence(json.loads(clean.read_text(encoding="utf-8")), json.loads(poisoned.read_text(encoding="utf-8")))
+        (out / DEPENDENCE_FILE).write_text(json.dumps(report, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+    text = dependence_markdown(report)
+    if summary:
+        with open(summary, "a", encoding="utf-8", newline="\n") as f:
+            f.write(text + "\n")
+    print(text)
+    return report
+
+
+# -
 # The negative control: what stock Firefox must read on the poisoned runner.
 
 #: Each requirement of the control, with what it means. Language is reported and not required: Playwright's Firefox is an en-US build, which
 #: takes its language from its own locale, not from the machine; the control prints what it read, and the requirement is one line away
 #: (REQUIRED) once a run has shown that stock reads it.
-REQUIRED = ("timezone", "dark", "canary", "audio")
+REQUIRED = ("timezone", "dark", "canary", "audio", "generic")
 
 
 def control_failures(probe, system: str) -> list:
@@ -250,6 +343,10 @@ def control_failures(probe, system: str) -> list:
     if not isinstance(canary, dict) or canary.get("present") is not True:
         out.append(("canary", "stock Firefox did not measure the user-installed family %s: %s" % (FAMILY, json.dumps(canary))))
     if system == "linux":
+        generic = probe.get("generic")
+        if not isinstance(generic, list) or not generic or not all(_is_canary_width(w) for w in generic):
+            out.append(("generic", "stock Firefox measured the generic families %s, not the canary's %s: the user's fonts.conf was not read"
+                        % (json.dumps(generic), CANARY_TEXT_WIDTH)))
         audio = probe.get("audio")
         if not isinstance(audio, dict) or audio.get("sampleRate") != SINK_RATE:
             out.append(("audio", "stock Firefox read the audio %s, not the null sink's %d Hz" % (json.dumps(audio), SINK_RATE)))
@@ -450,7 +547,29 @@ def _sink_server(info: str) -> str:
     return m.group(1) if m else ""
 
 
-def apply_linux(run: Run = _run, font_dir: Path | None = None, audio: bool = True) -> dict:
+def fonts_conf() -> str:
+    """The user's fontconfig file of the Linux poison: the canary is the first choice of the three generic families, and the rendering
+    settings are ones no desktop has (no antialiasing, full hinting, rgb subpixels, the light LCD filter). The engine's default FcConfig is
+    still the host's (FcConfigSubstitute(nullptr, ...) in gfxFcPlatformFontList and ScaledFontFontconfig), so a page that reads what this
+    changes read the host."""
+    aliases = "".join('  <alias binding="strong"><family>%s</family><prefer><family>%s</family></prefer></alias>\n' % (g, FAMILY) for g in GENERICS)
+    return ('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n' + aliases
+            + '  <match target="font">\n'
+              '    <edit name="antialias" mode="assign"><bool>false</bool></edit>\n'
+              '    <edit name="hinting" mode="assign"><bool>true</bool></edit>\n'
+              '    <edit name="hintstyle" mode="assign"><const>hintfull</const></edit>\n'
+              '    <edit name="rgba" mode="assign"><const>rgb</const></edit>\n'
+              '    <edit name="lcdfilter" mode="assign"><const>lcdlight</const></edit>\n'
+              '  </match>\n</fontconfig>\n')
+
+
+def fonts_conf_path(env=None) -> Path:
+    env = env or os.environ
+    base = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or Path.home()) / ".config")
+    return Path(base) / "fontconfig" / "fonts.conf"
+
+
+def apply_linux(run: Run = _run, font_dir: Path | None = None, audio: bool = True, conf_file: Path | None = None) -> dict:
     """Put the poison on this Linux machine; returns the state `undo_linux` needs. The environment part is for the later steps of the job
     (state["env"], appended to $GITHUB_ENV by `apply`)."""
     fonts = font_dir_linux() if font_dir is None else Path(font_dir)
@@ -460,6 +579,10 @@ def apply_linux(run: Run = _run, font_dir: Path | None = None, audio: bool = Tru
         _ok(run, _sudo(["locale-gen", LINUX_LANG]), "generate the %s locale" % LINUX_LANG)
     fonts.mkdir(parents=True, exist_ok=True)
     (fonts / FONT_FILE).write_bytes(canary_font())
+    conf = fonts_conf_path() if conf_file is None else Path(conf_file)
+    state["fonts_conf"] = {"path": str(conf), "before": conf.read_text(encoding="utf-8") if conf.is_file() else None}
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text(fonts_conf(), encoding="utf-8", newline="\n")
     _ok(run, ["fc-cache", "-f", str(fonts)], "refresh the font cache")
     if audio:
         _try(run, ["pulseaudio", "--daemonize=yes", "--exit-idle-time=-1", "--disallow-exit"])
@@ -483,6 +606,16 @@ def undo_linux(state: dict, run: Run = _run) -> None:
         font.unlink()
     except OSError:
         pass
+    saved = state.get("fonts_conf")
+    if saved:  # the file that was there comes back, or the one this wrote goes
+        conf = Path(saved["path"])
+        try:
+            if saved["before"] is None:
+                conf.unlink()
+            else:
+                conf.write_text(saved["before"], encoding="utf-8", newline="\n")
+        except OSError:
+            pass
     _try(run, ["fc-cache", "-f", str(font.parent)])
 
 
@@ -494,6 +627,13 @@ def verify_linux(run: Run = _run, state: dict | None = None, expect_env: bool = 
     problems += _font_file_problems(font)
     if FAMILY not in _try(run, ["fc-list", ":", "family"]):
         problems.append("fontconfig does not list the family %s" % FAMILY)
+    conf = Path(state["fonts_conf"]["path"]) if state and state.get("fonts_conf") else fonts_conf_path()
+    if not conf.is_file() or conf.read_text(encoding="utf-8") != fonts_conf():
+        problems.append("the user's fonts.conf is not the poison's")
+    for generic in GENERICS:
+        picked = _try(run, ["fc-match", "-f", "%{family}", generic])
+        if FAMILY not in picked:
+            problems.append("fontconfig answers %r for %s, not the canary" % (picked, generic))
     if audio:
         sinks = _try(run, ["pactl", "list", "short", "sinks"])
         line = next((ln for ln in sinks.splitlines() if SINK in ln), "")

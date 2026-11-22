@@ -411,6 +411,30 @@ def run_ab(leg: str, out: Path, engine_tag: str, published: tuple | None = None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def clean_name(engine_tag: str) -> str:
+    """poison-clean-68.json for firefox-68: the published engine's dump on the CLEAN runner, kept beside the poisoned run's (scripts/ci_poison_host.py)."""
+    return "poison-clean-" + dump_name(engine_tag)[len("dump-"):]
+
+
+def run_clean(leg: str, out: Path, engine_tag: str, visits: list, published: tuple | None = None) -> int:
+    """The published engine's dump of `visits` on this machine, written to out/clean_name(engine_tag), before the poison is applied. It judges nothing: 0
+    when it dumped, 1 when it did not (the by-product of the poisoned run is then missing and says so)."""
+    out.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="ab-oracle-clean-"))
+    try:
+        binary, seal = published or fetch_published(engine_tag, work)
+        _, problems = _dump_visits(engine_tag + "-clean", binary, seal, leg, visits, work, out, clean_name(engine_tag))
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - said, not raised: this is a by-product
+        problems = ["%s: %s" % (type(e).__name__, str(e)[:500])]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for p in problems:
+        print("CLEAN DUMP: " + p)
+    return 1 if problems else 0
+
+
 def recompare(directory: Path, engine_tag: str, visits: list | None = None, a_a: bool = False) -> int:
     visits = select_visits() if visits is None else visits
     published = unpack(json.loads((directory / dump_name(engine_tag)).read_text(encoding="utf-8")))
@@ -445,6 +469,13 @@ def main(argv=None) -> int:
     r.add_argument("--limit", type=int, help="visit only the first N seeds of the set (the A/A of a pull request)")
     r.add_argument("--published-binary", type=Path, help="use this binary for the published engine instead of fetching it")
     r.add_argument("--published-seal", type=Path, help="with --published-binary: the seal of that engine")
+    k = sub.add_parser("clean", help="the published engine's dump on this (clean) machine, for the poisoned run's by-product")
+    k.add_argument("--leg", required=True)
+    k.add_argument("--out", type=Path, required=True)
+    k.add_argument("--engine-tag", default=ENGINE_TAG)
+    k.add_argument("--seed-set", choices=SEED_SETS, default=SEED_SET)
+    k.add_argument("--shard")
+    k.add_argument("--limit", type=int)
     c = sub.add_parser("compare")
     c.add_argument("directory", type=Path)
     c.add_argument("--engine-tag", default=ENGINE_TAG)
@@ -453,6 +484,8 @@ def main(argv=None) -> int:
     c.add_argument("--limit", type=int)
     c.add_argument("--a-a", action="store_true", help="compare the two dumps of the published engine (the control)")
     args = ap.parse_args(argv)
+    if args.cmd == "clean":
+        return run_clean(args.leg, args.out, args.engine_tag, select_visits(args.seed_set, args.shard, limit=args.limit))
     if args.cmd == "compare":
         return recompare(args.directory, args.engine_tag, select_visits(args.seed_set, args.shard, limit=args.limit), args.a_a)
     if args.published_seal and not args.published_binary:

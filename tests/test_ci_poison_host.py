@@ -24,10 +24,11 @@ WANT = {"timezone": "Asia/Bangkok", "offsets": [-420, -420], "locale": "en-US", 
         "date_full": "Thursday, January 15, 2026", "number": "1,234,567.891", "dark": False, "sample_rate": 48000, "max_channels": 2}
 OURS = {"timezone": "Asia/Bangkok", "offsets": [-420, -420], "language": "en-US", "languages": ["en-US", "en"], "intl_locale": "en-US",
         "date_full": "Thursday, January 15, 2026", "number": "1,234,567.891", "dark": False, "canary_check": True,
-        "canary": {"with": [100, 100], "without": [100, 100], "present": False}, "audio": {"sampleRate": 48000, "maxChannelCount": 2}}
+        "canary": {"with": [100, 100], "without": [100, 100], "present": False}, "generic": [30.5, 41.0, 52.0],
+        "audio": {"sampleRate": 48000, "maxChannelCount": 2}}
 STOCK = {"timezone": "America/Bogota", "offsets": [300, 300], "language": "en-US", "languages": ["en-US", "en"], "intl_locale": "en-US",
          "dark": True, "canary_check": True, "canary": {"with": [180, 180], "without": [100, 100], "present": True},
-         "audio": {"sampleRate": 96000, "maxChannelCount": 6}}
+         "generic": [216.0, 216.0, 216.0], "audio": {"sampleRate": 96000, "maxChannelCount": 6}}
 
 
 # -
@@ -104,6 +105,9 @@ def test_an_engine_that_reads_the_declared_identity_has_no_finding():
     ({"dark": True}, "prefers-color-scheme"),
     ({"canary": {"with": [180, 180], "without": [100, 100], "present": True}}, "ZZHostCanary"),
     ({"audio": {"sampleRate": 96000, "maxChannelCount": 6}}, "sampleRate 96000"),
+    ({"generic": [216.0, 41.0, 52.0]}, "generic family sans-serif"),
+    ({"generic": [30.5, 216.0, 216.0]}, "generic family monospace"),
+    ({"generic": None}, "did not measure"),
     ({"audio": {"sampleRate": 48000, "maxChannelCount": 6}}, "maxChannelCount 6"),
     ({"audio": "ERR NotSupportedError"}, "did not read the audio"),
 ])
@@ -156,14 +160,16 @@ def test_stock_firefox_that_read_the_poison_is_a_sound_control():
     ({"dark": False}, "dark"),
     ({"canary": {"with": [100, 100], "without": [100, 100], "present": False}}, "canary"),
     ({"audio": {"sampleRate": 48000, "maxChannelCount": 2}}, "audio"),
+    ({"generic": [30.5, 216.0, 216.0]}, "generic"),
+    ({"generic": None}, "generic"),
 ])
 def test_a_poison_that_stock_firefox_did_not_read_is_a_broken_control(change, requirement):
     failures = poison.control_failures(dict(STOCK, **change), "linux")
     assert [name for name, _ in failures] == [requirement]
 
 
-def test_the_audio_sink_is_linux_s_only():
-    assert poison.control_failures(dict(STOCK, audio={"sampleRate": 48000, "maxChannelCount": 2}), "windows") == []
+def test_the_audio_sink_and_the_generic_families_are_linux_s_only():
+    assert poison.control_failures(dict(STOCK, audio={"sampleRate": 48000, "maxChannelCount": 2}, generic=[30.5, 41.0, 52.0]), "windows") == []
 
 
 def test_a_control_that_returned_nothing_is_broken():
@@ -199,6 +205,20 @@ class Fake:
 
     def text(self):
         return [" ".join(c) for c in self.calls]
+
+
+@pytest.fixture(autouse=True)
+def own_home(tmp_path, monkeypatch):
+    """The Linux poison writes under the user's config and data folders: they are this test's own."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+
+
+def put_conf(tmp_path):
+    conf = poison.fonts_conf_path()
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text(poison.fonts_conf(), encoding="utf-8")
+    return {"font": str(tmp_path / poison.FONT_FILE), "fonts_conf": {"path": str(conf), "before": None}}
 
 
 @pytest.fixture()
@@ -326,10 +346,11 @@ def test_linux_verify_wants_the_sink_to_be_6_channels_at_96000_and_the_default(t
     font = tmp_path / poison.FONT_FILE
     font.write_bytes(poison.canary_font())
     state = {"font": str(font)}
-    good = Fake({"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary", "list short sinks": "1\thostcanary\tmodule-null-sink.c\ts16le 6ch 96000Hz\tIDLE",
+    state = dict(state, **put_conf(tmp_path))
+    good = Fake({"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary", "fc-match": "ZZHostCanary", "list short sinks": "1\thostcanary\tmodule-null-sink.c\ts16le 6ch 96000Hz\tIDLE",
                  "get-default-sink": "hostcanary"})
     assert poison.verify_linux(good, state) == []
-    bad = Fake({"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary", "list short sinks": "1\thostcanary\tmodule-null-sink.c\ts16le 2ch 44100Hz\tIDLE",
+    bad = Fake({"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary", "fc-match": "ZZHostCanary", "list short sinks": "1\thostcanary\tmodule-null-sink.c\ts16le 2ch 44100Hz\tIDLE",
                 "get-default-sink": "alsa_output"})
     problems = poison.verify_linux(bad, state)
     assert any("6 channels at 96000" in p for p in problems) and any("default sink" in p for p in problems)
@@ -339,8 +360,8 @@ def test_linux_verify_wants_the_sink_to_be_6_channels_at_96000_and_the_default(t
 def test_linux_verify_of_the_environment_is_for_the_process_that_inherited_it(tmp_path):
     font = tmp_path / poison.FONT_FILE
     font.write_bytes(poison.canary_font())
-    quiet = Fake({"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary"})
-    state = {"font": str(font)}
+    quiet = Fake({"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary", "fc-match": "ZZHostCanary"})
+    state = dict({"font": str(font)}, **put_conf(tmp_path))
     assert poison.verify_linux(quiet, state, audio=False) == []
     problems = poison.verify_linux(quiet, state, expect_env=True, audio=False, env={"TZ": "UTC"})
     assert len(problems) == 4 and any("TZ" in p for p in problems)
@@ -402,3 +423,129 @@ def test_the_new_files_name_no_machine_path_and_no_forbidden_word():
         for word in banned:
             assert word not in text, "%s holds %r" % (path.name, word)
         assert "\r" not in text, "%s is not LF" % path.name
+
+
+# -
+# The user's fontconfig file of the Linux poison.
+
+def test_the_fonts_conf_makes_the_canary_the_first_choice_of_the_generic_families_and_sets_unusual_rendering():
+    conf = poison.fonts_conf()
+    for generic in ("sans-serif", "serif", "monospace"):
+        assert '<alias binding="strong"><family>%s</family><prefer><family>ZZHostCanary</family></prefer></alias>' % generic in conf
+    for edit in ('name="antialias" mode="assign"><bool>false', 'name="hinting" mode="assign"><bool>true', "<const>hintfull</const>",
+                 "<const>rgb</const>", "<const>lcdlight</const>"):
+        assert edit in conf
+    assert conf.startswith('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n') and conf.endswith("</fontconfig>\n")
+    import xml.etree.ElementTree as ET
+
+    assert ET.fromstring(conf.split("\n", 2)[2]).tag == "fontconfig"
+
+
+def test_linux_apply_writes_the_fonts_conf_and_undo_removes_it_when_there_was_none(tmp_path):
+    fake = Fake({"locale -a": "ja_JP.utf8"})
+    state = poison.apply_linux(fake, font_dir=tmp_path / "fonts", audio=False)
+    conf = Path(state["fonts_conf"]["path"])
+    assert conf == poison.fonts_conf_path() and conf.read_text(encoding="utf-8") == poison.fonts_conf() and state["fonts_conf"]["before"] is None
+    poison.undo_linux(state, fake)
+    assert not conf.exists()
+
+
+def test_a_fonts_conf_that_was_there_comes_back_on_undo(tmp_path):
+    conf = poison.fonts_conf_path()
+    conf.parent.mkdir(parents=True)
+    conf.write_text("<fontconfig/>\n", encoding="utf-8")
+    fake = Fake({"locale -a": "ja_JP.utf8"})
+    state = poison.apply_linux(fake, font_dir=tmp_path / "fonts", audio=False)
+    assert state["fonts_conf"]["before"] == "<fontconfig/>\n" and conf.read_text(encoding="utf-8") == poison.fonts_conf()
+    poison.undo_linux(state, fake)
+    assert conf.read_text(encoding="utf-8") == "<fontconfig/>\n"
+
+
+def test_linux_verify_names_a_fonts_conf_that_is_not_the_poison_s_and_a_generic_family_that_is_not_the_canary(tmp_path):
+    font = tmp_path / poison.FONT_FILE
+    font.write_bytes(poison.canary_font())
+    state = dict({"font": str(font)}, **put_conf(tmp_path))
+    answers = {"locale -a": "ja_JP.utf8", "fc-list": "ZZHostCanary", "fc-match": "DejaVu Sans"}
+    problems = poison.verify_linux(Fake(answers), state, audio=False)
+    assert len([p for p in problems if "not the canary" in p]) == 3 and not any("fonts.conf" in p for p in problems)
+    Path(state["fonts_conf"]["path"]).write_text("<fontconfig/>", encoding="utf-8")
+    assert any("fonts.conf is not the poison" in p for p in poison.verify_linux(Fake(dict(answers, **{"fc-match": "ZZHostCanary"})), state, audio=False))
+
+
+# -
+# The by-product: what the published engine reads from the host.
+
+def packed(*visits):
+    return {"format": "ab-oracle/1", "visits": [{"dpr": dpr, "seed": seed, "items": items} for dpr, seed, items in visits]}
+
+
+def test_every_leaf_that_differs_between_the_clean_and_the_poisoned_dump_is_a_host_dependence():
+    clean = packed((1.0, 0, {"surface.intl": {"timeZone": "Asia/Bangkok", "x": 1}, "text.rect": [1, 2], "diag.webgl": {"a": 1}}),
+                   (1.0, 2, {"surface.intl": {"timeZone": "Asia/Bangkok", "x": 1}}))
+    poisoned = packed((1.0, 0, {"surface.intl": {"timeZone": "America/Lima", "x": 1}, "text.rect": [1, 3], "diag.webgl": {"a": 2}}))
+    report = poison.host_dependence(clean, poisoned)
+    assert [(d["seed"], d["leaf"], d["clean"], d["poisoned"]) for d in report["differences"]] == [
+        (0, "surface.intl.timeZone", "Asia/Bangkok", "America/Lima"), (0, "text.rect", [1, 2], [1, 3])]
+    assert report["visits"] == ["seed 0 dpr 1.0"] and report["missing"] == ["seed 2 dpr 1.0"] and report["leaves_compared"] == 3
+
+
+def test_a_leaf_one_side_lacks_is_missing_not_equal_and_long_values_are_clipped():
+    report = poison.host_dependence(packed((1.0, 0, {"a": "x" * 1000})), packed((1.0, 0, {"b": 1})))
+    assert {d["leaf"] for d in report["differences"]} == {"a", "b"}
+    assert report["differences"][0]["clean"]["len"] > poison.CLIP and report["differences"][1]["clean"] == "<missing>"
+
+
+def test_two_equal_dumps_have_no_dependence_and_the_summary_says_so():
+    report = poison.host_dependence(packed((1.0, 0, {"a": 1})), packed((1.0, 0, {"a": 1})))
+    assert report["differences"] == []
+    assert "0 of 1 leaves differ" in poison.dependence_markdown(report)
+
+
+def test_the_summary_groups_by_family_and_is_a_finding_not_a_failure():
+    report = poison.host_dependence(packed((1.0, 0, {"surface.intl": {"a": 1, "b": 1}, "text.x": 1})),
+                                    packed((1.0, 0, {"surface.intl": {"a": 2, "b": 2}, "text.x": 2})))
+    text = poison.dependence_markdown(report)
+    assert "| surface.intl | 2 |" in text and "| text.x | 1 |" in text and "not a failure of the candidate" in text
+
+
+def test_without_a_clean_dump_the_summary_says_it_and_no_file_is_written(tmp_path):
+    (tmp_path / "dump-68.json").write_text(json.dumps(packed((1.0, 0, {"a": 1}))), encoding="utf-8")
+    summary = tmp_path / "summary.md"
+    assert poison.write_dependence(tmp_path, summary) is None
+    assert "No dump of the published engine on the clean runner" in summary.read_text(encoding="utf-8")
+    assert not (tmp_path / poison.DEPENDENCE_FILE).exists()
+
+
+def test_the_dependence_is_written_to_its_own_file_and_to_the_summary(tmp_path):
+    (tmp_path / poison.CLEAN_FILE).write_text(json.dumps(packed((1.0, 0, {"a": 1}))), encoding="utf-8")
+    (tmp_path / "dump-68.json").write_text(json.dumps(packed((1.0, 0, {"a": 2}))), encoding="utf-8")
+    summary = tmp_path / "summary.md"
+    report = poison.write_dependence(tmp_path, summary)
+    assert json.loads((tmp_path / poison.DEPENDENCE_FILE).read_text(encoding="utf-8")) == report
+    assert report["differences"] == [{"seed": 0, "dpr": 1.0, "leaf": "a", "clean": 1, "poisoned": 2}]
+    assert "1 of 1 leaves differ" in summary.read_text(encoding="utf-8")
+
+
+def test_the_files_of_the_by_product_are_poison_files_which_the_oracle_s_listing_ignores():
+    assert poison.CLEAN_FILE.startswith("poison-") and poison.DEPENDENCE_FILE.startswith("poison-")
+    import ci_ab_oracle as oracle
+
+    assert oracle.clean_name("firefox-68") == poison.CLEAN_FILE
+
+
+def test_the_clean_dump_is_the_published_engine_dumped_on_this_machine_and_judges_nothing(tmp_path, monkeypatch):
+    import ci_ab_oracle as oracle
+
+    seen = {}
+    monkeypatch.setattr(oracle, "fetch_published", lambda tag, work: ("published-binary", work / "seal.json"))
+    monkeypatch.setattr(oracle, "_dump_visits", lambda name, exe, seal, leg, visits, work, out, file_name:
+                        (seen.update(name=name, exe=exe, visits=visits, file=file_name) or ({}, [])))
+    assert oracle.run_clean("linux-x86_64", tmp_path, "firefox-68", [(1.0, 0), (1.5, 63)]) == 0
+    assert seen == {"name": "firefox-68-clean", "exe": "published-binary", "visits": [(1.0, 0), (1.5, 63)], "file": "poison-clean-68.json"}
+    monkeypatch.setattr(oracle, "fetch_published", lambda tag, work: (_ for _ in ()).throw(RuntimeError("no network")))
+    assert oracle.run_clean("linux-x86_64", tmp_path, "firefox-68", [(1.0, 0)]) == 1
+
+
+def test_the_e2e_writes_the_dependence_before_it_asserts_anything_on_a_poisoned_host():
+    source = (ROOT / "tests" / "test_ab_oracle_e2e.py").read_text(encoding="utf-8")
+    assert source.index("poison.write_dependence(") < source.index("poison.verify_here(") < source.index("poison.dump_findings(")
