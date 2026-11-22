@@ -1,0 +1,136 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# oracle-aa.yml - the A/A of the page A/B oracle on the PUBLISHED engine, on this branch only.
+#
+# A measurement, not a gate: before the additions of this branch (the second launch of seed 0 on one profile, `relaunch.`, and the final set of 20 seeds in four shards)
+# enter a candidate, the published engine must repeat itself on them with ZERO differences, on GitHub, on Linux and on Windows. There is no candidate here: INVISIBLE_SEAL_FILE
+# is not set, so tests/test_ab_oracle_e2e.py runs its A/A mode, and its verdict is the pytest result: the same test the pull request's e2e runs, the same file, the same assertions.
+#
+# Runs on a push to the branch below and nowhere else (not a pull request, not main): the file leaves with the branch, and e2e.yml is not touched.
+#
+# Rows of the matrix, 10 runs, never more than 2 at once (`max-parallel: 2` on the one matrix, so the whole workflow holds to it):
+#   * candidate set, the 5 seeds of ci/persona-seeds.json (AB_ORACLE_PR_SEEDS=5), seed 0 launched twice on one profile: Linux and Windows;
+#   * final set, 20 seeds in 4 shards (AB_ORACLE_SEED_SET=final, AB_ORACLE_SHARD=i/4), Linux and Windows. Seed 0 is in shard 1, with its second launch.
+#
+# Time: the test's own hang guard (tests/test_ab_oracle_e2e.py, budget_s) is 120 s to start, then for each of the two engine runs 180 s for the first seed, 100 s for each next
+# one and, in a shard that has seed 0, 200 s for its second launch: 1680 s for five seeds with the relaunch, 1280 s without, plus 120 s of thread guard. The test step ends at
+# 32 minutes and the job at 50 (setup is 5 to 10 minutes). Expected: about 20 to 28 minutes a run, so about 2 hours for the 10 runs, two at a time.
+#
+# No cache is written (no cache action, no setup-python cache): every run installs and fetches from scratch, as the e2e jobs do.
+# ─────────────────────────────────────────────────────────────────────────────
+name: oracle-aa
+
+on:
+  push:
+    branches: [tests/ab-page-h4h7]
+
+permissions:
+  contents: read
+
+# A push while a run is going waits for it (a measurement is not cancelled half way); of the ones waiting only the newest stays.
+concurrency:
+  group: oracle-aa-${{ github.ref }}
+  cancel-in-progress: false
+
+# Engine and GeoIP downloads go through the release API with this token (the same reason as e2e.yml).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  # The install below resolves `invisible-core==N.M.0` from the package index: the same gate as e2e.yml, so that a core that is not on the index yet skips the runs with the reason
+  # in the summary instead of failing them.
+  core-on-index:
+    uses: ./.github/workflows/core-on-index.yml
+
+  page-aa:
+    name: page oracle A/A (${{ matrix.set }}${{ matrix.shard && format(' {0}/4', matrix.shard) || '' }}, ${{ matrix.system }})
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - { set: candidate, shard: '', system: linux, runs_on: ubuntu-24.04 }
+          - { set: candidate, shard: '', system: windows, runs_on: windows-2022 }
+          - { set: final, shard: '1', system: linux, runs_on: ubuntu-24.04 }
+          - { set: final, shard: '1', system: windows, runs_on: windows-2022 }
+          - { set: final, shard: '2', system: linux, runs_on: ubuntu-24.04 }
+          - { set: final, shard: '2', system: windows, runs_on: windows-2022 }
+          - { set: final, shard: '3', system: linux, runs_on: ubuntu-24.04 }
+          - { set: final, shard: '3', system: windows, runs_on: windows-2022 }
+          - { set: final, shard: '4', system: linux, runs_on: ubuntu-24.04 }
+          - { set: final, shard: '4', system: windows, runs_on: windows-2022 }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: System deps (xvfb + Firefox runtime libs)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+          else
+            echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+          fi
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle A/A (the published engine against itself)
+        timeout-minutes: 32
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_ORACLE_SEED_SET: ${{ matrix.set }}
+          AB_ORACLE_SHARD: ${{ matrix.shard && format('{0}/4', matrix.shard) || '' }}
+          AB_ORACLE_PR_SEEDS: "5"
+        run: |
+          PREFIX=""
+          if [ "$RUNNER_OS" = Linux ]; then PREFIX="xvfb-run -a"; fi
+          $PREFIX env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-aa-e2e.xml"
+          python - "$RUNNER_TEMP/page-aa-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      # The evidence whatever the verdict: both dumps of the engine (dump-68.json, dump-68-again.json), the diff of the control (diff-a-a.json) and the oracle's log, under
+      # invpw-evidence/ab-oracle, and the junit of the run.
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oracle-aa-${{ matrix.set }}${{ matrix.shard && format('-{0}', matrix.shard) || '' }}-${{ matrix.system }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-aa-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
