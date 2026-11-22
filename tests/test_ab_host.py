@@ -946,7 +946,7 @@ NET_LOG = r"""300 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-profile"
 300 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT <unfinished ...>
 300 <... socket resumed>) = 42<socket:[81240]>
 300 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 43<socket:[81250]>
-301 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.215.14")}, 16) = -1 EINPROGRESS (Operation now in progress)
+301 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("8.8.8.8")}, 16) = -1 EINPROGRESS (Operation now in progress)
 300 socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_UDP) = 44<socket:[81260]>
 300 sendto(44<socket:[81260]>, "\x12\x34\x01\x00\x00\x01", 6, MSG_NOSIGNAL, {sa_family=AF_INET6, sin6_port=htons(53), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:4860:4860::8888", &sin6_addr), sin6_scope_id=0}, 28) = 6
 300 connect(43<socket:[81250]>, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
@@ -958,11 +958,11 @@ NET_LOG = r"""300 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-profile"
 300 fork() = 302
 302 execve("/proc/self/exe", ["/e/firefox/firefox", "-contentproc", "-prefsLen", "1", "socket"], 0x7ffd /* 40 vars */) = 0
 302 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 5<socket:[81300]>
-302 sendmmsg(5<socket:[81300]>, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(3478), sin_addr=inet_addr("74.125.250.129")}, msg_namelen=16, msg_iov=[{iov_base="\x00\x01\x00\x00", iov_len=4}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=4}], 1, 0) = 1
+302 sendmmsg(5<socket:[81300]>, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(3478), sin_addr=inet_addr("1.1.1.1")}, msg_namelen=16, msg_iov=[{iov_base="\x00\x01\x00\x00", iov_len=4}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=4}], 1, 0) = 1
 302 connect(5<socket:[81300]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:203.0.113.7", &sin6_addr), sin6_scope_id=0}, 28) = 0
 """
 
-PARENT_NET = ["parent: connect tcp AF_INET 93.184.215.14:443", "parent: netlink NETLINK_KOBJECT_UEVENT", "parent: netlink NETLINK_ROUTE",
+PARENT_NET = ["parent: connect tcp AF_INET 8.8.8.8:443", "parent: netlink NETLINK_KOBJECT_UEVENT", "parent: netlink NETLINK_ROUTE",
               "parent: netlink NETLINK_ROUTE RTM_GETADDR", "parent: netlink NETLINK_ROUTE RTM_GETLINK", "parent: netlink NETLINK_ROUTE bind nl_groups=00000511",
               "parent: send udp AF_INET6 [2001:4860:4860::8888]:53"]
 
@@ -973,7 +973,7 @@ def test_the_network_of_a_linux_run_is_its_netlink_sockets_their_requests_and_it
     monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
     monkeypatch.setattr(host, "_context", lambda binary, windows, work: host.Context("linux", app=["/e/firefox"], temp=["/tmp/ab-host-tmp-x"]))
     fp = host._seed_result(REAL, 11, tmp_path, [], log, None, None, False)
-    assert fp["net"] == PARENT_NET + ["socket: send udp AF_INET 74.125.250.129:3478"], "a thread's request is its process's, a socket is known by its inode"
+    assert fp["net"] == PARENT_NET + ["socket: send udp AF_INET 1.1.1.1:3478"], "a thread's request is its process's, a socket is known by its inode"
     assert fp["net_not_compared"] == {"lab": 2, "loopback": 1, "multicast": 1, "private": 1}, "198.51.100.9 and ::ffff:203.0.113.7 are the lab's"
     leaves = host.leaves_of(fp)
     assert leaves["net.parent: netlink NETLINK_ROUTE RTM_GETADDR"] == 1 and not any("127.0.0.1" in k or "198.51.100" in k for k in leaves)
@@ -989,7 +989,7 @@ def test_a_netlink_message_strace_printed_as_bytes_is_read_for_its_type():
 
 
 @pytest.mark.parametrize("address,cls", [
-    ("93.184.215.14", "public"), ("2001:4860:4860::8888", "public"), ("127.0.0.53", "loopback"), ("::1", "loopback"),
+    ("8.8.8.8", "public"), ("2001:4860:4860::8888", "public"), ("127.0.0.53", "loopback"), ("::1", "loopback"),
     ("192.0.2.53", "lab"), ("198.51.100.9", "lab"), ("203.0.113.80", "lab"), ("::ffff:198.51.100.5", "lab"),
     ("10.1.0.4", "private"), ("172.17.0.1", "private"), ("192.168.1.1", "private"), ("169.254.169.254", "private"), ("fe80::1%2", "private"),
     ("100.64.0.1", "private"), ("fd00::1", "private"), ("0.0.0.0", "private"), ("224.0.0.251", "multicast"), ("ff02::fb", "multicast"),
@@ -1027,11 +1027,11 @@ def test_the_same_request_from_another_kind_is_a_difference_too():
 
 
 def test_a_public_destination_only_the_candidate_reaches_is_red_and_the_declared_list_does_not_cover_it():
-    c = with_net(a_candidate_without_glxtest(), PARENT_NET + ["socket: connect tcp AF_INET 34.107.221.82:80"])
+    c = with_net(a_candidate_without_glxtest(), PARENT_NET + ["socket: connect tcp AF_INET 8.8.4.4:80"])
     report = judge(with_net(footprint(), PARENT_NET), c, expected=expected())
     assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["glxtest-69", "glxtest-69"]
     assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [
-        (11, "net.socket: connect tcp AF_INET 34.107.221.82:80", host.MISSING, 1), (12, "net.socket: connect tcp AF_INET 34.107.221.82:80", host.MISSING, 1)]
+        (11, "net.socket: connect tcp AF_INET 8.8.4.4:80", host.MISSING, 1), (12, "net.socket: connect tcp AF_INET 8.8.4.4:80", host.MISSING, 1)]
 
 
 def test_loopback_and_lab_destinations_are_not_compared_and_are_counted_as_evidence(capsys):
@@ -1052,11 +1052,11 @@ def test_identical_network_sets_are_green_and_are_counted_as_leaves():
 
 def test_a_network_entry_only_the_warm_up_had_is_listed_not_red(capsys):
     a = with_warmup(with_net(footprint(), PARENT_NET), kinds=KINDS)
-    a["warmup"]["net"] = PARENT_NET + ["parent: connect tcp AF_INET 34.107.221.82:80"]
+    a["warmup"]["net"] = PARENT_NET + ["parent: connect tcp AF_INET 8.8.4.4:80"]
     report = judge(a, with_net(footprint("again"), PARENT_NET), a_a=True)
-    assert report["verdict"] == "green" and report["warmup"]["A"]["net"] == ["parent: connect tcp AF_INET 34.107.221.82:80"]
+    assert report["verdict"] == "green" and report["warmup"]["A"]["net"] == ["parent: connect tcp AF_INET 8.8.4.4:80"]
     host.print_report(report, "firefox-68", "firefox-68 again")
-    assert "WARMUP-ONLY firefox-68 seed 11 net.parent: connect tcp AF_INET 34.107.221.82:80" in capsys.readouterr().out
+    assert "WARMUP-ONLY firefox-68 seed 11 net.parent: connect tcp AF_INET 8.8.4.4:80" in capsys.readouterr().out
 
 
 def test_on_windows_the_network_is_said_not_covered_with_the_reason(capsys):

@@ -777,7 +777,7 @@ def _raw_netlink_types(rest: str, proto: str) -> list:
 def network_events(lines) -> tuple:
     """`([(pid, what)], {class: n})` of a strace log read as lines: `what` is `netlink NETLINK_ROUTE` (a socket opened, failed attempts included),
     `netlink NETLINK_ROUTE RTM_GETADDR` (a request sent on it), `netlink NETLINK_ROUTE bind nl_groups=00000111` (a subscription to its groups),
-    `connect tcp AF_INET 93.184.216.34:443` or `send udp AF_INET6 [2001:4860::8888]:53` (a destination that is public); the destinations that are
+    `connect tcp AF_INET 1.0.0.1:443` or `send udp AF_INET6 [2001:4860::8888]:53` (a destination that is public); the destinations that are
     not public are counted by class. A socket is known by the inode `-y` printed for it, so a send names the protocol of the socket() that made it,
     whichever thread or process sends."""
     socks: dict = {}
