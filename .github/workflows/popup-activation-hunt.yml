@@ -1,0 +1,265 @@
+# -----------------------------------------------------------------------------
+# popup-activation-hunt.yml - TEMPORARY. Deleted, with its branch, when the cause is found.
+#
+# What it hunts. On Windows, in the job "e2e (windows, part 2)" of e2e.yml (4 browsers at once), the case
+#   tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py::test_a_peerconnection_of_a_torn_down_window_leaves_only_through_the_proxy[popup-socks5]
+# sometimes gets `made: False`: the page clicked a button whose handler calls window.open('about:blank') and the window was not made. Two causes are open:
+# the transient activation of the click had EXPIRED (a gap of more than 5 s between pointerdown and click, on a stalled runner), or window.open returned
+# null or threw while the activation was still valid. The test records the evidence (`POPUP-PROBE {json}` on stdout, and the junit property `popup_probe`).
+#
+# What it runs. 4 Windows jobs (slot 1 to 4) at once, each with the PUBLISHED engine and core the failed run used (`python -m invisible_playwright fetch`),
+# the same install, security state and GeoIP database as e2e.yml. In every job:
+#   - in the BACKGROUND, the files of part 2 (the row `wrapper.e2e.suite.windows.2`) with 3 browsers, one run after the other until the foreground ends,
+#     minus the popup node: the load of the failed run (3 + the 1 of the foreground = 4 browsers). Its result decides nothing; each iteration is logged;
+#   - in the FOREGROUND, the popup node alone, 25 times in a row, each rep with its own stdout and junit.
+#
+# How to read it (the summary of each job, and the artifact `popup-hunt-<slot>-<run id>`):
+#   - one line per rep: pass or fail and its POPUP-PROBE json; "no probe" when the test printed none (that is red too);
+#   - a red rep with `made: false`: `down_to_click_ms` above 5000 or `probe.isActive` false = the activation had expired (the machine stalled between the
+#     pointer going down and the click); `probe.isActive` true with `probe.openNull` true = window.open returned null with a valid activation (the engine or
+#     the popup blocker); `probe.openThrew` set = it threw; `click_s` is how long page.click took;
+#   - the totals give the reps, the reds, the reds with `made: false`, and the distribution of down_to_click_ms and click_s over all reps.
+# A job is red when any popup rep failed, when any rep has no probe, or when fewer than 25 reps ran. A green hunt proves nothing about a release.
+#
+# Triggered ONLY by a push to `hunt/popup-activation-windows`: no schedule, no dispatch, no pull request. A newer push replaces the run it supersedes.
+# -----------------------------------------------------------------------------
+name: popup activation hunt
+
+on:
+  push:
+    branches: [hunt/popup-activation-windows]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: popup-activation-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+# Engine and GeoIP downloads go through the release API with this token (as every workflow that runs tests).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: popup hunt (windows, slot ${{ matrix.slot }})
+    runs-on: windows-2022
+    timeout-minutes: 120
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder), as the job of e2e.yml has them.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        slot: [1, 2, 3, 4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      # The GeoIP database made by the repository, as on the Linux run (no download, the same bytes every run).
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      # The files of the load are the row of part 2 of ci/required-suites.json, as the job of e2e.yml reads it.
+      - name: The files of part 2 (the row of the suite, in ci/required-suites.json)
+        run: python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.windows.2" --os windows > "$RUNNER_TEMP/e2e_args.txt"
+      - name: The popup, 25 times, under the load of part 2
+        env:
+          PYTHONUNBUFFERED: "1"
+          HUNT_REPS: "25"
+          # No new rep starts after this many seconds of the step, so that the artifact is uploaded before the job's ceiling (fewer than 25 reps is red).
+          HUNT_BUDGET_S: "6300"
+          HUNT_NODE: "tests/test_nothing_of_a_context_leaves_but_through_its_proxy_e2e.py::test_a_peerconnection_of_a_torn_down_window_leaves_only_through_the_proxy[popup-socks5]"
+        run: |
+          # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before the verdict into a red step.
+          set -euo pipefail
+          finished=0
+          hunt="$RUNNER_TEMP/popup-hunt"
+          reps="$hunt/reps"
+          bg="$hunt/bg"
+          mkdir -p "$reps" "$bg"
+          bg_pid=""
+          # Every Firefox and the background run, whole trees. Safe to call twice.
+          cleanup() {
+            touch "$bg/stop"
+            powershell -NoProfile -ExecutionPolicy Bypass -File "$hunt/kill_bg.ps1" > "$hunt/kill-bg.txt" 2>&1 || true
+            if [ -n "$bg_pid" ]; then
+              for _ in $(seq 1 30); do kill -0 "$bg_pid" 2>/dev/null || break; sleep 2; done
+              kill -9 "$bg_pid" 2>/dev/null || true
+              wait "$bg_pid" 2>/dev/null || true
+              bg_pid=""
+            fi
+            powershell -NoProfile -ExecutionPolicy Bypass -File "$hunt/kill_firefox.ps1" > "$hunt/kill-firefox.txt" 2>&1 || true
+          }
+          trap 'cleanup; if [ "$finished" != 1 ]; then echo "::error::the hunt step stopped before its verdict"; exit 1; fi' EXIT
+          if [ -z "${FF:-}" ] || [ ! -e "$FF" ]; then echo "::error::no engine binary (FF='${FF:-}')"; exit 1; fi
+          # The run as scripts/run_e2e.py makes it: the binary in both variables, and no INVISIBLE_CORE_PIN (one e2e asserts the pin repair it disables).
+          unset INVISIBLE_CORE_PIN
+          export INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF"
+          mapfile -t ARGS < <(tr -d '\r' < "$RUNNER_TEMP/e2e_args.txt")
+          echo "the load: ${#ARGS[@]} arguments (files and node ids of part 2); the popup node: $HUNT_NODE"
+          cat > "$hunt/kill_bg.ps1" <<'PS'
+          # The background pytest of the loop (its command line carries junit_suite_name=popup_hunt_bg) and its whole tree, workers included.
+          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*junit_suite_name=popup_hunt_bg*' } |
+            ForEach-Object { & taskkill /F /T /PID $_.ProcessId }
+          exit 0
+          PS
+          cat > "$hunt/kill_firefox.ps1" <<'PS'
+          Get-Process firefox -ErrorAction SilentlyContinue | ForEach-Object { & taskkill /F /T /PID $_.Id }
+          Start-Sleep -Seconds 3
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          "firefox left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+          exit 0
+          PS
+          # THE BACKGROUND LOOP: the files of part 2 with 3 browsers (the options of command() in invisible_core.testing.e2e, the popup node deselected), one run
+          # after the other until the stop file exists. Its result decides nothing: one line per iteration in bg.tsv (iteration, pytest exit, seconds, last line).
+          # A function of this shell, run in a subshell, so that it sees ARGS; nothing in it may stop the loop.
+          bg_loop() {
+            set +e +o pipefail
+            local n=0 t0 code last
+            while [ ! -e "$bg/stop" ]; do
+              n=$((n + 1))
+              t0=$SECONDS
+              INVPW_TEST_WATCHDOG_FILE="$bg/watchdog.log" python -u -m pytest "${ARGS[@]}" --deselect "$HUNT_NODE" \
+                -m "e2e and not wall_clock" -o addopts= -p no:rerunfailures -o junit_family=xunit2 -o junit_suite_name=popup_hunt_bg \
+                --junitxml="$bg/it-$n.xml" --timeout 420 --timeout-method thread -o faulthandler_timeout=399 -p no:cacheprovider -v --tb=short \
+                -n 3 --dist loadfile --max-worker-restart 0 > "$bg/it-$n.log" 2>&1
+              code=$?
+              last=$(tr -d '\r' < "$bg/it-$n.log" | grep -v '^$' | tail -n 1 | cut -c1-200)
+              if [ -e "$bg/stop" ]; then last="cut at the end of the hunt: $last"; fi
+              printf '%s\t%s\t%s\t%s\n' "$n" "$code" "$((SECONDS - t0))" "$last" >> "$bg/bg.tsv"
+            done
+          }
+          bg_loop > "$bg/loop.log" 2>&1 &
+          bg_pid=$!
+          echo "background loop started (pid $bg_pid)"
+          # The load is up before the first rep: the first browsers of the loop have started.
+          sleep 45
+          # THE FOREGROUND: only the popup node, one pytest after the other, each rep with its own stdout and junit. A rep that fails does not stop the step.
+          reps_done=0
+          for i in $(seq 1 "$HUNT_REPS"); do
+            if [ "$SECONDS" -gt "$HUNT_BUDGET_S" ]; then echo "::warning::the budget of the step is spent: rep $i and the following did not run"; break; fi
+            r=$(printf '%02d' "$i")
+            code=0
+            INVPW_TEST_WATCHDOG_FILE="$hunt/watchdog-fg.log" python -u -m pytest "$HUNT_NODE" -m e2e -n 0 -o addopts='' -p no:cacheprovider -p no:rerunfailures \
+              -q -s -o junit_family=xunit2 --timeout 300 --timeout-method thread --junitxml="$reps/rep-$r.xml" > "$reps/rep-$r.log" 2>&1 || code=$?
+            echo "$code" > "$reps/rep-$r.exit"
+            reps_done=$((reps_done + 1))
+            echo "rep $i of $HUNT_REPS: pytest exit $code; $(tr -d '\r' < "$reps/rep-$r.log" | grep -m1 -o 'POPUP-PROBE .*' | cut -c1-300 || true)"
+          done
+          # The foreground has ended: the loop stops (its run in progress is killed with its tree), then every Firefox is killed and counted.
+          cleanup
+          cat "$hunt/kill-firefox.txt" || true
+          cat > "$hunt/summary.py" <<'PY'
+          import glob, json, math, os, re, statistics, sys, xml.etree.ElementTree as ET
+          hunt, want = sys.argv[1], int(sys.argv[2])
+          reps = os.path.join(hunt, "reps")
+          lines, reds, reds_false, no_probe, ran = [], 0, 0, 0, 0
+          down, click = [], []
+          for exit_file in sorted(glob.glob(os.path.join(reps, "rep-*.exit"))):
+              r = os.path.basename(exit_file)[len("rep-"):-len(".exit")]
+              ran += 1
+              code = open(exit_file).read().strip()
+              log = open(os.path.join(reps, "rep-%s.log" % r), encoding="utf-8", errors="replace").read()
+              prop, counts = None, None
+              try:
+                  root = ET.parse(os.path.join(reps, "rep-%s.xml" % r)).getroot()
+                  suite = root if root.tag == "testsuite" else root.find("testsuite")
+                  counts = tuple(int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped"))
+                  for p in root.iter("property"):
+                      if p.get("name") == "popup_probe":
+                          prop = p.get("value")
+              except Exception:
+                  pass
+              passed = code == "0" and counts == (1, 0, 0, 0)
+              text = None
+              found = re.findall(r"POPUP-PROBE (\{.*\})", log)
+              if found:
+                  text = found[-1]
+              elif prop:
+                  text = prop
+              probe = None
+              if text:
+                  try:
+                      probe = json.loads(text)
+                  except Exception:
+                      probe = None
+              if not passed:
+                  reds += 1
+                  if isinstance(probe, dict) and probe.get("made") is False:
+                      reds_false += 1
+              if isinstance(probe, dict):
+                  if isinstance(probe.get("down_to_click_ms"), (int, float)):
+                      down.append(float(probe["down_to_click_ms"]))
+                  if isinstance(probe.get("click_s"), (int, float)):
+                      click.append(float(probe["click_s"]))
+              if text is None:
+                  no_probe += 1
+              state = "pass" if passed else "FAIL (pytest exit %s, junit tests/failures/errors/skipped %s)" % (code, counts)
+              lines.append("rep %s: %s | %s" % (r, state, ("POPUP-PROBE " + text) if text else "no probe"))
+          def dist(name, xs):
+              if not xs:
+                  return "%s: no values" % name
+              s = sorted(xs)
+              p90 = s[max(0, math.ceil(0.9 * len(s)) - 1)]
+              return "%s: count %d, min %s, median %s, p90 %s, max %s" % (name, len(s), s[0], statistics.median(s), p90, s[-1])
+          bg = []
+          tsv = os.path.join(hunt, "bg", "bg.tsv")
+          if os.path.exists(tsv):
+              rows = [l.rstrip("\n").split("\t") for l in open(tsv, encoding="utf-8", errors="replace")]
+              whole = [x for x in rows if len(x) > 3 and not x[3].startswith("cut at the end")]
+              bg.append("background loop (decides nothing): %d iterations ended, %d cut at the end, %d with pytest exit 0" % (
+                  len(whole), len(rows) - len(whole), sum(1 for x in whole if x[1] == "0")))
+              bg.extend("  it %s: pytest exit %s, %s s, %s" % tuple(x[:4]) for x in rows if len(x) > 3)
+          else:
+              bg.append("background loop: no iteration ended")
+          red = reds > 0 or no_probe > 0 or ran < want
+          out = ["## popup hunt, per rep", ""] + ["- " + l for l in lines] + ["", "## totals", "",
+                 "- reps: %d (wanted %d)" % (ran, want), "- reds: %d" % reds, "- reds with made false: %d" % reds_false,
+                 "- reps with no probe: %d" % no_probe, "- " + dist("down_to_click_ms", down), "- " + dist("click_s", click), "", "## load", ""] + ["    " + b for b in bg] + [
+                 "", "verdict: %s" % ("RED" if red else "green")]
+          text = "\n".join(out) + "\n"
+          open(os.path.join(hunt, "summary.md"), "w", encoding="utf-8", newline="\n").write(text)
+          sys.stdout.write(text)
+          sys.exit(1 if red else 0)
+          PY
+          verdict=0
+          python "$hunt/summary.py" "$hunt" "$HUNT_REPS" > "$hunt/summary.txt" || verdict=$?
+          cat "$hunt/summary.txt"
+          cat "$hunt/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          finished=1
+          if [ "$verdict" != 0 ]; then echo "::error::the hunt is red: a popup rep failed, a rep has no probe, or fewer than $HUNT_REPS reps ran"; exit 1; fi
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload the reps, the background logs and what the tests saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: popup-hunt-${{ matrix.slot }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/popup-hunt
+            ${{ runner.temp }}/invpw-evidence
+          if-no-files-found: warn
+          retention-days: 14
