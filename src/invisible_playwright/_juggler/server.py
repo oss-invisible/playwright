@@ -373,7 +373,7 @@ def _launch_environment(named) -> Dict[str, str]:
     return {e["name"]: e["value"] for e in named}
 
 
-def _upload_paths(server: "JugglerServer", params: Dict) -> list:
+def _upload_paths(server: "JugglerServer", params: Dict, context: Optional["BrowserContextDispatcher"] = None) -> list:
     """The local paths a `setInputFiles` request stands for.
 
     ⛔ ONE READER, because there are two senders. The same request arrives at
@@ -400,6 +400,13 @@ def _upload_paths(server: "JugglerServer", params: Dict) -> list:
     names those streams here. Each one is a file of this session, already
     closed, and goes through the engine like any other path.
 
+    ⛔ A STREAM IS USABLE ONLY BY THE CONTEXT THAT MADE IT. `context` is the
+    one of the frame or the handle doing the `setInputFiles`; a stream that is
+    not its child is answered as the stock server answers a guid outside the
+    connection (`streams[i]: no object with guid <g>`), whether it belongs to
+    another context of the same client or to another client's. Without a
+    context no stream is usable.
+
     ⛔ A FOLDER IS REFUSED, BY NAME. The engine's `Page.setFileInputFiles`
     takes files: handed the folder's path it took the TAB down (the next call
     answered "cannot find session"), measured on firefox-34 and on the engine
@@ -415,7 +422,7 @@ def _upload_paths(server: "JugglerServer", params: Dict) -> list:
         raise _folder_refused("a folder streamed by the client")
     streams = params.get("streams")
     if streams:
-        return [_streamed_file(server, channel) for channel in streams]
+        return [_streamed_file(server, channel, context, "streams[%d]" % n) for n, channel in enumerate(streams)]
     raw = params.get("localPaths") or params.get("files")
     if raw:
         return [entry.get("name") if isinstance(entry, dict) else entry
@@ -431,13 +438,21 @@ def _folder_refused(what: str) -> ProtocolException:
         "takes files, so pass the files inside it instead" % what)
 
 
-def _streamed_file(server: "JugglerServer", channel: Any) -> str:
-    """The path of the file a `streams` entry of `setInputFiles` names: a `WritableStream` this server made and the client closed."""
+def _streamed_file(server: "JugglerServer", channel: Any, context: Any, where: str) -> str:
+    """The path of the file a `streams` entry of `setInputFiles` names: a `WritableStream` of `context` that the client closed.
+
+    The sentences are the stock server's (`_tChannelImplFromWire`, playwright 1.61.0 coreBundle.js:18308-18318): `<where>: no object with guid <g>`,
+    `<where>: object with guid <g> has type <t>, expected WritableStream`. A stream of another context is "no object": it is not in the scope the
+    request came from.
+    """
     guid = channel.get("guid") if isinstance(channel, dict) else None
+    if not isinstance(guid, str):
+        raise ProtocolException("%s: expected guid for WritableStream" % where)
     stream = server._objects.get(guid)
+    if stream is None or (isinstance(stream, WritableStreamDispatcher) and (context is None or stream.parent is not context)):
+        raise ProtocolException("%s: no object with guid %s" % (where, guid))
     if not isinstance(stream, WritableStreamDispatcher):
-        raise ProtocolException(
-            "set_input_files names a stream (%r) that this server did not make, or that is gone" % (guid,))
+        raise ProtocolException("%s: object with guid %s has type %s, expected WritableStream" % (where, guid, stream.TYPE))
     if not stream.closed:
         raise ProtocolException(
             "the stream %s is not closed: the client has not finished copying the file, and the page would read half of it" % guid)
@@ -1226,7 +1241,7 @@ class ElementHandleDispatcher(Dispatcher):
         upload, not two.
         """
         self.frame.actions.set_input_files(
-            _HANDLE, _upload_paths(self.server, params),
+            _HANDLE, _upload_paths(self.server, params, self.frame.page.context),
             **self._act_args(params))
         return None
 
@@ -1913,7 +1928,7 @@ class FrameDispatcher(Dispatcher):
     def op_set_input_files(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
         self.actions.set_input_files(selector,
-                                     _upload_paths(self.server, params),
+                                     _upload_paths(self.server, params, self.page.context),
                                      timeout=self._timeout(params),
                                      frame_id=frame_id,
                                      **self._act_opts(params))
