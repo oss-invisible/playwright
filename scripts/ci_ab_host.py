@@ -79,6 +79,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import datetime
 import collections
 import ipaddress
 import json
@@ -1513,6 +1514,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
             "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))},
             "bare": {side: _bare_summary((fp.get("bare") or {}).get("bare")) for side, fp in (("A", a), ("B", b))},
+            "shortcuts": {side: _shortcuts_summary(((fp.get("idle") or {}).get("idle") or {}).get("shortcut_changes")) for side, fp in (("A", a), ("B", b))},
             "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
 
 
@@ -1532,6 +1534,11 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
                 print("WARMUP-ONLY %s seed %s file.%s (touched by: %s)" % (name, warm["seed"], f["path"], ", ".join(f["touched_by"]) or "-"))
             for entry in warm.get("net", [])[:100]:
                 print("WARMUP-ONLY %s seed %s net.%s" % (name, warm["seed"], entry))
+    for side, name in (("A", a_name), ("B", b_name)):
+        shortcuts = (report.get("shortcuts") or {}).get(side)
+        if shortcuts:
+            print("SHORTCUTS (the places of the shortcut code, before and after the idle launch; evidence) %s: %d new, %d changed, %d gone %s" % (
+                name, shortcuts["new"], shortcuts["changed"], shortcuts["gone"], json.dumps(shortcuts["files"])))
     for side, name in (("A", a_name), ("B", b_name)):
         bare = (report.get("bare") or {}).get(side)
         if bare:
@@ -1676,6 +1683,8 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
     notified, watcher = None, None
+    places = shortcut_places() if (windows and idle) else None
+    shortcuts_before = snapshot_places(places) if places else None
     before = set(Path(tempfile.gettempdir()).glob("invisible_profile_*"))
 
     def crash_dirs():
@@ -1738,7 +1747,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
         if idle:
-            result["idle"] = {"notified": notified}
+            result["idle"] = {"notified": notified, "shortcut_changes": diff_snapshots(shortcuts_before, snapshot_places(places)) if places else None}
         if bare:
             result["bare"] = {"notified": notified, "crash": crash_evidence(watcher.stop(), result, core_info(seed_work, binary) if not windows else None)}
             watcher = None
@@ -1857,6 +1866,71 @@ def crash_evidence(watched: dict, fp: dict, core: dict | None = None) -> dict:
     procs = [{"kind": p["label"], "argv": p.get("cmd") or p.get("exec")} for p in fp.get("processes", []) if CRASH_PROCESS.search(p["label"])]
     return {"parent_exits": exits if lifecycle is not None else None, "root_returncode": (fp.get("close") or {}).get("root_returncode"), "crash_processes": procs,
             "files": watched.get("files", []), "scans": watched.get("scans"), "core": core}
+
+
+def shortcut_places(env=None) -> list:
+    """`[(folder, recursive)]` of the places the shortcut code of Windows reads and writes (StartupOSIntegration.sys.mjs, nsWindowsShellService.cpp): the Start menu of the
+    user and of ProgramData (its Programs below it), the Desktop of the user and the Public one, the pinned taskbar shortcuts of the user (and ImplicitAppShortcuts) and every
+    `Mozilla-*` folder of ProgramData (the shortcuts log is there)."""
+    env = os.environ if env is None else env
+    appdata, programdata = env.get("APPDATA"), env.get("ProgramData") or env.get("PROGRAMDATA")
+    profile, public = env.get("USERPROFILE"), env.get("PUBLIC")
+    places = []
+    for base in (appdata and Path(appdata) / "Microsoft" / "Windows" / "Start Menu", programdata and Path(programdata) / "Microsoft" / "Windows" / "Start Menu"):
+        if base:
+            places += [(base, False), (base / "Programs", True)]
+    for desktop in (profile and Path(profile) / "Desktop", public and Path(public) / "Desktop"):
+        if desktop:
+            places.append((desktop, False))
+    if appdata:
+        pinned = Path(appdata) / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned"
+        places += [(pinned / "TaskBar", True), (pinned / "ImplicitAppShortcuts", True)]
+    if programdata:
+        try:
+            places += [(p, True) for p in sorted(Path(programdata).glob("Mozilla-*")) if p.is_dir()]
+        except OSError:
+            pass
+    return places
+
+
+def snapshot_places(places, limit: int = 20000) -> dict:
+    """`{path: {"size", "mtime_ns"}}` of the files in `places` (`shortcut_places`), a folder walked below itself when it says so."""
+    out: dict = {}
+    for folder, recursive in places:
+        try:
+            entries = Path(folder).rglob("*") if recursive else Path(folder).iterdir()
+            for entry in entries:
+                if len(out) >= limit:
+                    return out
+                try:
+                    if entry.is_file():
+                        st = entry.stat()
+                        out[str(entry)] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+
+def diff_snapshots(before: dict, after: dict) -> dict:
+    """The files that are new, changed (another size or modification time) or gone between two snapshots, each `{"path", "size", "mtime"}` (the mtime as an ISO
+    text, evidence): the direct proof of whether the engine left a shortcut or a log on the host."""
+    def entry(path, info):
+        stamp = datetime.datetime.fromtimestamp(info["mtime_ns"] / 1e9, datetime.timezone.utc).isoformat()
+        return {"path": path, "size": info["size"], "mtime": stamp}
+
+    return {"new": [entry(p, after[p]) for p in sorted(set(after) - set(before))],
+            "changed": [entry(p, after[p]) for p in sorted(set(after) & set(before)) if after[p] != before[p]],
+            "gone": [entry(p, before[p]) for p in sorted(set(before) - set(after))]}
+
+
+def _shortcuts_summary(changes: dict | None) -> dict | None:
+    """A line's worth of `diff_snapshots`: how many files, and which ones by name."""
+    if changes is None:
+        return None
+    return {"new": len(changes["new"]), "changed": len(changes["changed"]), "gone": len(changes["gone"]),
+            "files": [(kind, Path(e["path"]).name, e["size"]) for kind in ("new", "changed", "gone") for e in changes[kind]][:20]}
 
 
 def wait_for_notification(read, period=NOTIFY_PERIOD_S, limit_s=NOTIFY_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> dict:

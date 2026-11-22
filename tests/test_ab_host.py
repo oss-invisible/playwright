@@ -1757,3 +1757,67 @@ def test_the_report_carries_the_bare_launch_without_comparing_it(capsys):
     assert report["bare"]["A"]["crash_processes"] == [("crashreporter", "crashreporter --ping-cleanup /x /y")] and report["bare"]["B"]["crash_processes"] == []
     host.print_report(report, "firefox-68", "firefox-68 again")
     assert "BARE (no client, no page; not compared) firefox-68:" in capsys.readouterr().out
+
+
+# -
+# The places of the shortcut code, before and after the idle launch (Windows): the direct proof of whether the engine left a shortcut or a log on the host.
+
+def a_windows_home(tmp_path):
+    env = {"APPDATA": str(tmp_path / "Roaming"), "ProgramData": str(tmp_path / "ProgramData"), "USERPROFILE": str(tmp_path / "User"), "PUBLIC": str(tmp_path / "Public")}
+    for rel in ("Roaming/Microsoft/Windows/Start Menu/Programs/Accessories", "ProgramData/Microsoft/Windows/Start Menu/Programs", "User/Desktop", "Public/Desktop",
+                "Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar", "Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/ImplicitAppShortcuts",
+                "ProgramData/Mozilla-1de4eec8", "ProgramData/Mozilla-other", "ProgramData/NotMozilla"):
+        (tmp_path / rel).mkdir(parents=True)
+    return env
+
+
+def test_the_places_of_the_shortcut_code_are_the_start_menus_the_desktops_the_pinned_taskbar_and_every_mozilla_folder(tmp_path):
+    env = a_windows_home(tmp_path)
+    places = host.shortcut_places(env)
+    names = [(str(p.relative_to(tmp_path)).replace("\\", "/"), r) for p, r in places]
+    assert ("Roaming/Microsoft/Windows/Start Menu", False) in names and ("Roaming/Microsoft/Windows/Start Menu/Programs", True) in names
+    assert ("ProgramData/Microsoft/Windows/Start Menu/Programs", True) in names and ("User/Desktop", False) in names and ("Public/Desktop", False) in names
+    assert ("Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar", True) in names
+    assert ("Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/ImplicitAppShortcuts", True) in names
+    assert ("ProgramData/Mozilla-1de4eec8", True) in names and ("ProgramData/Mozilla-other", True) in names and not any("NotMozilla" in n for n, _r in names)
+    assert host.shortcut_places({}) == [], "a machine with none of these variables has none of these places"
+
+
+def test_what_the_launch_made_changed_or_removed_in_those_places_is_the_difference_of_two_snapshots(tmp_path):
+    import os as _os
+
+    env = a_windows_home(tmp_path)
+    places = host.shortcut_places(env)
+    taskbar = tmp_path / "Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar"
+    log = tmp_path / "ProgramData/Mozilla-1de4eec8/firefox_S-1-5-21-500_shortcuts.ini"
+    log.write_text("[STARTMENU]\n", encoding="utf-8")
+    (taskbar / "old.lnk").write_bytes(b"L")
+    (tmp_path / "User/Desktop/stays.lnk").write_bytes(b"L")
+    before = host.snapshot_places(places)
+    log.write_text("[STARTMENU]\nShortcut0=Firefox.lnk\n", encoding="utf-8")
+    _os.utime(log, (1_700_000_000, 1_700_000_000))
+    (taskbar / "nightly.lnk").write_bytes(b"LNK" * 10)
+    (tmp_path / "Roaming/Microsoft/Windows/Start Menu/Programs/Accessories/Private Browsing.lnk").write_bytes(b"LNK")
+    (taskbar / "old.lnk").unlink()
+    after = host.snapshot_places(places)
+    got = host.diff_snapshots(before, after)
+    assert [Path(e["path"]).name for e in got["new"]] == sorted(["Private Browsing.lnk", "nightly.lnk"], key=str.lower) or {Path(e["path"]).name for e in got["new"]} == {"Private Browsing.lnk", "nightly.lnk"}
+    assert [Path(e["path"]).name for e in got["changed"]] == ["firefox_S-1-5-21-500_shortcuts.ini"] and got["changed"][0]["mtime"].startswith("2023-11-14")
+    assert [Path(e["path"]).name for e in got["gone"]] == ["old.lnk"]
+    assert [e["size"] for e in got["new"] if e["path"].endswith("nightly.lnk")] == [30]
+    assert not any("stays.lnk" in e["path"] for kind in got.values() for e in kind), "a file the launch did not touch is not in it"
+    assert host.diff_snapshots(after, host.snapshot_places(places)) == {"new": [], "changed": [], "gone": []}
+
+
+def test_a_launch_that_left_nothing_says_so_and_the_report_carries_the_summary_line_without_comparing_it(capsys):
+    a = footprint(platform="win32")
+    a["idle"] = {"seed": 11, "kinds": {}, "idle": {"notified": {"observed": True, "polls": 2}, "shortcut_changes": {
+        "new": [{"path": "C:/ProgramData/Microsoft/Windows/Start Menu/Programs/Private Browsing.lnk", "size": 1650, "mtime": "2026-11-22T05:20:08+00:00"}], "changed": [], "gone": []}}}
+    b = footprint("again", platform="win32")
+    b["idle"] = {"seed": 11, "kinds": {}, "idle": {"notified": {"observed": True, "polls": 2}, "shortcut_changes": {"new": [], "changed": [], "gone": []}}}
+    report = judge(a, b, a_a=True)
+    assert report["shortcuts"] == {"A": {"new": 1, "changed": 0, "gone": 0, "files": [("new", "Private Browsing.lnk", 1650)]}, "B": {"new": 0, "changed": 0, "gone": 0, "files": []}}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    out = capsys.readouterr().out
+    assert "SHORTCUTS (the places of the shortcut code, before and after the idle launch; evidence) firefox-68: 1 new, 0 changed, 0 gone" in out and "Private Browsing.lnk" in out
+    assert judge(footprint(), footprint("again"), a_a=True)["shortcuts"] == {"A": None, "B": None}, "Linux has none of this"
