@@ -27,7 +27,7 @@ pytestmark = pytest.mark.unit
 
 SMALL = {"proc": 2, "file": 3}
 SEEDS = (11, 12)
-KINDS = {"parent": 1, "tab/isForBrowser": 2, "gpu": 1, "glxtest": 1}
+KINDS = {"parent": 1, "tab/isForBrowser": 2, "gpu": 1, "gfxtest": 1}
 FILES = ["/etc/fonts/fonts.conf", "/etc/hosts", "/usr/lib/x86_64-linux-gnu/libc.so.6"]
 
 LIN = host.Context("linux", app=["/srv/lab/runner/.cache/invisible/engines/firefox-68/firefox"],
@@ -48,8 +48,8 @@ def footprint(engine="firefox-68", platform="linux", kinds=None, files=None):
             "seeds": [seed_footprint(s, copy.deepcopy(kinds), copy.deepcopy(files)) for s in SEEDS]}
 
 
-def a_candidate_without_glxtest():
-    return footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "glxtest"})
+def a_candidate_without_gfxtest():
+    return footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "gfxtest"})
 
 
 def judge(a, b, **kw):
@@ -59,6 +59,22 @@ def judge(a, b, **kw):
 
 def expected():
     return host.load_expected()
+
+
+def fake_engine(root, package, payload=b"engine bytes"):
+    """A package of an engine as a folder with a binary, its omni.ja and a link, under `root/package`; returns the path of the binary."""
+    folder = Path(root) / package
+    (folder / "browser").mkdir(parents=True)
+    (folder / "firefox").write_bytes(payload)
+    (folder / "omni.ja").write_bytes(payload + b" omni")
+    (folder / "browser" / "omni.ja").write_bytes(payload + b" browser omni")
+    return str(folder / "firefox")
+
+
+@pytest.fixture(autouse=True)
+def staging_in_the_test_folder(tmp_path, monkeypatch):
+    """The engines of an `ab` are staged at `<RUNNER_TEMP>/ab-host/engine/firefox`: here, a folder of the test."""
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path / "runner_temp"))
 
 
 # -
@@ -179,21 +195,21 @@ def test_nothing_is_excused_there_is_no_list_of_noise():
 # -
 # The declared differences.
 
-def test_the_declared_difference_is_the_glxtest_of_linux_by_kind_and_there_is_one_only():
+def test_the_declared_difference_is_the_gfxtest_of_linux_by_kind_and_there_is_one_only():
     entries = expected()
-    assert [(e["id"], e["os"], e["category"], e["name"]) for e in entries] == [("glxtest-69", "linux", "proc", "glxtest")]
-    assert "0e896e4ee1" in entries[0]["reason"] and "glxtest never reads the host" in entries[0]["reason"]
+    assert [(e["id"], e["os"], e["category"], e["name"]) for e in entries] == [("gfxtest-69", "linux", "proc", "gfxtest")]
+    assert "0e896e4ee1" in entries[0]["reason"] and "GfxInfo.cpp:55" in entries[0]["reason"]
     assert len(entries) <= 1, "the list of declared differences may only shrink"
 
 
-def test_the_declared_glxtest_difference_passes_in_an_a_b():
-    report = judge(footprint(), a_candidate_without_glxtest(), expected=expected())
+def test_the_declared_gfxtest_difference_passes_in_an_a_b():
+    report = judge(footprint(), a_candidate_without_gfxtest(), expected=expected())
     assert report["verdict"] == "green", report["problems"]
-    assert [d["leaf"] for d in report["declared"]] == ["proc.glxtest", "proc.glxtest"] and report["stale"] == []
+    assert [d["leaf"] for d in report["declared"]] == ["proc.gfxtest", "proc.gfxtest"] and report["stale"] == []
 
 
 def test_a_difference_next_to_the_declared_one_is_still_red():
-    c = a_candidate_without_glxtest()
+    c = a_candidate_without_gfxtest()
     c["seeds"][0]["kinds"]["utility/sandboxingKind=1"] = 1
     report = judge(footprint(), c, expected=expected())
     assert report["verdict"] == "red"
@@ -201,14 +217,14 @@ def test_a_difference_next_to_the_declared_one_is_still_red():
 
 
 def test_the_declared_difference_the_other_way_round_is_red():
-    report = judge(a_candidate_without_glxtest(), footprint(), expected=expected())
-    assert report["verdict"] == "red" and any(d["leaf"] == "proc.glxtest" for d in report["differences"])
+    report = judge(a_candidate_without_gfxtest(), footprint(), expected=expected())
+    assert report["verdict"] == "red" and any(d["leaf"] == "proc.gfxtest" for d in report["differences"])
 
 
 def test_a_declared_difference_that_does_not_show_is_red_as_stale():
     report = judge(footprint(), footprint("candidate"), expected=expected())
-    assert report["verdict"] == "red" and report["stale"] == ["glxtest-69"]
-    assert any("stale" in p and "glxtest-69" in p for p in report["problems"])
+    assert report["verdict"] == "red" and report["stale"] == ["gfxtest-69"]
+    assert any("stale" in p and "gfxtest-69" in p for p in report["problems"])
 
 
 def test_a_declared_difference_of_another_os_is_not_applied_and_not_stale_there():
@@ -217,13 +233,13 @@ def test_a_declared_difference_of_another_os_is_not_applied_and_not_stale_there(
 
 
 def test_in_the_a_a_the_declared_list_is_not_applied():
-    report = judge(footprint(), a_candidate_without_glxtest(), expected=expected(), a_a=True)
+    report = judge(footprint(), a_candidate_without_gfxtest(), expected=expected(), a_a=True)
     assert report["verdict"] == "red" and report["declared"] == [] and report["stale"] == []
-    assert [d["leaf"] for d in report["differences"]] == ["proc.glxtest", "proc.glxtest"]
+    assert [d["leaf"] for d in report["differences"]] == ["proc.gfxtest", "proc.gfxtest"]
 
 
-def test_the_declared_glxtest_does_not_cover_a_path():
-    c = a_candidate_without_glxtest()
+def test_the_declared_gfxtest_does_not_cover_a_path():
+    c = a_candidate_without_gfxtest()
     c["seeds"][0]["files"] = FILES + ["/usr/lib/x86_64-linux-gnu/libglx.so.0"]
     report = judge(footprint(), c, expected=expected())
     assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./usr/lib/x86_64-linux-gnu/libglx.so.0"]
@@ -231,7 +247,7 @@ def test_the_declared_glxtest_does_not_cover_a_path():
 
 def test_the_cli_says_broken_control_for_an_a_a_difference(tmp_path, capsys):
     a, b = tmp_path / "a.json", tmp_path / "b.json"
-    for path, doc in ((a, footprint()), (b, a_candidate_without_glxtest())):
+    for path, doc in ((a, footprint()), (b, a_candidate_without_gfxtest())):
         path.write_text(json.dumps(doc), encoding="utf-8")
     assert host.main(["compare", str(a), str(b), "--a-a"]) == 2
     out = capsys.readouterr().out
@@ -758,13 +774,15 @@ def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(mon
 
 def test_the_runs_of_an_ab_follow_one_another_in_the_same_order_each_with_its_own_warm_up(tmp_path, monkeypatch):
     runs = []
-    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub-binary", "pub-seal"))
-    monkeypatch.setattr(host, "run_subprocess", lambda exe, seal, leg, out, label, seeds: runs.append((label, exe, list(seeds))) or 1)
-    assert host.ab("cand-binary", Path("cand-seal"), "linux-x86_64", tmp_path / "o1", "firefox-68", [11, 12]) == 2
-    assert [(r[0], r[1]) for r in runs] == [("firefox-68", "pub-binary"), ("firefox-68 again", "pub-binary"), ("candidate", "cand-binary")]
+    pub = fake_engine(tmp_path / "fetch" / "engines", "firefox-68_x", b"published")
+    cand = fake_engine(tmp_path / "checkout" / "ff", ".", b"candidate")
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
+    monkeypatch.setattr(host, "run_subprocess", lambda exe, seal, leg, out, label, seeds: runs.append((label, Path(exe).read_bytes(), list(seeds))) or 1)
+    assert host.ab(cand, Path("cand-seal"), "linux-x86_64", tmp_path / "o1", "firefox-68", [11, 12]) == 2
+    assert [(r[0], r[1]) for r in runs] == [("firefox-68", b"published"), ("firefox-68 again", b"published"), ("candidate", b"candidate")]
     runs.clear()
     assert host.ab(None, None, "linux-x86_64", tmp_path / "o2", "firefox-68", [11, 12]) == 2
-    assert [(r[0], r[1]) for r in runs] == [("firefox-68", "pub-binary"), ("firefox-68 again", "pub-binary")], "the A/A: the published engine twice, in the same order"
+    assert [(r[0], r[1]) for r in runs] == [("firefox-68", b"published"), ("firefox-68 again", b"published")], "the A/A: the published engine twice, in the same order"
 
 
 def test_what_only_the_warm_up_did_is_listed_with_the_process_that_did_it():
@@ -1028,9 +1046,9 @@ def test_the_same_request_from_another_kind_is_a_difference_too():
 
 
 def test_a_public_destination_only_the_candidate_reaches_is_red_and_the_declared_list_does_not_cover_it():
-    c = with_net(a_candidate_without_glxtest(), PARENT_NET + ["socket: connect tcp AF_INET 8.8.4.4:80"])
+    c = with_net(a_candidate_without_gfxtest(), PARENT_NET + ["socket: connect tcp AF_INET 8.8.4.4:80"])
     report = judge(with_net(footprint(), PARENT_NET), c, expected=expected())
-    assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["glxtest-69", "glxtest-69"]
+    assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["gfxtest-69", "gfxtest-69"]
     assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [
         (11, "net.socket: connect tcp public:80", host.MISSING, 1), (12, "net.socket: connect tcp public:80", host.MISSING, 1)]
 
@@ -1278,8 +1296,10 @@ def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
 
 def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_verdict_and_a_broken_one_is_exit_2(tmp_path, monkeypatch):
     order = []
+    pub = fake_engine(tmp_path / "fetch", "pub")
+    cand = fake_engine(tmp_path / "checkout", "cand")
     monkeypatch.setattr(host, "_windows", lambda: True)
-    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub-binary", "pub-seal"))
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
     monkeypatch.setattr(host, "print_report", lambda *a, **k: None)
     monkeypatch.setattr(host, "load_expected", lambda path: [])
     stock = {"doc": a_stock(WIN_KINDS)}
@@ -1301,11 +1321,11 @@ def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_
     monkeypatch.setattr(host, "run_subprocess", fake_run)
     monkeypatch.setattr(host, "run_stock_subprocess", fake_stock)
     monkeypatch.setattr(host, "judge", fake_judge)
-    assert host.ab("cand", Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
+    assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
     assert order == [("run", "firefox-68"), ("run", "firefox-68 again"), ("run", "candidate"), ("judge", "a-a"), ("stock", "windows-x86_64")]
     order.clear()
     stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}))
-    assert host.ab("cand", Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
+    assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
     assert order[-2:] == [("stock", "windows-x86_64"), ("judge", "a-b")]
     order.clear()
     assert host.ab(None, None, "windows-x86_64", tmp_path / "o3", "firefox-68", [11]) == 0
@@ -1952,7 +1972,9 @@ def test_the_system_class_is_system32_syswow64_and_winsxs_and_everything_else_st
 
 def test_the_ab_passes_the_other_run_of_the_68_to_the_judge(tmp_path, monkeypatch):
     seen = {}
-    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub", None))
+    pub = fake_engine(tmp_path / "fetch", "pub")
+    cand = fake_engine(tmp_path / "checkout", "cand")
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, None))
     docs = {"footprint-68.json": win(), "footprint-68-again.json": win("again"), "footprint-candidate.json": win("candidate")}
 
     def fake_run(exe, seal, leg, out, label, seeds):
@@ -1965,7 +1987,7 @@ def test_the_ab_passes_the_other_run_of_the_68_to_the_judge(tmp_path, monkeypatc
     monkeypatch.setattr(host, "run_stock_control", lambda leg, out: {"stock": True})
     real = host.judge
     monkeypatch.setattr(host, "judge", lambda a, b, **kw: seen.update(kw) or real(a, b, **kw))
-    host.ab("cand", Path("seal"), "win-x86_64", tmp_path / "o", "firefox-68", [11, 12])
+    host.ab(cand, Path("seal"), "win-x86_64", tmp_path / "o", "firefox-68", [11, 12])
     assert seen["also_68"][0]["engine"] == "again"
 
 
@@ -2383,3 +2405,189 @@ def test_a_crash_watcher_does_not_take_the_reports_of_earlier_crashes_for_the_la
     (pending / "new.extra").write_text('{"CrashType": "NEW"}', encoding="utf-8")
     got = watcher.stop()
     assert [f["name"] for f in got["files"]] == ["new.extra"]
+
+
+# -
+# Run from the same folder: where the engine sits is a variable of the experiment, not a difference of the paths.
+
+def _ancestors(exe) -> tuple:
+    return tuple(str(p) for p in Path(exe).parents)
+
+
+def test_every_engine_run_of_an_ab_is_launched_from_the_same_folder_whatever_the_root_the_engine_came_from(tmp_path, monkeypatch):
+    """The content processes call realpath(<install>/omni.ja), which reads the link of every ancestor of the install folder: run 45043617981 saw `readlink /srv/lab/work/...`
+    for the candidate and `readlink /tmp/ab-host-fetch-<random>/engines` for the 68. Both come from different roots here, and what each run is given is one path."""
+    seen = []
+    pub = fake_engine(tmp_path / "tmp" / "ab-host-fetch-dc0cc7qh" / "engines", "firefox-68_x", b"published")
+    cand = fake_engine(tmp_path / "srv" / "lab" / "work" / "checkout" / "checkout", "ff", b"candidate")
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
+
+    def run(exe, seal, leg, out, label, seeds):
+        folder = Path(exe).parent
+        seen.append((label, exe, _ancestors(exe), sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*")), Path(exe).read_bytes(), (folder / "omni.ja").read_bytes()))
+        return 1
+
+    monkeypatch.setattr(host, "run_subprocess", run)
+    assert host.ab(cand, Path("cand-seal"), "linux-x86_64", tmp_path / "o", "firefox-68", [11]) == 2
+    assert [s[0] for s in seen] == ["firefox-68", "firefox-68 again", "candidate"]
+    assert len({s[1] for s in seen}) == 1, "one absolute path for every run"
+    assert len({s[2] for s in seen}) == 1, "so the links read are of the same ancestors"
+    assert Path(seen[0][1]) == host.stage_dir() / "firefox" and Path(seen[0][1]).parent.parent == Path(os.environ["RUNNER_TEMP"]) / "ab-host" / "engine"
+    assert [s[4] for s in seen] == [b"published", b"published", b"candidate"] and [s[5] for s in seen] == [b"published omni", b"published omni", b"candidate omni"]
+    assert seen[0][3] == seen[2][3] == ["browser", "browser/omni.ja", "firefox", "omni.ja"], "the whole package tree is copied"
+    assert not host.stage_dir().exists(), "and removed after each run"
+    assert Path(pub).read_bytes() == b"published" and Path(cand).read_bytes() == b"candidate", "the engine itself is not touched"
+
+
+def test_the_folder_of_the_engine_is_part_of_the_ours_class_and_its_ancestors_are_the_same_host_leaves_in_every_run(tmp_path):
+    """What the oracle records of the install: the package root is `ours`, its ancestors are host leaves, and they are the same set for the 68 and for the candidate."""
+    leaves = []
+    for root, package, payload in ((tmp_path / "a" / "ab-host-fetch-x" / "engines", "firefox-68_y", b"1"), (tmp_path / "b" / "srv" / "lab" / "work", "ff", b"2")):
+        with host.staged_engine(fake_engine(root, package, payload)) as exe:
+            folder = os.path.dirname(exe)
+            ctx = host.Context("linux", app=[folder])
+            ancestors = [str(p).replace("\\", "/") for p in Path(folder).parents if str(p) != str(Path(folder).anchor)]
+            leaves.append((host.classify(folder, ctx)[0], host.classify_paths(ancestors, host.Context("linux")), len(ancestors)))
+    assert leaves[0][0] == leaves[1][0] == "package" and leaves[0] == leaves[1]
+
+
+def test_a_host_path_outside_the_root_is_still_red_nothing_is_normalised():
+    """The comparison is not told to ignore the ancestors of the install: one extra path outside the package root on one side is a difference."""
+    c = footprint("candidate")
+    for seed in c["seeds"]:
+        seed["files"] = FILES + ["/srv/lab/work"]
+        seed["touched_by"] = {"/srv/lab/work": ["Web Content", "forkserver"]}
+        seed["touched_calls"] = {"/srv/lab/work": ["readlink"]}
+    report = judge(footprint(), c, expected=expected())
+    assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./srv/lab/work"] * 2
+    assert any("file./srv/lab/work" in p and "via readlink" in p for p in report["problems"])
+
+
+def test_the_staged_package_is_a_copy_of_the_whole_tree_with_its_links_and_a_leftover_of_an_earlier_run_does_not_stay(tmp_path):
+    engine = fake_engine(tmp_path / "src", "pkg", b"bytes")
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink("omni.ja", str(Path(engine).parent / "link.ja"))
+        except OSError:
+            pass
+    stale = host.stage_dir() / "leftover.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("an earlier run", encoding="utf-8")
+    with host.staged_engine(engine) as exe:
+        folder = Path(exe).parent
+        assert folder == host.stage_dir() and not (folder / "leftover.txt").exists()
+        assert sorted(p.name for p in folder.iterdir()) == sorted(p.name for p in Path(engine).parent.iterdir())
+        assert (folder / "browser" / "omni.ja").read_bytes() == b"bytes browser omni" and os.access(exe, os.R_OK)
+        if (Path(engine).parent / "link.ja").is_symlink():
+            assert (folder / "link.ja").is_symlink()
+    assert not host.stage_dir().exists()
+
+
+# -
+# The graphics probe is `gfxtest`: the declared difference names the real process, and covers what only that process touched.
+
+GFX_PCI = ["/sys/bus/pci", "/sys/bus/pci/"]
+GFX_ONLY = {path: ["gfxtest"] for path in GFX_PCI}
+
+
+def with_files(fp, files, touched_by, calls=None, seeds=None):
+    """`fp` whose seeds (every one, or `seeds`) also touched `files`, with the kinds `touched_by` says touched each of them."""
+    for seed in fp["seeds"]:
+        if seeds is None or seed["seed"] in seeds:
+            seed["files"] = list(seed["files"]) + list(files)
+            seed["touched_by"] = dict(seed.get("touched_by", {}), **touched_by)
+            seed["touched_calls"] = dict(seed.get("touched_calls", {}), **(calls or {path: ["access"] for path in files}))
+    return fp
+
+
+def test_the_probe_of_the_68_is_named_gfxtest_by_what_it_ran_in_every_spelling_the_engine_runs_it():
+    argv = ["gfxtest", "glx", "-f", "18"]
+    assert host.label_of_exec("/srv/lab/work/checkout/checkout/ff/gfxtest", argv, REAL) == "gfxtest"
+    assert host.label_of_exec("/proc/self/exe", argv, REAL) == "gfxtest"
+    assert host.label_of_exec(REAL, argv, REAL) == "gfxtest" and host.label_of_exec(REAL, ["/e/firefox/firefox"], REAL) == "parent"
+    log = ['100 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-profile", "/tmp/p"], 0x7ffd /* 40 vars */) = 0',
+           "100 fork() = 101", '101 execve("/proc/self/exe", ["gfxtest", "glx", "-f", "18"], 0x7ffd /* 40 vars */) = 0']
+    procs = host.spawned_processes(log, REAL)
+    assert {pid: p["label"] for pid, p in procs.items()} == {100: "parent", 101: "gfxtest"} and host.spawned_counts(procs)["gfxtest"] == 1
+
+
+def test_the_declared_difference_covers_the_gfxtest_process_and_the_paths_only_it_touched_in_the_seeds_where_the_candidate_has_none_of_it():
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    report = judge(a, a_candidate_without_gfxtest(), expected=expected())
+    assert report["verdict"] == "green", report["problems"]
+    assert report["stale"] == [] and {d["id"] for d in report["declared"]} == {"gfxtest-69"}
+    assert sorted({d["leaf"] for d in report["declared"]}) == ["file./sys/bus/pci", "file./sys/bus/pci/", "proc.gfxtest"]
+    assert [d["seed"] for d in report["declared"] if d["leaf"] == "proc.gfxtest"] == list(SEEDS)
+
+
+def test_a_path_the_gfxtest_touched_with_another_process_stays_a_difference():
+    a = with_files(footprint(), GFX_PCI + ["/sys/devices/pci0000:00"], dict(GFX_ONLY, **{"/sys/devices/pci0000:00": ["gfxtest", "parent"]}))
+    report = judge(a, a_candidate_without_gfxtest(), expected=expected())
+    assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./sys/devices/pci0000:00"] * len(SEEDS)
+    assert report["differences"][0]["by"]["A"] == ["gfxtest", "parent"]
+    assert {d["leaf"] for d in report["declared"]} == {"proc.gfxtest", "file./sys/bus/pci", "file./sys/bus/pci/"}
+
+
+def test_a_path_only_another_process_touched_or_only_the_candidate_has_is_not_covered_by_the_gfxtest_entry():
+    a = with_files(footprint(), ["/etc/only-the-parent-has"], {"/etc/only-the-parent-has": ["parent"]})
+    report = judge(a, a_candidate_without_gfxtest(), expected=expected())
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./etc/only-the-parent-has"}
+    c = with_files(a_candidate_without_gfxtest(), ["/sys/bus/pci/candidate"], {"/sys/bus/pci/candidate": ["gfxtest"]})
+    report = judge(footprint(), c, expected=expected())
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./sys/bus/pci/candidate"}, "the entry is the published engine having it, never the candidate"
+
+
+def test_a_path_only_the_gfxtest_touched_in_a_seed_where_both_sides_have_it_is_a_difference():
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    report = judge(a, footprint("candidate"), expected=expected())
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} >= {"file./sys/bus/pci", "file./sys/bus/pci/"}
+    assert report["stale"] == ["gfxtest-69"]
+
+
+def test_the_entry_covers_only_the_seeds_where_the_process_is_gone_and_the_path_of_another_seed_is_red():
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    c = footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "gfxtest"})
+    c["seeds"][1]["kinds"] = dict(KINDS)
+    report = judge(a, c, expected=expected())
+    assert report["verdict"] == "red" and {(d["seed"], d["leaf"]) for d in report["differences"]} == {(SEEDS[1], "file./sys/bus/pci"), (SEEDS[1], "file./sys/bus/pci/")}
+    assert {d["seed"] for d in report["declared"]} == {SEEDS[0]}
+
+
+def test_the_declared_list_may_only_shrink_and_stays_applied_by_kind():
+    entries = expected()
+    assert len(entries) == 1 and entries[0]["category"] == "proc" and entries[0]["name"] == "gfxtest" and "glxtest" not in json.dumps(entries)
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    assert judge(a, a_candidate_without_gfxtest(), expected=expected(), a_a=True)["declared"] == [], "the A/A applies none"
+    assert judge(footprint(platform="win32"), footprint("candidate", platform="win32"), expected=expected())["verdict"] == "green", "another OS: not applied, not stale"
+
+
+# -
+# Windows: the WOF stream of a file is the file.
+
+WOF = ":wofcompresseddata"
+SYS = "c:\\windows\\system32\\"
+REAL_PLAIN = [SYS + "msauddecmft.dll", SYS + "en-us\\ole32.dll.mui", SYS + "ole32.dll"]
+REAL_STREAMS = [SYS + "msauddecmft.dll" + WOF, SYS + "en-us\\ole32.dll.mui" + WOF]
+
+
+def test_the_wof_stream_of_a_file_is_the_file_the_process_opened(tmp_path):
+    """Run 45043617981: 31 paths `...:wofcompresseddata` only the first run of the 68 had (the files were opened by all three runs: the stream is read when the decompressed data
+    is not cached, the first access after boot)."""
+    def read(name, *events):
+        xml = tmp_path / name
+        xml.write_text(etw(*events), encoding="utf-8")
+        return host.etw_files(xml, {100})[0]
+
+    plain = read("plain.xml", *[(100, p) for p in REAL_PLAIN])
+    streams = read("streams.xml", *[(100, p) for p in REAL_PLAIN + REAL_STREAMS])
+    assert plain == {(100, p) for p in REAL_PLAIN}
+    assert streams == plain, "a run with the stream variants and the plain paths is a run with the plain paths"
+    assert read("only.xml", (100, REAL_STREAMS[0])) == {(100, REAL_PLAIN[0])}, "the stream alone is the file it belongs to"
+    assert read("case.xml", (100, REAL_PLAIN[0] + ":WofCompressedData")) == {(100, REAL_PLAIN[0])}
+
+
+def test_another_alternate_stream_is_a_path_of_its_own(tmp_path):
+    names = [REAL_PLAIN[2], REAL_PLAIN[2] + ":Zone.Identifier", REAL_PLAIN[2] + ":other", WOF, "c:\\x" + WOF + "x"]
+    xml = tmp_path / "other.xml"
+    xml.write_text(etw(*[(100, n) for n in names]), encoding="utf-8")
+    assert host.etw_files(xml, {100})[0] == {(100, n) for n in names}

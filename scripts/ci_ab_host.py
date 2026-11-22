@@ -77,7 +77,11 @@ files and the minidump names are collected the same way. `crash-probe` is the re
 candidate. Exit 0 green, 1 red, 2 the control is broken (A/A differs: what is compared is not stable, the A/B says nothing). Nothing here reads
 the clock for a verdict, and nothing excuses a difference: the A/A is green or the comparison is not stable.
 
-Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, by kind, and one that does not show is red as stale.
+Every engine run (the published engine, again, the candidate) is launched from the SAME absolute folder, `<RUNNER_TEMP>/ab-host/engine/firefox` (`staged_engine`: the package is copied
+there and removed after the run): the browser's processes read the link of every ancestor of the install folder, so where the engine sits would otherwise be a difference of the paths.
+
+Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, by kind, and one that does not show is red as stale. A declared `proc` difference covers the
+process kind and the file leaves whose only toucher on the published side is that kind (a leaf another process touched too is still a difference).
 """
 from __future__ import annotations
 
@@ -221,8 +225,12 @@ def _base(path: str) -> str:
     return re.split(r"[\\/]", path)[-1]
 
 
+#: The graphics probe the 68 spawns on Linux is called `gfxtest` (widget/gtk/GfxInfo.cpp:55 GFX_PROBE_BINARY; `gfxtest glx -f 18`), not `glxtest`: its kind is that name.
+GFX_PROBE = "gfxtest"
+
+
 def label_of_exec(path: str, argv: list, real: str) -> str:
-    """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), else the
+    """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), `gfxtest` (argv0 or the file it ran), else the
     program's name (lower case); a background task of the engine (`firefox.exe --backgroundtask pingsender ...`) is `backgroundtask/<name>`."""
     if "-contentproc" in argv:
         return kind_of(argv)  # whatever path it was started by (the binary, /proc/self/exe)
@@ -232,6 +240,8 @@ def label_of_exec(path: str, argv: list, real: str) -> str:
             return "backgroundtask/%s" % (argv[i + 1].lower() if i + 1 < len(argv) else "?")
     if any(a.lstrip("-") == "glxtest" for a in argv[1:]) or _base(argv[0] if argv else "").lower() == "glxtest":
         return "glxtest"
+    if GFX_PROBE in (_base(path).lower(), _base(argv[0] if argv else "").lower()):
+        return GFX_PROBE
     if path == real or _base(path).lower() == _base(real).lower():
         return "parent"
     return _base(path).lower() or path
@@ -1165,6 +1175,18 @@ DISPOSITIONS = {0: "SUPERSEDE", 1: "OPEN", 2: "CREATE", 3: "OPEN_IF", 4: "OVERWR
 MAKING = (0, 2, 3, 4, 5)
 
 
+#: The Windows Overlay Filter (WOF) keeps a system file compressed (Compact OS) and serves its decompressed bytes from a cache; when they are not cached (the first access
+#: after the boot) the open of the file is followed by an open of its stream `<file>:WofCompressedData`, the compressed data of the SAME file. That stream is not a path the
+#: process chose: it is the file the process opened, read from where Windows keeps it. The footprint spells it as the file (the run 45043617981: 31 system paths only the first
+#: run of the 68 had, all `<file>:wofcompresseddata`, while every one of the files was opened by all three runs). Any other stream (`:Zone.Identifier`, ...) is a path of its own.
+WOF_STREAM = ":wofcompresseddata"
+
+
+def wof_base(name: str) -> str:
+    """`name` with the WOF compressed-data stream of a file taken off (the file itself), see WOF_STREAM; any other name is itself."""
+    return name[:-len(WOF_STREAM)] if len(name) > len(WOF_STREAM) and name.lower().endswith(WOF_STREAM) else name
+
+
 def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tuple:
     """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
     stream: the file has every open of the machine for the length of the run. With a list in `exits`, the process stops of the same file (Kernel-Process, event 2)
@@ -1189,6 +1211,8 @@ def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tup
                 when = child.get("SystemTime", "")
             elif tag == "EventID":
                 event_id = (child.text or "").strip()
+        if name:
+            name = wof_base(name)
         if exits is not None and event_id == "2" and "ExitCode" in data and data.get("ProcessID"):
             exits.append({"pid": _number(data["ProcessID"]), "code": _number(data["ExitCode"]), "time": when, "image": data.get("ImageName", "")})
         if name and pid is not None and (pids is None or pid in pids):
@@ -1461,13 +1485,21 @@ def load_expected(path: Path = EXPECTED_FILE) -> list:
     return document["differences"]
 
 
-def _declared_covers(entry: dict, diff: dict) -> bool:
-    """A declared difference covers a difference of `proc.<name>` that is the published engine having it (count >= 1) and the candidate not
-    having it: by kind."""
-    if entry.get("category") != "proc" or diff["leaf"] != "proc." + entry["name"]:
+def _declared_covers(entry: dict, diff: dict, probe_seeds=()) -> bool:
+    """A declared difference covers, by kind (a `proc` entry, the name of the process):
+
+      * the leaf `proc.<name>` that is the published engine having it (count >= 1) and the candidate not having it;
+      * a file leaf of a seed in `probe_seeds` (the seeds where that leaf above differs) that only the published engine has and whose ONLY toucher on that side is that kind:
+        what a process the candidate no longer spawns alone touched goes with it. A leaf another process touched too stays a difference, and so does a leaf the
+        candidate touches or one the candidate alone has."""
+    if entry.get("category") != "proc":
         return False
     published, candidate = diff["a"], diff["b"]
-    return (published != MISSING and published >= 1) and candidate == MISSING
+    if diff["leaf"] == "proc." + entry["name"]:
+        return (published != MISSING and published >= 1) and candidate == MISSING
+    by = diff.get("by") or {}
+    return (diff["category"] == "file" and diff["seed"] in probe_seeds and published != MISSING and candidate == MISSING
+            and by.get("A") == [entry["name"]] and not by.get("B"))
 
 
 def warmup_only(fp: dict) -> dict | None:
@@ -1631,8 +1663,9 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
         for entry in expected or []:
             if entry.get("os") != os_name:
                 continue
-            hit = [d for d in differences if _declared_covers(entry, d)]
-            if not hit:
+            probe_seeds = {d["seed"] for d in differences if d["leaf"] == "proc." + entry.get("name", "") and _declared_covers(entry, d)}
+            hit = [d for d in differences if _declared_covers(entry, d, probe_seeds)]
+            if not any(d["leaf"] == "proc." + entry.get("name", "") for d in hit):
                 stale.append(entry)
                 problems.append("the declared difference %r (%s) does not show in this run: it is stale, remove it"
                                 % (entry.get("id", entry.get("name")), entry.get("reason", "")))
@@ -2279,6 +2312,37 @@ def read_json(path: Path) -> dict:
 # -
 # The run of an engine as a subprocess (the seal a process runs under is read at import), and the orchestration.
 
+#: Where the engine under test is run from, whichever engine it is: `<RUNNER_TEMP>/ab-host/engine/firefox` (the temp root of the machine without it). The content processes and the
+#: forkserver call `realpath(<install>/omni.ja)` (Omnijar::ChildProcessInit -> XRE_GetFileFromPath -> nsToolkitProfileService.cpp realpath), which reads the link of EVERY ancestor of
+#: the install folder: the oracle sees `readlink /srv`, `/srv/lab/work`, ... for an engine that sits in the checkout and `readlink /tmp/ab-host-fetch-<random>/engines` for one
+#: that was fetched (run 45043617981: 10 leaves of that on each of 5 seeds). The place of the install is a variable of the experiment, so it is the same in the three runs of an
+#: A/B, and the ancestors of the package are the same leaves in each: nothing is normalised in the comparison.
+STAGE_ENGINE = ("ab-host", "engine")
+STAGE_PACKAGE = "firefox"
+
+
+def stage_dir(base=None) -> Path:
+    """The folder the engine under test is run from: the same absolute path for every engine and every run."""
+    return Path(base or os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()).joinpath(*STAGE_ENGINE) / STAGE_PACKAGE
+
+
+@contextlib.contextmanager
+def staged_engine(binary: str, base=None):
+    """The whole package of `binary` (its folder, every file, links kept, the bytes as they are) copied to `stage_dir`, yielding the path of the binary there; the copy is
+    removed when the run is over, so the next engine is staged at the very same path."""
+    source = Path(os.path.abspath(binary))
+    dest = stage_dir(base)
+    shutil.rmtree(dest, ignore_errors=True)
+    if dest.exists():
+        raise OSError("the folder the engine is run from, %s, could not be emptied" % dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source.parent, dest, symlinks=True)
+    try:
+        yield str(dest / source.name)
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
+
+
 def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: str, seeds: list, crash_with: str | None = None) -> int:
     """`run` in a process of its own, with a cache folder and a temp root of its own: they are the run's, so what the engine does in them is `ours`
     (the cache of the bundle's fonts, the profile and the temp dirs of the launch) and the rest of the machine is the host's.
@@ -2380,9 +2444,14 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             runs.append((oracle.CANDIDATE, "footprint-candidate.json", candidate, candidate_seal))
         failed = []
         for label, name, exe, seal_file in runs:
-            print("=== footprint with %s: %s" % (label, exe))
+            print("=== footprint with %s: %s (run from %s)" % (label, exe, stage_dir()))
             sys.stdout.flush()
-            rc = run_subprocess(exe, Path(seal_file) if seal_file else None, leg, out / name, label, seeds)
+            try:
+                with staged_engine(exe) as staged:
+                    rc = run_subprocess(staged, Path(seal_file) if seal_file else None, leg, out / name, label, seeds)
+            except OSError as e:
+                print("the engine of %s could not be staged: %s" % (label, e))
+                rc = 125
             if rc != 0 or not (out / name).exists():
                 failed.append("the run with %s ended with %s" % (label, rc))
         if failed:
