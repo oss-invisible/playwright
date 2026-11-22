@@ -86,6 +86,17 @@ def test_query_selector_all_finds_every_match_inside_the_element_and_not_outside
     assert box.query_selector_all("#outside") == []
 
 
+def test_query_selector_all_inside_the_element_keeps_the_document_order_of_a_long_list(page):
+    """A list longer than ten: read as one array, its places are 0, 1, ... 9, 10, ... and not '0', '1', '10', '11', ... '2'."""
+    page.evaluate("""() => {
+        const list = document.createElement('div'); list.id = 'long';
+        for (let i = 0; i < 25; i++) { const li = document.createElement('i'); li.id = 'n' + i; list.appendChild(li); }
+        document.body.appendChild(list);
+    }""")
+    found = page.query_selector("#long").query_selector_all("i")
+    assert ids(found) == ["n%d" % i for i in range(25)]
+
+
 def test_eval_on_selector_runs_the_function_on_the_match_inside_the_element(page):
     box = page.query_selector("#box")
     assert box.eval_on_selector(".x", "(e, suffix) => e.id + suffix", "!") == "s1!"

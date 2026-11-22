@@ -143,20 +143,57 @@ def test_query_selector_that_finds_nothing_answers_no_element(page, element):
     assert element.call("querySelector", {"selector": "span"}) == {"element": None}
 
 
+def listed(*object_ids):
+    """What `InjectedScript.properties` answers for an array of nodes: one property per place, the node as the RemoteObject the engine made of it."""
+    return [{"name": str(i), "value": {"type": "object", "subtype": "node", "objectId": oid}} for i, oid in enumerate(object_ids)]
+
+
 def test_query_selector_all_looks_inside_the_element_and_hands_back_every_match(page, element):
-    page.injected.call.side_effect = ["list-1", 2, "child-1", "child-2"]
+    page.injected.call.side_effect = ["list-1"]
+    page.injected.context_id.return_value = "utility-1"
+    page.injected.properties.return_value = listed("child-1", "child-2")
     answer = element.call("querySelectorAll", {"selector": "li"})
     first = page.injected.call.call_args_list[0]
     assert first.args[0] == "main" and first.args[2] == {"objectId": "el-1"} and first.args[3] == "li", first
     page.injected.query_selector_all.assert_not_called()
+    page.injected.properties.assert_called_once_with("utility-1", "list-1")
     assert [handle_of(page, e).object_id for e in answer["elements"]] == ["child-1", "child-2"]
     assert all(handle_of(page, e).frame is page.frame for e in answer["elements"])
     page.injected.dispose.assert_called_once_with("main", "list-1")     # the list that held them is not left in the page
 
 
 def test_query_selector_all_with_no_match_answers_an_empty_list(page, element):
-    page.injected.call.side_effect = ["list-1", 0]
+    page.injected.call.side_effect = ["list-1"]
+    page.injected.properties.return_value = []
     assert element.call("querySelectorAll", {"selector": "li"}) == {"elements": []}
+    page.injected.dispose.assert_called_once_with("main", "list-1")
+
+
+@pytest.mark.parametrize("matches", [0, 1, 2, 25])
+def test_the_list_of_a_rooted_query_is_read_in_one_command_whatever_its_length(page, element, matches):
+    """The core's own `query_selector_all` asks for the length and then for each place, N + 2 commands; the rooted path reads the array once
+    (`Runtime.getObjectProperties`, which is the core's `properties`) after the query that made it: two commands, then the release of the list."""
+    page.injected.call.side_effect = ["list-1"]
+    page.injected.properties.return_value = listed(*["child-%d" % i for i in range(matches)])
+    answer = element.call("querySelectorAll", {"selector": "li"})
+    assert page.injected.call.call_count == 1, page.injected.call.call_args_list
+    assert page.injected.properties.call_count == 1
+    assert [handle_of(page, e).object_id for e in answer["elements"]] == ["child-%d" % i for i in range(matches)]
+
+
+def test_the_matches_of_a_rooted_query_come_in_document_order_whatever_order_the_engine_lists_them(page, element):
+    page.injected.call.side_effect = ["list-1"]
+    shuffled = listed(*["child-%d" % i for i in range(12)])
+    page.injected.properties.return_value = [shuffled[i] for i in (10, 2, 0, 11, 1, 9, 3, 8, 4, 7, 5, 6)]
+    answer = element.call("querySelectorAll", {"selector": "li"})
+    assert [handle_of(page, e).object_id for e in answer["elements"]] == ["child-%d" % i for i in range(12)]
+
+
+def test_a_rooted_list_is_released_even_when_it_cannot_be_read(page, element):
+    page.injected.call.side_effect = ["list-1"]
+    page.injected.properties.side_effect = RuntimeError("the world went away")
+    with pytest.raises(RuntimeError):
+        element.call("querySelectorAll", {"selector": "li"})
     page.injected.dispose.assert_called_once_with("main", "list-1")
 
 
@@ -191,7 +228,8 @@ def test_eval_on_selector_that_finds_nothing_says_what_stock_says(page, element)
 
 
 def test_eval_on_selector_all_runs_the_callers_code_on_the_matches_inside_the_element_as_one_array(page, element):
-    page.injected.call.side_effect = ["list-1", 2, "child-1", "child-2"]
+    page.injected.call.side_effect = ["list-1"]
+    page.injected.properties.return_value = listed("child-1", "child-2")
     page.frame._call_on_elements = Mock(return_value=2)
     params = {"selector": "li", "expression": "els => els.length", "isFunction": True, "arg": arg({"v": "null"})}
     assert element.call("evalOnSelectorAll", params) == {"value": {"n": 2}}
