@@ -510,11 +510,11 @@ def _bare_summary(bare: dict | None) -> dict | None:
 #: THE SYSTEM MODULES OF WINDOWS: the paths under System32, SysWOW64 and WinSxS (the security catalogs are under System32 catroot) that are not in the package. They are
 #: loaded by the Windows loader on behalf of system DLLs (a catalog lookup when a library is loaded, a library a system DLL loads lazily, the resource file of a module), and no
 #: page reads them: which of them a launch opens follows the system and its timing, not the engine. They are compared as a set per PATH over the union of the launches of a
-#: run that are compared (the measured seeds and the warm-up), never seed by seed:
+#: run (the measured seeds and the warm-up, and as a layer of its own the long idle and bare launches), never seed by seed:
 #:   * in the A/B, red only a module the CANDIDATE opened that NO launch of the 68 opened, in either run of the 68 (the published engine twice, warm-ups included); a module
 #:     the candidate lacks is not red (printed as `lacking`);
 #:   * in the A/A, a module of this class that only one run has is `rare`: printed with its count, and the control is red only if the rare ones of a run are more than RARE_LIMIT
-#:     paths (the class is growing and must be looked at).
+#:     paths in its measured launches, or RARE_LIMIT_LONG in its long ones (the class is growing and must be looked at).
 #: Everything outside these folders stays strict, and the shortcut inventory is its own rule (absent or complete).
 SYSTEM_FOLDERS = tuple("c:" + chr(92) + "windows" + chr(92) + name + chr(92) for name in ("system32", "syswow64", "winsxs"))
 SYSTEM_PREFIX = tuple("file." + f for f in SYSTEM_FOLDERS)
@@ -523,36 +523,56 @@ SYSTEM_REASON = ("loaded by the Windows loader on behalf of system DLLs, and no 
                  "A/B red only a module the candidate opened that no launch of the 68 opened; in the A/A the ones only one run has are rare, red above %d" % RARE_LIMIT)
 
 
-def _launches(fp: dict) -> list:
-    return list(fp.get("seeds", [])) + [fp.get("warmup") or {}]
+LAYERS = {"measured": ("seeds", "warmup"), "long": ("idle", "bare")}
+RARE_LIMIT_LONG = 30
 
 
-def system_paths(fp: dict, with_inventory: bool = True) -> set:
-    """The system modules (SYSTEM_FOLDERS) any launch of a footprint opened: the measured seeds and the warm-up. The idle and the bare launch are not in it: they run 120 s,
-    in which the parent runs Mozilla's idle tasks (the maintenance at 57 s, the shell code), and they are evidence, not compared (run 44993377458: 19 of the 21 modules only
-    run A had were theirs; with the seeds and the warm-up it is 2). Without `with_inventory` the ones a
-    launch opened as part of the shortcut inventory (its own rule: absent or complete, `INVENTORY_MARKER`) are left out."""
+def _launches(fp: dict, layer: str) -> list:
+    out = []
+    for key in LAYERS[layer]:
+        got = fp.get(key)
+        out += got if key == "seeds" else [got or {}]
+    return out
+
+
+def system_paths(fp: dict, layers=("measured", "long"), with_inventory: bool = True) -> set:
+    """The system modules (SYSTEM_FOLDERS) the launches of the given layers of a footprint opened. Two layers: `measured` (the seeds and the warm-up) and `long` (the idle
+    and the bare launch, 120 s, in which the parent runs Mozilla's idle tasks: the maintenance at 57 s, the shell code). Without `with_inventory` the ones a launch opened
+    as part of the shortcut inventory (its own rule: absent or complete, `INVENTORY_MARKER`) are left out."""
     out = set()
-    for launch in _launches(fp):
-        skip = set() if with_inventory else set(launch.get("inventory") or [])
-        out.update(p for p in launch.get("files", []) if p.startswith(SYSTEM_FOLDERS) and p not in skip)
+    for layer in layers:
+        for launch in _launches(fp, layer):
+            skip = set() if with_inventory else set(launch.get("inventory") or [])
+            out.update(p for p in launch.get("files", []) if p.startswith(SYSTEM_FOLDERS) and p not in skip)
     return out
 
 
 def system_class(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
-    """`(differences, problems, report)` of the system modules of two footprints: see SYSTEM_REASON. `also_68` are the other footprints of the 68 in an A/B."""
-    ua, ub = system_paths(a, False), system_paths(b, False)
+    """`(differences, problems, report)` of the system modules of two footprints: see SYSTEM_REASON. `also_68` are the other footprints of the 68 in an A/B.
+
+    A/A: a module only one run has is rare, counted in two layers with their own caps: the measured launches (RARE_LIMIT) and the long ones (RARE_LIMIT_LONG, what only a
+    long launch of the run opened). A module the other run has in ANY launch is not rare. A/B: red only a module any launch of the candidate opened that no launch of either 68
+    run opened."""
     differences, problems = [], []
     if a_a:
-        rare = {"A": sorted(ua - ub), "B": sorted(ub - ua)}
-        for side in ("A", "B"):
-            if len(rare[side]) > RARE_LIMIT:
-                problems.append("the system modules only run %s has are %d, more than %d: the class is growing (%s)" % (side, len(rare[side]), RARE_LIMIT, rare[side][:3]))
-        return differences, problems, {"mode": "a-a", "rare": rare, "counts": {k: len(v) for k, v in rare.items()}, "limit": RARE_LIMIT, "reason": SYSTEM_REASON}
-    known = set(ua).union(*[system_paths(x, False) for x in also_68])
-    for path in sorted(ub - known):
+        rare = {"measured": {}, "long": {}}
+        for side, x, y in (("A", a, b), ("B", b, a)):
+            other = system_paths(y, with_inventory=False)
+            measured = system_paths(x, ("measured",), False)
+            rare["measured"][side] = sorted(measured - other)
+            rare["long"][side] = sorted(system_paths(x, ("long",), False) - measured - other)
+        for layer, limit in (("measured", RARE_LIMIT), ("long", RARE_LIMIT_LONG)):
+            for side in ("A", "B"):
+                if len(rare[layer][side]) > limit:
+                    problems.append("the system modules only run %s has in its %s launches are %d, more than %d: the class is growing (%s)"
+                                    % (side, layer, len(rare[layer][side]), limit, rare[layer][side][:3]))
+        counts = {layer: {k: len(v) for k, v in rare[layer].items()} for layer in rare}
+        return differences, problems, {"mode": "a-a", "rare": rare, "counts": counts, "limits": {"measured": RARE_LIMIT, "long": RARE_LIMIT_LONG}, "reason": SYSTEM_REASON}
+    known = set(system_paths(a, with_inventory=False)).union(*[system_paths(x, with_inventory=False) for x in also_68])
+    mine = system_paths(b, with_inventory=False)
+    for path in sorted(mine - known):
         differences.append({"seed": "all", "category": "file", "leaf": "file." + path, "a": MISSING, "b": 1, "by": {"A": [], "B": []}, "calls": {"A": [], "B": []}})
-    return differences, problems, {"mode": "a-b", "candidate_only": sorted(ub - known), "lacking": sorted(known - ub)[:50], "lacking_count": len(known - ub), "reason": SYSTEM_REASON}
+    return differences, problems, {"mode": "a-b", "candidate_only": sorted(mine - known), "lacking": sorted(known - mine)[:50], "lacking_count": len(known - mine), "reason": SYSTEM_REASON}
 
 
 PRIVILEGED = "Privileged Cont"
@@ -1591,8 +1611,10 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
     system = report.get("system_modules")
     if system and system["mode"] == "a-a":
         for side, name in (("A", a_name), ("B", b_name)):
-            if system["rare"][side]:
-                print("RARE system modules only %s has: %d (red above %d): %s" % (name, len(system["rare"][side]), system["limit"], json.dumps(system["rare"][side][:20])))
+            for layer in ("measured", "long"):
+                if system["rare"][layer][side]:
+                    print("RARE system modules only %s has in its %s launches: %d (red above %d): %s" % (
+                        name, layer, len(system["rare"][layer][side]), system["limits"][layer], json.dumps(system["rare"][layer][side][:20])))
     elif system:
         print("SYSTEM modules the 68 has and the candidate lacks (not red): %d; the candidate has alone: %d" % (system["lacking_count"], len(system["candidate_only"])))
     for side, name in (("A", a_name), ("B", b_name)):

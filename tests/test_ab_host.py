@@ -1854,9 +1854,9 @@ def test_a_system_module_in_a_launch_of_each_run_is_the_same_module_and_a_rare_o
     b = with_system(win("again"), {"warmup": [SYS_B], 12: [SYS_A]})
     report = judge(a, b, a_a=True)
     assert report["verdict"] == "green", report["problems"]
-    assert report["system_modules"]["rare"] == {"A": [], "B": [SYS_A]} and report["system_modules"]["counts"] == {"A": 0, "B": 1}
+    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": [SYS_A]} and report["system_modules"]["counts"]["measured"] == {"A": 0, "B": 1}
     host.print_report(report, "firefox-68", "firefox-68 again")
-    assert "RARE system modules only firefox-68 again has: 1 (red above 5)" in capsys.readouterr().out
+    assert "RARE system modules only firefox-68 again has in its measured launches: 1 (red above 5)" in capsys.readouterr().out
     assert "no page reads them" in host.SYSTEM_REASON and "Windows loader" in host.SYSTEM_REASON
 
 
@@ -1864,11 +1864,23 @@ def test_six_rare_system_modules_in_an_a_a_run_are_red_and_five_are_not():
     many = ["c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "rare%d.dll" % i for i in range(6)]
     assert judge(with_system(win(), {11: many}), win("again"), a_a=True)["verdict"] == "red"
     report = judge(with_system(win(), {11: many}), win("again"), a_a=True)
-    assert any("the system modules only run A has are 6, more than 5: the class is growing" in p for p in report["problems"])
+    assert any("the system modules only run A has in its measured launches are 6, more than 5: the class is growing" in p for p in report["problems"])
     assert judge(with_system(win(), {11: many[:5]}), win("again"), a_a=True)["verdict"] == "green"
     assert judge(win(), with_system(win("again"), {"warmup": many}), a_a=True)["verdict"] == "red", "either run, the warm-up included"
-    long_launches = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many, "bare": many}), a_a=True)
-    assert long_launches["verdict"] == "green", long_launches["problems"]  # the long launches are evidence, not in the class
+
+
+def test_the_rare_modules_of_the_long_launches_are_counted_apart_with_a_cap_of_thirty():
+    many = ["c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "long%d.dll" % i for i in range(31)]
+    ok = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many[:30], "bare": []}), a_a=True)
+    assert ok["verdict"] == "green", ok["problems"]
+    assert ok["system_modules"]["counts"] == {"measured": {"A": 0, "B": 0}, "long": {"A": 0, "B": 30}} and ok["system_modules"]["limits"] == {"measured": 5, "long": 30}
+    red = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many, "bare": []}), a_a=True)
+    assert red["verdict"] == "red" and any("only run B has in its long launches are 31, more than 30" in p for p in red["problems"])
+    seven = many[:7]
+    measured = judge(with_system(win(), {"idle": []}), with_system(win("again"), {11: seven}), a_a=True)
+    assert measured["verdict"] == "red", "the measured launches keep the cap of 5"
+    in_both = judge(with_system(win(), {"idle": many}), with_system(win("again"), {11: many, "idle": []}), a_a=True)
+    assert in_both["verdict"] == "green" and in_both["system_modules"]["counts"]["long"] == {"A": 0, "B": 0}, "a module the other run has in any launch is not rare"
 
 
 def test_in_an_ab_a_system_module_only_the_candidate_opened_is_red_and_one_the_candidate_lacks_is_green():
@@ -1883,6 +1895,12 @@ def test_in_an_ab_a_system_module_only_the_candidate_opened_is_red_and_one_the_c
     assert red["verdict"] == "red" and [d["leaf"] for d in red["differences"]] == ["file." + new]
     assert judge(win(), with_system(win("candidate"), {"warmup": [new]}), expected=[])["verdict"] == "red", "a module the candidate opened in a warm-up counts"
     assert judge(with_system(win(), {"warmup": [new]}), with_system(win("candidate"), {11: [new]}), expected=[])["verdict"] == "green", "a 68 warm-up opened it too"
+    # the long launches are inside the class: a candidate's long-launch module is red only if no launch of the 68 loaded it
+    long_red = judge(published, with_system(win("candidate"), {"idle": [new]}), expected=[], also_68=[again])
+    assert long_red["verdict"] == "red" and [d["leaf"] for d in long_red["differences"]] == ["file." + new]
+    assert judge(with_system(win(), {"idle": [new]}), with_system(win("candidate"), {"idle": [new]}), expected=[])["verdict"] == "green", "a 68 long launch opened it"
+    assert judge(with_system(win(), {"warmup": [new]}), with_system(win("candidate"), {"bare": [new]}), expected=[])["verdict"] == "green", "any 68 launch counts"
+    assert judge(published, with_system(win("candidate"), {"bare": [new]}), expected=[], also_68=[with_system(win("again"), {"idle": [new]})])["verdict"] == "green", "the other 68 run too"
 
 
 def test_the_system_class_is_system32_syswow64_and_winsxs_and_everything_else_stays_strict_seed_by_seed():
