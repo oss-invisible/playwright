@@ -50,7 +50,7 @@ import http.server
 import threading
 
 import pytest
-from _moving_page import _SENT, _goto, _landing
+from _moving_page import _goto, _landing, forget
 
 pytestmark = pytest.mark.e2e
 
@@ -171,12 +171,24 @@ def site():
 
 
 @pytest.fixture(scope="module")
-def page(firefox_binary):
+def _browser(firefox_binary):
     from invisible_playwright import InvisiblePlaywright
 
     with InvisiblePlaywright(seed=4321, binary_path=firefox_binary,
                              headless=True) as browser:
-        yield browser.new_page()
+        yield browser
+
+
+@pytest.fixture
+def page(_browser):
+    """A page of its own for each test, closed at its end: a page that is still moving when its test ends (`goto` raised for the page before,
+    and ours went on) cannot reach the next test."""
+    page = _browser.new_page()
+    try:
+        yield page
+    finally:
+        forget(page)
+        page.close()
 
 
 @pytest.mark.parametrize("path", ["/head", "/r0", "/r50", "/r300",
@@ -211,8 +223,6 @@ def test_a_read_right_after_goto_answers(page, site, path, engine_reaches):
             assert page.evaluate("1 + 1") == 2
         except Error as e:
             assert "Execution context was destroyed" in str(e), e
-    # The next test starts on a page that stays: the last page this frame went with has landed.
-    page.wait_for_url(lambda u, end=_landing(_SENT[id(page)]): u.endswith(end), timeout=30_000)
 
 
 @pytest.mark.parametrize("path", ["/r0", "/r50", "/x0", "/x50"])
@@ -222,12 +232,12 @@ def test_networkidle_is_reached_on_the_page_that_replaced_ours(page, site, path,
     Playwright), or on the page that replaced it. Either way the page then lands, and `networkidle` is reached there.
     A `goto` that never answers because the new frame forgot the navigation ([B228]) is still red; the answer that
     must never come on the first page is the strict case below. Each round starts on a page that stays (the round
-    before waited for its landing, and so did the test before)."""
+    before waited for its landing; the page is the test's own)."""
     older = not engine_reaches("firefox-68")
     for i in range(ROUNDS):
         url = "%s/i%s?n=%s-%d" % (site, path[1:], path[1:], i)
         assert _goto(page, url, the_page_before_may_move=False, our_page_may_stop_ours=older,
-                     wait_until="networkidle", timeout=30_000) == url
+                     wait_until="networkidle", timeout=30_000) == {url}
         assert page.url.split("?")[0].endswith(("/i" + path[1:], "/landed")), page.url
         page.wait_for_url(lambda u, end=_landing(url): u.endswith(end), timeout=30_000)
         page.wait_for_load_state("networkidle", timeout=30_000)
@@ -255,7 +265,7 @@ def test_networkidle_is_reached_only_on_the_page_that_replaced_a_document_still_
     for i in range(ROUNDS):
         url = "%s%s?n=%s-%d" % (site, path, path[1:], i)
         assert _goto(page, url, the_page_before_may_move=False, our_page_may_stop_ours=older,
-                     wait_until="networkidle", timeout=30_000) == url
+                     wait_until="networkidle", timeout=30_000) == {url}
         assert page.url.endswith(_landing(url)), page.url
 
 

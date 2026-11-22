@@ -195,3 +195,21 @@ def test_a_stopped_goto_is_red_when_no_page_may_stop_it():
     page = FakePage().step(aborted(0), now=landed(0))
     with pytest.raises(AssertionError):
         go(page, 0, before_may_move=False, ours_may_stop=False)
+
+
+def test_a_goto_says_which_pages_the_frame_may_go_with():
+    page = (FakePage().step()
+            .step(interrupted(4, 3), now=landed(3), later=[landed(4)])
+            .step())
+    assert go(page, 3) == {sent(3)}
+    assert go(page, 4) == {sent(3), sent(4)}
+    assert go(page, 5) == {sent(5)}
+
+
+def test_a_page_forgotten_has_no_page_that_may_be_moving():
+    """The ledger is by `id`, which a new page may reuse: the fixture forgets a page when its test ends."""
+    page = FakePage().step().step(interrupted(4, 3), now=landed(3))
+    go(page, 3)
+    mp.forget(page)
+    with pytest.raises(AssertionError):
+        go(page, 4)
