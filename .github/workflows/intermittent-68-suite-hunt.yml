@@ -4,8 +4,10 @@
 # of it counts as green for anything: a green hunt proves nothing about a release, a red one is evidence to read.
 #
 # What it runs. The e2e of .github/workflows/e2e.yml on this branch, as that file runs it, ROUNDS times in sequence per job, and it never stops at a red:
-#   * linux 1..4: four identical copies of the Linux job of e2e.yml (the whole suite under xvfb-run without the root and the sandbox files, then the root
+#   * linux 1..3: three identical copies of the Linux job of e2e.yml (the whole suite under xvfb-run without the root and the sandbox files, then the root
 #     step and the sandbox step, as e2e.yml runs them);
+#   * linux-secstate: ONLY tests/test_security_state_engine_e2e.py, the whole file, as e2e.yml runs it (scripts/run_e2e.py under xvfb-run, the gdb and
+#     core_pattern set up as in e2e.yml), 40 rounds one pytest each; what it leaves is a core file and its gdb text, kept per round when there is one;
 #   * windows 1..4: the four Windows parts of e2e.yml (rows `wrapper.e2e.suite.windows.N` of ci/required-suites.json through scripts/ci_verdict.py args).
 # Left out on purpose: the gate that waits for the core on the index, and the Windows job of Control+A. Same runners, same install, same security state, same
 # fetch, same GeoIP database, same scripts/run_e2e.py with its own width (-n), its own deadline and no rerun of any kind.
@@ -55,9 +57,11 @@ jobs:
           - label: linux-3
             os: ubuntu-24.04
             temp: /tmp
-          - label: linux-4
+          - label: linux-secstate
             os: ubuntu-24.04
             temp: /tmp
+            mode: secstate
+            rounds: 40
           - label: windows-1
             os: windows-2022
             temp: 'D:\a\_temp'
@@ -124,8 +128,12 @@ jobs:
       - name: The suite, round after round
         env:
           PYTHONUNBUFFERED: "1"
-          # The number of rounds: 3 unless said otherwise here, and never more than 6 (the script clamps it).
-          HUNT_ROUNDS: "3"
+          # The number of rounds: the matrix's (40 for the one-file job), else 3, and never more than 6 for the whole suite or 100 for the one file (the script clamps it).
+          HUNT_ROUNDS: ${{ matrix.rounds || '3' }}
+          # `suite`: the e2e of e2e.yml (the Linux job or the Windows part); `secstate`: only tests/test_security_state_engine_e2e.py, on Linux.
+          HUNT_MODE: ${{ matrix.mode || 'suite' }}
+          # No new round starts after this many seconds of the step, so that the artifact is uploaded before the job's ceiling.
+          HUNT_BUDGET_S: "19000"
           HUNT_LABEL: ${{ matrix.label }}
           # The watchdog of tests/conftest.py, as e2e.yml sets it for the run of the runner user (the junit of the run is written beside it).
           HUNT_WATCHDOG: ${{ runner.temp }}/e2e-watchdog.log
@@ -144,13 +152,15 @@ jobs:
           rounds="${HUNT_ROUNDS:-3}"
           case "$rounds" in ''|*[!0-9]*) echo "::warning::HUNT_ROUNDS='$rounds' is not a number: 3 rounds"; rounds=3;; esac
           if [ "$rounds" -lt 1 ]; then rounds=3; fi
-          if [ "$rounds" -gt 6 ]; then echo "::warning::HUNT_ROUNDS=$rounds is more than 6: 6 rounds"; rounds=6; fi
+          most=6
+          if [ "$HUNT_MODE" = "secstate" ]; then most=100; fi
+          if [ "$rounds" -gt "$most" ]; then echo "::warning::HUNT_ROUNDS=$rounds is more than $most: $most rounds"; rounds=$most; fi
           hunt="$RUNNER_TEMP/hunt"
           mkdir -p "$hunt"
+          extras=()
           if [ "$RUNNER_OS" = "Windows" ]; then
             mapfile -t ARGS < <(tr -d '\r' < "$RUNNER_TEMP/e2e_args.txt")
-            extras=()
-          else
+          elif [ "$HUNT_MODE" = "suite" ]; then
             # What the restriction on user namespaces was, to put it back after the sandbox step of every round.
             USERNS0="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 1)"
             extras=("root-e2e.xml=$ROOT_TESTS" "sandbox-e2e.xml=$SANDBOX_TESTS")
@@ -218,6 +228,9 @@ jobs:
           run_main() {
             if [ "$RUNNER_OS" = "Windows" ]; then
               INVPW_TEST_WATCHDOG_FILE="$HUNT_WATCHDOG" python -u scripts/run_e2e.py "$FF" "${ARGS[@]}"
+            elif [ "$HUNT_MODE" = "secstate" ]; then
+              # The one file, as e2e.yml runs it (the whole file, the engine in its generate mode, under xvfb), on the serial path of run_e2e.py: one pytest.
+              INVPW_TEST_WATCHDOG_FILE="$HUNT_WATCHDOG" xvfb-run -a python -u scripts/run_e2e.py "$FF" tests/test_security_state_engine_e2e.py -n 1
             else
               local IGNORE=() DESELECT=() f nodeid
               for f in $ROOT_FILES $SANDBOX_FILES; do IGNORE+=("--ignore=$f"); done
@@ -246,11 +259,17 @@ jobs:
           {
             echo "## $HUNT_LABEL"
             echo ""
-            echo "The whole e2e of e2e.yml on this branch, $rounds rounds in sequence. A hunt, not a gate: nothing here counts as green."
+            if [ "$HUNT_MODE" = "secstate" ]; then what="tests/test_security_state_engine_e2e.py alone"; else what="The whole e2e of e2e.yml on this branch"; fi
+            echo "$what, $rounds rounds in sequence. A hunt, not a gate: nothing here counts as green."
             echo ""
           } > "$hunt/hunt-summary.md"
           rounds_run=0; rounds_red=0
           for n in $(seq 1 "$rounds"); do
+            if [ "$SECONDS" -gt "${HUNT_BUDGET_S:-19000}" ]; then
+              echo "::warning::time budget reached after $rounds_run rounds of $rounds: no new round"
+              echo "- time budget reached after $rounds_run rounds of $rounds: no new round" >> "$hunt/hunt-summary.md"
+              break
+            fi
             rd="$hunt/round-$n"
             mkdir -p "$rd"
             log="$rd/round.log"
@@ -260,7 +279,7 @@ jobs:
             set +e
             run_main 2>&1 | tee "$log"
             code_main=${PIPESTATUS[0]}
-            if [ "$RUNNER_OS" = "Linux" ]; then
+            if [ "$RUNNER_OS" = "Linux" ] && [ "$HUNT_MODE" = "suite" ]; then
               run_root 2>&1 | tee -a "$log"
               code_root=${PIPESTATUS[0]}
               # Whatever root wrote under the evidence folder is the runner's again.
@@ -287,6 +306,11 @@ jobs:
               if [ -e "$item" ]; then mv "$item" "$rd/"; fi
             done
             if [ -d "$RUNNER_TEMP/invpw-evidence" ]; then mv "$RUNNER_TEMP/invpw-evidence" "$rd/invpw-evidence"; fi
+            # A core file the engine left (the test deletes the ones it reads) and the gdb texts beside it, kept with the round that made them.
+            if [ -n "${INVPW_CORE_DIR:-}" ] && [ -d "$INVPW_CORE_DIR" ] && [ -n "$(ls -A "$INVPW_CORE_DIR")" ]; then
+              mkdir -p "$rd/invpw-cores"
+              find "$INVPW_CORE_DIR" -mindepth 1 -maxdepth 1 -exec mv -t "$rd/invpw-cores" {} +
+            fi
             shopt -u nullglob
             # Python writes CRLF on Windows: every line read back loses its carriage return before it is used in an arithmetic expression.
             python "$hunt/read_round.py" "$rd" "${extras[@]}" | tr -d '\r' > "$rd/round-read.txt"
