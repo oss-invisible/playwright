@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -24,6 +25,34 @@ pytestmark = pytest.mark.e2e
 HERE = pathlib.Path(__file__).resolve().parent / "fakeweb"
 HARD = ["leaving_beacons_subframe", "leaving_beacons", "cancel_among_beacons"]
 REPETITIONS = 10
+
+
+class P2Evidence(FailureEvidence):
+    """What a round that does not reach networkidle leaves, on top of the helper's own files: `p2-not-idle.json` (each such cell with its WHOLE in-flight list:
+    type, method, url, frame url, seconds from the navigation's start; and what the served browser's lifecycle held open when the wait expired) and
+    `p2-open-requests-history.txt` (the history of each of those open requests on the Juggler wire, `profile_p2.open_requests_history`). It only reads what the
+    helper already saved; a failure of its own is written to stderr and never hides the failure of the test."""
+
+    def _save(self, exc_type, exc, kept: str = "") -> None:
+        self.saved_to = None
+        super()._save(exc_type, exc, kept)
+        target = self.saved_to
+        if target is None:
+            return
+        try:
+            cells = self.cells or []
+            not_idle = [{key: cell.get(key) for key in ("round", "pattern", "canary", "after", "err", "seconds", "expired_at", "in_flight", "lifecycle_open")}
+                        for cell in cells if not cell.get("idle")]
+            (target / "p2-not-idle.json").write_text(json.dumps(not_idle, indent=1, default=str), encoding="utf-8")
+            wire = target / "juggler-wire.jsonl"
+            lines = wire.read_text(encoding="utf-8").splitlines() if wire.exists() else []
+            (target / "p2-open-requests-history.txt").write_text(profile_p2.open_requests_history(lines, cells), encoding="utf-8")
+            meta_path = target / "meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["files"] = sorted(p.name for p in target.iterdir())
+            meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+        except Exception as problem:
+            sys.stderr.write("p2 evidence: could not be written: %r\n" % (problem,))
 
 
 def _stock_client():
@@ -135,7 +164,7 @@ def test_the_page_that_leaves_with_beacons_reaches_networkidle_every_time_under_
     import tempfile
     import time
 
-    with FailureEvidence("fakeweb-leaving-beacons-under-load") as evidence:
+    with P2Evidence("fakeweb-leaving-beacons-under-load") as evidence:
         loader = pathlib.Path(__file__).resolve().parent / "fakeweb" / "loader.py"
         ready_dir = pathlib.Path(tempfile.mkdtemp(prefix="fakeweb-loaders-"))
         ready = [ready_dir / ("loader-%d.ready" % i) for i in range(LOADERS)]
@@ -148,7 +177,7 @@ def test_the_page_that_leaves_with_beacons_reaches_networkidle_every_time_under_
             assert wait_until(lambda: all(mark.exists() for mark in ready), 180, lambda: time.sleep(0.25)),             "the loaders did not start loading: %s" % [m.name for m in ready if not m.exists()]
             evidence.arm()
             cells = profile_p2.run_on_candidate(_stock_client(), firefox_binary, origin, ["leaving_beacons_subframe"], 10,
-                                                client_log=evidence.client_log)
+                                                client_log=evidence.client_log, lifecycle_dump=True)
             evidence.note_cells(cells)
         finally:
             stop()
@@ -163,7 +192,7 @@ def test_the_page_that_leaves_with_beacons_reaches_networkidle_every_time_under_
             assert len(cells) == 20, "the run made %d navigations, not 20" % len(cells)
             return
         bad = ["round %d%s: %s -- in flight: %s" % (c["round"], " (canary)" if c["canary"] else "", c["err"],
-                                                     [(r["type"], r["method"], r["frame"]) for r in c.get("in_flight", [])[:3]])
+                                                     [(r["type"], r["method"], r["frame"], r["url"], r["t"]) for r in c.get("in_flight", [])])
                for c in cells if not c["idle"]]
         assert not bad, "%d of %d navigations did not reach networkidle under load:%s" % (
             len(bad), len(cells), "".join("\n  " + line for line in bad[:6]))
