@@ -961,7 +961,11 @@ def test_a_host_with_ipv6_addresses_gathers_through_an_ipv4_relay(monkeypatch):
     assert took_the_relay, "the page's STUN request did not take the relay. " + verdict
 
 
+# The distance of the gateway is a sleep of the lab, and the core measures the UDP road of the proxy with a fixed budget (3 s): on a runner with no CPU
+# left the lab's threads are scheduled late and the measurement ends before the answers do (run 45058944650). A verdict that reads the wall clock
+# runs in the lane that gives the test the whole machine, after the parallel tests.
 @pytest.mark.e2e
+@pytest.mark.wall_clock
 @pytest.mark.parametrize("rtt_ms", [80, 150, 250])
 @pytest.mark.parametrize("ice_prefs", _ICE_PREFS, ids=_ICE_IDS)
 @pytest.mark.usefixtures("the_udp_line")
@@ -1009,6 +1013,7 @@ _START_A_GATHER_JS = r"""async (stun) => {
 
 
 @pytest.mark.e2e
+@pytest.mark.wall_clock
 @pytest.mark.parametrize("ice_prefs", _ICE_PREFS, ids=_ICE_IDS)
 @pytest.mark.usefixtures("the_udp_line")
 def test_the_first_candidate_of_a_gather_does_not_wait_for_a_gateway_that_is_far_away(monkeypatch, ice_prefs):
@@ -1057,6 +1062,7 @@ def test_the_first_candidate_of_a_gather_does_not_wait_for_a_gateway_that_is_far
 
 
 @pytest.mark.e2e
+@pytest.mark.wall_clock
 @pytest.mark.usefixtures("the_udp_line")
 def test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_to_the_server(monkeypatch):
     """⛔ THE KNOWN-BAD INPUT: a gateway 250 ms away, a page loaded through it, and a while later the page asks for WebRTC.
