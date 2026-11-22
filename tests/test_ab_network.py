@@ -987,7 +987,7 @@ def test_the_hang_guard_of_the_e2e_grows_with_the_seeds_and_the_subprocess_ends_
     """Run 44963364060: 5 seeds under the default 420 s killed the xdist worker on Linux and on Windows."""
     import test_ab_network_e2e as e2e
 
-    assert e2e.budget_s(1, 2) == 600 and e2e.budget_s(5, 2) == 1800 and e2e.budget_s(5, 3) == 2640
+    assert e2e.budget_s(1, 2) == 880 and e2e.budget_s(5, 2) == 2080 and e2e.budget_s(5, 3) == 3060
     assert e2e.budget_s(5, 2) > 420 and e2e.budget_s(2, 2) < e2e.budget_s(3, 2)
     monkeypatch.delenv("INVISIBLE_SEAL_FILE", raising=False)
     monkeypatch.delenv("AB_NETWORK_PR_SEEDS", raising=False)
@@ -1002,6 +1002,195 @@ def test_the_hang_guard_of_the_e2e_grows_with_the_seeds_and_the_subprocess_ends_
     assert e2e.plan() == (len(ab.default_seeds()), 3)
     mark = next(m for m in e2e.test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_the_published_engine_puts.pytestmark if m.name == "timeout")
     assert mark.args == (e2e.BUDGET_S + 120,) and mark.kwargs == {"method": "thread"} and e2e.TIMEOUT_S == e2e.BUDGET_S
+
+
+def _socks_connect_name(proxy_port: int, host: str, port: int):
+    """A SOCKS5 CONNECT by NAME (address type 3), as a pingsender asks for the telemetry host: ``(socket, reply code)``."""
+    sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=60)
+    sock.settimeout(60)
+    sock.sendall(b"\x05\x01\x00")
+    assert sock.recv(2) == b"\x05\x00"
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode() + struct.pack("!H", port))
+    reply = b""
+    while len(reply) < 10:
+        chunk = sock.recv(10 - len(reply))
+        if not chunk:
+            break
+        reply += chunk
+    return sock, reply[1]
+
+
+TELEMETRY = "incoming.telemetry.mozilla.org:443"
+
+
+def test_the_pref_wait_reads_the_profile_every_period_changes_nothing_and_ends_at_the_limit_with_not_recorded(tmp_path):
+    prefs = tmp_path / "prefs.js"
+    clock = {"t": 0.0}
+    polls = []
+
+    def sleep(period):
+        polls.append((clock["t"], period))
+        clock["t"] += period
+        if len(polls) == 3:       # the engine writes the pref on the third look
+            prefs.write_text('user_pref("browser.startup.homepage_override.mstone", "x");\nuser_pref("%s", 1700000000000);\n' % ab.NOTIFIED_PREF, encoding="utf-8")
+
+    assert ab.wait_for_pref(prefs, ab.NOTIFIED_PREF, limit_s=120.0, period=0.5, sleep=sleep, now=lambda: clock["t"]) is True
+    assert polls == [(0.0, 0.5), (0.5, 0.5), (1.0, 0.5)], "the file did not exist for two looks (no file is not an error), and it is read every half second"
+    before = prefs.read_bytes()
+    clock["t"] = 0.0
+    assert ab.wait_for_pref(prefs, ab.NOTIFIED_PREF, sleep=lambda p: None, now=lambda: clock["t"]) is True and prefs.read_bytes() == before, "reading changes nothing"
+    other = tmp_path / "other" / "prefs.js"
+    other.parent.mkdir()
+    other.write_text('user_pref("datareporting.policy.firstRunURL", "x");\n', encoding="utf-8")
+    ticks = iter(range(0, 1000, 30))
+    assert ab.wait_for_pref(other, ab.NOTIFIED_PREF, limit_s=120.0, sleep=lambda p: None, now=lambda: float(next(ticks))) is False, "a launch that never gets there ends at the limit: not recorded"
+    assert ab.PREF_LIMIT_S == 120.0 and ab.PREF_POLL_S == 0.5
+
+
+def test_the_profile_of_a_session_is_the_argument_of_its_parent_process_and_not_a_content_process():
+    class Proc:
+        def __init__(self, cmd):
+            self.cmd = cmd
+
+        def cmdline(self):
+            if self.cmd is None:
+                raise OSError("gone")
+            return self.cmd
+
+    found = [Proc(["firefox", "-contentproc", "-profile", "/not/this", "tab"]), Proc(None), Proc(["firefox", "-no-remote", "-headless", "-profile", "/tmp/invisible_profile_1_x", "-juggler-pipe"])]
+    assert ab.profile_of("token", find=lambda token: found) == Path("/tmp/invisible_profile_1_x")
+    assert ab.profile_of("token", find=lambda token: found[:2]) is None
+
+
+def test_the_gateway_answers_a_connect_to_the_telemetry_host_itself_with_host_unreachable_and_writes_it_down_and_reaches_nothing():
+    from _doh_servers import FakeDoh
+
+    gateway_class, turn_class, _page = ab.make_lab_classes()
+    rec = ab.Recorder()
+    rec.set_phase("exit")
+    gateway = gateway_class(rec, FakeDoh({}), turn_class("127.0.0.1"), "127.0.0.1", "198.51.100.9")
+    try:
+        sock, code = _socks_connect_name(gateway.port, "incoming.telemetry.mozilla.org", 443)
+        sock.close()
+        assert code == 4, "SOCKS5 reply 4, host unreachable: the lab answers, nothing goes to the internet"
+        assert [e["target"] for e in rec.of("exit", "connect")] == [TELEMETRY]
+        assert ("incoming.telemetry.mozilla.org", 443) in gateway.refused and gateway.refused == [("incoming.telemetry.mozilla.org", 443)]
+    finally:
+        gateway.close()
+
+
+def test_a_connect_target_is_outside_the_lab_when_it_is_neither_loopback_nor_a_server_the_lab_runs():
+    with ab.Lab(wire=True, host="127.0.0.1") as lab:
+        assert ab.outside_the_lab(lab, TELEMETRY) and ab.outside_the_lab(lab, "34.120.208.123:443") and ab.outside_the_lab(lab, "incoming.telemetry.mozilla.org:80")
+        assert not ab.outside_the_lab(lab, "127.0.0.1:%d" % lab.site.port) and not ab.outside_the_lab(lab, "192.0.2.53:443")
+        assert not ab.outside_the_lab(lab, "127.0.0.1:%d" % lab.h1.port)
+
+
+def _with_pings(t, targets, recorded=True, direct=None):
+    norm = ab.Normalizer({})
+    body = ab.exit_pings_summary(targets, recorded, norm)
+    body["direct"] = direct if direct is not None else {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}
+    for seed in t["seeds"].values():
+        seed["idle"]["exit_pings"] = copy.deepcopy(body)
+    return t
+
+
+def test_the_exit_pings_are_the_connects_to_the_proxy_towards_the_telemetry_host_and_they_are_compared_strictly():
+    three = [TELEMETRY] * 3
+    assert ab.exit_pings_summary(three, True, ab.Normalizer({})) == {"order": [TELEMETRY], "counts": {TELEMETRY: 3}, "recorded": True}
+    green = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), three))
+    assert green["verdict"] == "green"
+    # a different number
+    red = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), [TELEMETRY] * 2))
+    assert red["verdict"] == "red" and any(d["path"].endswith("/idle/exit_pings/counts/" + TELEMETRY) and d["a"] == 3 and d["b"] == 2 for d in red["differences"])
+    # a different form: the address instead of the name
+    form = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), ["34.120.208.123:443"] * 3))
+    assert form["verdict"] == "red" and any("/idle/exit_pings/order/0" in d["path"] and d["b"] == "34.120.208.123:443" for d in form["differences"])
+    # recorded on one side only
+    one_sided = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), [], recorded=False))
+    assert one_sided["verdict"] == "red" and any(d["path"].endswith("/idle/exit_pings/recorded") and d["a"] is True and d["b"] is False for d in one_sided["differences"])
+    # not recorded on both: the A/A agrees and the shutdown sent nothing
+    both = compare(_with_pings(transcript("a"), [], recorded=False), _with_pings(transcript("b"), [], recorded=False))
+    assert both["verdict"] == "green"
+    # a ping that did not go to the proxy is red on either side, and when both do it
+    leak = {"witness_tcp": [], "witness_udp": [], "watcher": ["tcp firefox -> 34.120.208.123:443"], "doh_direct": [], "resolver_trap": [], "blind": []}
+    direct = compare(_with_pings(transcript("a"), three, direct=leak), _with_pings(transcript("b"), three))
+    assert direct["verdict"] == "red" and direct["direct"] and any("(the exit pings)" in d for d in direct["direct"])
+    assert compare(_with_pings(transcript("a"), three, direct=leak), _with_pings(transcript("b"), three, direct=leak))["verdict"] == "red"
+
+
+def test_the_exit_launch_waits_for_the_pref_then_closes_and_records_what_the_proxy_was_asked_until_the_tree_has_exited(tmp_path, monkeypatch):
+    import _leaks
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    order = []
+
+    class Watcher:
+        watched_pids = {1}
+        process_names: list = []
+        direct: list = []
+
+        def __init__(self, match=()):
+            pass
+
+        def start(self):
+            return self
+
+        def stop(self):
+            order.append("watcher stopped")
+
+    class Session:
+        _end_token = "token"
+
+        def __init__(self, lab):
+            self.lab = lab
+
+        def __enter__(self):
+            order.append("launched")
+            (profile / "prefs.js").write_text('user_pref("%s", 1);\n' % ab.NOTIFIED_PREF, encoding="utf-8")
+            return object()
+
+        def __exit__(self, *exc):
+            order.append("closing in stage " + self.lab.rec.phase)
+            for _ in range(3):                         # the pingsender of the shutdown, three times, past the browser's close
+                self.lab.rec.event("connect", target=TELEMETRY)
+            self.lab.rec.event("connect", target="192.0.2.53:443")
+            order.append("tree exited")
+            return False
+
+    monkeypatch.setattr(_leaks, "Watcher", Watcher)
+    monkeypatch.setattr(ab, "host_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(ab, "start_trap", lambda: None)
+    monkeypatch.setattr(ab, "profile_of", lambda token, find=None: profile)
+    monkeypatch.setattr(ab, "launch", lambda binary, seed, lab, patch: Session(lab))
+    out = ab.run_exit_pings("/ff/firefox", 11, object())
+    assert out["recorded"] is True and out["counts"] == {TELEMETRY: 3} and out["order"] == [TELEMETRY], "the DoH connection of the lab is not an exit ping"
+    assert out["direct"]["watcher"] == [] and out["direct"]["blind"] == []
+    assert order == ["launched", "closing in stage exit", "tree exited", "watcher stopped"]
+    # no pref ever: the launch ends at the limit and says so
+    (profile / "prefs.js").unlink()
+    monkeypatch.setattr(ab, "PREF_LIMIT_S", 0.0)
+    monkeypatch.setattr(ab, "wait_for_pref", lambda *a, **k: False)
+
+    class Quiet(Session):
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(ab, "launch", lambda binary, seed, lab, patch: Quiet(lab))
+    silent = ab.run_exit_pings("/ff/firefox", 11, object())
+    assert silent["recorded"] is False and silent["counts"] == {} and silent["order"] == []
+
+
+def test_the_idle_category_of_the_first_seed_holds_the_exit_pings(monkeypatch):
+    monkeypatch.setattr(ab, "run_idle", lambda binary, seed, condition, patch: {"destinations": {}})
+    monkeypatch.setattr(ab, "run_exit_pings", lambda binary, seed, patch: {"recorded": True})
+    monkeypatch.setattr(ab, "run_main", lambda binary, seed, patch: {"journey": {}})
+    assert ab.walk_seed("ff", 11, True, object())["idle"] == {"c1": {"destinations": {}}, "c2": {"destinations": {}}, "exit_pings": {"recorded": True}}
+    assert "idle" not in ab.walk_seed("ff", 12, False, object())
 
 
 def test_the_script_names_the_categories_the_run_writes_and_the_e2e_floor_is_below_a_minimal_run():

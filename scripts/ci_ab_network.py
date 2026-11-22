@@ -60,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -88,6 +89,12 @@ H3_VISITS = 5
 #: The safety nets of a run, in seconds: a launch that does not come back, a run that does not end. Never a verdict.
 RUN_TIMEOUT_S = 40 * 60
 WAIT_S = 30
+#: The pref the engine writes when it has told the user about its data reporting policy: from then on the shutdown sends its pings (TelemetryReportingPolicy.sys.mjs
+#: ``_recordNotificationData``), by a background task of the engine that is a process of its own.
+NOTIFIED_PREF = "datareporting.policy.dataSubmissionPolicyNotifiedTime"
+#: How often the profile's prefs.js is read while the launch waits for it, and the safety net that ends a launch that never gets there (it is not a verdict: the transcript says
+#: ``recorded: false`` and the A/A must agree on it).
+PREF_POLL_S, PREF_LIMIT_S = 0.5, 120.0
 #: How many times a lab is made again when two of its servers share a port number.
 MAX_LAB_TRIES = 50
 #: Whose categories a transcript holds under each seed.
@@ -159,12 +166,14 @@ def load_volatile(path: Path = VOLATILE_FILE) -> List[Dict[str, str]]:
 
 
 def direct_problems(transcript: Dict[str, Any], side: str) -> List[str]:
-    """What a transcript says reached the lab, or the network, around the proxy: ``seeds/<seed>/lab/direct/*`` must be empty lists on every side."""
+    """What a transcript says reached the lab, or the network, around the proxy: ``seeds/<seed>/lab/direct/*`` must be empty lists on every side, and so must ``seeds/<seed>/idle/exit_pings/direct/*``."""
     out = []
     for seed, body in sorted((transcript.get("seeds") or {}).items()):
-        for name, found in sorted(((body.get("lab") or {}).get("direct") or {}).items()):
-            if found:
-                out.append("%s, seed %s: %d direct %s: %s" % (side, seed, len(found), name, json.dumps(found, sort_keys=True)[:300]))
+        where = (("", (body.get("lab") or {}).get("direct")), (" (the exit pings)", (((body.get("idle") or {}).get("exit_pings")) or {}).get("direct")))
+        for label, lists in where:
+            for name, found in sorted((lists or {}).items()):
+                if found:
+                    out.append("%s, seed %s: %d direct %s%s: %s" % (side, seed, len(found), name, label, json.dumps(found, sort_keys=True)[:300]))
     return out
 
 
@@ -1266,10 +1275,87 @@ def run_idle(binary: str, seed: int, condition: str, patch: Any) -> Dict[str, An
     return out
 
 
+def wait_for_pref(prefs_js: Path, name: str, limit_s: float = PREF_LIMIT_S, period: float = PREF_POLL_S, sleep: Callable[[float], Any] = time.sleep,
+                  now: Callable[[], float] = time.monotonic) -> bool:
+    """True when ``user_pref("<name>", ...)`` is in the profile's prefs.js, read again every ``period`` seconds until it is or ``limit_s`` is over. Changes nothing in the profile."""
+    needle = 'user_pref("%s"' % name
+    end = now() + limit_s
+    while True:
+        try:
+            if needle in prefs_js.read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            pass
+        if now() >= end:
+            return False
+        sleep(period)
+
+
+def profile_of(token: Any, find: Optional[Callable[[Any], list]] = None) -> Optional[Path]:
+    """The profile folder of a running session: the ``-profile`` argument of its parent process (the one that is not a ``-contentproc``)."""
+    if find is None:
+        from invisible_core.process import find_processes as find
+    for proc in find(token):
+        try:
+            cmd = [str(a) for a in proc.cmdline()]
+        except Exception:  # noqa: BLE001 - a process that is gone
+            continue
+        if "-contentproc" not in cmd and "-profile" in cmd and cmd.index("-profile") + 1 < len(cmd):
+            return Path(cmd[cmd.index("-profile") + 1])
+    return None
+
+
+def outside_the_lab(lab: Lab, target: str) -> bool:
+    """A CONNECT target that is neither the lab's own (loopback, the DoH, a server it runs, the egress endpoints) nor anything it serves: where an exit ping goes."""
+    import _doh_servers as ds
+    from _socks_servers import WEB_NAME, WHOAMI4, WHOAMI6
+
+    host, _sep, port = target.rpartition(":")
+    known = ((host, int(port)) in ds.DOH_TARGETS or (host, int(port)) in (WHOAMI4, WHOAMI6, (WEB_NAME, 80)) or (host, int(port)) in lab.gateway.allowed_tcp
+             or host.lower() in lab.gateway.whoami_names)
+    return not (ds.is_loopback(host) or known)
+
+
+def exit_pings_summary(targets: List[str], recorded: bool, norm: Normalizer) -> Dict[str, Any]:
+    """What the shutdown of an idle launch sent out of the lab: ``recorded`` (the pref was written, so the engine may send), and the CONNECTs towards names outside the lab, in the
+    form the proxy was asked them (a name, or an address), how many of each, and in the order they were first asked."""
+    return dict(connect_summary(targets, norm), recorded=recorded)
+
+
+def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
+    """An idle launch behind the lab's proxy with no pref changed: it waits until the engine has written ``NOTIFIED_PREF`` to the profile (or ``PREF_LIMIT_S`` is over: then
+    ``recorded`` is false), closes, and records until the tree has exited, the pingsender of the shutdown included (``EndingPlaywright`` returns when the reaper has). What went
+    to the proxy towards a name outside the lab is the exit pings; the proxy refuses those CONNECTs itself (a SOCKS reply 4, host unreachable: nothing leaves the lab), and a
+    connection from the browser or from its pingsender that did not go to the proxy is in ``direct``, which is red on either side."""
+    from _leaks import Watcher
+
+    with open_lab() as lab:
+        trap = start_trap()
+        watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
+        recorded = False
+        try:
+            session = launch(binary, seed, lab, patch)
+            with session as browser:
+                lab.rec.set_phase("exit.wait")
+                profile = profile_of(session._end_token)
+                recorded = bool(profile) and wait_for_pref(profile / "prefs.js", NOTIFIED_PREF)
+                lab.rec.set_phase("exit")
+            lab.rec.set_phase("exit.end")
+        finally:
+            watcher.stop()
+            if trap is not None:
+                trap.__exit__(None, None, None)
+        targets = [e["target"] for e in lab.rec.of("exit", "connect") if outside_the_lab(lab, e["target"])]
+        out = exit_pings_summary(targets, recorded, lab.norm)
+        out["direct"] = direct_report(lab, watcher, trap)
+        return out
+
+
 def walk_seed(binary: str, seed: int, with_idle: bool, patch: Any) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     if with_idle:
         body["idle"] = {c: guarded(lambda c=c: run_idle(binary, seed, c, patch)) for c in ("c1", "c2")}
+        body["idle"]["exit_pings"] = guarded(lambda: run_exit_pings(binary, seed, patch))
     body.update(guarded(lambda: run_main(binary, seed, patch)))
     return body
 
