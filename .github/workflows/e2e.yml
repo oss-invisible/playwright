@@ -80,12 +80,23 @@ jobs:
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
-  e2e:
-    name: e2e (linux, xvfb)
+  # THE e2e ON LINUX, IN THREE PARTS. One job ran the whole Linux e2e in 24.6 minutes on a normal runner and 35.7 on a slow one (the same tests, every
+  # one slower by the same 1.44x), close to the 40-minute ceiling. The files of each part are the rows `wrapper.e2e.suite.linux.1` to `.3` of
+  # ci/required-suites.json, the same partition the gate of the candidate runs on the engine under test (tests/test_the_e2e_suite_is_accounted_for.py
+  # holds it whole), read the way the Windows parts read theirs. The rows leave out by name the tests of `wrapper.e2e.udp.exit` (root) and
+  # `wrapper.e2e.udp.sandbox` (user namespaces): part 1, the lightest by the test time of the junit of run 45064266867, runs them in their own steps
+  # after its run, and no other part does. The job `e2e (linux, xvfb)` below waits for the three parts and is the one check the release and the
+  # branch protection read.
+  e2e-linux:
+    name: e2e (linux, part ${{ matrix.part }})
     needs: core-on-index
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
@@ -147,7 +158,13 @@ jobs:
 
       # test_release_e2e.py and test_upgrade_e2e.py (pip, uv, PyPI, the GitHub release) are NOT in this run or in the Windows legs below: tests/conftest.py leaves
       # them out of every run that does not name their file, and user-install.yml (the round after the publication) names it. tests/_post_publication.py.
-      - name: Run the full e2e suite under a virtual display, without the root ones
+      # The files of the part are the row `wrapper.e2e.suite.linux.N` of ci/required-suites.json (files, and node ids where a file has tests that skip on
+      # Linux or run in another suite). The rows hold no test of `wrapper.e2e.udp.exit` or `wrapper.e2e.udp.sandbox`: those run in the root and sandbox
+      # steps of part 1 below, and tests/test_the_root_e2e_run_in_the_root_step_and_nowhere_else.py and tests/test_the_sandbox_e2e_runs_where_user_namespaces_are_on.py
+      # hold both the exclusion and the steps.
+      - name: The files of this part (the row of the suite, in ci/required-suites.json)
+        run: python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.linux.${{ matrix.part }}" --os linux > "$RUNNER_TEMP/e2e_args.txt"
+      - name: Run this part of the e2e under a virtual display, without the root ones
         # PYTHONUNBUFFERED, and it is not a nicety. Without it Python block-buffers
         # stdout when it is a pipe, and this step printed NOTHING for 39 minutes
         # before the 40-minute timeout killed it on 2026-08-04: a run with no
@@ -163,29 +180,25 @@ jobs:
           # the descriptors at the system level: whatever is captured is lost
           # when the process is killed, which is exactly the case it exists for.
           INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog.log
-          ROOT_FILES: tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py
-          ROOT_NODES: tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick
-          SANDBOX_FILES: tests/test_the_socket_process_is_sandboxed_e2e.py
-        # The root ones are left out by name and run in the step below, as root: here, as the runner user, they errored. The sandbox one is left out
-        # by name too and runs in its own step after them: it is red on a runner whose AppArmor refuses user namespaces to a normal user.
+        # The root ones are in no row and run in the step below, as root: here, as the runner user, they errored. The sandbox ones are in no row either
+        # and run in their own step after them: the first is red on a runner whose AppArmor refuses user namespaces to a normal user.
         run: |
-          IGNORE=(); for f in $ROOT_FILES $SANDBOX_FILES; do IGNORE+=("--ignore=$f"); done
-          DESELECT=(); for n in $ROOT_NODES; do DESELECT+=("--deselect=$n"); done
-          xvfb-run -a python -u scripts/run_e2e.py "$FF" "${IGNORE[@]}" "${DESELECT[@]}"
+          mapfile -t ARGS < <(tr -d '\r' < "$RUNNER_TEMP/e2e_args.txt")
+          xvfb-run -a python -u scripts/run_e2e.py "$FF" "${ARGS[@]}"
 
       # THE ROOT SUITE, AS THE GATE RUNS IT (wrapper.e2e.udp.exit in ci/required-suites.json). Seven e2e need root: the exit of the lab is a documentation
       # address (198.51.100.9) added to `lo` with `ip addr add`. Collected here as the runner user they ERRORED (run 43262636367: "cannot hold 198.51.100.9
-      # on lo (needs root and iproute2 on Linux)"), so the run above leaves them out by name (ROOT_FILES / ROOT_NODES) and this step runs them, and only
-      # them, the way the gate does: the engine copied to /opt/ff (the socket process execs inside a new user namespace, where the runner's 750 home is not
+      # on lo (needs root and iproute2 on Linux)"), so no row of the parts holds them (ROOT_FILES / ROOT_NODES are the suite's list) and this step of part 1
+      # runs them, and only them, in that part only, the way the gate does: the engine copied to /opt/ff (the socket process execs inside a new user namespace, where the runner's 750 home is not
       # readable), `sudo -H -E env -u XDG_RUNTIME_DIR` (Firefox refuses to run as root in a regular user's session), no rerun plugin. Nothing is skipped
       # silently: the step reads its own junit and refuses anything but exactly that many tests, all passed.
       # AFTER the run of the runner user, never before it (run 43271443150 of PR 483: with this step first, every launch of the run that followed
       # waited for the browser's readiness line until its timeout, and the job was cancelled at 40 minutes; the same head without the step had 748
       # green). Whatever root leaves behind (files under the runner's home or /tmp, /etc/resolv.conf, an address on lo) cannot reach a launch of the
       # runner user any more; the step after this one prints what it left, and decides nothing.
-      # tests/test_the_root_e2e_run_in_the_root_step_and_nowhere_else.py holds the two lists, this step and the run above to the suite's list, and the order.
+      # tests/test_the_root_e2e_run_in_the_root_step_and_nowhere_else.py holds this step to the suite's list, the rows of the parts without it, the part and the order.
       - name: The root e2e (wrapper.e2e.udp.exit), as root, as the gate runs them
-        if: success() || failure()
+        if: matrix.part == 1 && (success() || failure())
         env:
           PYTHONUNBUFFERED: "1"
           ROOT_FILES: tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py
@@ -208,23 +221,25 @@ jobs:
           if counts["tests"] != int(os.environ["ROOT_TESTS"]) or counts["failures"] or counts["errors"] or counts["skipped"]:
               sys.exit("the root e2e must be exactly %s tests, all passed: %s" % (os.environ["ROOT_TESTS"], counts))
           PY
-      # THE SANDBOX E2E (wrapper.e2e.udp.sandbox), as the gate runs its first file: the browser WITH its sandbox, run by the runner user. On this runner AppArmor
+      # THE SANDBOX E2E (wrapper.e2e.udp.sandbox), as the gate runs it: the browser WITH its sandbox, run by the runner user. On this runner AppArmor
       # refuses user namespaces to a normal user (kernel.apparmor_restrict_unprivileged_userns=1), so the browser of every other step starts WITHOUT the sandbox
       # of its socket and content processes, and tests/test_the_socket_process_is_sandboxed_e2e.py (which fails unless both have a seccomp filter) can only
-      # be green after the restriction is turned off. It is left out of the run above by name (SANDBOX_FILES) so that it cannot fail on a runner without the
-      # sysctl, and it runs here, after the run and the root step (whatever the sysctl changes cannot reach a launch of the run), as the runner user. Nothing
+      # be green after the restriction is turned off. No row of the parts holds the tests of the suite (SANDBOX_FILES / SANDBOX_NODES are its list: the file
+      # and the three situations of the UDP line, which the rows leave to this suite), so the first cannot fail on a runner without the sysctl, and they run
+      # here, in part 1 only, after the run and the root step (whatever the sysctl changes cannot reach a launch of the run), as the runner user. Nothing
       # is skipped silently: the step reads its own junit and refuses anything but exactly that many tests, all passed.
-      # tests/test_the_sandbox_e2e_runs_where_user_namespaces_are_on.py holds this step, the exclusion above and the order.
+      # tests/test_the_sandbox_e2e_runs_where_user_namespaces_are_on.py holds this step to the suite's list, the rows of the parts without it, the part and the order.
       - name: The sandbox e2e (wrapper.e2e.udp.sandbox), with unprivileged user namespaces on
-        if: success() || failure()
+        if: matrix.part == 1 && (success() || failure())
         env:
           PYTHONUNBUFFERED: "1"
           SANDBOX_FILES: tests/test_the_socket_process_is_sandboxed_e2e.py
-          SANDBOX_TESTS: "1"
+          SANDBOX_NODES: tests/test_webrtc_realness.py::test_the_gather_is_real_without_a_proxy tests/test_webrtc_realness.py::test_a_gateway_with_coherent_udp_gives_the_page_a_srflx_born_through_its_relay tests/test_ice_names_by_the_context_proxy_e2e.py::test_a_gateway_without_udp_resolves_the_ice_name_then_ends_in_701
+          SANDBOX_TESTS: "13"
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           JUNIT="${RUNNER_TEMP}/sandbox-e2e.xml"
-          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -m pytest $SANDBOX_FILES -m e2e -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$JUNIT" || true
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -m pytest $SANDBOX_FILES $SANDBOX_NODES -m e2e -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$JUNIT" || true
           python - <<'PY'
           import os, sys, xml.etree.ElementTree as ET
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "sandbox-e2e.xml")).getroot()
@@ -235,7 +250,7 @@ jobs:
               sys.exit("the sandbox e2e must be exactly %s tests, all passed: %s" % (os.environ["SANDBOX_TESTS"], counts))
           PY
       - name: What the root step left behind (diagnostic, decides nothing)
-        if: always()
+        if: always() && matrix.part == 1
         run: |
           echo "-- files owned by root under the runner's home and /tmp"; sudo find /home/runner /tmp -maxdepth 3 -user root 2>/dev/null | head -40 || true
           echo "-- /etc/resolv.conf"; cat /etc/resolv.conf || true
@@ -283,18 +298,18 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-watchdog-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-watchdog-linux-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-watchdog.log
           if-no-files-found: warn
           retention-days: 14
 
       # The junit of every pass of the run (scripts/run_e2e.py writes one per pass, e2e-junit-*.xml, in the directory of the watchdog file) and of the two
-      # steps above that run alone (root, sandbox): what a red is read from, kept whether the run is green or red.
+      # steps above that run alone (root, sandbox; part 1 only, absent from the others): what a red is read from, kept whether the run is green or red.
       - name: Upload the junit of the run
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-junit-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-junit-linux-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/e2e-junit-*.xml
             ${{ runner.temp }}/root-e2e.xml
@@ -309,10 +324,34 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: invpw-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          name: invpw-evidence-linux-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/invpw-evidence
           if-no-files-found: ignore
           retention-days: 14
+
+  # THE CHECK OF THE LINUX e2e. `e2e (linux, xvfb)` is the name scripts/e2e_is_green.py, the branch protection and every reader before the split know:
+  # it is green only when every part is green. `needs.e2e-linux.result` is the result of the matrix as a whole (`success` only when every part succeeded;
+  # one failed, cancelled or skipped part makes it something else), and anything but `success` is red here: a cancelled part measured nothing, a skipped
+  # one ran nothing. `always()` so that a red or cancelled part still reaches this job and turns it red instead of skipping it, which reads as not red.
+  # The gate of the core on the index stays the same as for the parts: while the pinned core is not on the index the parts are skipped with the reason in
+  # the summary (core-on-index.yml), and so is this job, as the Linux job was before the split.
+  # tests/test_ci_runs_once_per_commit.py (5.) holds this job.
+  e2e:
+    name: e2e (linux, xvfb)
+    needs: [core-on-index, e2e-linux]
+    if: always() && needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every part of the Linux e2e is green
+        env:
+          PARTS: ${{ needs.e2e-linux.result }}
+        run: |
+          echo "the parts of the Linux e2e: $PARTS"
+          if [ "$PARTS" != "success" ]; then
+            echo "::error::the Linux e2e is not green: its parts ended in '$PARTS' (success is the only green)"
+            exit 1
+          fi
 
   # ``Control+A`` selects all in a field, on the PUBLISHED engine and the core this package pins, on Windows, where the keyboard of a real
   # user is: the shortcut letter used to reach the browser as Control+Shift+A (invisible-core 63.66.0 fixes it). The e2e is red on the
