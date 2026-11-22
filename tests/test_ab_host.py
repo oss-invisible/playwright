@@ -1588,13 +1588,13 @@ def test_an_inventory_that_is_not_complete_on_both_sides_is_red_and_so_is_a_path
 
 def test_the_inventory_of_a_launch_is_what_the_parent_first_touched_from_the_first_to_the_last_open_of_the_places_it_walks():
     ctx = host.Context("win32", devices={"\\Device\\HarddiskVolume3": "C:"})
-    order = {(10, "C:\\early.dll"): 1, (10, "C:\\Users\\Public\\Desktop\\desktop.ini"): 5, (10, "C:\\Windows\\System32\\windows.fileexplorer.common.dll"): 6,
-             (10, "C:\\Users\\r\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\nightly.lnk"): 8,
+    order = {(10, "C:\\early.dll"): 1, (10, "D:\\Users\\Public\\Desktop\\desktop.ini"): 5, (10, "C:\\Windows\\System32\\windows.fileexplorer.common.dll"): 6,
+             (10, "D:\\Users\\r\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\nightly.lnk"): 8,
              (11, "C:\\Windows\\System32\\gpu-only.dll"): 6, (10, "C:\\late.dll"): 20}
     labels = {10: "parent", 11: "gpu"}
     got = host.inventory_of(order, lambda pid: labels[pid], ctx)
-    assert got == ["c:\\users\\public\\desktop\\desktop.ini", "c:\\users\\r\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
-                   "c:\\windows\\system32\\windows.fileexplorer.common.dll"]
+    assert got == sorted(["d:\\users\\public\\desktop\\desktop.ini", "d:\\users\\r\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
+                   "c:\\windows\\system32\\windows.fileexplorer.common.dll"])
     assert host.inventory_of({(10, "C:\\early.dll"): 1}, lambda pid: "parent", ctx) == [], "a launch that did not run it has none"
     assert "StartupOSIntegration.sys.mjs" in open(host.__file__, encoding="utf-8").read(), "the source that launches it is cited"
 
