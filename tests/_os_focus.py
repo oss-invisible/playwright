@@ -5,7 +5,10 @@ first know that the OS did give the focus to the second session's window; otherw
 it, or took it later than the read). The OS answers that without the engine:
 
 * Linux: the X input focus (``XGetInputFocus`` on the display the sessions share); the display is a private Xvfb started for the test (``a_display_of_its_own``),
-  so no other test's headed window moves the focus in it;
+  so no other test's headed window moves the focus in it. No window manager runs there, so nobody ever sets the X input focus: it stays ``PointerRoot``
+  and GDK activates whichever toplevel is under the pointer (``has_pointer_focus``, ``gdk/x11/gdkdevicemanager-core-x11.c``), and Firefox raises a window
+  itself only when it is not active already (``nsWindow::SetFocus``, ``gtk_window_present_with_time``). The test therefore does what a window manager does
+  when the user clicks a window: ``XSetInputFocus`` on the toplevel the step names (found by its ``_NET_WM_NAME``), and reads ``XGetInputFocus`` back;
 * Windows: the foreground window (``GetForegroundWindow``), the window of the session found by the title its page gave it.
 """
 from __future__ import annotations
@@ -17,8 +20,23 @@ import sys
 import threading
 from typing import Iterator, Optional
 
-#: ``None`` and ``PointerRoot``: what the X input focus is when no client holds it.
-_X_NO_WINDOW = (0, 1)
+#: ``RevertToParent`` and ``CurrentTime`` of ``XSetInputFocus`` (as GDK's own ``gdk_x11_window_focus`` without a window manager); ``IsViewable``.
+_REVERT_TO_PARENT, _CURRENT_TIME, _IS_VIEWABLE = 2, 0, 2
+
+
+class _XWindowAttributes(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int), ("width", ctypes.c_int), ("height", ctypes.c_int), ("border_width", ctypes.c_int),
+                ("depth", ctypes.c_int), ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong), ("c_class", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+                ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+                ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong), ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+                ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+                ("override_redirect", ctypes.c_int), ("screen", ctypes.c_void_p)]
+
+
+#: An X error (a window gone between two requests, a focus asked for a window not yet viewable) is ignored instead of ending the process as Xlib's
+#: default handler does; the wait that asked reads the focus again on its next look.
+_X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+_ignore_x_error = _X_ERROR_HANDLER(lambda display, event: 0)
 
 
 @contextlib.contextmanager
@@ -50,23 +68,68 @@ def a_display_of_its_own(monkeypatch) -> Iterator[str]:
 
 
 class XFocus:
-    """The X input focus of a display, read through a connection of its own (libX11, as the engine's own client library)."""
+    """The X input focus of a display, read and given through a connection of its own (libX11, as the engine's own client library)."""
 
     def __init__(self, display: str) -> None:
-        self.x11 = ctypes.CDLL("libX11.so.6")
-        self.x11.XOpenDisplay.restype, self.x11.XOpenDisplay.argtypes = ctypes.c_void_p, (ctypes.c_char_p,)
-        self.x11.XGetInputFocus.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int))
-        self.x11.XCloseDisplay.argtypes = (ctypes.c_void_p,)
-        self.connection = self.x11.XOpenDisplay(display.encode())
+        x11 = self.x11 = ctypes.CDLL("libX11.so.6")
+        ulong_p, int_p = ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int)
+        x11.XOpenDisplay.restype, x11.XOpenDisplay.argtypes = ctypes.c_void_p, (ctypes.c_char_p,)
+        x11.XSetErrorHandler.argtypes = (_X_ERROR_HANDLER,)
+        x11.XDefaultRootWindow.restype, x11.XDefaultRootWindow.argtypes = ctypes.c_ulong, (ctypes.c_void_p,)
+        x11.XInternAtom.restype, x11.XInternAtom.argtypes = ctypes.c_ulong, (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int)
+        x11.XQueryTree.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ulong_p, ulong_p, ctypes.POINTER(ulong_p), ctypes.POINTER(ctypes.c_uint))
+        x11.XGetWindowAttributes.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_XWindowAttributes))
+        x11.XGetWindowProperty.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+                                           ulong_p, int_p, ulong_p, ulong_p, ctypes.POINTER(ctypes.c_void_p))
+        x11.XFree.argtypes = (ctypes.c_void_p,)
+        x11.XSetInputFocus.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+        x11.XSync.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        x11.XGetInputFocus.argtypes = (ctypes.c_void_p, ulong_p, int_p)
+        x11.XCloseDisplay.argtypes = (ctypes.c_void_p,)
+        x11.XSetErrorHandler(_ignore_x_error)
+        self.connection = x11.XOpenDisplay(display.encode())
         assert self.connection, "no connection to the display %r" % display
+        self.root = x11.XDefaultRootWindow(self.connection)
+        self.net_wm_name = x11.XInternAtom(self.connection, b"_NET_WM_NAME", False)
+        self.utf8_string = x11.XInternAtom(self.connection, b"UTF8_STRING", False)
 
     def holder(self) -> int:
         window, revert = ctypes.c_ulong(), ctypes.c_int()
         self.x11.XGetInputFocus(self.connection, ctypes.byref(window), ctypes.byref(revert))
         return int(window.value)
 
-    def is_a_window(self, holder: int) -> bool:
-        return holder not in _X_NO_WINDOW
+    def _title(self, window: int) -> str:
+        kind, size, count, left, data = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        if self.x11.XGetWindowProperty(self.connection, window, self.net_wm_name, 0, 1024, False, self.utf8_string, ctypes.byref(kind),
+                                       ctypes.byref(size), ctypes.byref(count), ctypes.byref(left), ctypes.byref(data)) != 0 or not data.value:
+            return ""
+        try:
+            return ctypes.string_at(data.value, count.value).decode("utf-8", "replace") if size.value == 8 else ""
+        finally:
+            self.x11.XFree(data)
+
+    def _viewable(self, window: int) -> bool:
+        attributes = _XWindowAttributes()
+        return bool(self.x11.XGetWindowAttributes(self.connection, window, ctypes.byref(attributes))) and attributes.map_state == _IS_VIEWABLE
+
+    def window_titled(self, title: str) -> Optional[int]:
+        """The one viewable toplevel (a child of the root: no window manager reparents it) whose ``_NET_WM_NAME`` starts with ``title``, or None."""
+        root, parent, children, count = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+        if not self.x11.XQueryTree(self.connection, self.root, ctypes.byref(root), ctypes.byref(parent), ctypes.byref(children), ctypes.byref(count)):
+            return None
+        try:
+            windows = [int(children[i]) for i in range(count.value)]
+        finally:
+            if children:
+                self.x11.XFree(children)
+        found = [window for window in windows if self._title(window).startswith(title) and self._viewable(window)]
+        return found[0] if len(found) == 1 else None
+
+    def ask_for_the_foreground(self, window: int) -> int:
+        """What a window manager does when the user clicks the window (none runs on this display): ``XSetInputFocus`` on it, then the focus is read back."""
+        self.x11.XSetInputFocus(self.connection, window, _REVERT_TO_PARENT, _CURRENT_TIME)
+        self.x11.XSync(self.connection, False)
+        return self.holder()
 
     def close(self) -> None:
         self.x11.XCloseDisplay(self.connection)
@@ -86,9 +149,6 @@ class ForegroundWindow:
 
     def holder(self) -> int:
         return self.user32.GetForegroundWindow() or 0
-
-    def is_a_window(self, holder: int) -> bool:
-        return bool(holder)
 
     def window_titled(self, title: str) -> Optional[int]:
         """The one visible top-level Firefox window whose title starts with ``title``, or None (none, or more than one)."""

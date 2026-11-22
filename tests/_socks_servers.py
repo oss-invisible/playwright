@@ -39,7 +39,9 @@ of a test may stand, and the name ``localhost``). These tests run in the gate of
 browser behind a gateway makes background requests of its own (a name of the vendor, a captive-portal check, a telemetry endpoint): such a
 destination is REFUSED, never forwarded (a CONNECT is answered with reply 2, "not allowed"; a datagram is dropped), and RECORDED
 (:class:`LabGuard`: the time since the gateway started, the SOCKS5 address type, the destination as it was received - the NAME for type 3 -, the
-port and the protocol, ``tcp`` or ``udp``). The record is always written, when the gateway is closed, under
+port, the protocol, ``tcp`` or ``udp``, and the REASON: which rule refused it, the lab's or the narrower one of a subclass). The interfaces of this
+host are read when the guard is made (``psutil.net_if_addrs``, written once in the record with how they were read) and again at each decision that
+needs them; a reading that fails RAISES (``_witness.HostInterfacesUnreadable``), it is never an empty list. The record is always written, when the gateway is closed, under
 ``$RUNNER_TEMP/invpw-evidence/<gateway>/<pid>-<ms>/refused-destinations.json`` (the folder the e2e jobs upload; off a runner nothing is
 written), so that a reader sees what the browser asked for besides what the test drives. There is no option that reopens it. A subclass can only
 narrow it (:meth:`Gateway._admits`); the destinations it serves itself (the fake STUN server, the page of ``WEB_NAME``, the exit questions) are
@@ -171,30 +173,52 @@ LAB_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
 EVIDENCE_FOLDER = "invpw-evidence"
 
 
+def _own_interfaces() -> Dict[str, List[str]]:
+    """The addresses assigned to each interface of this host (a server of a test stands at one of them), by interface name. It RAISES when they
+    cannot be listed (``_witness.HostInterfacesUnreadable``, or the ImportError of ``_witness``): never an empty list in place of an unreadable one."""
+    from _witness import read_host_interfaces
+
+    return read_host_interfaces()
+
+
 def _own_addresses() -> Set[str]:
-    """The addresses assigned to an interface of this host (a server of a test stands at one of them), or none when they cannot be listed."""
-    try:
-        from _witness import host_addresses
-
-        return host_addresses()
-    except Exception:
-        return set()
+    """Every address of :func:`_own_interfaces` (raises as it does)."""
+    return {address for addresses in _own_interfaces().values() for address in addresses}
 
 
-def is_lab_destination(host: str) -> bool:
-    """Whether ``host`` (an address, or a name as a SOCKS5 client sent it) is the lab's: loopback, a documentation range, an address of one of this host's
-    own interfaces, or ``localhost``. Any other NAME is not: nothing here resolves a name for the internet's sake, and the question would leave the machine."""
+def _how_own_interfaces_are_read() -> str:
+    from _witness import how_host_interfaces_are_read
+
+    return how_host_interfaces_are_read()
+
+
+def lab_refusal(host: str) -> Optional[str]:
+    """None when ``host`` (an address, or a name as a SOCKS5 client sent it) is the lab's: loopback, a documentation range, an address of one of this host's
+    own interfaces, or ``localhost``; otherwise WHY it is not, one sentence. Any other NAME is not the lab's: nothing here resolves a name for the internet's
+    sake, and the question would leave the machine. The interfaces are read (:func:`_own_addresses`) only for an address outside loopback and the
+    documentation ranges, and a reading that fails raises."""
     text = host.strip().strip("[]").split("%", 1)[0].rstrip(".").lower()
     try:
         address = ipaddress.ip_address(text)
     except ValueError:
-        return text == "localhost" or text.endswith(".localhost")
+        if text == "localhost" or text.endswith(".localhost"):
+            return None
+        return "a name that is not localhost: a gateway of the tests resolves no name, the question would leave the machine"
     mapped = getattr(address, "ipv4_mapped", None)
     if mapped is not None:
         address = mapped
     if any(address in network for network in LAB_NETWORKS):
-        return True
-    return address.compressed in _own_addresses()
+        return None
+    own = _own_addresses()
+    if address.compressed in own:
+        return None
+    return ("%s is not loopback, not in a documentation range and not one of the %d addresses of this host's interfaces read at the decision"
+            % (address.compressed, len(own)))
+
+
+def is_lab_destination(host: str) -> bool:
+    """Whether ``host`` is the lab's (:func:`lab_refusal` has no reason to refuse it)."""
+    return lab_refusal(host) is None
 
 
 class LabGuard:
@@ -203,25 +227,45 @@ class LabGuard:
     :meth:`admits` is asked with the destination as RECEIVED (``atyp`` is the SOCKS5 address type: 1 IPv4, 3 a name, 4 IPv6; ``protocol`` is ``"tcp"`` or
     ``"udp"``); ``target`` is where it would really go, as (host, port), when that is not the destination itself (a name a gateway maps to a local server): the lab's
     decision is about the target. A refusal is recorded in :attr:`records` as a dict with ``t`` (seconds since ``t0``, the start of the gateway), ``atyp``,
-    ``destination`` (as received), ``port`` and ``protocol``. :meth:`write_evidence` leaves them, always, under ``$RUNNER_TEMP/invpw-evidence/<name>/``."""
+    ``destination`` (as received), ``port``, ``protocol`` and ``reason`` (the rule that refused it). :meth:`write_evidence` leaves them, always, under
+    ``$RUNNER_TEMP/invpw-evidence/<name>/``, with the interfaces of this host as the guard read them when it was made (:attr:`host_interfaces`) and how.
+
+    The interfaces are read when the guard is made: a reading that fails raises there (the gateway is not made). A reading at a decision that fails refuses
+    the destination with that failure as its reason, is listed in :attr:`read_errors`, and :meth:`write_evidence` (the close of the gateway) raises it."""
 
     def __init__(self, name: str, t0: Optional[float] = None):
         self.name = name
         self.t0 = time.monotonic() if t0 is None else t0
         #: Every refusal, in order.
         self.records: List[dict] = []
+        #: The addresses of each interface of this host, read when the guard was made (raises if they cannot be read), and how they were read.
+        self.host_interfaces: Dict[str, List[str]] = _own_interfaces()
+        self.host_interfaces_read_by = _how_own_interfaces_are_read()
+        #: Every reading of the interfaces at a decision that failed (the destination was refused with it as the reason).
+        self.read_errors: List[str] = []
         self._lock = threading.Lock()
         self._written = False
 
     def admits(self, host: str, port: int, atyp: int, protocol: str, target: Optional[Tuple[str, int]] = None) -> bool:
-        if is_lab_destination(host if target is None else target[0]):
+        try:
+            reason = lab_refusal(host if target is None else target[0])
+        except Exception as exc:  # the interfaces could not be read at the decision: refused, said, and raised at the close
+            error = "the interfaces of this host could not be read at the decision: %s: %s" % (type(exc).__name__, exc)
+            with self._lock:
+                self.read_errors.append(error)
+            self.refuse(host, port, atyp, protocol, reason=error)
+            return False
+        if reason is None:
             return True
-        self.refuse(host, port, atyp, protocol)
+        if target is not None and (target[0], target[1]) != (host, port):
+            reason = "mapped to %s:%d, and %s" % (target[0], target[1], reason)
+        self.refuse(host, port, atyp, protocol, reason=reason)
         return False
 
-    def refuse(self, host: str, port: int, atyp: int, protocol: str) -> None:
-        """Write down a destination that was refused (by this guard's rule, or by the narrower rule of a subclass)."""
-        record = {"t": round(time.monotonic() - self.t0, 3), "atyp": atyp, "destination": host, "port": port, "protocol": protocol}
+    def refuse(self, host: str, port: int, atyp: int, protocol: str, *, reason: str) -> None:
+        """Write down a destination that was refused (by this guard's rule, or by the narrower rule of a subclass), with the ``reason``: which rule, one sentence."""
+        record = {"t": round(time.monotonic() - self.t0, 3), "atyp": atyp, "destination": host, "port": port, "protocol": protocol,
+                  "reason": reason}
         with self._lock:
             self.records.append(record)
 
@@ -230,18 +274,33 @@ class LabGuard:
         with self._lock:
             return [(r["destination"], r["port"]) for r in self.records if protocol is None or r["protocol"] == protocol]
 
+    def evidence(self, extra: Optional[dict] = None) -> dict:
+        """The record as it is written: the refusals, the interfaces of this host as read when the guard was made and how, the failed readings."""
+        with self._lock:
+            records, errors = list(self.records), list(self.read_errors)
+        return dict({"gateway": self.name, "refused": records,
+                     "host_interfaces": {"read_by": self.host_interfaces_read_by, "read_at": "when the gateway was made",
+                                         "interfaces": self.host_interfaces},
+                     "host_interfaces_read_errors": errors}, **(extra or {}))
+
     def write_evidence(self, extra: Optional[dict] = None) -> Optional[pathlib.Path]:
-        """Write the record, once (a gateway may be closed twice): the file written, or None off a runner (no ``$RUNNER_TEMP``) or when already written."""
+        """Write the record, once (a gateway may be closed twice): the file written, or None off a runner (no ``$RUNNER_TEMP``) or when already written.
+        Then, the first time, it RAISES if a reading of the interfaces failed at a decision (:attr:`read_errors`), on a runner or not."""
         runner_temp = os.environ.get("RUNNER_TEMP")
         with self._lock:
-            if self._written or not runner_temp:
+            if self._written:
                 return None
             self._written = True
-            records = list(self.records)
-        folder = pathlib.Path(runner_temp) / EVIDENCE_FOLDER / self.name / ("%d-%d" % (os.getpid(), int(time.time() * 1000)))
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / "refused-destinations.json"
-        path.write_text(json.dumps(dict({"gateway": self.name, "refused": records}, **(extra or {})), indent=2), encoding="utf-8")
+        path = None
+        if runner_temp:
+            folder = pathlib.Path(runner_temp) / EVIDENCE_FOLDER / self.name / ("%d-%d" % (os.getpid(), int(time.time() * 1000)))
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / "refused-destinations.json"
+            path.write_text(json.dumps(self.evidence(extra), indent=2), encoding="utf-8")
+        if self.read_errors:
+            from _witness import HostInterfacesUnreadable
+
+            raise HostInterfacesUnreadable("gateway %s: %s" % (self.name, "; ".join(self.read_errors)))
         return path
 
 

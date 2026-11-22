@@ -147,7 +147,7 @@ class _GatewayToALocalListener(Gateway):
 
     def _admits(self, host, port, atyp, protocol, target=None):
         if (target or (host, port)) not in self._carried.values():
-            self.guard.refuse(host, port, atyp, protocol)
+            self.guard.refuse(host, port, atyp, protocol, reason="not the listener of the lab this gateway maps a destination to")
             self._current.record["outcome"] = "refused"
             return False
         self._current.record["outcome"] = "carried to the listener of the lab"

@@ -697,7 +697,8 @@ class DohGateway(Gateway):
         if not is_loopback(host):
             self.connects.append((host, port))
             self.refused.append((host, port))
-            self.guard.refuse(host, port, getattr(self._local, "atyp", 3), "tcp")
+            self.guard.refuse(host, port, getattr(self._local, "atyp", 3), "tcp",
+                              reason="past loopback: the DoH gateway carries only loopback (besides the DoH, the exit questions and the web name it answers)")
             self._send(c, self._reply(2 if _is_address(host) else 4))
             return
         self.connects.append((host, port))

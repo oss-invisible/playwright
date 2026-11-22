@@ -19,8 +19,11 @@ Both sessions are headed on one display, and the test owns it: on Linux a privat
 share is never used, so no neighbour's headed window moves the focus); on Windows the interactive desktop of the runner, which only this test touches because
 it is ``wall_clock`` (the e2e run gives such a test the machine alone, after the parallel tests).
 
-What the verdict waits for is the operating system, not a pause: before anything is judged the test reads from the OS that the focus really is where the step
-says (the X input focus on Linux, ``GetForegroundWindow`` on Windows: first the first session's window, then the second session's window). "No blur" is judged
+What the verdict waits for is the operating system, not a pause: before anything is judged the test asks the OS for the focus of the window the step names,
+as a user's click does, and reads back that the OS gave it (``GetForegroundWindow`` on Windows, the X input focus on Linux: first the first session's window,
+then the second session's window). On Linux no window manager runs on the private Xvfb, so nobody sets the X input focus (it stays ``PointerRoot`` and GDK
+activates the toplevel under the pointer, which is not a step the test can name): the test does the window manager's part, ``XSetInputFocus`` on the window
+(also on the session's own new window, as a window manager's focus on map). "No blur" is judged
 after that and after a round trip to the first page's own process (two painted frames), which handles everything the parent sent it before: the deactivation
 that would cause a blur has been delivered by then, so a late one cannot give a false green.
 """
@@ -47,9 +50,9 @@ HAS_FOCUS = "() => document.hasFocus()"
 EVENTS = "() => window.__events"
 #: A round trip to the page's own process: it has handled what the parent sent it before this ran (the deactivation, if the parent had one to send).
 ROUND_TRIP = "() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))"
-#: Names the page, so that on Windows its top-level window is found by its title.
+#: Names the page, so that its top-level window is found by its title (the window text on Windows, ``_NET_WM_NAME`` on X).
 NAME = "(name) => { document.title = name; return document.title; }"
-FIRST_TITLE, SECOND_TITLE = "focus-first-session", "focus-second-session"
+FIRST_TITLE, SECOND_TITLE, OWN_TITLE = "focus-first-session", "focus-second-session", "focus-own-page"
 
 
 @contextlib.contextmanager
@@ -66,37 +69,29 @@ def the_os_focus(monkeypatch):
             reader.close()
 
 
-def takes_the_focus(b):
-    """Runs in the second session's own thread: opens a window, names it, and waits until its page has the focus."""
+def opens_a_named_window(b):
+    """Runs in the second session's own thread: opens a window and names it; gives its page."""
     taker = b.new_page()
     taker.goto("about:blank")
     taker.evaluate(NAME, SECOND_TITLE)
+    return taker
+
+
+def its_page_has_the_focus(taker):
+    """Runs in the second session's own thread: waits until its page has the focus."""
     wait_for_condition(taker, lambda: taker.evaluate(HAS_FOCUS), lambda focused: focused is True, "the second session's page never took the focus")
 
 
-def os_focus_is_on_the_first_window(first, os_focus):
-    """Waits until the OS says the first session's window holds the focus; gives what holds it."""
-    if sys.platform == "win32":
-        window = wait_for_condition(first, lambda: os_focus.window_titled(FIRST_TITLE), lambda hwnd: hwnd is not None,
-                                    "no single visible top-level window is titled %r" % FIRST_TITLE).history[-1][1]
-        wait_for_condition(first, lambda: os_focus.ask_for_the_foreground(window), lambda holder: holder == window,
-                           "the first session's window never became the foreground window")
-        return window
-    seen = wait_for_condition(first, os_focus.holder, os_focus.is_a_window, "no window of the display ever held the X input focus")
-    return seen.history[-1][1]
+def os_focus_is_on_the_window_titled(page, os_focus, title):
+    """Waits until the OS says the one window titled ``title`` holds the focus, asking for it as a user's click does; gives that window.
 
-
-def os_focus_is_on_the_second_window(first, os_focus, before):
-    """Waits until the OS says a window other than the first one holds the focus (on Windows: the second session's window, by its title)."""
-    if sys.platform == "win32":
-        window = wait_for_condition(first, lambda: os_focus.window_titled(SECOND_TITLE), lambda hwnd: hwnd is not None,
-                                    "no single visible top-level window is titled %r" % SECOND_TITLE).history[-1][1]
-        assert window != before, "the second session's window is the first one's"
-        wait_for_condition(first, lambda: os_focus.ask_for_the_foreground(window), lambda holder: holder == window,
-                           "the second session's window never became the foreground window")
-        return
-    wait_for_condition(first, os_focus.holder, lambda holder: os_focus.is_a_window(holder) and holder != before,
-                       "the X input focus never left the first session's window %r" % before)
+    Windows: the foreground window (``SetForegroundWindow``, which the system may refuse: the read decides). Linux: no window manager runs on the private
+    Xvfb, so the X input focus stays ``PointerRoot`` unless a client sets it; the test sets it as a window manager would (``XSetInputFocus``)."""
+    window = wait_for_condition(page, lambda: os_focus.window_titled(title), lambda found: found is not None,
+                                "no single visible top-level window is titled %r" % title).history[-1][1]
+    wait_for_condition(page, lambda: os_focus.ask_for_the_foreground(window), lambda holder: holder == window,
+                       "the window titled %r never held the focus of the OS" % title)
+    return window
 
 
 def another_session_takes_the_display(firefox_binary, os_focus, keeps, with_own_page=False):
@@ -107,11 +102,12 @@ def another_session_takes_the_display(firefox_binary, os_focus, keeps, with_own_
         first.goto("about:blank")
         first.evaluate(NAME, FIRST_TITLE)
         first.evaluate(RECORD)
+        before = os_focus_is_on_the_window_titled(first, os_focus, FIRST_TITLE)
         wait_for_condition(first, lambda: first.evaluate(HAS_FOCUS), lambda focused: focused is True, "the page never had the focus of its own window")
-        before = os_focus_is_on_the_first_window(first, os_focus)
         with in_a_thread_of_its_own(firefox_binary) as b:
-            b.run(takes_the_focus)
-            os_focus_is_on_the_second_window(first, os_focus, before)
+            taker = b.run(opens_a_named_window)
+            assert os_focus_is_on_the_window_titled(first, os_focus, SECOND_TITLE) != before, "the second session's window is the first one's"
+            b.run(lambda _: its_page_has_the_focus(taker))
             if keeps:
                 # the OS has moved the focus; one round trip to the page's process orders the read after the deactivation that would have followed
                 first.evaluate(ROUND_TRIP)
@@ -122,6 +118,10 @@ def another_session_takes_the_display(firefox_binary, os_focus, keeps, with_own_
             if with_own_page:
                 own = a.new_page()
                 own.goto("about:blank")
+                own.evaluate(NAME, OWN_TITLE)
+                if sys.platform != "win32":
+                    # Windows gives the session's new window the foreground itself; on the private Xvfb only a window manager would (focus on map)
+                    os_focus_is_on_the_window_titled(own, os_focus, OWN_TITLE)
                 wait_for_condition(own, lambda: (own.evaluate(HAS_FOCUS), first.evaluate(EVENTS), first.evaluate(HAS_FOCUS)),
                                    lambda state: state[0] is True and state[1].count("blur") == 1 and state[2] is False,
                                    "a page of the session's own did not take the focus from the first with one blur")

@@ -15,14 +15,22 @@ a verdict would then depend on whether the runner reaches them. What this holds,
 * the gateway of ``test_ipv6_literal_connect_e2e.py``, which narrows the rule to the listener it carries to, still carries the mapped destination and refuses
   a loopback server that is not the one mapped.
 
+* the interfaces of this host: read by ``psutil.net_if_addrs`` in every form it gives (a zone id, upper case, an IPv4-mapped address, an interface with
+  no IPv4); a reading that fails (``psutil`` raises or does not import, ``_witness`` does not import, an entry is not an address, no address at all)
+  RAISES, in the gateway and in the witness, and is never an empty list (an empty list made every address of this host "not the lab's", silently);
+* every refusal says its reason (the lab's rule, or the narrower one of the gateway: the DoH gateway refuses an address of this host by its own rule),
+  and the record says once, per gateway, the interfaces it read and how.
+
 Known-bad inputs: a CONNECT to ``8.8.8.8:443`` (a public address), to ``detectportal.firefox.com:80`` (a name) and to a public IPv6 address; a datagram to
 ``8.8.8.8:443`` and to a name; each must be refused and recorded, and nothing must be opened or sent for it.
 """
 from __future__ import annotations
 
+import collections
 import json
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -43,8 +51,9 @@ V4, NAMED, V6 = 1, 3, 4
 
 @pytest.fixture(autouse=True)
 def _no_own_addresses(monkeypatch):
-    """The addresses of this machine's interfaces are not a fact of the test (a runner may have a public one): none, unless a test names them."""
-    monkeypatch.setattr(servers, "_own_addresses", lambda: set())
+    """The addresses of this machine's interfaces are not a fact of the test (a runner may have a public one): none, unless a test names them (or
+    undoes this, to read them through a fake ``psutil``)."""
+    monkeypatch.setattr(servers, "_own_interfaces", lambda: {})
 
 
 def _address(host: str, atyp: int) -> bytes:
@@ -426,3 +435,144 @@ def test_off_a_runner_nothing_is_written(tmp_path, monkeypatch):
     gateway.close()
     assert list(tmp_path.rglob("*")) == []
     assert servers.LabGuard("x").write_evidence() is None
+
+
+# -- the interfaces of this host -------------------------------------------------------------------------------------------
+_AF_LINK = -1   # psutil.AF_LINK on Windows: a MAC address, not an IP one
+_Snicaddr = collections.namedtuple("snicaddr", "family address netmask broadcast ptp")
+
+
+def _entry(family, address):
+    return _Snicaddr(family, address, None, None, None)
+
+
+#: What ``psutil.net_if_addrs()`` gives on a Windows runner, in its own forms: a MAC entry, an upper-case link-local address with a zone id, the
+#: loopback pseudo-interface, an IPv4-mapped address, an interface with IPv6 only.
+WINDOWS_LIKE = {
+    "Ethernet": [_entry(_AF_LINK, "00-0D-3A-5B-1C-2D"), _entry(socket.AF_INET, "10.1.0.52"), _entry(socket.AF_INET6, "FE80::1C2D:3A5B%12")],
+    "Loopback Pseudo-Interface 1": [_entry(socket.AF_INET6, "::1"), _entry(socket.AF_INET, "127.0.0.1")],
+    "vEthernet (nat)": [_entry(socket.AF_INET6, "::FFFF:10.1.0.53")],
+    "Teredo Tunneling Pseudo-Interface": [_entry(socket.AF_INET6, "2001:0:2851:782C::1")],
+}
+
+
+class _FakePsutil:
+    __version__ = "fake"
+
+    def __init__(self, table=None, error=None):
+        self._table, self._error = table, error
+
+    def net_if_addrs(self):
+        if self._error is not None:
+            raise self._error
+        return self._table
+
+
+def _real_interfaces(monkeypatch, psutil_module):
+    """Undo the fixture (the real readers of ``_socks_servers`` and ``_witness``) and put ``psutil_module`` (None: not importable) in place of psutil."""
+    monkeypatch.undo()
+    monkeypatch.setitem(sys.modules, "psutil", psutil_module)
+
+
+@pytest.mark.parametrize("broken", ["psutil_raises", "psutil_does_not_import", "the_witness_does_not_import"])
+def test_interfaces_that_cannot_be_read_raise_and_are_never_an_empty_list(monkeypatch, broken):
+    """The old reader returned an empty set on any failure: every address of this host then read as "not the lab's" and nothing said why."""
+    if broken == "psutil_raises":
+        _real_interfaces(monkeypatch, _FakePsutil(error=OSError("GetAdaptersAddresses failed")))
+    elif broken == "psutil_does_not_import":
+        _real_interfaces(monkeypatch, None)
+    else:
+        _real_interfaces(monkeypatch, _FakePsutil(WINDOWS_LIKE))
+        monkeypatch.setitem(sys.modules, "_witness", None)
+    for read in (servers._own_addresses, lambda: is_lab_destination("10.1.0.52"), lambda: servers.LabGuard("x")):
+        with pytest.raises(Exception) as raised:
+            read()
+        assert type(raised.value).__name__ == "HostInterfacesUnreadable" or isinstance(raised.value, ImportError), raised.value
+    # loopback and the documentation ranges are decided without the interfaces
+    assert is_lab_destination("127.0.0.1") and is_lab_destination("198.51.100.5")
+
+
+@pytest.mark.parametrize("table", [{}, {"Ethernet": [_entry(socket.AF_INET, "not-an-address")]}],
+                         ids=["no_address_at_all", "an_entry_is_not_an_address"])
+def test_an_empty_list_and_an_entry_that_is_not_an_address_are_a_failed_reading(monkeypatch, table):
+    _real_interfaces(monkeypatch, _FakePsutil(table))
+    with pytest.raises(Exception) as raised:
+        servers._own_addresses()
+    assert type(raised.value).__name__ == "HostInterfacesUnreadable", raised.value
+
+
+def test_the_forms_psutil_gives_on_windows_are_read_as_the_addresses_they_are_and_written_once(tmp_path, monkeypatch):
+    _real_interfaces(monkeypatch, _FakePsutil(WINDOWS_LIKE))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    for host in ("10.1.0.52", "::ffff:10.1.0.52", "fe80::1c2d:3a5b", "FE80::1C2D:3A5B%5", "[fe80::1c2d:3a5b%12]", "10.1.0.53", "2001:0:2851:782c::1"):
+        assert is_lab_destination(host), host
+    assert not is_lab_destination("10.1.0.54") and not is_lab_destination("fe80::1")
+    path = servers.LabGuard("forms").write_evidence()
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["host_interfaces"]["interfaces"] == {
+        "Ethernet": ["10.1.0.52", "fe80::1c2d:3a5b"], "Loopback Pseudo-Interface 1": ["::1", "127.0.0.1"],
+        "vEthernet (nat)": ["10.1.0.53"], "Teredo Tunneling Pseudo-Interface": ["2001:0:2851:782c::1"]}
+    assert "psutil.net_if_addrs()" in written["host_interfaces"]["read_by"] and written["host_interfaces_read_errors"] == []
+
+
+def test_every_refusal_says_its_reason_and_the_doh_gateway_refuses_an_address_of_this_host_by_its_own_rule(monkeypatch):
+    """In the gate a DoH gateway refused CONNECTs to an address of the runner (the witness of a probe): by its own rule (loopback only), which the
+    record did not say. The base gateway judges the same address the lab's, and refuses a public one and a name by the lab's rule."""
+    from _doh_servers import DohGateway, FakeDoh
+
+    interfaces = {"Ethernet": ["10.1.0.52"], "lo": ["127.0.0.1"]}
+    monkeypatch.setattr(servers, "_own_interfaces", lambda: interfaces)
+    with FakeDoh({}) as doh, DohGateway("gw", doh) as gateway:
+        s, code = _connect(gateway.port, "10.1.0.52", 61272, V4)
+        s.close()
+        assert code == 2
+        [record] = [r for r in gateway.guard.records if r["destination"] == "10.1.0.52"]
+        assert record["reason"].startswith("past loopback: the DoH gateway carries only loopback"), record
+        assert gateway.guard.evidence()["host_interfaces"]["interfaces"] == interfaces
+    with coherent() as gateway:
+        gateway._open_upstream = lambda target: pytest.fail("the gateway opened a connection to %s" % (target,))
+        for host, atyp in ((PUBLIC_V4, V4), (NAME, NAMED)):
+            s, code = _connect(gateway.port, host, 443, atyp)
+            s.close()
+            assert code == 2
+        assert [(r["destination"], r["reason"]) for r in gateway.guard.records] == [
+            (PUBLIC_V4, "8.8.8.8 is not loopback, not in a documentation range and not one of the 2 addresses of this host's interfaces read at the decision"),
+            (NAME, "a name that is not localhost: a gateway of the tests resolves no name, the question would leave the machine")]
+        assert is_lab_destination("10.1.0.52")
+        written = gateway.guard.evidence()
+        assert written["host_interfaces"]["interfaces"] == interfaces and [r["reason"] for r in written["refused"]] == [
+            r["reason"] for r in gateway.guard.records]
+
+
+def test_a_reading_that_fails_at_a_decision_refuses_says_so_and_the_close_raises(monkeypatch):
+    from _witness import HostInterfacesUnreadable
+
+    monkeypatch.setattr(servers, "_own_interfaces", lambda: {"lo": ["127.0.0.1"]})
+    gateway = coherent()
+
+    def broken():
+        raise HostInterfacesUnreadable("psutil.net_if_addrs() failed")
+
+    monkeypatch.setattr(servers, "_own_interfaces", broken)
+    s, code = _connect(gateway.port, "10.1.0.52", 443, V4)
+    s.close()
+    assert code == 2
+    assert "could not be read at the decision" in gateway.guard.records[0]["reason"] and gateway.guard.read_errors
+    with pytest.raises(HostInterfacesUnreadable):
+        gateway.close()
+    gateway.close()     # once: the second close neither writes nor raises
+
+
+def test_a_witness_that_cannot_read_the_interfaces_again_keeps_the_arrival_and_raises_when_read(monkeypatch):
+    import _witness
+
+    with _witness.Witness("127.0.0.1") as witness:
+        def broken():
+            raise _witness.HostInterfacesUnreadable("psutil.net_if_addrs() failed")
+
+        monkeypatch.setattr(_witness, "host_addresses", broken)
+        assert witness._is_host("10.200.0.1"), "an arrival the witness cannot judge is kept as the host's: a direct send is never hidden"
+        with pytest.raises(_witness.HostInterfacesUnreadable):
+            witness.heard()
+        with pytest.raises(_witness.HostInterfacesUnreadable):
+            witness.heard_foreign()

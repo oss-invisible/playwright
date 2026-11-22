@@ -40,17 +40,59 @@ def _normal(ip: str) -> str:
     return (mapped or parsed).compressed
 
 
-def host_addresses() -> Set[str]:
-    """Every IPv4 and IPv6 address assigned to an interface of this machine (loopback and link-local included), normalised.
-    ``psutil`` is a dependency of the package and answers the same on Linux and on Windows."""
-    import psutil
+class HostInterfacesUnreadable(RuntimeError):
+    """The interfaces of this host could not be listed. Whatever decides by them (is a source the browser's? is a destination the lab's?) must fail
+    with this, never decide on an empty list in its place."""
 
-    found: Set[str] = set()
-    for addresses in psutil.net_if_addrs().values():
-        for entry in addresses:
-            if entry.family in _IP_FAMILIES:
-                found.add(_normal(entry.address))
-    return found
+
+def how_host_interfaces_are_read() -> str:
+    """How :func:`read_host_interfaces` lists the interfaces, said in the record of a reader (the version of ``psutil`` included)."""
+    try:
+        import psutil
+
+        version = psutil.__version__
+    except Exception as exc:  # the reading itself raises it, with its cause: here it is only said
+        version = "not importable: %s: %s" % (type(exc).__name__, exc)
+    return "psutil.net_if_addrs() (psutil %s): the AF_INET and AF_INET6 entries of every interface, normalised (zone id dropped, " \
+           "IPv4-mapped read as IPv4, lower case)" % version
+
+
+def read_host_interfaces() -> Dict[str, List[str]]:
+    """Every IPv4 and IPv6 address assigned to an interface of this machine (loopback and link-local included), normalised, by interface name.
+    ``psutil`` is a dependency of the package and answers the same on Linux and on Windows.
+
+    Raises :class:`HostInterfacesUnreadable` when the list cannot be read: ``psutil`` does not import, ``net_if_addrs()`` raises, an entry of an IP
+    family is not an address, or no interface has any IP address at all (every host has loopback: an empty list is a failed reading)."""
+    try:
+        import psutil
+
+        table = psutil.net_if_addrs()
+    except Exception as exc:
+        raise HostInterfacesUnreadable("the interfaces of this host could not be read (%s): %s: %s"
+                                       % (how_host_interfaces_are_read(), type(exc).__name__, exc)) from exc
+    interfaces: Dict[str, List[str]] = {}
+    for name, entries in table.items():
+        for entry in entries:
+            if entry.family not in _IP_FAMILIES:
+                continue
+            normal = _normal(entry.address)
+            try:
+                ipaddress.ip_address(normal)
+            except ValueError:
+                raise HostInterfacesUnreadable("interface %r lists %r as an address of family %s, and it is not one"
+                                               % (name, entry.address, entry.family)) from None
+            listed = interfaces.setdefault(name, [])
+            if normal not in listed:
+                listed.append(normal)
+    if not interfaces:
+        raise HostInterfacesUnreadable("psutil.net_if_addrs() listed no IPv4 or IPv6 address on any interface (not even loopback): %r"
+                                       % sorted(table))
+    return interfaces
+
+
+def host_addresses() -> Set[str]:
+    """Every address of :func:`read_host_interfaces`, of every interface (raises :class:`HostInterfacesUnreadable` as it does)."""
+    return {address for addresses in read_host_interfaces().values() for address in addresses}
 
 
 def is_host_source(ip: str, known: Set[str]) -> bool:
@@ -71,6 +113,8 @@ class Witness:
         self.tcp: List[Tuple[str, int]] = []
         self.foreign_udp: List[Tuple[str, int, int]] = []
         self.foreign_tcp: List[Tuple[str, int]] = []
+        #: Every failed reading of the interfaces after the start (the first one raises here): :meth:`heard` raises while any is listed.
+        self.read_errors: List[str] = []
         self._host: Set[str] = host_addresses() | {_normal(address)}
         self._lock = threading.Lock()
         self._closed = False
@@ -113,23 +157,34 @@ class Witness:
 
     # --- what a test reads ------------------------------------------------------------------------------------------
     def heard(self) -> Dict[str, list]:
+        self._raise_if_unread()
         with self._lock:
             return {"udp": list(self.udp), "tcp": list(self.tcp)}
 
     def heard_foreign(self) -> Dict[str, list]:
         """What reached the witness from a source that is NOT an address of this host: not the browser, noise from the network."""
+        self._raise_if_unread()
         with self._lock:
             return {"udp": list(self.foreign_udp), "tcp": list(self.foreign_tcp)}
 
     def _is_host(self, ip: str) -> bool:
-        """Whether ``ip`` is an address of this host; a miss looks at the interfaces again (an address added since) before it is foreign."""
+        """Whether ``ip`` is an address of this host; a miss looks at the interfaces again (an address added since) before it is foreign. A reading
+        that fails is never a silent "foreign": the arrival is kept as the host's (a direct send is not hidden) and every reader of the witness raises."""
         if is_host_source(ip, self._host):
             return True
         try:
             self._host |= host_addresses()
-        except Exception:
-            return False
+        except HostInterfacesUnreadable as exc:
+            with self._lock:
+                self.read_errors.append(str(exc))
+            return True
         return is_host_source(ip, self._host)
+
+    def _raise_if_unread(self) -> None:
+        with self._lock:
+            errors = list(self.read_errors)
+        if errors:
+            raise HostInterfacesUnreadable("the witness could not read the interfaces of this host again: %s" % "; ".join(errors))
 
     def heard_from_other_than(self, allowed: Iterable[str]) -> Dict[str, list]:
         """What the witness heard from a source that is not one of ``allowed`` (the exit of the proxy): a direct send."""
