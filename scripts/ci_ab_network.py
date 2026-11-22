@@ -57,6 +57,7 @@ import argparse
 import collections
 import fnmatch
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -77,6 +78,7 @@ import ci_crash_evidence as crash  # noqa: E402  (how each launch's parent ended
 
 FORMAT = "ab-network/1"
 DIFF_FORMAT = "ab-network-diff/1"
+EVIDENCE_FORMAT = "ab-network-evidence/1"
 VOLATILE_FORMAT = "ab-network-volatile/1"
 VOLATILE_FILE = ROOT / "ci" / "ab-network-volatile.json"
 SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
@@ -587,6 +589,7 @@ class Recorder:
         self.phase = "launch"
         self.events: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._t0 = time.monotonic()
         self._sources: Dict[str, list] = {}
         self._marks: List[Tuple[str, Dict[str, int]]] = []
 
@@ -601,7 +604,7 @@ class Recorder:
 
     def event(self, kind: str, **fields: Any) -> None:
         with self._lock:
-            self.events.append(dict(fields, kind=kind, phase=self.phase))
+            self.events.append(dict(fields, kind=kind, phase=self.phase, t=round(time.monotonic() - self._t0, 3)))
 
     def of(self, phase_prefix: str, kind: str) -> List[Dict[str, Any]]:
         with self._lock:
@@ -626,6 +629,7 @@ class RawTee:
         from _wire_capture import Http1Parser
 
         self.rec, self.upstream, self.role, self._parser = rec, upstream_port, role, Http1Parser
+        self._connections = itertools.count()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(64)
@@ -639,9 +643,9 @@ class RawTee:
                 client, _ = self._listener.accept()
             except OSError:
                 return
-            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+            threading.Thread(target=self._serve, args=(client, next(self._connections)), daemon=True).start()
 
-    def _serve(self, client: socket.socket) -> None:
+    def _serve(self, client: socket.socket, connection: int) -> None:
         try:
             upstream = socket.create_connection(("127.0.0.1", self.upstream), timeout=WAIT_S)
         except OSError:
@@ -658,7 +662,7 @@ class RawTee:
                     if tap is not None:
                         for request in tap.feed(data):
                             self.rec.event("http", role=self.role, method=request["method"], target=request["target"], headers=request["headers"],
-                                           body_length=request["body_length"])
+                                           body_length=request["body_length"], connection=connection)
                     sink.sendall(data)
             except (OSError, ValueError):
                 pass
@@ -1036,7 +1040,10 @@ class Lab:
         from _wire_capture import WireServer
 
         phase = lambda: self.rec.phase  # noqa: E731
-        self.h1 = WireServer(self.host, alpn=("http/1.1",), phase=phase, dns_names=(H1_NAME,))
+        # The HTTP/1.1 server ends each connection after its answer (``Connection: close``), so every request after the first rides a connection the browser opens when it already has the session
+        # ticket the first answer carried: whether a resumed connection happens no longer follows how fast the pool opened a second connection while the first was still busy (A/A run
+        # 45025164169, Linux: a resumed h1 connection on one seed of one run and on none of the five seeds of the other).
+        self.h1 = WireServer(self.host, alpn=("http/1.1",), phase=phase, dns_names=(H1_NAME,), close_after_response=True)
         self.h2 = WireServer(self.host, alpn=("h2", "http/1.1"), phase=phase, dns_names=(H2_NAME,))
         self.h3 = WireServer(self.host, alpn=("h2", "http/1.1"), h3=True, phase=phase, dns_names=(H3_NAME,))
         for server, role in ((self.h1, "h1"), (self.h2, "h2"), (self.h3, "h3")):
@@ -1422,7 +1429,38 @@ def run_main(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
                 trap.__exit__(None, None, None)
         out["lab"] = {"direct": direct_report(lab, watcher, trap), "resolver_trap_ran": trap is not None,
                       "launch": lab.norm.walk(launch_data(lab))}
+        EVIDENCE[str(seed)] = guarded(lambda: wire_evidence(lab))
     return out
+
+
+#: What each seed of this run saw, request by request, kept OUTSIDE the leaves that are compared (``transcript["evidence"]``, like ``exits``): the transcript folds a request into a count
+#: and drops the connection it rode and the moment it arrived, which is what a run that differs from itself needs to be explained (A/A run 45025164169, Windows: a request of step 15
+#: counted twice in one run and once in the other, and nothing in the transcript said which page sent it or when).
+EVIDENCE: Dict[str, Any] = {}
+
+
+def wire_evidence(lab: Lab) -> Dict[str, Any]:
+    """The requests the tees of the journey saw (when, on which connection of the tee, in which stage, the line and the referer) and the connections of the HTTPS servers (when, in which
+    stage, whether the ClientHello resumes a session, and for HTTP/1.1 the requests it carried with their moments). Times are seconds since the lab started."""
+    journey = []
+    for e in lab.rec.of("journey", "http"):
+        referer = next((v for n, v in e["headers"] if n.lower() == "referer"), None)
+        journey.append({"t": e["t"], "connection": e["connection"], "phase": e["phase"], "request": "%s %s%s" % (e["method"], e["role"], lab.norm.text(e["target"])),
+                        "referer": lab.norm.text(referer) if referer else None})
+    https: Dict[str, Any] = {}
+    for role, server in (("h1", lab.h1), ("h2", lab.h2)):
+        if server is None:
+            continue
+        connections = []
+        for c in server.snapshot()["connections"]:
+            item = {"id": c["id"], "t": c.get("t"), "phase": c["phase"], "alpn": c["alpn"], "resumed": _resumed(c["tls"] or {})}
+            if "http1" in c:
+                item["requests"] = [{"t": r.get("t"), "request": r["request_line"]} for r in c["http1"]]
+            if "h2" in c:
+                item["requests"] = len(c["h2"].get("requests") or [])
+            connections.append(item)
+        https[role] = connections
+    return {"journey": journey, "https": https}
 
 
 def sentinel_signature(lab: Lab) -> Dict[str, Any]:
@@ -1564,11 +1602,13 @@ def run(binary: str, label: str, seeds: Tuple[int, ...], out: Path) -> int:
 
         _lab_egress.install(patch, work)
         transcript: Dict[str, Any] = {"format": FORMAT, "label": label, "platform": sys.platform, "seeds": {}}
+        EVIDENCE.clear()
         for index, seed in enumerate(seeds):
             print("=== %s: seed %d" % (label, seed))
             sys.stdout.flush()
             transcript["seeds"][str(seed)] = walk_seed(binary, seed, index == 0, patch)
         crash.stop_probe()
+        transcript["evidence"] = {"format": EVIDENCE_FORMAT, "seeds": dict(EVIDENCE)}
         transcript["exits"] = probe.document()
         probe.write()
         for line in crash.exit_problems(probe.launches, label, windows=sys.platform == "win32"):
