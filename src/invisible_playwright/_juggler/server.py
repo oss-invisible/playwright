@@ -464,13 +464,11 @@ _READ = "o => o"
 _ARRAY = "(...a) => a"
 #: The queries of a selector with an ELEMENT as root, which the core's `InjectedScript.query_selector` and `query_selector_all` cannot be asked (they pass `document`):
 #: the injected script's own `querySelector(parsed, root, strict)` and `querySelectorAll(parsed, root)`, the ones stock runs with `scope || document`
-#: (`FrameSelectors.query`, `queryAll`). The list of a `querySelectorAll` is read by its length and its places, and released by the caller.
+#: (`FrameSelectors.query`, `queryAll`). The list of a `querySelectorAll` is read once (`FrameDispatcher._all`) and released there.
 _QUERY_IN = ("(injected, root, selector, strict) => injected.querySelector("
              "injected.parseSelector(selector), root, strict) || null")
 _QUERY_ALL_IN = ("(injected, root, selector) => injected.querySelectorAll("
                  "injected.parseSelector(selector), root)")
-_LENGTH = "(injected, list) => list.length"
-_PLACE = "(injected, list, i) => list[i]"
 #: Playwright's own sentence for a node that is no longer in the document (`throwElementIsNotAttached`).
 _NOT_ATTACHED = "Element is not attached to the DOM"
 #: The waits between the turns of an action that retries, in seconds (`ElementHandle._retryAction`: 0, 20, 100, 100, then 500 ms for every turn after).
@@ -1442,11 +1440,17 @@ class FrameDispatcher(Dispatcher):
         found = self.injected.call(frame_id, _QUERY_ALL_IN, {"objectId": root},
                                    selector, by_value=False)
         try:
-            count = self.injected.call(frame_id, _LENGTH, {"objectId": found})
-            places = [self.injected.call(frame_id, _PLACE, {"objectId": found},
-                                         index, by_value=False)
-                      for index in range(count)]
-            return [place for place in places if place]
+            # ⛔ THE ARRAY IS READ ONCE, whatever its length: the core's own
+            # `query_selector_all` asks for the length and then for each place
+            # (N + 2 commands for N matches), and `properties` is the engine's
+            # `Runtime.getObjectProperties`, which lists the places of the array
+            # with the object of each node. The places are named "0", "1", ...
+            # and are put in numeric order here, so "10" never comes before "2".
+            places = self.injected.properties(
+                self.injected.context_id(frame_id), found)
+            indexed = sorted((int(place["name"]), place["value"].get("objectId"))
+                             for place in places if place["name"].isdigit())
+            return [object_id for _, object_id in indexed if object_id]
         finally:
             self.injected.dispose(frame_id, found)
 
