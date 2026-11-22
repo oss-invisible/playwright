@@ -113,8 +113,9 @@ jobs:
           sudo apt-get install -y xvfb
           # the fontconfig e2e trace the opens of the browser: strace is not in the runner image (setsid is, util-linux)
           sudo apt-get install -y strace
-          # tests/test_security_state_engine_e2e.py, on a crash of the engine: a core file where kernel.core_pattern says, and gdb to read it (the test deletes the core and
-          # uploads the backtrace with the evidence). Only a process that lifts its own core limit leaves a core, the runner's default limit is 0.
+          # TEMPORARY (the -11 at the exit of the security state's generate): a core file of any crash where kernel.core_pattern says, and gdb to read it. tests/conftest.py
+          # lifts the core limit of the pytest session (the runner's default soft limit is 0) and, after a test that fails, tests/_crash_cores.py saves gdb's text of every
+          # core in INVPW_CORE_DIR under invpw-evidence/cores/<test>/ and deletes the core.
           sudo apt-get install -y gdb
           mkdir -p "$RUNNER_TEMP/invpw-cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%e.%p"

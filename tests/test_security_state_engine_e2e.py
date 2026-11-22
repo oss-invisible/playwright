@@ -34,13 +34,12 @@ import ssl
 import subprocess
 import sys
 import threading
-import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
 
-from _generation_evidence import evidence_folder, lift_the_core_limit, save_what_the_failed_generation_left, the_core_s_generation_keeps_its_evidence
+from _generation_evidence import evidence_folder, save_what_the_failed_generation_left, the_core_s_generation_keeps_its_evidence
 from _servers import LocalServer
 
 pytestmark = pytest.mark.e2e
@@ -118,12 +117,11 @@ def _engine_env(work: Path) -> dict:
     return env
 
 
-def _run_to_the_end(argv, env, cwd, timeout_s, *, output_to=None, core_dumps=False):
+def _run_to_the_end(argv, env, cwd, timeout_s, *, output_to=None):
     """Runs `argv` with nothing on stdout and stderr (or, with `output_to`, with both written to files `<output_to>.stdout` and `<output_to>.stderr`, which is all
-    that changes); (exit code, None) or (None, "timed out ...") with its whole tree ended. `core_dumps` (Linux only) lifts the core size limit of the process, so that
-    a crash leaves a core file where `kernel.core_pattern` says (e2e.yml sets it)."""
+    that changes); (exit code, None) or (None, "timed out ...") with its whole tree ended. A crash leaves a core where `kernel.core_pattern` says: the process
+    inherits the core limit of the session (TEMPORARY, tests/_crash_cores.py, which reads it after the test fails)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    extra = {"preexec_fn": lift_the_core_limit} if core_dumps and sys.platform.startswith("linux") else {}
     sinks = [subprocess.DEVNULL, subprocess.DEVNULL]
     opened = []
     if output_to is not None:
@@ -131,7 +129,7 @@ def _run_to_the_end(argv, env, cwd, timeout_s, *, output_to=None, core_dumps=Fal
             opened.append(open(str(output_to) + suffix, "wb"))
             sinks[index] = opened[-1]
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=sinks[0], stderr=sinks[1], env=env, cwd=str(cwd), creationflags=flags, **extra)
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=sinks[0], stderr=sinks[1], env=env, cwd=str(cwd), creationflags=flags)
         try:
             try:
                 return proc.wait(timeout=timeout_s), None
@@ -274,10 +272,9 @@ def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_pat
     profile.mkdir()
     (profile / "user.js").write_bytes(_user_js(files))
     output = work / "engine-output"
-    started_at = time.time()
-    code, why = _run_to_the_end([ff, "-headless", "-no-remote", "-profile", str(profile)], _engine_env(work), work, GENERATE_TIMEOUT_S, output_to=output, core_dumps=True)
+    code, why = _run_to_the_end([ff, "-headless", "-no-remote", "-profile", str(profile)], _engine_env(work), work, GENERATE_TIMEOUT_S, output_to=output)
     if code != 0:  # TEMPORARY, with tests/_generation_evidence.py
-        save_what_the_failed_generation_left(ff, profile, output, started_at, code, why, evidence_folder("security-state-generate", work), cwd=work)
+        save_what_the_failed_generation_left(profile, output, code, why, evidence_folder("security-state-generate", work))
     said = (profile / RESULT_NAME).read_bytes().decode("utf-8") if (profile / RESULT_NAME).is_file() else "no %s" % RESULT_NAME
     assert code == 0, "the engine in generate mode %s (exit code %r); its result: %s" % (why or "exited", code, said)
 
