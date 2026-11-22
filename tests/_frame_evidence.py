@@ -19,10 +19,15 @@ import sys
 import threading
 import time
 
+from _far_away_probes import LoadSampler, StallWitness
+from _far_away_probes import Records as ProbeRecords
+
 #: The events of a page the client hears, recorded with the frame they are about.
 FRAME_EVENTS = ("frameattached", "framenavigated", "framedetached")
 #: The most records of the wire the summary keeps (the window of one test is a few hundred messages).
 SUMMARY_LIMIT = 600
+#: The most commands without an answer the summary says (a browser that is closed leaves a few; the evidence has the wire itself).
+UNANSWERED_LIMIT = 20
 #: The commands that carry code to a context.
 _CALLS = ("Runtime.evaluate", "Runtime.callFunction")
 #: The events of the engine that say which frame and which world exist, and when they come and go.
@@ -175,23 +180,92 @@ class FrameWatch(Records):
             pass
 
 
+    def unanswered_line(self, limit: int = 3) -> str:
+        """The commands the wire reading found with no answer, in one line each (id, method, context and its frame's url, seconds waited, whether the
+        context was announced and whether it was destroyed). Empty when there is none. Never raises."""
+        try:
+            with self.wire.lock:
+                found = [r for r in self.wire.records if r.get("event") == "command without an answer"]
+            parts = []
+            for r in found[:limit]:
+                end = r.get("context_at_the_end") or {}
+                frame = r.get("frame_at_the_end") or {}
+                parts.append("%s #%s to context %s (frame %s, %s) had no answer after %ss; context %s" % (
+                    r.get("method"), r.get("id"), r.get("executionContextId"), end.get("frame"), frame.get("url"), r.get("waited_s"),
+                    "not announced in the window" if not end else ("destroyed at m=%s" % end.get("destroyed_m") if end.get("destroyed_m") else "alive")))
+            return "; ".join(parts)
+        except Exception:
+            return ""
+
+
+class ProcessProbes:
+    """The stall witness and the runner's CPU load of ``tests/_far_away_probes.py``, on the clock of the wire: ``m`` is ``time.perf_counter()``
+    (their epoch is 0, so ``from_gw`` and ``to_gw`` are ``m``). A beat that is late is a stall of the whole test process, the one that also holds
+    the client's reader of the Juggler pipe; a quiet process and a call that gets no answer put the stall in the browser or in the context, not
+    in the client. ``evidence.note_records`` keeps both lists. Nothing here raises: both recorders keep a failure as a record."""
+
+    def __init__(self, load_source=None):
+        self.stall_records, self.load_records = ProbeRecords(), ProbeRecords()
+        self.witness = StallWitness(self.stall_records, 0.0, clock=time.perf_counter)
+        self.sampler = LoadSampler(self.load_records, 0.0, source=load_source, clock=time.perf_counter)
+
+    def keep_in(self, evidence) -> None:
+        evidence.note_records("stalls-of-the-test-process", self.stall_records)
+        evidence.note_records("runner-load", self.load_records)
+
+    def start(self) -> None:
+        self.witness.start()
+        self.sampler.start()
+
+    def stop(self) -> None:
+        self.witness.stop()
+        self.sampler.stop()
+
+    def line(self) -> str:
+        """Stalls and load in one short line (``m`` of each stall). Never raises."""
+        try:
+            stalls = sorted(self.witness.stalls(), key=lambda r: -r["gap_s"])
+            if stalls:
+                said = ", ".join("%.2fs at m=%.2f" % (r["gap_s"], r["from_gw"]) for r in stalls[:3])
+                stall = "%d stall(s) of the test process over %.0f ms: %s" % (len(stalls), self.witness.stall_s * 1000, said)
+            else:
+                stall = "no stall of the test process over %.0f ms (%d beats, longest gap %.3fs)" % (
+                    self.witness.stall_s * 1000, self.witness.beats, self.witness.longest_gap_s)
+            cpu = [r["cpu_percent"] for r in self.sampler.samples()]
+            load = "runner CPU max %.0f%%, mean %.0f%% in %d samples" % (max(cpu), sum(cpu) / len(cpu), len(cpu)) if cpu else "runner CPU: no sample"
+            return "%s; %s" % (stall, load)
+        except Exception as problem:
+            return "stalls and load: not read (%r)" % (problem,)
+
+
 class OnFailure:
     """``with OnFailure(evidence, watch):`` around the body of a test: when the body fails, the frames and the wire reading are added and the
     evidence is saved (the folder the e2e jobs upload); the exception goes on, the very one the body raised."""
 
-    def __init__(self, evidence, watch: FrameWatch):
+    def __init__(self, evidence, watch: FrameWatch, probes: ProcessProbes = None):
         self.evidence = evidence
         self.watch = watch
+        self.probes = probes
 
     def __enter__(self):
         self.watch.start(self.evidence)
+        self._probes("start")
         return self
 
+    def _probes(self, action: str) -> None:
+        try:
+            if self.probes is not None:
+                getattr(self.probes, action)()
+        except Exception:
+            pass
+
     def __exit__(self, exc_type, exc, tb):
+        self._probes("stop")
         try:
             if exc_type is not None and issubclass(exc_type, Exception):      # not a skip, not an interrupt
                 self.watch.note("failure", {"type": exc_type.__name__, "message": str(exc)[:1500]})
                 self.watch.at_failure(self.evidence)
+                self._say(exc)
                 try:
                     self.evidence._save(exc_type, exc)
                 except Exception as problem:
@@ -205,6 +279,24 @@ class OnFailure:
                 pass
         return False
 
+    def _say(self, exc) -> None:
+        """A note on the exception the body raised (the very object, its type and message untouched): what the wire says of the commands with no
+        answer, and the stalls and load of the process. It is read in the failure report next to the traceback."""
+        try:
+            lines = []
+            unanswered = self.watch.unanswered_line()
+            if unanswered:
+                lines.append("wire: " + unanswered)
+            if self.probes is not None:
+                lines.append("process: " + self.probes.line())
+            if lines:
+                self.watch.note("said at the failure", {"lines": lines})
+                add_note = getattr(exc, "add_note", None)
+                if add_note is not None:
+                    add_note("evidence of this failure: " + " | ".join(lines))
+        except Exception:
+            pass
+
 
 # ---- the wire --------------------------------------------------------------------------------------------------------
 def _short(text, limit=160):
@@ -217,12 +309,31 @@ def summarize_wire(path, since_m=None, marker: str = "window.__r") -> list:
     (``perf_counter``) on: the engine's frame and context events with their ids, urls and names; each ``Runtime.evaluate`` or ``callFunction`` sent
     with its context id and the beginning of its code; each answer to one of those (its error text, if it has one); and, for every command whose code
     contains ``marker``, a ``marker command`` record that joins the context id it was sent to with what the wire knows of that context (its frame id
-    and name, when it was announced and when it was destroyed) and of that frame (the url it last committed, its parent). A line of the log
-    that is not JSON, or was cut at the log's limit, is counted, not read. Never raises: a failure is a record."""
+    and name, when it was announced and when it was destroyed) and of that frame (the url it last committed, its parent). Whatever the code, every
+    command that has no answer by the end of the log gets a ``command without an answer`` record with the same join, taken when it was sent and at
+    the end of the log, and the time it has waited: the evaluate that a client gave up on (``no response in 30s``) is there whether or not its code
+    has the marker. An answer says how long after its command it came (``after_s``). A line of the log that is not JSON, or was cut at the log's
+    limit, is counted, not read. Never raises: a failure is a record."""
     try:
         return _summarize_wire(path, since_m, marker)
     except Exception as problem:
         return [{"event": "the wire could not be read", "error": repr(problem)}]
+
+
+def _join(contexts, frames, context_id):
+    """What the wire knows now of a context, of its frame and of the frame's parent (copies: the entries change later); ``None`` for what it does
+    not know (a context announced before the window, or never)."""
+    context = dict(contexts.get(context_id) or {}) or None
+    frame = dict(frames.get((context or {}).get("frame")) or {}) or None
+    parent = dict(frames.get((frame or {}).get("parent")) or {}) or None
+    return context, frame, parent
+
+
+def _after(start_m, end_m):
+    try:
+        return round(end_m - start_m, 4)
+    except Exception:
+        return None
 
 
 def _summarize_wire(path, since_m, marker) -> list:
@@ -230,6 +341,8 @@ def _summarize_wire(path, since_m, marker) -> list:
     contexts = {}          # context id -> {"frame", "name", "created_m", "destroyed_m"}
     frames = {}            # frame id -> {"url", "name", "parent", "attached_m", "detached_m", "committed_m"}
     sent = {}              # command id -> the record of the command
+    waiting = {}           # command id -> what the wire knew of its context and frame when it was sent, until it is answered
+    last_m = None
     unparsed = 0
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -250,6 +363,7 @@ def _summarize_wire(path, since_m, marker) -> list:
                 continue
             if not isinstance(message, dict):
                 continue
+            last_m = m if last_m is None else max(last_m, m)
             base = {"t": row.get("t"), "m": m, "dir": row.get("dir")}
             method, params = message.get("method"), message.get("params") or {}
             if row.get("dir") == "out" and method in _CALLS:
@@ -258,16 +372,17 @@ def _summarize_wire(path, since_m, marker) -> list:
                               executionContextId=params.get("executionContextId"), code=_short(code))
                 sent[message.get("id")] = record
                 out.append(record)
+                context, frame, parent = _join(contexts, frames, params.get("executionContextId"))
+                waiting[message.get("id")] = {"record": record, "context": context, "frame": frame, "parent": parent}
                 if marker and marker in str(code):
-                    context = dict(contexts.get(params.get("executionContextId")) or {}) or None     # copies: the entries change later
-                    frame = dict(frames.get((context or {}).get("frame")) or {}) or None
-                    parent = dict(frames.get((frame or {}).get("parent")) or {}) or None
                     out.append(dict(base, event="marker command", id=message.get("id"), executionContextId=params.get("executionContextId"),
                                     context=context, frame=frame, parent=parent))
             elif row.get("dir") == "in" and message.get("id") in sent:
                 answer = message.get("error")
                 result = message.get("result")
-                out.append(dict(base, event="answer", id=message.get("id"), to=sent[message.get("id")].get("code"),
+                command = sent[message.get("id")]
+                waiting.pop(message.get("id"), None)
+                out.append(dict(base, event="answer", id=message.get("id"), to=command.get("code"), after_s=_after(command.get("m"), m),
                                 error=_short(answer, 400) if answer is not None else None,
                                 result=_short(json.dumps(result, default=str), 300) if answer is None else None))
             elif row.get("dir") == "in" and method in _EVENTS:
@@ -289,6 +404,14 @@ def _summarize_wire(path, since_m, marker) -> list:
             if len(out) >= SUMMARY_LIMIT:
                 out.append({"event": "summary cut", "limit": SUMMARY_LIMIT})
                 break
-    out.append({"event": "summary end", "unparsed_lines": unparsed, "since_m": since_m,
+    for command_id, known in list(waiting.items())[:UNANSWERED_LIMIT]:
+        record = known["record"]
+        context_now, frame_now, parent_now = _join(contexts, frames, record.get("executionContextId"))
+        out.append({"event": "command without an answer", "id": command_id, "method": record.get("method"), "sessionId": record.get("sessionId"),
+                    "executionContextId": record.get("executionContextId"), "code": record.get("code"), "sent_m": record.get("m"),
+                    "waited_s": _after(record.get("m"), last_m), "context_known_when_sent": known["context"] is not None,
+                    "context_when_sent": known["context"], "frame_when_sent": known["frame"], "parent_when_sent": known["parent"],
+                    "context_at_the_end": context_now, "frame_at_the_end": frame_now, "parent_at_the_end": parent_now})
+    out.append({"event": "summary end", "unparsed_lines": unparsed, "last_m": last_m, "commands_without_an_answer": len(waiting), "since_m": since_m,
                 "contexts_known": len(contexts), "frames_known": len(frames)})
     return out
