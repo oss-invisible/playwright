@@ -48,7 +48,7 @@ import time
 import pytest
 
 from _servers import LocalServer
-from _socks_servers import EXIT, Gateway
+from _socks_servers import EXIT, Gateway, _REQUEST
 from _udp_line import egress_by_proxy, measure_servers
 from _waits import wait_until
 from test_declared_host_network_e2e import DUAL, NETWORK_ENV, V4_ONLY
@@ -134,7 +134,7 @@ class _GatewayToALocalListener(Gateway):
 
     def _read_address(self, c):
         host, port = super()._read_address(c)
-        atyp = self._local.atyp
+        atyp = _REQUEST.atyp
         self.addresses.append((host, port, atyp))
         record = {"t": round(time.monotonic() - self._launch_t0, 3), "atyp": atyp, "destination": host, "port": port,
                   "outcome": "answered by the lab (or not a CONNECT)"}

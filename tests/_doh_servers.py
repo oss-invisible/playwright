@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-from _socks_servers import EXIT, Gateway, WEB_NAME, WHOAMI4, WHOAMI6
+from _socks_servers import EXIT, Gateway, WEB_NAME, WHOAMI4, WHOAMI6, _REQUEST
 
 try:  # the HTTP/2 side needs it; a test that wants h2 says pytest.importorskip("h2")
     import h2.config
@@ -697,7 +697,7 @@ class DohGateway(Gateway):
         if not is_loopback(host):
             self.connects.append((host, port))
             self.refused.append((host, port))
-            self.guard.refuse(host, port, getattr(self._local, "atyp", 3), "tcp",
+            self.guard.refuse(host, port, getattr(_REQUEST, "atyp", 3), "tcp",
                               reason="past loopback: the DoH gateway carries only loopback (besides the DoH, the exit questions and the web name it answers)")
             self._send(c, self._reply(2 if _is_address(host) else 4))
             return

@@ -223,6 +223,10 @@ def is_lab_destination(host: str) -> bool:
     return lab_refusal(host) is None
 
 
+#: The address type of the SOCKS request the current thread last read (:meth:`Gateway._read_address`).
+_REQUEST = threading.local()
+
+
 class LabGuard:
     """What refuses a destination that is not the lab's and writes it down: one per gateway.
 
@@ -553,10 +557,12 @@ class Gateway:
             self._send(c, b"\x01\x00")
         return True
 
-    def _read_address(self, c: socket.socket) -> Tuple[str, int]:
-        """The destination of a request, as received (the NAME for address type 3); its address type is left in ``self._local.atyp``."""
+    @staticmethod
+    def _read_address(c: socket.socket) -> Tuple[str, int]:
+        """The destination of a request, as received (the NAME for address type 3); its address type is left in :data:`_REQUEST` ``.atyp`` of the
+        thread that read it. A static method, as on main: a test that wraps it calls ``type(gateway)._read_address(c)``."""
         atyp = _recv_exact(c, 1)[0]
-        self._local.atyp = atyp
+        _REQUEST.atyp = atyp
         if atyp == 1:
             host = socket.inet_ntoa(_recv_exact(c, 4))
         elif atyp == 3:
@@ -642,7 +648,7 @@ class Gateway:
             self._send(c, self._reply(2))      # not allowed: the exit of this gateway is declared, it is not asked of the internet
             return
         target = self._target(host, port)
-        if not self._admits(host, port, getattr(self._local, "atyp", 3), "tcp", target):
+        if not self._admits(host, port, getattr(_REQUEST, "atyp", 3), "tcp", target):
             self._send(c, self._reply(2))      # not allowed: the gateway carries nothing outside the lab
             return
         try:
