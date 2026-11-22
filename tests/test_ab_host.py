@@ -1446,16 +1446,13 @@ def test_the_idle_launch_is_green_when_the_notification_was_seen_and_the_three_p
     assert judge(footprint(), footprint("again"), a_a=True)["idle"] == {"A": None, "B": None}, "a footprint with no idle launch has nothing to compare"
 
 
-@pytest.mark.parametrize("kwargs,words", [
-    ({"observed": False}, "the notification of the data policy was not recorded in the profile within 120 s (TelemetrySend.sys.mjs:1083 is false"),
-    ({"n": 0}, "0 pingsender processes, the pings of a first run must leave: 3"),
-    ({"n": 2}, "2 pingsender processes"),
-    ({"types": ("event", "event", "new-profile")}, "not the pings of a first run"),
-    ({"parent": "gpu"}, "not all spawned by the parent"),
-])
-def test_an_idle_launch_in_which_the_pings_did_not_leave_as_they_must_is_red(kwargs, words):
+@pytest.mark.parametrize("kwargs", [{"observed": False}, {"n": 0}, {"n": 1, "types": ("new-profile",)}, {"n": 2}, {"n": 5}, {"types": ("event", "event", "new-profile")}, {"parent": "gpu"}])
+def test_the_idle_launch_holds_no_rule_on_the_notification_or_on_how_many_pingsenders_it_started(kwargs):
+    """Run 44993377458: the notification is never recorded (the core declares the terms of use accepted, so canUpload is true from the start) and the long launch
+    started 1 pingsender on Linux and 0 on Windows: what leaves is evidence until it is proven."""
     report = judge(with_idle(footprint(), **kwargs), with_idle(footprint("firefox-68 again")), a_a=True)
-    assert report["verdict"] == "red" and any(words in p and p.startswith("idle launch of side A") for p in report["problems"]), report["problems"]
+    assert report["verdict"] == "green", report["problems"]
+    assert report["idle"]["A"]["pingsenders"] == kwargs.get("n", 3)
 
 
 def test_the_separate_pingsender_executable_in_the_idle_launch_is_red_and_a_side_with_no_idle_launch_is_red():
@@ -1821,3 +1818,53 @@ def test_a_launch_that_left_nothing_says_so_and_the_report_carries_the_summary_l
     out = capsys.readouterr().out
     assert "SHORTCUTS (the places of the shortcut code, before and after the idle launch; evidence) firefox-68: 1 new, 0 changed, 0 gone" in out and "Private Browsing.lnk" in out
     assert judge(footprint(), footprint("again"), a_a=True)["shortcuts"] == {"A": None, "B": None}, "Linux has none of this"
+
+
+# -
+# The system modules of Windows: a set over the union of the measured seeds of a side.
+
+SYS_A = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "wevtapi.dll"
+SYS_B = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "imagehlp.dll"
+
+
+def with_system(fp, per_seed):
+    fp = copy.deepcopy(fp)
+    for seed in fp["seeds"]:
+        add = per_seed.get(seed["seed"], [])
+        seed["files"] = sorted(set(seed["files"]) | set(add))
+        seed["touched_by"] = {p: ["tab/isForBrowser"] for p in add}
+    return fp
+
+
+def test_a_system_module_that_is_in_a_seed_of_each_side_is_the_same_module_whatever_the_seed():
+    a = with_system(footprint(platform="win32"), {11: [SYS_B]})
+    b = with_system(footprint("again", platform="win32"), {12: [SYS_B]})
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green", report["problems"]
+    assert "set over the union" in host.SYSTEM_REASON
+
+
+def test_a_system_module_only_one_side_has_in_any_seed_is_still_red_and_names_who_loaded_it():
+    a = with_system(footprint(platform="win32"), {11: [SYS_A], 12: [SYS_B]})
+    b = with_system(footprint("again", platform="win32"), {12: [SYS_B]})
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "red"
+    assert [(d["seed"], d["leaf"], d["a"], d["b"], d["by"]) for d in report["differences"]] == [("all", "file." + SYS_A, 1, host.MISSING, {"A": ["tab/isForBrowser"], "B": []})]
+    assert any("seed all file." in p and "(by A: tab/isForBrowser | B: -)" in p for p in report["problems"])
+
+
+def test_a_module_outside_the_system_folder_and_every_module_on_linux_is_compared_seed_by_seed():
+    other = "c:" + chr(92) + "program files" + chr(92) + "vendor" + chr(92) + "hook.dll"
+    a = with_system(footprint(platform="win32"), {11: [other]})
+    b = with_system(footprint("again", platform="win32"), {12: [other]})
+    assert {d["seed"] for d in judge(a, b, a_a=True)["differences"]} == {11, 12}
+    lin = "/usr/lib/libx.so"
+    la, lb = with_system(footprint(), {11: [lin]}), with_system(footprint("again"), {12: [lin]})
+    assert {d["seed"] for d in judge(la, lb, a_a=True)["differences"]} == {11, 12}
+
+
+def test_the_system_class_does_not_hide_a_module_the_candidate_alone_loads_in_every_seed():
+    a = footprint(platform="win32")
+    b = with_system(footprint("candidate", platform="win32"), {11: [SYS_A], 12: [SYS_A]})
+    report = judge(a, b, a_a=True)
+    assert [d["leaf"] for d in report["differences"]] == ["file." + SYS_A] and report["verdict"] == "red"

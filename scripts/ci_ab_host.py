@@ -36,20 +36,15 @@ helper spawned at the first shutdown of a cold machine) stays visible from run t
 after the warm-up is red.
 
 The exit pings (`firefox --backgroundtask pingsender`, through the session's route, never the separate `pingsender[.exe]`) leave only when Mozilla's `canUpload()` is
-true (TelemetrySend.sys.mjs:1083), once the notification of the data policy was recorded, which a short launch may or may not have reached: in a measured launch their
+true (TelemetrySend.sys.mjs:1083), which the core's declared terms of use make true from the start: in a measured launch their
 number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red. The paths and the destinations only they touch are compared when they are
 there on both sides of a launch, and left out when they are there on one side only (a destination is `public, telemetry`: the telemetry host is the third party's, and
-whether the connection succeeded is not in the verdict). The IDLE launch of each engine run is where they must leave: no journey, no pref changed, the session has no
-proxy so the route is direct and a ping going to the telemetry host is the product's behaviour; it waits until the profile's prefs.js records the notification (the
-precondition, seen in a file of the launch; at most 120 s) and then closes. There the comparison is strict on what does not depend on the third party: the notification
-seen, three pingsender processes of the three types, always the background task, spawned by the parent. Behind a session proxy a direct pingsender is the network oracle's.
+whether the connection succeeded is not in the verdict). The IDLE launch of each engine run (a page, no pref changed, up to 120 s) is evidence: which pings leave in a long launch is not a rule until it is proven (the core declares
+the terms of use accepted, so `canUpload()` is true from the start and the notification of the data policy is never recorded; Linux started 1 pingsender in it, Windows 0).
+Only a separate `pingsender[.exe]` there is red. Behind a session proxy a direct pingsender is the network oracle's.
 
-A BARE launch ends each engine run, never compared: no client and no page (the idle launch of run 44988820319, in which a crash reporter ran on both systems; it was
-`crashreporter --ping-cleanup`, started by CrashManager 57 s after the launch, exit 0). It records how the browser ended (the exit code or signal of its parent
-processes), every crash reporter or minidump analyzer process with its command line, the `.dmp` names and `.extra` contents found in the profile's minidumps and the
-`Crash Reports/pending` of the user's application data (read while the launch lives, as the profile is deleted when it ends), and, on Linux, a core dump allowed in the
-launch's folder with its `gdb -batch -ex bt`. On Windows the footprint also lists the host paths a process of the tree asked the system to MAKE (`creates`: the Create
-event's disposition), the evidence of whether a file was written and not only looked for.
+On Windows the system modules (a path under the system folder) are compared as a SET over the union of the measured seeds of a side (`SYSTEM_REASON`): a module that is in a
+seed of each side is the same module; one that only one side has in any seed is still red.
 
 How the trace is taken:
 
@@ -506,6 +501,26 @@ def _bare_summary(bare: dict | None) -> dict | None:
             "cores": core.get("cores"), "core_pattern": core.get("core_pattern")}
 
 
+#: The system modules of Windows: a path under the system folder (a library, its resource file, a security catalog read when it is loaded). Which of them a launch
+#: opens follows the system (a catalog lookup, a lazily loaded library of a system DLL, a resource of a module a shell call loaded), so they are compared as a SET over
+#: the union of the measured seeds of a side, not seed by seed: a module that is in a seed of each side is the same module. A module that only one side has in any seed is
+#: still a difference, whatever loaded it; the shortcut inventory is its own rule (absent or complete).
+SYSTEM_PREFIX = "file.c:" + chr(92) + "windows" + chr(92)
+SYSTEM_REASON = ("which system modules a launch opens follows the system (catalog lookups, libraries loaded lazily by system DLLs): compared as a set over the union of the "
+                 "measured seeds of a side")
+
+
+def system_class_differences(per_seed_a: dict, per_seed_b: dict, by_a: dict, by_b: dict) -> list:
+    """The differences of the system modules as a set over the union of the seeds (`per_seed_*`: {seed: {leaf}}): `[{leaf, a, b, by}]`, seed `all`."""
+    ua = set().union(*per_seed_a.values()) if per_seed_a else set()
+    ub = set().union(*per_seed_b.values()) if per_seed_b else set()
+    out = []
+    for leaf in sorted(ua ^ ub):
+        out.append({"seed": "all", "category": "file", "leaf": leaf, "a": 1 if leaf in ua else MISSING, "b": 1 if leaf in ub else MISSING,
+                    "by": {"A": sorted(by_a.get(leaf, [])), "B": sorted(by_b.get(leaf, []))}, "calls": {"A": [], "B": []}})
+    return out
+
+
 def _idle_summary(idle: dict | None) -> dict | None:
     """What the idle launch of one side shows, for the report: the notification, the pingsenders (count, types, parents), ."""
     if not idle:
@@ -516,8 +531,11 @@ def _idle_summary(idle: dict | None) -> dict | None:
 
 
 def idle_problems(a: dict, b: dict) -> list:
-    """The strict comparison of the IDLE launch (the launch in which the pings must leave): on both sides the notification was observed in the profile, three
-    pingsenders of the three types of a first run, always the background task, spawned by the parent. What the connection to the telemetry host does is not here."""
+    """What is held of the IDLE launch: that each side has one, and that no pingsender in it is the separate executable. NOTHING about how many pingsenders it
+    started or whether the notification of the data policy was recorded: the core declares the terms of use accepted (invisible_core/prefs.py `termsofuse.accepted*`,
+    `browser.preonboarding.enabled`), so `canUpload()` is true from the start (TelemetryReportingPolicy.sys.mjs:839, `_delayedSetup` :1156 returns before `_userNotified`
+    :988) and the notification is never recorded; which pings leave in a long launch is evidence (run 44993377458: Linux started 1, new-profile; Windows 0), not a rule
+    until it is proven."""
     ia, ib = a.get("idle"), b.get("idle")
     if not ia and not ib:
         return []
@@ -526,12 +544,7 @@ def idle_problems(a: dict, b: dict) -> list:
         if not idle:
             out.append("side %s has no idle launch" % side)
             continue
-        if not ((idle.get("idle") or {}).get("notified") or {}).get("observed"):
-            out.append("idle launch of side %s: the notification of the data policy was not recorded in the profile within %d s (%s is false: the pings cannot leave)"
-                       % (side, NOTIFY_LIMIT_S, CAN_UPLOAD))
-        if idle.get("kinds", {}).get(PINGSENDER_KIND, 0) != 3:
-            out.append("idle launch of side %s: %d pingsender processes, the pings of a first run must leave: 3" % (side, idle.get("kinds", {}).get(PINGSENDER_KIND, 0)))
-        out += ["idle launch of side %s: %s" % (side, p) for p in pingsender_problems(idle)]
+        out += ["idle launch of side %s: %s" % (side, p) for p in pingsender_problems(idle) if p.startswith("the separate ")]
     return out
 
 
@@ -1439,6 +1452,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             problems.append("side %s: %s" % (side, message))
     if sorted(seeds_a) != sorted(seeds_b):
         problems.append("the two footprints have different seeds: A %s, B %s" % (sorted(seeds_a), sorted(seeds_b)))
+    sys_a, sys_b, sys_by_a, sys_by_b = {}, {}, {}, {}
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         both = bool(seeds_a[seed].get("kinds", {}).get(PINGSENDER_KIND)) and bool(seeds_b[seed].get("kinds", {}).get(PINGSENDER_KIND))
         la, lb = leaves_of(seeds_a[seed], both), leaves_of(seeds_b[seed], both)
@@ -1464,12 +1478,20 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                 if have[c] < floor:
                     problems.append("seed %s side %s has %d %s leaves, fewer than the floor of %d: the run was not seen"
                                     % (seed, side, have[c], c, floor))
+        if os_name == "windows":
+            for leaves, bucket, fp, who in ((la, sys_a, seeds_a[seed], sys_by_a), (lb, sys_b, seeds_b[seed], sys_by_b)):
+                moved = {k for k in leaves if k.startswith(SYSTEM_PREFIX)}
+                bucket[seed] = moved
+                for k in moved:
+                    who.setdefault(k, set()).update(_by(fp, k))
+                    del leaves[k]
         for leaf in sorted(set(la) | set(lb)):
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
             if va != vb:
                 differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)},
                                     "calls": {"A": _calls(seeds_a[seed], leaf), "B": _calls(seeds_b[seed], leaf)}})
+    differences += system_class_differences(sys_a, sys_b, sys_by_a, sys_by_b)
     if os_name == "windows" and not a_a:
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
             problems += geolocation_problems(fp, where)
