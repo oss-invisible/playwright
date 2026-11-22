@@ -98,11 +98,13 @@ def gateway_on_loopback(monkeypatch):
         yield chain
 
 
+@pytest.mark.wall_clock       # a chain 130 ms away, and the core's UDP measurement of it has a fixed budget: a verdict that reads the wall clock
 def test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick(gateway, firefox_binary, engine_at_least):
     """The exit of the lab is an address that is not loopback, and no pref: the product's own setting (Linux, root)."""
     _walk(gateway, firefox_binary, engine_at_least, PREFS)
 
 
+@pytest.mark.wall_clock
 def test_a_turn_srflx_by_name_arrives_through_the_relay_when_the_exit_of_the_lab_is_loopback(gateway_on_loopback, firefox_binary,
                                                                                           engine_at_least):
     """The exit of the lab is 127.0.0.2 and the ICE context allows loopback (the pref): the same walk on every system, Windows too."""

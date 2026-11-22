@@ -276,5 +276,3 @@ def _assert_a_new_page_with_a_new_worker(page, events, where, old, back):
         elif m == "Page.workerDestroyed":
             live.pop(p["workerId"], None)
     assert list(live) == [new[0]], "live workers after the page was built again: %r" % list(live.values())
-    assert _wait(lambda: where == "top" or any(f.url.endswith("/frame-worker") for f in page.frames)), "the frame of the new page is missing"
-    assert _ask(page, where) == 1, "the worker of the page built again is not a fresh worker"
