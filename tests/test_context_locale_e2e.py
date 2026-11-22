@@ -203,20 +203,22 @@ def test_a_worker_with_its_own_language_ignores_the_accept_languages_pref(firefo
     One session with nothing declared at launch (``juggler.locale.override`` empty: no language falls back to the session) and two
     contexts: one asks for de-DE, the other for nothing (``locale=None``). The pref goes to "ja, en-US" from the chrome scope. The worker
     of the context with nothing declared takes it (the control: the broadcast reaches workers, so the other worker's silence is
-    its own); the worker with de-DE keeps de-DE and its four entries. The silent worker is read AFTER the other has changed, and the
-    broadcast is queued to every worker in one pass, so its answer comes after the broadcast was handled.
+    its own); the worker with de-DE keeps de-DE and its four entries. The two contexts are in different content processes, so the change of
+    the other worker proves nothing about the process of the silent one: before the silent worker is read, the test waits on the
+    CONDITION "the content process of each of the two tabs reports ``intl.accept_languages`` = "ja, en-US"" (a process script reads the pref
+    in each process). A process that reports it has applied the change and queued the broadcast to its workers before it answered, so the
+    answer of the worker with de-DE comes after the broadcast was handled in its own process.
     """
     import webfont_probe
     from invisible_playwright import InvisiblePlaywright
 
     monkeypatch.setenv("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1")   # the chrome-scope write below
-    port = webfont_probe.marionette_port()
     srv, base = probe.serve(SITE)
     marionette = None
     try:
         with InvisiblePlaywright(seed=5150, binary_path=firefox_binary, headless=True, locale="it-IT", timezone="Europe/Rome",
                                  extra_args=probe.MARIONETTE_ARGS,
-                                 extra_prefs={"marionette.port": port, "juggler.locale.override": ""}) as browser:
+                                 extra_prefs={"marionette.port": 0, "juggler.locale.override": ""}) as browser:
             own = browser.new_context(locale="de-DE").new_page()
             none = browser.new_context(locale=None).new_page()
             for name, page in (("own", own), ("none", none)):
@@ -227,8 +229,19 @@ def test_a_worker_with_its_own_language_ignores_the_accept_languages_pref(firefo
             before = none.evaluate(probe.ASK_LANG_WORKER_JS)["languages"]
             assert before != ["ja", "en-US"], "the control worker already speaks the list the pref is about to take: %r" % (before,)
 
-            marionette = probe.open_chrome(port)
+            marionette = probe.open_chrome(webfont_probe.marionette_active_port())
             assert probe.set_pref(marionette, "intl.accept_languages", "ja, en-US") == "ja, en-US"
+
+            # The barrier: the content process of EACH tab holds the new value (read in that process), so the worker with de-DE is read after its
+            # own process handled the change.
+            processes = []
+
+            def every_process_has_it():
+                processes.append(probe.content_process_prefs(marionette, "intl.accept_languages", ("own", "none")))
+                return processes[-1].get("prefs") == {"own": "ja, en-US", "none": "ja, en-US"}
+
+            assert _wait_for(every_process_has_it, none), (
+                "a content process never reported the new intl.accept_languages (last answers: %r)" % (processes[-3:],))
 
             seen = []
 

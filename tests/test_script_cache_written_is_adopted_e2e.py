@@ -74,17 +74,18 @@ def _amounts(reports, path):
     return reports.get(path, [])
 
 
-def _session(binary, profile, port):
+def _session(binary, profile):
     from invisible_playwright import InvisiblePlaywright
 
     return InvisiblePlaywright(binary_path=binary, profile_dir=profile, extra_args=MARIONETTE_ARGS,
-                               extra_prefs={"marionette.port": port}, **LAUNCH)
+                               extra_prefs={"marionette.port": 0}, **LAUNCH)
 
 
-def _open_marionette(port):
+def _open_marionette(profile):
+    """Marionette of the browser on ``profile``: the port is the one the browser got (it was asked for port 0), read from the profile."""
     import webfont_probe
 
-    marionette = webfont_probe._Marionette(port)
+    marionette = webfont_probe._Marionette(webfont_probe.marionette_active_port(profile))
     marionette.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {}}})
     marionette.call("WebDriver:SetTimeouts", {"script": 240000})
     marionette.call("Marionette:SetContext", {"value": "chrome"})
@@ -99,24 +100,27 @@ def test_a_fresh_profile_reports_its_written_cache_as_mapped(firefox_binary, mon
     cache = profile / "startupCache" / "scriptCache.bin"
 
     # The fresh session: the cache is written during it and adopted.
-    port = webfont_probe.marionette_port()
     marionette = None
     try:
-        with _session(firefox_binary, profile, port) as context:
+        with _session(firefox_binary, profile) as context:
             page = context.new_page()
             page.goto("about:blank", timeout=60_000)
             written_file = wait_until(lambda: cache.exists() and cache.stat().st_size > 0, 180, lambda: page.wait_for_timeout(500))
             assert written_file, "the profile never got %s (the startup script cache is written once the startup is over)" % cache
-            marionette = _open_marionette(port)
+            marionette = _open_marionette(profile)
             seen = {}
+            sampled = []
 
             def reported():
+                # ONE sample per poll: the size of the file read here is the one the report is compared with and the one the test keeps (the
+                # file can be written again between two reads).
                 seen.clear()
                 seen.update(_reports(marionette))
-                return cache.exists() and cache.stat().st_size in _amounts(seen, WRITTEN)
+                sampled.append(cache.stat().st_size if cache.exists() else 0)
+                return sampled[-1] > 0 and sampled[-1] in _amounts(seen, WRITTEN)
 
             adopted = wait_until(reported, 60, lambda: page.wait_for_timeout(500))
-            size = cache.stat().st_size
+            size = sampled[-1]
             fresh = dict(seen)
             files_adopted = _files(profile)
     finally:
@@ -135,13 +139,12 @@ def test_a_fresh_profile_reports_its_written_cache_as_mapped(firefox_binary, mon
     files_left = _files(profile)
     started_with = cache.stat().st_size if cache.exists() else 0
     assert started_with > 0, "the fresh session left no script cache for the warm session to open: %s; startupCache/: %r" % (cache, files_left)
-    port = webfont_probe.marionette_port()
     marionette = None
     try:
-        with _session(firefox_binary, profile, port) as context:
+        with _session(firefox_binary, profile) as context:
             page = context.new_page()
             page.goto("about:blank", timeout=60_000)
-            marionette = _open_marionette(port)
+            marionette = _open_marionette(profile)
             warm = _reports(marionette)
             # A warm session MOVES the file it found to `scriptCache-current.bin` when it opens the cache (`ScriptPreloader::OpenCache`) and maps that
             # one; `scriptCache.bin` is there again only once this session has written a cache of its own (about 3 s after the startup, and only if

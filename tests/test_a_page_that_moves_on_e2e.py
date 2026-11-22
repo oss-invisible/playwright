@@ -48,13 +48,30 @@ from __future__ import annotations
 
 import http.server
 import threading
+import time
+import types
 
 import pytest
+import _moving_page
 from _moving_page import _goto, _landing, forget
+
+from _evidence_on_failure import FailureEvidence
 
 pytestmark = pytest.mark.e2e
 
 ROUNDS = 5
+
+
+#: What the client heard, for the evidence a failing test leaves (`FailureEvidence`; it only listens and changes no wait or assertion).
+_CLIENT_LOG: list = []
+
+
+def _note(what: str, **fields) -> None:
+    """One line of the client's own view of the module: what the test sent or heard, on the clocks of the evidence (`t` wall, `m` perf_counter)."""
+    _CLIENT_LOG.append({"t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "what": what, **fields})
+
+
+_moving_page.note = _note
 
 
 def _replace_after_load(ms: int, cross_site: bool) -> bytes:
@@ -116,12 +133,18 @@ for _name, _held in (("0", False), ("50", True)):
 HELD_DOCUMENTS = {"/hdr": _replace_while_the_document_is_held(False), "/hdx": _replace_while_the_document_is_held(True)}
 
 
+#: The test server's own record of every request it served, in the shape `FailureEvidence.watch_server` reads (`.state.lock`, `.state.records`).
+RECORD = types.SimpleNamespace(lock=threading.Lock(), records=[])
+
+
 @pytest.fixture(scope="module")
 def site():
     release = threading.Event()
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            with RECORD.lock:
+                RECORD.records.append({"t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "method": "GET", "path": self.path})
             if self.path.split("?")[0] == "/hold":
                 # a response that has begun and does not end: 16 KiB so the first chunk is delivered at once,
                 # then it stays open until the page that asked for it moves away (or the module's teardown)
@@ -171,7 +194,38 @@ def site():
 
 
 @pytest.fixture(scope="module")
-def _browser(firefox_binary):
+def evidence():
+    """What a failing test of this module leaves for a reader (only on a failure; nothing is changed in what the tests wait for or assert):
+    the client's view of every request and navigation, the Juggler wire, the engine's own trace, the record of the test server.
+    Armed before the browser is launched (the engine reads its trace folder at launch) and held for the module."""
+    held = FailureEvidence("a-page-that-moves-on")
+    held.client_log = _CLIENT_LOG
+    held.watch_server(types.SimpleNamespace(state=RECORD))
+    held.arm()
+    try:
+        yield held
+    finally:
+        held.__exit__(None, None, None)
+
+
+class _on_failure:
+    """``with _on_failure(evidence):`` around the body of a test: when the body raises, the evidence held for the module is saved
+    (the folder the e2e jobs upload), and the exception goes on."""
+
+    def __init__(self, held):
+        self.held = held
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.held._save(exc_type, exc)
+        return False
+
+
+@pytest.fixture(scope="module")
+def _browser(firefox_binary, evidence):
     from invisible_playwright import InvisiblePlaywright
 
     with InvisiblePlaywright(seed=4321, binary_path=firefox_binary,
@@ -184,6 +238,12 @@ def page(_browser):
     """A page of its own for each test, closed at its end: a page that is still moving when its test ends (`goto` raised for the page before,
     and ours went on) cannot reach the next test."""
     page = _browser.new_page()
+    page.on("request", lambda r: _note("request", url=r.url, navigation=r.is_navigation_request()))
+    page.on("requestfinished", lambda r: _note("requestfinished", url=r.url))
+    page.on("requestfailed", lambda r: _note("requestfailed", url=r.url, failure=str(r.failure)))
+    page.on("framenavigated", lambda f: _note("framenavigated", url=f.url, main=f.parent_frame is None))
+    page.on("domcontentloaded", lambda p: _note("domcontentloaded", url=p.url))
+    page.on("load", lambda p: _note("load", url=p.url))
     try:
         yield page
     finally:
@@ -193,7 +253,12 @@ def page(_browser):
 
 @pytest.mark.parametrize("path", ["/head", "/r0", "/r50", "/r300",
                                   "/x0", "/x50", "/x300"])
-def test_a_read_right_after_goto_answers(page, site, path, engine_reaches):
+def test_a_read_right_after_goto_answers(page, site, path, engine_reaches, evidence):
+    with _on_failure(evidence):
+        _a_read_right_after_goto_answers(page, site, path, engine_reaches)
+
+
+def _a_read_right_after_goto_answers(page, site, path, engine_reaches):
     older = not engine_reaches("firefox-68")
     for i in range(ROUNDS):
         _goto(page, "%s%s?i=%s-%d" % (site, path, path[1:], i), the_page_before_may_move=True,

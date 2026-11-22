@@ -82,8 +82,9 @@ def site():
     srv.server_close()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def browser(firefox_binary):
+    # One browser per case: a crash in one case reddens that case only, not the ones after it.
     from invisible_playwright import InvisiblePlaywright
 
     with InvisiblePlaywright(seed=4321, binary_path=firefox_binary,

@@ -7,6 +7,11 @@ the client's view of every request); when the body raises (an assertion included
 body passes, it deletes it all. Off a runner (no ``RUNNER_TEMP``) nothing is copied. It changes no assertion, wait or deadline of the
 test: it only listens.
 
+A test that passed slowly may keep the evidence too: ``evidence.keep(why)`` saves what the helper holds at that moment (the same folder, a
+``meta.json`` whose ``kept`` says why, judged after the fact and never a verdict). ``arm(moz_log=...)`` also starts the engine's own log
+(``MOZ_LOG``, its file in the evidence), and ``note_records(name, state)`` adds a record the test keeps itself (``state.lock``,
+``state.records``) as ``<name>.jsonl``.
+
 The times written: ``t``, wall-clock seconds since the epoch (``time.time()``; the engine's own trace writes milliseconds in ``t``, its
 ``performance.timeOrigin + now``, also since the epoch), and ``m``, ``time.perf_counter()`` of the test process, finer on Windows (whose wall
 clock ticks every 15 ms) and shared by the fake web's record, the client's log and the Juggler wire.
@@ -31,6 +36,8 @@ EVIDENCE_FOLDER = "invpw-evidence"
 WIRE_LIMIT = 4000
 #: The engine's trace: the variable `Trace.js` of the engine reads in the parent process (off without it).
 TRACE_ENV = "INVISIBLE_JUGGLER_TRACE_DIR"
+#: The base name of the engine's log file in the evidence (``MOZ_LOG_FILE``; the engine adds a suffix per process).
+MOZ_LOG_BASE = "engine"
 
 
 class FailureEvidence:
@@ -39,6 +46,9 @@ class FailureEvidence:
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="invpw-failure-evidence-"))
         self.trace_dir = self.work / "juggler-engine-trace"
         self.wire_path = self.work / "juggler-wire.jsonl"
+        self.moz_log_dir = self.work / "moz-log"
+        #: The records the test keeps itself, by name (``note_records``).
+        self.records = {}
         #: What the client heard of each request (a list ``profile_p2.drive(client_log=...)`` fills).
         self.client_log = []
         #: The cells of the run, once it has returned (``note_cells``).
@@ -57,12 +67,21 @@ class FailureEvidence:
     def note_cells(self, cells) -> None:
         self.cells = cells
 
-    def arm(self) -> None:
+    def note_records(self, name: str, state) -> None:
+        """A record the test keeps itself (``state.lock``, ``state.records``: a list of dicts), saved as ``<name>.jsonl``."""
+        self.records[name] = state
+
+    def arm(self, moz_log: str = "") -> None:
         """Before the browser under test is launched: the engine writes its trace, and the Juggler wire of this process is logged.
-        Armed after the other processes of the test were started, so that they do not inherit the variable."""
+        Armed after the other processes of the test were started, so that they do not inherit the variable. ``moz_log``, a value of
+        ``MOZ_LOG`` (modules and levels), also starts the engine's own log into the evidence (a diagnostic no page reads: the core passes it)."""
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self._patch = pytest.MonkeyPatch()
         self._patch.setenv(TRACE_ENV, str(self.trace_dir))
+        if moz_log:
+            self.moz_log_dir.mkdir(parents=True, exist_ok=True)
+            self._patch.setenv("MOZ_LOG", moz_log)
+            self._patch.setenv("MOZ_LOG_FILE", str(self.moz_log_dir / MOZ_LOG_BASE))
         self._wire = open(self.wire_path, "w", encoding="utf-8")
         try:
             from invisible_core.juggler import connection
@@ -106,6 +125,14 @@ class FailureEvidence:
             pass
 
     # ---- the end ---------------------------------------------------------------------------------------------------------
+    def keep(self, why: str) -> None:
+        """Saves what the helper holds now, though the test has not failed: a run judged after the fact as one to read (a step slower
+        than any healthy run). Not a verdict: nothing is raised and the test goes on. Never raises."""
+        try:
+            self._save(None, None, kept=why)
+        except Exception as problem:
+            sys.stderr.write("evidence: could not be kept: %r\n" % (problem,))
+
     def __enter__(self) -> "FailureEvidence":
         return self
 
@@ -125,7 +152,7 @@ class FailureEvidence:
             shutil.rmtree(self.work, ignore_errors=True)
         return False
 
-    def _save(self, exc_type, exc) -> None:
+    def _save(self, exc_type, exc, kept: str = "") -> None:
         base = os.environ.get("RUNNER_TEMP")
         if not base:
             return
@@ -136,17 +163,27 @@ class FailureEvidence:
             with state.lock:
                 records = list(state.records)
             self._jsonl(target / "fakeweb-server-record.jsonl", records)
-        self._jsonl(target / "client-request-log.jsonl", self.client_log)
+        for name, state in self.records.items():
+            with state.lock:
+                records = list(state.records)
+            self._jsonl(target / ("%s.jsonl" % name), records)
+        self._jsonl(target / "client-request-log.jsonl", list(self.client_log))
         if self.cells is not None:
             (target / "cells.json").write_text(json.dumps(self.cells, indent=1, default=str), encoding="utf-8")
         if self.wire_path.exists():
             shutil.copyfile(self.wire_path, target / "juggler-wire.jsonl")
         if self.trace_dir.exists():
             shutil.copytree(self.trace_dir, target / "juggler-engine-trace", dirs_exist_ok=True)
-        meta = {"test": self.name, "failure": "%s: %s" % (exc_type.__name__, str(exc)[:1500]), "platform": sys.platform,
+        if self.moz_log_dir.exists():
+            shutil.copytree(self.moz_log_dir, target / "moz-log", dirs_exist_ok=True)
+        meta = {"test": self.name, "platform": sys.platform,
                 "machine": platform.machine(), "python": platform.python_version(), "saved_at": round(time.time(), 4),
                 "times": "t: wall-clock seconds since the epoch (the engine's trace: milliseconds, in t); m: time.perf_counter() of the test process, the scale shared by the server record, the client log and the wire",
                 "files": sorted(p.name for p in target.iterdir())}
+        if exc_type is not None:
+            meta["failure"] = "%s: %s" % (exc_type.__name__, str(exc)[:1500])
+        if kept:
+            meta["kept"] = kept
         (target / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
         self.saved_to = target
 

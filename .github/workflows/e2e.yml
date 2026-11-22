@@ -324,6 +324,11 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     # `run:` blocks are PowerShell on Windows unless said otherwise (e2e-hunt.yml had a ParserError on its first launch there).
     defaults:
       run:
@@ -362,6 +367,11 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 40
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     strategy:
       fail-fast: false
       matrix:

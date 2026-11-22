@@ -12,6 +12,11 @@ def _landing(url: str) -> str:
 _SENT: dict = {}
 
 
+#: An optional hook for the evidence a failing test leaves: called as ``note(what, **fields)`` where `_goto` sends, hears the answer and hears the error.
+#: The test module sets it; it only listens and changes no wait or assertion.
+note = None
+
+
 def forget(page) -> None:
     _SENT.pop(id(page), None)
 
@@ -38,10 +43,16 @@ def _goto(page, url, *, the_page_before_may_move, our_page_may_stop_ours, **kwar
     from invisible_playwright.sync_api import Error
 
     before = _SENT.get(id(page), frozenset()) if the_page_before_may_move else frozenset()
+    if note:
+        note("goto", url=url, before=sorted(before))
     try:
         page.goto(url, **kwargs)
+        if note:
+            note("goto-answered", url=url)
     except Error as e:
         text = str(e)
+        if note:
+            note("goto-raised", url=url, error=text[:300])
         if "NS_BINDING_ABORTED" in text:
             ends = tuple(_landing(u) for u in sorted(before | ({url} if our_page_may_stop_ours else frozenset())))
             assert ends, e

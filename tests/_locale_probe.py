@@ -3,7 +3,8 @@
 * ``serve(routes)``: a local HTTP server on a port the OS gives, answering a table of paths (the query is ignored), each with its bytes, its type
   and, if the test needs them, extra headers. Nothing leaves the machine.
 * ``open_chrome(port)`` / ``chrome(...)`` / ``set_pref(...)``: the engine's own chrome scope through Marionette, for what no protocol command of
-  the wrapper does: writing ``intl.accept_languages`` while a session runs.
+  the wrapper does: writing ``intl.accept_languages`` while a session runs, and ``content_process_prefs(...)``: what a pref holds in the
+  content process of each tab asked for (the proof that a process has taken a change, read from the process itself).
 * ``read_in_page_realm(page, body)``: runs ``body`` as an inline ``<script>`` of the page, so in the page's own realm, and returns what it
   wrote into the DOM. ``page.evaluate`` is not the page's realm on this engine; an inline script is what a site runs.
 * the measuring scripts of the canvas tests (``MEASURE_JS``): the width of a few strings as a canvas of one language group draws them.
@@ -74,6 +75,7 @@ def open_chrome(port: int):
     """A Marionette session in chrome scope on the engine that listens on ``port``."""
     marionette = webfont_probe._Marionette(port)
     marionette.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {}}})
+    marionette.call("WebDriver:SetTimeouts", {"script": 240000})
     marionette.call("Marionette:SetContext", {"value": "chrome"})
     return marionette
 
@@ -92,6 +94,52 @@ return JSON.stringify(Services.prefs.getStringPref(name));
 
 def set_pref(marionette, name: str, value: str) -> str:
     return chrome(marionette, SET_STRING_PREF_JS, name, value)
+
+
+#: What the content process of each tab holds for a pref, read in that process. ``arguments``: the pref's name and the labels of the tabs; a tab is
+#: found by its address ending in ``?<label>``. A process script (``Services.ppmm.loadProcessScript``, a data: URL, only the processes that exist)
+#: runs in every process and sends back its pid and the value ``Services.prefs`` of THAT process gives; the answer comes when each tab's process
+#: has answered. The parent sends a pref change to a content process before this message on the same channel, and the process applies it
+#: (and runs its observers) before it runs the script, so a process that answers has handled the change.
+PROCESS_PREFS_JS = """
+const [name, labels] = arguments;
+const done = arguments[arguments.length - 1];
+const wanted = {};
+for (const win of Services.wm.getEnumerator('navigator:browser')) {
+  for (const tab of win.gBrowser.tabs) {
+    const spec = tab.linkedBrowser.currentURI.spec;
+    const wg = tab.linkedBrowser.browsingContext && tab.linkedBrowser.browsingContext.currentWindowGlobal;
+    for (const label of labels) {
+      if (spec.endsWith('?' + label) && wg && wg.domProcess) { wanted[label] = wg.domProcess.osPid; }
+    }
+  }
+}
+const missing = labels.filter((label) => !(label in wanted));
+if (missing.length) { done(JSON.stringify({missing})); return; }
+const KEY = 'invisible-probe:pref';
+const answers = {};
+const listener = {
+  receiveMessage(message) {
+    answers[message.data.pid] = message.data.value;
+    if (Object.values(wanted).every((pid) => pid in answers)) {
+      Services.ppmm.removeMessageListener(KEY, listener);
+      const prefs = {};
+      for (const [label, pid] of Object.entries(wanted)) { prefs[label] = answers[pid]; }
+      done(JSON.stringify({pids: wanted, prefs}));
+    }
+  },
+};
+Services.ppmm.addMessageListener(KEY, listener);
+const body = 'sendAsyncMessage(' + JSON.stringify(KEY) + ', {pid: Services.appinfo.processID, value: Services.prefs.getStringPref(' + JSON.stringify(name) + ', "")});';
+Services.ppmm.loadProcessScript('data:,' + encodeURIComponent(body), false);
+"""
+
+
+def content_process_prefs(marionette, name: str, labels) -> Dict[str, Any]:
+    """``{"pids": {label: pid}, "prefs": {label: value}}``: what pref ``name`` holds in the content process of each tab whose address ends with
+    ``?<label>`` (or ``{"missing": [labels]}`` when a tab is not there)."""
+    answer = marionette.call("WebDriver:ExecuteAsyncScript", {"script": PROCESS_PREFS_JS, "args": [name, list(labels)]})
+    return json.loads(answer["value"])
 
 
 # -------------------------------------------------------------------------------------------------------------------- the page realm
