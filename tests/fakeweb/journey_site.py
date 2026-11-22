@@ -156,10 +156,10 @@ addEventListener('pagehide', () => {
 # Page that stays "not idle" on purpose: its held request is released when the walk reaches this step.
 PARK_PAGES = {"category": 9}
 # Same with a keepalive fetch (a request the client must still count as in flight): the search page, until step 13.
-# The fetch starts from a task after `load`, never while the page is parsed: the engine announces a request at once, but the
-# commit of the document waits for the engine's handshake, so a request started during parsing can be announced before the
-# commit and the client drops it at the commit (the reference Juggler does the same). The step tests the rule "an open
-# keepalive holds networkidle", not that race.
+# Both held fetches start from a task after `load`, never while the page is parsed: the engine announces a request at once, but
+# the commit of the document waits for the engine's handshake, so a request started during parsing can be announced before the
+# commit and the client drops it at the commit (the reference Juggler does the same). The steps test the rule "an open request
+# holds networkidle", not that race.
 PARK_KEEPALIVE_PAGES = {"search": 13}
 
 
@@ -168,7 +168,7 @@ def noise_script(ctx, park_until=None, park_keepalive_until=None):
         return ""
     js = DET_JS
     if park_until:
-        js += "\nget(A + '/hold?id=park' + tok + '&until=%d');\n" % park_until
+        js += "\nafterLoad(0, () => get(A + '/hold?id=park' + tok + '&until=%d'));\n" % park_until
     if park_keepalive_until:
         js += ("\nafterLoad(0, () => fetch(A + '/hold?id=kapark' + tok + '&until=%d', {keepalive: true}).catch(noop));\n"
                % park_keepalive_until)
