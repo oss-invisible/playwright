@@ -1553,8 +1553,8 @@ def test_a_class_that_only_one_side_reaches_or_another_port_or_another_kind_is_r
     assert {d["leaf"] for d in judge(a, with_net_entries(footprint("again"), []), a_a=True)["differences"]} == {"net.parent: connect tcp public:443"}
 
 
-INV = ["c:\\programdata\\microsoft\\windows\\start menu\\programs\\desktop.ini", "c:\\users\\public\\desktop\\desktop.ini",
-       "c:\\users\\runneradmin\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
+INV = ["c:\\programdata\\microsoft\\windows\\start menu\\programs\\desktop.ini", "d:\\users\\public\\desktop\\desktop.ini",
+       "d:\\lab\\runner\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\user pinned\\taskbar\\nightly.lnk",
        "c:\\windows\\system32\\windows.fileexplorer.common.dll", "c:\\windows\\system32\\en-us\\urlmon.dll.mui"]
 
 
