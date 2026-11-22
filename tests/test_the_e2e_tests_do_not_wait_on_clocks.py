@@ -149,7 +149,7 @@ def test_a_limit_that_is_a_named_variable_or_has_a_slack_added_is_refused_and_a_
     assert rules_of(fake("def test_x(took, limit_s):\n    assert took < limit_s\n")) == ["bound"], "a limit is a limit when it is not written in capitals"
     assert rules_of(fake("def test_x(elapsed, max_ms):\n    assert elapsed <= max_ms\n")) == ["bound"]
     assert rules_of(fake("def test_x(limit_s, took):\n    assert limit_s > took\n")) == ["bound"]
-    assert rules_of(fake("def test_x(wait, rtt_ms):\n    assert wait < rtt_ms + 250\n")) == ["bound"], "an absolute slack added to a measure is an absolute limit"
+    assert rules_of(fake("def test_x(wait, expected_ms):\n    assert wait < expected_ms + 250\n")) == ["bound"], "an absolute slack added to a measure is an absolute limit"
     assert rules_of(fake("def test_x(took, control):\n    assert took <= control + 0.5\n")) == ["bound"]
     assert rules_of(fake("def test_x(res):\n    assert res['opened'] < 3000\n")) == ["bound"], "the time a connection took to open is a duration"
     assert rules_of(fake("def test_x(took, control):\n    assert took <= control * 3\n")) == [], "a factor of a measure of the same run is relative"
@@ -350,7 +350,8 @@ def test_a_file_with_every_violation_is_red_and_one_that_waits_on_conditions_is_
         "    page.click('#go', timeout=5000)\n"
         "    time.sleep(1)\n"
         "    assert took < 3\n"
-        "    assert len(pids) == 2\n")
+        "    assert len(pids) == 2\n"
+        "    coherent(rtt_ms=250)\n")
     assert rules_of(bad) == sorted(set(clocks.RULES) - {"egress"})
     good = fake(
         "import time\n"
