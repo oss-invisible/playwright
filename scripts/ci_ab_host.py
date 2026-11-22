@@ -15,6 +15,15 @@ Two things are compared, over the whole trace:
   * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. The SET of host
     paths must be identical, no exception. `ours` leaves the comparison as a class (OURS below: reading its own package is not touching the host).
 
+The trace is of the TREE of the launch only: what a process outside it does (on Windows a service, the antivirus) is not the engine's, so it is left out of
+the comparison and the report says how many paths each outside process name touched (`OUTSIDE THE TREE`). A path or a kind that differs names the processes
+to blame (`by A: ... | B: ...`: who touched the path, who spawned the kind).
+
+Each engine run starts with a discarded WARM-UP launch (the first seed), an experiment control and not an excuse: its trace is kept in the footprint and the
+report lists what only the warm-up did (`WARMUP-ONLY`, per kind and per path, with the process that did it), so that a first-launch-only behaviour (a
+helper spawned at the first shutdown of a cold machine) stays visible from run to run. The measured launches are compared as they are: a kind or a count that differs
+after the warm-up is red.
+
 How the trace is taken:
 
   * Linux: `strace -f -y` of the whole tree (the stand-in of tests/_strace_stand_in.py), calls execve, clone, fork, prctl and the file calls
@@ -282,11 +291,8 @@ def _unescape(text: str) -> str:
     return codecs.escape_decode(text.encode("latin-1", errors="replace"))[0].decode("utf-8", errors="replace")
 
 
-def touched_paths(lines) -> set:
-    """Every path a strace log (read as lines) says a process of the tree touched, failed attempts included: opening, stat, access, readlink,
-    execve. A path relative to a directory descriptor is joined to the path `-y` printed for it, one relative to the working directory is
-    spelled `<cwd>/...`, an empty path (the descriptor itself) is not a path."""
-    found = set()
+def _path_calls(lines):
+    """(pid, base, raw path) of every call of a strace log that names a path: `base` is what a relative path is relative to."""
     for line in lines:
         m = _LINE.match(line)
         if not m:
@@ -302,12 +308,63 @@ def touched_paths(lines) -> set:
         else:
             continue
         if raw:
-            found.add((base, raw))
-    out = set()
-    for base, raw in found:
-        path = _unescape(raw)
-        out.add(path if path.startswith("/") else _unescape(base).rstrip("/") + "/" + path)
+            yield int(m.group(1)), base, raw
+
+
+def _joined(base: str, raw: str) -> str:
+    path = _unescape(raw)
+    return path if path.startswith("/") else _unescape(base).rstrip("/") + "/" + path
+
+
+def touched_paths(lines) -> set:
+    """Every path a strace log (read as lines) says a process of the tree touched, failed attempts included: opening, stat, access, readlink,
+    execve. A path relative to a directory descriptor is joined to the path `-y` printed for it, one relative to the working directory is
+    spelled `<cwd>/...`, an empty path (the descriptor itself) is not a path."""
+    return {_joined(base, raw) for _pid, base, raw in _path_calls(lines)}
+
+
+def touched_by_pid(lines) -> dict:
+    """{path: {pids that touched it}} of a strace log: `touched_paths` with the process (or thread) that did it."""
+    out: dict = {}
+    for pid, base, raw in set(_path_calls(lines)):
+        out.setdefault(_joined(base, raw), set()).add(pid)
     return out
+
+
+def thread_owners(lines) -> dict:
+    """{tid: pid of the process it belongs to} from the clones with CLONE_THREAD of a strace log (a thread's calls are logged under its tid)."""
+    owners: dict = {}
+    pending: dict = {}
+    for line in lines:
+        m = _LINE.match(line)
+        if m:
+            pid, call, rest = int(m.group(1)), m.group(2), m.group(3)
+            if call in ("clone", "clone3"):
+                flags = _FLAGS.search(rest)
+                is_thread = bool(flags and "CLONE_THREAD" in flags.group(1)) or ("CLONE_THREAD" in rest)
+                if "<unfinished ...>" in rest:
+                    pending[pid] = is_thread
+                else:
+                    r = _RESULT.search(rest)
+                    if is_thread and r and int(r.group(1)) > 0:
+                        owners[int(r.group(1))] = pid
+            continue
+        m = _RESUMED.match(line)
+        if m and m.group(2) in ("clone", "clone3"):
+            pid = int(m.group(1))
+            r = _RESULT.search(m.group(3))
+            if pending.pop(pid, False) and r and int(r.group(1)) > 0:
+                owners[int(r.group(1))] = pid
+    return owners
+
+
+def owner_of(pid: int, owners: dict) -> int:
+    """The process a tid belongs to (itself when it is not a known thread)."""
+    seen = set()
+    while pid in owners and pid not in seen:
+        seen.add(pid)
+        pid = owners[pid]
+    return pid
 
 
 def spawned_processes(lines, real: str) -> dict:
@@ -383,6 +440,25 @@ def spawned_processes(lines, real: str) -> dict:
     for pid in procs:
         procs[pid]["label"] = label(pid)
     return procs
+
+
+def by_kind(pairs, label_of, ctx: Context) -> dict:
+    """{host path: sorted kinds of the processes that touched it} of `(pid, raw path)` pairs, `label_of(pid)` naming the process. Evidence: the cause
+    of a path that differs, or that is only in the warm-up."""
+    out: dict = {}
+    for pid, raw in pairs:
+        got = classify(raw, ctx)
+        if got and got[0] == "host":
+            out.setdefault(got[1], set()).add(label_of(pid))
+    return {path: sorted(kinds) for path, kinds in sorted(out.items())}
+
+
+def spawners(labels: dict, parents: dict) -> dict:
+    """{kind: sorted kinds of the processes that spawned it} from {pid: kind} and {pid: parent pid}: the process that is to blame for a kind."""
+    out: dict = {}
+    for pid, label in labels.items():
+        out.setdefault(label, set()).add(labels.get(parents.get(pid), "(oracle)"))
+    return {kind: sorted(v) for kind, v in sorted(out.items())}
 
 
 def spawned_counts(procs: dict) -> dict:
@@ -489,9 +565,9 @@ def windows_processes(tree, real: str) -> dict:
     return out
 
 
-def etw_files(path, pids) -> tuple:
-    """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids`. Read as a stream: the file
-    has every open of the machine for the length of the run."""
+def etw_files(path, pids=None) -> tuple:
+    """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
+    stream: the file has every open of the machine for the length of the run."""
     seen, events = set(), 0
     for _ev, el in ET.iterparse(path, events=("end",)):
         if el.tag.rsplit("}", 1)[-1] != "Event":
@@ -505,7 +581,7 @@ def etw_files(path, pids) -> tuple:
                 pid = _number(raw) if raw else None
             elif tag == "Data" and child.get("Name") == "FileName":
                 name = child.text
-        if name and pid in pids:
+        if name and pid is not None and (pids is None or pid in pids):
             seen.add((pid, name))
         el.clear()
     return seen, events
@@ -544,6 +620,7 @@ class WindowsTrace:
         self.first_record = 0
         self.before = None
         self.session = False
+        self.images: dict = {}
 
     def _canary(self, which: str) -> str:
         """A file of the oracle's own, written and read now: the session must have a Create event of it."""
@@ -579,22 +656,39 @@ class WindowsTrace:
 
     def tree(self, roots) -> list:
         xml = _tool(["wevtutil", "qe", "Security", "/q:*[System[(EventID=4688) and (EventRecordID>%d)]]" % self.first_record, "/f:xml"])
-        return process_tree(parse_audit_events(xml), roots)
+        events = parse_audit_events(xml)
+        self.images = {e["pid"]: _base(e["image"]).lower() for e in events}
+        return process_tree(events, roots)
 
-    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic) -> dict:
-        """`{"tree": [4688 events], "files": {(pid, name)}, "exited": {...}, "events": n}`: what the tree did from its first process to its last."""
+    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None) -> dict:
+        """`{"tree": [4688 events], "files": {(pid, name)}, "outside": {process name: paths}, "exited": {...}, "events": n}`: what the TREE did from its
+        first process to its last (the ancestry by the creator's pid from the launched process). What a process outside the tree opened (a service, the
+        antivirus, the oracle itself apart) is not the engine's: it is counted by process name and left out of the comparison."""
         if alive is None:
             import psutil
 
             alive = psutil.pid_exists
+        if namer is None:
+            def namer(pid):
+                try:
+                    import psutil
+
+                    return psutil.Process(pid).name().lower()
+                except Exception:  # noqa: BLE001 - a process that is gone has no name
+                    return "pid %d" % pid
         tree, exited = wait_exited(lambda: self.tree(roots), alive, sleep=sleep, now=now)
         end_canary = self._canary("end")
         _tool(["logman", "stop", self.name, "-ets"])
         self.session = False
         summary = self.work / "files.txt"
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
-        pids = {e["pid"] for e in tree} | {os.getpid()}
-        seen, events = etw_files(self.xml, pids)
+        everything, events = etw_files(self.xml)
+        tree_pids = {e["pid"] for e in tree}
+        seen = {(p, n) for p, n in everything if p in tree_pids or p == os.getpid()}
+        outside: dict = {}
+        for p, n in everything:
+            if p not in tree_pids and p != os.getpid():
+                outside.setdefault(self.images.get(p) or namer(p), set()).add(n)
         problems = []
         mine = {name for pid, name in seen if pid == os.getpid()}
         for label, canary in (("last start", self._start_canary), ("end", end_canary)):
@@ -603,11 +697,11 @@ class WindowsTrace:
         lost = re.search(r"(?i)events?\s+lost\D{0,20}(\d+)", summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else "")
         if lost and int(lost.group(1)):
             problems.append("the file trace lost %s events" % lost.group(1))
-        tree_pids = {e["pid"] for e in tree}
         missing = sorted(tree_pids - {pid for pid, _n in seen})
         if missing:
             problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
-        return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "exited": exited, "events": events, "problems": problems}
+        return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
+                "exited": exited, "events": events, "problems": problems}
 
     def cleanup(self) -> None:
         """Put the machine back: the session closed, the audit as it was."""
@@ -723,6 +817,37 @@ def _declared_covers(entry: dict, diff: dict) -> bool:
     return (published != MISSING and published >= 1) and candidate == MISSING
 
 
+def warmup_only(fp: dict) -> dict | None:
+    """What the discarded warm-up launch of an engine did that its measured launch of the same seed did not (a first-launch-only behaviour, which stays
+    visible run to run): the kinds that are in the warm-up and not in the measured launch, or more of them (not for the tab kinds, whose count
+    is the idle time's), and the host paths only the warm-up touched, each with the process that did it. None for a footprint with no warm-up."""
+    w = fp.get("warmup")
+    if not w:
+        return None
+    m = next((s for s in fp.get("seeds", []) if s["seed"] == w["seed"]), None)
+    if m is None:
+        return {"seed": w["seed"], "kinds": [], "files": [], "measured": False}
+    kinds = []
+    for kind, n in sorted(w.get("kinds", {}).items()):
+        measured = m.get("kinds", {}).get(kind, 0)
+        if measured == 0 or (n > measured and not is_tab(kind)):
+            kinds.append({"kind": kind, "warmup": n, "measured": measured, "spawned_by": w.get("spawned_by", {}).get(kind, [])})
+    measured_files = set(m.get("files", []))
+    files = [{"path": path, "touched_by": w.get("touched_by", {}).get(path, [])} for path in w.get("files", []) if path not in measured_files]
+    return {"seed": w["seed"], "kinds": kinds, "files": files, "measured": True}
+
+
+def _by_text(d: dict) -> str:
+    by = d.get("by") or {}
+    return " (by A: %s | B: %s)" % (", ".join(by.get("A", [])) or "-", ", ".join(by.get("B", [])) or "-") if by.get("A") or by.get("B") else ""
+
+
+def _by(seed_footprint: dict, leaf: str) -> list:
+    """The processes to blame for a leaf in a seed's footprint: who touched a path, who spawned a kind."""
+    category, _dot, name = leaf.partition(".")
+    return list(seed_footprint.get("touched_by" if category == "file" else "spawned_by", {}).get(name, []))
+
+
 def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, platform: str | None = None,
           floors: dict | None = None) -> dict:
     """The verdict on two footprints (the document `run` writes). `expected` is the declared differences, applied only when `a_a` is false.
@@ -756,7 +881,8 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
         for leaf in sorted(set(la) | set(lb)):
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
             if va != vb:
-                differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb)})
+                differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb),
+                                    "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)}})
     stale = []
     if not a_a:
         for entry in expected or []:
@@ -771,22 +897,40 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                 differences.remove(d)
                 declared.append(dict(d, id=entry.get("id")))
     for d in differences:
-        problems.append("seed %s %s: A %s | B %s" % (d["seed"], d["leaf"], json.dumps(d["a"], sort_keys=True)[:160],
-                                                     json.dumps(d["b"], sort_keys=True)[:160]))
+        problems.append("seed %s %s: A %s | B %s%s" % (d["seed"], d["leaf"], json.dumps(d["a"], sort_keys=True)[:160],
+                                                       json.dumps(d["b"], sort_keys=True)[:160], _by_text(d)))
     tab = {str(seed): {"A": {k: n for k, n in seeds_a[seed].get("kinds", {}).items() if is_tab(k)},
                        "B": {k: n for k, n in seeds_b[seed].get("kinds", {}).items() if is_tab(k)}}
            for seed in sorted(set(seeds_a) & set(seeds_b))}
+    outside = {side: {str(seed): seeds[seed]["outside_tree"] for seed in sorted(seeds) if seeds[seed].get("outside_tree")}
+               for side, seeds in (("A", seeds_a), ("B", seeds_b))}
+    warm = {"A": warmup_only(a), "B": warmup_only(b)}
+    both = None
+    if warm["A"] and warm["B"]:
+        both = {"kinds": sorted({k["kind"] for k in warm["A"]["kinds"]} & {k["kind"] for k in warm["B"]["kinds"]}),
+                "files": sorted({f["path"] for f in warm["A"]["files"]} & {f["path"] for f in warm["B"]["files"]})}
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
-            "stale": [e.get("id") for e in stale], "leaves": counts}
+            "outside_tree": outside, "warmup": dict(warm, both=both), "stale": [e.get("id") for e in stale], "leaves": counts}
 
 
 def print_report(report: dict, a_name: str, b_name: str) -> None:
     for seed, per in sorted(report["leaves"].items()):
         print("seed %s leaves: %s" % (seed, ", ".join("%s %d" % kv for kv in sorted(per.items()))))
     for d in report["differences"][:200]:
-        print("DIFF seed %s %s: %s %s | %s %s" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160],
-                                                  b_name, json.dumps(d["b"], sort_keys=True)[:160]))
+        print("DIFF seed %s %s: %s %s | %s %s%s" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160],
+                                                    b_name, json.dumps(d["b"], sort_keys=True)[:160], _by_text(d)))
+    for side, name in (("A", a_name), ("B", b_name)):
+        warm = (report.get("warmup") or {}).get(side)
+        if warm:
+            for k in warm["kinds"][:50]:
+                print("WARMUP-ONLY %s seed %s proc.%s: warm-up %s, measured %s (spawned by: %s)" % (
+                    name, warm["seed"], k["kind"], k["warmup"], k["measured"], ", ".join(k["spawned_by"]) or "-"))
+            for f in warm["files"][:100]:
+                print("WARMUP-ONLY %s seed %s file.%s (touched by: %s)" % (name, warm["seed"], f["path"], ", ".join(f["touched_by"]) or "-"))
+    for side, name in (("A", a_name), ("B", b_name)):
+        for seed, names in sorted(((report.get("outside_tree") or {}).get(side) or {}).items()):
+            print("OUTSIDE THE TREE (not compared) %s seed %s: %s" % (name, seed, ", ".join("%s %d paths" % kv for kv in sorted(names.items()))))
     for d in report["declared"]:
         print("DECLARED seed %s %s (%s)" % (d["seed"], d["leaf"], d["id"]))
     print("OURS (not compared): " + "; ".join("%s: %s" % kv for kv in sorted(report.get("ours", OURS).items())))
@@ -824,15 +968,15 @@ def _context(binary: str, windows: bool, work: Path) -> Context:
     return Context("linux", app=app, temp=temp, cache={os.environ.get("XDG_CACHE_HOME", "")})
 
 
-def run_seed(binary: str, seed: int, work: Path) -> dict:
-    """One browser, one journey, one close, one trace. Returns the seed's footprint."""
+def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dict:
+    """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own)."""
     from playwright.sync_api import sync_playwright
 
     from fakeweb import journey_site, profile_p4
     from invisible_playwright._juggler.remote import launch_server
 
     windows = sys.platform == "win32"
-    seed_work = work / ("seed%d" % seed)
+    seed_work = work / (name or "seed%d" % seed)
     seed_work.mkdir(parents=True)
     exe, log, pidfile, pgid = binary, seed_work / "strace.log", seed_work / "stand-in.pid", None
     trace = None
@@ -921,39 +1065,52 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     if windows:
         got = trace.finish({root_pid})
         procs = windows_processes(got["tree"], real)
-        raw = {name for _pid, name in got["files"]}
+        pairs = list(got["files"])
+        labels = {pid: p["label"] for pid, p in procs.items()}
+        parents = {e["pid"]: e["ppid"] for e in got["tree"]}
+        label_of = lambda pid: labels.get(pid, "?")  # noqa: E731
         info = {"source": "etw+audit", "events": got["events"], "exited": got["exited"]["exited"], "reads": got["exited"]["reads"]}
         problems = list(got["problems"])
         if not got["exited"]["exited"]:
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         detail = sorted(({"label": p["label"], "cmd": p["cmd"][:300]} for p in procs.values()), key=lambda d: (d["label"], d["cmd"]))
-        by = collections.defaultdict(set)
-        for pid, name in got["files"]:
-            c = classify(name, ctx)
-            if c and c[0] == "host" and pid in procs:
-                by[c[1]].add(procs[pid]["label"])
-        touched_by = {path: sorted(kinds) for path, kinds in sorted(by.items())}
+        outside = got["outside"]
     else:
-        touched_by = None
-        procs = spawned_processes(_read_lines(log), real)
-        raw = touched_paths(_read_lines(log))
-        info, problems = {"source": "strace", "exited": True}, []
+        lines = list(_read_lines(log))
+        procs = spawned_processes(lines, real)
+        owners = thread_owners(lines)
+        by_pid = touched_by_pid(lines)
+        pairs = [(pid, path) for path, pids in by_pid.items() for pid in pids]
+        labels = {pid: p["label"] for pid, p in procs.items()}
+        parents = {pid: owner_of(p["parent"], owners) for pid, p in procs.items() if p["parent"] is not None}
+        label_of = lambda pid: labels.get(owner_of(pid, owners), "?")  # noqa: E731
+        info, problems, outside = {"source": "strace", "exited": True}, [], {}  # strace follows our tree and nothing else
         detail = sorted(({"label": p["label"], "exec": (" ".join([os.path.basename(p["exec"][0])] + p["exec"][1][1:6]) if p["exec"] else None),
                           "name": p["name"]} for p in procs.values()), key=lambda d: (d["label"], d["exec"] or ""))
+    raw = {path for _pid, path in pairs}
     host, ours = classify_paths(raw, ctx)
     kinds = dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
     info.update({"processes": len(procs), "paths": len(raw)})
-    out = {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail}
-    if touched_by is not None:
-        out["touched_by"] = touched_by  # evidence, not compared: which kinds of process opened each host path
-    return out
+    # touched_by and spawned_by are evidence, never compared: the process to blame for a path or a kind that differs
+    return {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
+            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside}
 
 
 def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
-    """The footprint document of one engine: every seed's journey, one browser at a time."""
+    """The footprint document of one engine. A discarded WARM-UP launch first, of the first seed, then every seed's journey, one browser at a time.
+
+    The warm-up is a control of the experiment and not an excuse: what a machine does the first time it runs an engine (its files scanned, its caches
+    cold, a first-run behaviour of the engine) is in a launch that is not compared, whose trace is kept in the document (`warmup`) so that what it
+    did and the measured launch did not stays visible, run to run (`warmup_only`). The order is the same in every run: the warm-up of an engine, then its
+    measured launches; the runs of an A/A or an A/B follow one another."""
     work = Path(tempfile.mkdtemp(prefix="ab-host-"))
     problems, out_seeds = [], []
     try:
+        warm = run_seed(binary, seeds[0], work, name="warmup")
+        problems += ["warm-up: %s" % p for p in warm.get("problems", [])]
+        problems += ["warm-up: seed %d: step %d (%s) failed: %s" % (seeds[0], st["n"], st["name"], st.get("error")) for st in warm["steps"] if not st["ok"]]
+        print("warm-up (seed %d, discarded): %s; %d host paths" % (seeds[0], json.dumps(warm["kinds"], sort_keys=True), len(warm["files"])))
+        sys.stdout.flush()
         for seed in seeds:
             fp = run_seed(binary, seed, work)
             out_seeds.append(fp)
@@ -965,7 +1122,7 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
             sys.stdout.flush()
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "problems": problems,
+    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "problems": problems,
             "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
 
 

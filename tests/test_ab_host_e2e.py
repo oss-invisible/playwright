@@ -8,6 +8,9 @@ counts), and the set of host paths the tree touched, whatever is `ours` (its pac
 Linux: strace of the whole tree. Windows: the process-creation audit (event 4688, with the command line) and an ETW file trace (Kernel-File), which need an administrator, as the
 hosted runners are. One browser at a time.
 
+Each engine run starts with a discarded warm-up launch (the first seed): an experiment control whose trace is kept in the footprint and listed in the report (`WARMUP-ONLY`, with the
+process that did it), never an excuse. Only the tree of the launch is compared; what a process outside it opened on Windows is counted by process name and left out (`OUTSIDE THE TREE`).
+
 Two modes, chosen by the environment as the gate chooses it:
 
   * no candidate (the PR's e2e: INVPW_BINARY_PATH is the published engine, INVISIBLE_SEAL_FILE is not set): the A/A control, the engine twice, on the first two seeds of the

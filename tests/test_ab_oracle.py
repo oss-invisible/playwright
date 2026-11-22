@@ -599,18 +599,46 @@ def test_the_script_prints_one_variable_per_oracle_with_unix_line_ends_for_the_e
     assert pr.main([]) == 2
 
 
-def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_linux_job_and_the_windows_parts_and_the_e2e_tests_read_its_variables():
+def _job(text, name):
+    """The text of one job of e2e.yml, from its header to the next one."""
+    import re
+
+    start = text.index("\n  %s:\n" % name)
+    following = re.search(r"\n  [A-Za-z0-9_-]+:[ ]*\n", text[start + 1:])
+    return text[start:start + 1 + following.start()] if following else text[start:]
+
+
+def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
-    control_a, windows = text.index("\n  e2e-windows-control-a:\n"), text.index("\n  e2e-windows:\n")
-    legs = {"linux": text[text.index("\n  e2e:\n"):control_a], "control-a": text[control_a:windows], "windows": text[windows:]}
+    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows")}
     step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
             "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
             '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
-    assert step in legs["linux"] and step in legs["windows"] and step not in legs["control-a"], "the legs that run the oracles' tests, and only those"
-    for leg in ("linux", "windows"):
-        assert legs[leg].index("actions/setup-python") < legs[leg].index(step) < legs[leg].index("Fetch the published firefox binary")
-    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 2 and "uses:" not in step
+    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows"], "the jobs that run the oracles' tests, and only those"
+    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows"):
+        assert legs[name].index("actions/setup-python") < legs[name].index(step) < legs[name].index("Fetch the published firefox binary")
+    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 4 and "uses:" not in step
     for variable, source in (("AB_ORACLE_PR_SEEDS", "test_ab_oracle_e2e.py"), ("AB_NETWORK_PR_SEEDS", "test_ab_network_e2e.py"), ("AB_HOST_PR_SEEDS", "test_ab_host_e2e.py")):
         assert 'pr_seed_count("%s"' % variable in (root / "tests" / source).read_text(encoding="utf-8")
         assert variable in pr.ORACLES
+
+
+def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs_leave_its_file_out():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    network = "tests/test_ab_network_e2e.py"
+    linux, windows = _job(text, "e2e-network"), _job(text, "e2e-network-windows")
+    assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
+    for body in (linux, windows):
+        assert body.count(network) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 40" in body and "needs: core-on-index" in body
+        assert "      - name: Run the network oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
+    assert "xvfb-run -a" in linux
+    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
+    assert "OWN_JOB_FILES: " + network in shared_linux and "$ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES" in shared_linux
+    assert 'own_job = ["%s"]' % network in shared_windows and "f not in left_out and f not in own_job" in shared_windows
+    assert network not in _job(text, "e2e-windows-control-a")
+    # the budget of the test itself fits the job: 5 seeds, two engine runs, with its own setup
+    import test_ab_network_e2e as network_e2e
+
+    assert network_e2e.budget_s(5, 2) == 1800 and network_e2e.budget_s(5, 2) + 10 * 60 <= 40 * 60

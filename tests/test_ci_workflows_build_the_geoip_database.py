@@ -5,6 +5,7 @@ the database (scripts/ci_lab_geoip.py: the same bytes every run, no download) BE
 gets and is left as it is. publish.yml is the release: it runs the three checks on the REAL database (scripts/ci_real_geoip_check.py) before it uploads, and
 nothing else touches it.
 """
+import re
 from pathlib import Path
 
 import pytest
@@ -18,20 +19,25 @@ RUNS_PYTEST = {
     "tests.yml": "      - name: Run pytest\n",
     "e2e.yml": "      - name: Run the full e2e suite under a virtual display, without the root ones\n",
     "e2e.yml#windows": "      - name: Run this part of the e2e\n",
+    "e2e.yml#network": "      - name: Run the network oracle's A/A\n",
+    "e2e.yml#network-windows": "      - name: Run the network oracle's A/A\n",
 }
 
 
+JOBS = {"e2e.yml": "e2e", "e2e.yml#windows": "e2e-windows", "e2e.yml#control-a": "e2e-windows-control-a", "e2e.yml#network": "e2e-network",
+        "e2e.yml#network-windows": "e2e-network-windows"}
+
+
 def _scope(name):
-    """The text of one workflow, or of one leg of it: `e2e.yml` is its Linux job, `e2e.yml#windows` its Windows parts."""
-    file, _, leg = name.partition("#")
+    """The text of one workflow, or of one job of e2e.yml (`e2e.yml` is its Linux job, `#windows` its Windows parts, `#control-a` the Windows job of the keyboard
+    shortcut, `#network` and `#network-windows` the jobs of the network oracle): a job runs from its header to the next one."""
+    file, _, _leg = name.partition("#")
     text = (WORKFLOWS / file).read_text(encoding="utf-8")
     if file != "e2e.yml":
         return text
-    windows = text.index("\n  e2e-windows:\n")
-    if leg == "windows":
-        return text[windows:]
-    ends = [i for i in (text.find("\n  e2e-windows-control-a:\n"), windows) if i >= 0]
-    return text[:min(ends)]
+    start = text.index("\n  %s:\n" % JOBS[name])
+    following = re.search(r"\n  [A-Za-z0-9_-]+:[ ]*\n", text[start + 1:])
+    return text[start:start + 1 + following.start()] if following else text[start:]
 
 
 @pytest.mark.parametrize("name, pytest_step", sorted(RUNS_PYTEST.items()))

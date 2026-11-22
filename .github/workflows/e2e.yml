@@ -168,10 +168,12 @@ jobs:
           ROOT_FILES: tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py
           ROOT_NODES: tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick
           SANDBOX_FILES: tests/test_the_socket_process_is_sandboxed_e2e.py
+          # The network oracle's A/A has jobs of its own (e2e-network, e2e-network-windows below): five seeds of it do not fit in this job's 40 minutes.
+          OWN_JOB_FILES: tests/test_ab_network_e2e.py
         # The root ones are left out by name and run in the step below, as root: here, as the runner user, they errored. The sandbox one is left out
         # by name too and runs in its own step after them: it is red on a runner whose AppArmor refuses user namespaces to a normal user.
         run: |
-          IGNORE=(); for f in $ROOT_FILES $SANDBOX_FILES; do IGNORE+=("--ignore=$f"); done
+          IGNORE=(); for f in $ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES; do IGNORE+=("--ignore=$f"); done
           DESELECT=(); for n in $ROOT_NODES; do DESELECT+=("--deselect=$n"); done
           xvfb-run -a python -u scripts/run_e2e.py "$FF" "${IGNORE[@]}" "${DESELECT[@]}"
 
@@ -409,7 +411,8 @@ jobs:
           rows = json.load(open("ci/required-suites.json", encoding="utf-8"))
           left_out = [t for r in rows if r.get("linux_only") for t in r["tests"]]
           files = [l.strip() for l in open(os.path.join(tmp, "e2e_files.txt")) if l.strip()]
-          files = [f for f in files if f not in left_out]
+          own_job = ["tests/test_ab_network_e2e.py"]  # the network oracle's A/A: e2e-network-windows below
+          files = [f for f in files if f not in left_out and f not in own_job]
           mine = [f for i, f in enumerate(files) if i % 4 == part - 1]
           nodes = [t for t in left_out if "::" in t and t.split("::")[0] in mine]
           open(os.path.join(tmp, "e2e_args.txt"), "w").write("\n".join(mine + ["--deselect=" + n for n in nodes]) + "\n")
@@ -456,5 +459,142 @@ jobs:
         with:
           name: invpw-evidence-windows-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/invpw-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ``The network oracle``: the A/A of tests/test_ab_network_e2e.py (the P4 journey and the lab, the published engine against itself) on its own job, Linux and Windows,
+  # as its gate leg runs it. On a pull request that changes the oracle it visits all five seeds of the candidate set (scripts/ci_ab_pr_seeds.py), 30 minutes at most
+  # for the run (the test's own budget: 120 s to start and, for each of the two engine runs, 240 s for the first seed and 150 s for each next one; about 15 minutes on
+  # Linux and 19 on Windows expected), which would not fit in the shared job's 40 minutes next to everything else. The shared jobs leave this file out (OWN_JOB_FILES
+  # above, `own_job` in the Windows parts). The same setup as the shared jobs: the security state, the engine, the GeoIP database made by the repository.
+  e2e-network:
+    name: e2e (network, linux)
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: System deps (xvfb + Firefox runtime libs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        shell: bash
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the network oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_network_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/network-e2e.xml"
+          python - "$RUNNER_TEMP/network-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        shell: bash
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-network-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/network-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-network-windows:
+    name: e2e (network, windows)
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the network oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_network_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/network-e2e.xml"
+          python - "$RUNNER_TEMP/network-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-network-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/network-e2e.xml
           if-no-files-found: ignore
           retention-days: 14

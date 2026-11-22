@@ -704,3 +704,173 @@ def test_the_session_is_recording_when_the_last_start_canary_is_in_the_trace_eve
     trace, _fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start1", "start2", "end"))
     problems = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"]
     assert len(problems) == 1 and "last start canary" in problems[0]
+
+
+# -
+# The warm-up: a discarded launch of each engine before its measured ones, kept as evidence, never an excuse.
+
+def with_warmup(fp, kinds=None, files=None, touched_by=None, spawned_by=None, seed=11):
+    fp = copy.deepcopy(fp)
+    fp["warmup"] = {"seed": seed, "steps": [], "problems": [], "kinds": dict(KINDS if kinds is None else kinds), "files": list(FILES if files is None else files),
+                    "touched_by": touched_by or {}, "spawned_by": spawned_by or {}}
+    return fp
+
+
+def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_and_then_its_measured_ones(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_seed(binary, seed, work, name=None):
+        calls.append((seed, name))
+        return seed_footprint(seed)
+
+    monkeypatch.setattr(host, "run_seed", fake_run_seed)
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68")
+    assert calls == [(11, "warmup"), (11, None), (12, None)]
+    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["problems"] == []
+
+
+def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(monkeypatch):
+    def fake_run_seed(binary, seed, work, name=None):
+        fp = seed_footprint(seed)
+        if name == "warmup":
+            fp["problems"] = ["the file trace did not see the end canary file of the oracle"]
+            fp["steps"] = [{"n": 2, "name": "hover", "ok": False, "error": "timeout"}]
+        return fp
+
+    monkeypatch.setattr(host, "run_seed", fake_run_seed)
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    doc = host.run_engine("ff", "linux-x86_64", [11], "firefox-68")
+    assert doc["problems"] == ["warm-up: the file trace did not see the end canary file of the oracle", "warm-up: seed 11: step 2 (hover) failed: timeout"]
+    report = judge(dict(footprint(), problems=doc["problems"]), footprint(), a_a=True)
+    assert report["verdict"] == "red" and any("side A: warm-up: " in p for p in report["problems"])
+
+
+def test_the_runs_of_an_ab_follow_one_another_in_the_same_order_each_with_its_own_warm_up(tmp_path, monkeypatch):
+    runs = []
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub-binary", "pub-seal"))
+    monkeypatch.setattr(host, "run_subprocess", lambda exe, seal, leg, out, label, seeds: runs.append((label, exe, list(seeds))) or 1)
+    assert host.ab("cand-binary", Path("cand-seal"), "linux-x86_64", tmp_path / "o1", "firefox-68", [11, 12]) == 2
+    assert [(r[0], r[1]) for r in runs] == [("firefox-68", "pub-binary"), ("firefox-68 again", "pub-binary"), ("candidate", "cand-binary")]
+    runs.clear()
+    assert host.ab(None, None, "linux-x86_64", tmp_path / "o2", "firefox-68", [11, 12]) == 2
+    assert [(r[0], r[1]) for r in runs] == [("firefox-68", "pub-binary"), ("firefox-68 again", "pub-binary")], "the A/A: the published engine twice, in the same order"
+
+
+def test_what_only_the_warm_up_did_is_listed_with_the_process_that_did_it():
+    kinds = dict(KINDS, **{"backgroundtask/pingsender": 3, "socket": 2})
+    fp = with_warmup(footprint(kinds={**KINDS, "socket": 1}), kinds=kinds, files=FILES + ["/etc/machine-id", "/usr/lib/libx.so"],
+                     touched_by={"/etc/machine-id": ["backgroundtask/pingsender"], "/usr/lib/libx.so": ["parent", "tab/isForBrowser"]},
+                     spawned_by={"backgroundtask/pingsender": ["parent"], "socket": ["parent"]})
+    listing = host.warmup_only(fp)
+    assert [(k["kind"], k["warmup"], k["measured"], k["spawned_by"]) for k in listing["kinds"]] == [
+        ("backgroundtask/pingsender", 3, 0, ["parent"]), ("socket", 2, 1, ["parent"])]
+    assert [(f["path"], f["touched_by"]) for f in listing["files"]] == [("/etc/machine-id", ["backgroundtask/pingsender"]), ("/usr/lib/libx.so", ["parent", "tab/isForBrowser"])]
+    assert host.warmup_only(footprint()) is None, "a footprint with no warm-up lists nothing"
+
+
+def test_the_count_of_a_tab_kind_in_the_warm_up_is_not_a_first_launch_behaviour():
+    fp = with_warmup(footprint(), kinds=dict(KINDS, **{"tab/isForBrowser": 9}))
+    assert host.warmup_only(fp)["kinds"] == []
+
+
+def test_the_report_lists_what_is_only_in_the_warm_up_and_says_when_both_engines_have_it(capsys):
+    kinds = dict(KINDS, **{"backgroundtask/pingsender": 3})
+    spawned = {"backgroundtask/pingsender": ["parent"]}
+    a = with_warmup(footprint(), kinds=kinds, spawned_by=spawned, files=FILES + ["/etc/machine-id"], touched_by={"/etc/machine-id": ["backgroundtask/pingsender"]})
+    b = with_warmup(footprint("firefox-68 again"), kinds=kinds, spawned_by=spawned)
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green", "a first-launch-only behaviour that the measured launches do not have is written, not red"
+    assert report["warmup"]["both"] == {"kinds": ["backgroundtask/pingsender"], "files": []}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    out = capsys.readouterr().out
+    assert "WARMUP-ONLY firefox-68 seed 11 proc.backgroundtask/pingsender: warm-up 3, measured 0 (spawned by: parent)" in out
+    assert "WARMUP-ONLY firefox-68 seed 11 file./etc/machine-id (touched by: backgroundtask/pingsender)" in out
+    assert "WARMUP-ONLY firefox-68 again seed 11 proc.backgroundtask/pingsender" in out
+
+
+def test_a_pingsender_count_that_differs_after_the_warm_up_is_red_and_names_who_spawned_it():
+    warm = dict(KINDS, **{"backgroundtask/pingsender": 3})
+    a = with_warmup(footprint(kinds=dict(KINDS, **{"backgroundtask/pingsender": 3})), kinds=warm)
+    b = with_warmup(footprint("firefox-68 again"), kinds=warm)
+    for seed in a["seeds"]:
+        seed["spawned_by"] = {"backgroundtask/pingsender": ["parent"]}
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "red"
+    assert {(d["leaf"], d["a"], d["b"]) for d in report["differences"]} == {("proc.backgroundtask/pingsender", 3, host.MISSING)}
+    assert all(d["by"] == {"A": ["parent"], "B": []} for d in report["differences"])
+    assert any("proc.backgroundtask/pingsender: A 3 | B \"<missing>\" (by A: parent | B: -)" in p for p in report["problems"])
+    same = judge(a, with_warmup(footprint("again", kinds=dict(KINDS, **{"backgroundtask/pingsender": 3})), kinds=warm), a_a=True)
+    assert same["verdict"] == "green"
+
+
+def test_a_path_that_differs_names_the_kinds_that_touched_it():
+    a, b = footprint(files=FILES + ["/etc/machine-id"]), footprint("again")
+    for seed in a["seeds"]:
+        seed["touched_by"] = {"/etc/machine-id": ["gpu", "parent"]}
+    report = judge(a, b, a_a=True)
+    assert all(d["by"] == {"A": ["gpu", "parent"], "B": []} for d in report["differences"])
+    assert any("file./etc/machine-id: A 1 | B \"<missing>\" (by A: gpu, parent | B: -)" in p for p in report["problems"])
+
+
+# -
+# The tree only: what a process outside the tree of the launch opens is not compared.
+
+def test_a_path_a_service_opened_is_counted_by_process_name_and_left_out_and_the_trees_stays(tmp_path, monkeypatch):
+    service = TREE_FILES + [(106, "C:\\ProgramData\\Microsoft\\Windows Defender\\Scans\\x.db"), (106, "C:\\Windows\\System32\\catroot2\\y"), (999, "C:\\Windows\\Prefetch\\z.pf")]
+    trace, _fake = a_windows_run(tmp_path, monkeypatch, service)
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None, namer=lambda pid: "sysmain.exe")
+    assert got["outside"] == {"svchost.exe": 2, "sysmain.exe": 2}, "pid 106 is named by its audit event, the pid with no event by the machine (999 has the unrelated.dll and the .pf)"
+    assert {pid for pid, _n in got["files"]} == {100, 101, 102, 103, 104, 107}
+    assert not any("Defender" in n or "catroot2" in n for _p, n in got["files"])
+    assert got["problems"] == []
+
+
+def test_a_process_that_the_tree_made_is_in_the_tree_whatever_it_is_called():
+    tree = host.process_tree(host.parse_audit_events("\n".join(TREE)), {100})
+    assert 101 in {e["pid"] for e in tree} and 106 not in {e["pid"] for e in tree} and 105 not in {e["pid"] for e in tree}
+
+
+def test_the_report_says_what_was_left_out_of_the_comparison(capsys):
+    a, b = footprint(platform="win32"), footprint("again", platform="win32")
+    a["seeds"][0]["outside_tree"] = {"svchost.exe": 12, "msmpeng.exe": 3}
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green" and report["outside_tree"] == {"A": {"11": {"svchost.exe": 12, "msmpeng.exe": 3}}, "B": {}}
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "OUTSIDE THE TREE (not compared) firefox-68 seed 11: msmpeng.exe 3 paths, svchost.exe 12 paths" in capsys.readouterr().out
+
+
+STRACE_THREADS = """\
+100 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-contentproc", "forkserver"], 0x1) = 0
+100 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM, exit_signal=0}, 88) = 150
+100 fork() = 200
+200 prctl(PR_SET_NAME, "Web Content") = 0
+200 clone(child_stack=0x7f, flags=CLONE_VM|CLONE_THREAD|CLONE_SIGHAND <unfinished ...>
+200 <... clone resumed>, child_tidptr=0x7f) = 250
+150 openat(AT_FDCWD, "/etc/a", O_RDONLY) = 3
+250 openat(AT_FDCWD, "/etc/b", O_RDONLY) = 3
+200 openat(AT_FDCWD, "/etc/b", O_RDONLY) = 3
+"""
+
+
+def test_on_linux_the_strace_tree_is_the_tree_and_a_threads_path_is_its_processs():
+    lines = STRACE_THREADS.splitlines()
+    owners = host.thread_owners(lines)
+    assert owners == {150: 100, 250: 200}
+    assert host.touched_by_pid(lines) == {"/e/firefox/firefox": {100}, "/etc/a": {150}, "/etc/b": {250, 200}}
+    procs = host.spawned_processes(lines, REAL)
+    labels = {pid: p["label"] for pid, p in procs.items()}
+    assert labels == {100: "forkserver", 200: "Web Content"}
+    assert host.by_kind([(pid, p) for p, pids in host.touched_by_pid(lines).items() for pid in pids], lambda pid: labels.get(host.owner_of(pid, owners), "?"),
+                        host.Context("linux")) == {"/e/firefox/firefox": ["forkserver"], "/etc/a": ["forkserver"], "/etc/b": ["Web Content"]}
+    assert host.spawners(labels, {200: 100}) == {"Web Content": ["forkserver"], "forkserver": ["(oracle)"]}
+
+
+def test_a_closed_linux_run_keeps_the_kinds_that_touched_each_path_and_nothing_is_outside_its_tree(tmp_path, monkeypatch):
+    log = tmp_path / "strace.log"
+    log.write_text(LOG + '101 openat(AT_FDCWD, "/etc/machine-id", O_RDONLY) = 3\n104 stat("/etc/machine-id", {st_mode=S_IFREG}) = 0\n', encoding="utf-8")
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    monkeypatch.setattr(host, "_context", lambda binary, windows, work: host.Context("linux", app=["/e/firefox"], temp=["/tmp/ab-host-tmp-x"]))
+    fp = host._seed_result(REAL, 11, tmp_path, [], log, None, None, False)
+    assert fp["touched_by"]["/etc/machine-id"] == ["glxtest", "lsb_release"]
+    assert fp["spawned_by"]["glxtest"] == ["parent"] and fp["outside_tree"] == {}
