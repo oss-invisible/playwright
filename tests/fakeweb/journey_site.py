@@ -6,7 +6,8 @@ host would be the same site, and with Fission an "other origin" frame of the sam
 with two sites the ad frames and the partner page are really out of process. Cookies and sign-in stay on A.
 Every page also runs a deterministic ad noise (DET_JS): every slow
 response is held by the server until an event releases it, never by a timer, and nothing is aborted or
-removed while a request is in flight, so stock Firefox gives the same outcome on every run. Two pages stay
+removed while a request is in flight, so stock Firefox gives the same outcome on every run. The noise runs on
+timers after `load`; a page declares when it is done (`window.__noiseDone`), and the walk leaves a page only then. Two pages stay
 "not idle" on purpose (PARK_PAGES, PARK_KEEPALIVE_PAGES). Add ?noise=0 to a URL to turn the noise off
 (every internal link and form keeps the switch).
 
@@ -87,6 +88,10 @@ def link(ctx, path, **params):
 DET_JS = r"""
 const tok = Math.random().toString(36).slice(2, 8);
 const rel = (id) => get(A + '/release?id=' + id);
+// 0. the end of the noise, declared: window.__noiseDone is true once the font stage is done (its stylesheet has loaded and
+// document.fonts.ready has resolved after it) and the last stage has loaded its stylesheet ld3. The walk leaves the page only then.
+let fontsDone = false, lastDone = false;
+const noiseDone = () => { if (fontsDone && lastDone) window.__noiseDone = true; };
 // 1. beacons and keepalive fetches
 afterLoad(300, () => {
   navigator.sendBeacon(O + '/beacon?src=load&n=1', 'a=1');
@@ -101,6 +106,10 @@ for (let i = 0; i < 4; i++) { const im = new Image(); im.src = O + '/r?kind=png&
 afterLoad(250, () => {
   const l = document.createElement('link');
   l.rel = 'stylesheet'; l.href = O + '/r?kind=fontcss&id=fc';
+  // the @font-face rules are in: lay the spans out (their fonts start to load) and wait for the fonts of the document
+  const fonts = () => { void document.body.offsetWidth; document.fonts.ready.then(() => { fontsDone = true; noiseDone(); }); };
+  l.addEventListener('load', fonts);
+  l.addEventListener('error', fonts);
   document.head.appendChild(l);
   for (const w of [400, 500, 600, 700, 800]) {
     const sp = document.createElement('span');
@@ -146,6 +155,9 @@ afterLoad(LAST_MS, () => {
   document.body.appendChild(svg);
   const l = document.createElement('link');
   l.rel = 'stylesheet'; l.href = A + '/r?kind=css&id=ld3';
+  const last = () => { lastDone = true; noiseDone(); };
+  l.addEventListener('load', last);
+  l.addEventListener('error', last);
   document.head.appendChild(l);
 });
 // 9. aborts that cannot race: the server sends headers and part of the body, the page aborts on the headers
@@ -172,7 +184,7 @@ PARK_KEEPALIVE_PAGES = {"search": 13}
 
 def noise_script(ctx, park_until=None, park_keepalive_until=None):
     if not ctx.noise:
-        return ""
+        return "<script>window.__noiseDone = true;</script>"      # no noise: nothing to wait for before the walk leaves the page
     js = DET_JS
     if park_until:
         js += "\nafterLoad(0, () => get(A + '/hold?id=park' + tok + '&until=%d'));\n" % park_until

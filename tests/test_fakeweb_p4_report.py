@@ -314,6 +314,207 @@ def test_the_site_keeps_the_referrer_and_the_type_of_every_answer_and_the_lab_ca
     assert "LAST_MS=%d;" % journey_site.LAST_STAGE_MS in page and journey_site.LAST_STAGE_MS == 600
 
 
+# the walk leaves a page only once the page has declared its noise done (profile_p4.Journey.leave) -------------------------------------
+class _Page:
+    """A page of the walk without a browser: it logs what the walk does to it; `moves` maps an action to the URLs it lands on, in turn."""
+
+    def __init__(self, log, url, moves=None):
+        self.log, self.url, self.moves = log, url, {k: list(v) for k, v in (moves or {}).items()}
+        page = self
+
+        class Keyboard:
+            def press(self, key):
+                page.act("press " + key)
+
+            def type(self, text, delay=0):
+                page.log.append("type")
+
+        self.keyboard = Keyboard()
+
+    def act(self, what):
+        self.log.append(what)
+        if self.moves.get(what):
+            self.url = self.moves[what].pop(0)
+
+    def wait_for_function(self, expression, timeout=None):
+        self.log.append(("wait", expression, timeout))
+
+    def locator(self, selector):
+        page = self
+
+        class Locator:
+            first = property(lambda self: self)
+
+            def hover(self):
+                page.log.append("hover " + selector)
+
+            def click(self):
+                page.act("click " + selector)
+
+            def count(self):
+                return 3
+
+        return Locator()
+
+    def click(self, selector):
+        self.act("click " + selector)
+
+    def expect_navigation(self, **expect):
+        page = self
+
+        class Navigation:
+            def __enter__(self):
+                page.log.append("expect")
+
+            def __exit__(self, *exc):
+                page.log.append("navigated")
+                return False
+
+        return Navigation()
+
+    def go_back(self, wait_until=None, timeout=None):
+        self.act("back")
+
+    def go_forward(self, wait_until=None, timeout=None):
+        self.act("forward")
+
+    def wait_for_load_state(self, state, timeout=None):
+        self.log.append("load " + state)
+
+    def wait_for_selector(self, selector):
+        self.log.append("selector " + selector)
+
+    def inner_text(self, selector):
+        return "quiet morning" if selector == "#qshow" else "alice"
+
+    def evaluate(self, expression):
+        return 1        # window.__keep: the page did not navigate where the walk says it must not
+
+    def close(self):
+        self.log.append("close")
+
+
+def _waited_before(log, what):
+    """Every `what` of the log comes right after a wait for the page's declaration, with a deadline of at least 30 s."""
+    from fakeweb import profile_p4
+
+    at = [i for i, entry in enumerate(log) if entry == what]
+    assert at, "the walk did not %s" % what
+    return all(i > 0 and log[i - 1][:2] == ("wait", profile_p4.NOISE_DONE) and log[i - 1][2] >= 30000 for i in at)
+
+
+def test_step_15_leaves_the_home_page_only_once_its_noise_is_done():
+    """The case the network oracle saw: from the account page the logo opens the home page, and Account is clicked on it at once."""
+    from fakeweb import profile_p4
+
+    log = []
+    page = _Page(log, A + "/account", {"click #logo": [A + "/"], "click #nav-account": [A + "/account"]})
+    profile_p4.Journey(None, page, A, O).s15_logo_account()
+    assert [e if isinstance(e, str) else e[0] for e in log] == ["wait", "expect", "click #logo", "navigated",
+                                                               "wait", "expect", "click #nav-account", "navigated"]
+    assert _waited_before(log, "expect")
+
+
+def test_the_keys_that_send_a_form_leave_the_page_only_once_its_noise_is_done():
+    """Step 14: Sign in, then Enter twice (the wrong password, then the right one); step 12: Enter on the search page."""
+    from fakeweb import profile_p4
+
+    log = []
+    page = _Page(log, A + "/", {"click #nav-signin": [A + "/signin"], "press Enter": [A + "/signin", A + "/account"]})
+    profile_p4.Journey(None, page, A, O).s14_signin()
+    assert [e for e in log if e == "press Enter"] == ["press Enter"] * 2
+    assert _waited_before(log, "expect")
+    log = []
+    page = _Page(log, A + "/", {"click #nav-search": [A + "/search"], "press Enter": [A + "/search?q=quiet+morning"]})
+    profile_p4.Journey(None, page, A, O).s12_search()
+    assert log.count("press Enter") == 1 and _waited_before(log, "expect")
+
+
+def test_back_and_forward_leave_the_page_only_once_its_noise_is_done():
+    from fakeweb import profile_p4
+
+    log = []
+    page = _Page(log, A + "/article/3", {"back": [A + "/article/2"], "forward": [A + "/article/3"]})
+    journey = profile_p4.Journey(None, page, A, O)
+    journey.s4_back()
+    assert _waited_before(log, "back")
+    assert journey.history_step("forward") and _waited_before(log, "forward")
+
+
+def test_the_tab_and_the_last_page_are_left_only_once_their_noise_is_done(monkeypatch):
+    """Step 10 closes the partner tab; when the walk ends the context closes the page it is on."""
+    from fakeweb import journey_site, profile_p4
+
+    log = []
+    tab = _Page(log, O + "/partner/2")
+    journey = profile_p4.Journey(None, _Page([], A + "/article/2"), A, O)
+    journey.leave(tab.close, page=tab)
+    assert _waited_before(log, "close")
+
+    class Walk(profile_p4.Journey):
+        def s_only(self):
+            self.page.log.append("step")
+            return self.page, None
+
+    class Tracer:
+        events, step = None, 0
+
+        def snapshot(self):
+            return []
+
+    log = []
+    page = _Page(log, A + "/")
+    walk = Walk(None, page, A, O)
+    walk.ctx = type("Context", (), {"pages": [page]})()
+    monkeypatch.setattr(profile_p4, "STEPS", [("the only step", "s_only")])
+    monkeypatch.setattr(journey_site, "STATE", journey_site.State())
+    records = profile_p4.run_round(walk, Tracer(), 1, 30000)
+    assert records[0]["ok"] and log[0] == "step" and log[-1][:2] == ("wait", profile_p4.NOISE_DONE)
+
+
+def test_every_navigation_back_forward_and_close_of_the_walk_goes_through_its_one_point_of_leaving():
+    """Read from the source: the walk waits for a navigation only in Journey.navigate, presses back or forward only in Journey._press
+    (and in the popstate step, which stays on its document), and closes a page only through Journey.leave."""
+    import ast
+
+    from fakeweb import profile_p4
+
+    tree = ast.parse(Path(profile_p4.__file__).read_text(encoding="utf-8"))
+    journey = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Journey")
+    allowed = {"expect_navigation": {"navigate"}, "go_back": {"_press", "s8_filter_popstate"}, "go_forward": {"_press"}}
+    wrong = []
+    for method in (n for n in journey.body if isinstance(n, ast.FunctionDef)):
+        passed_to_leave = {id(a) for c in ast.walk(method) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                           and c.func.attr == "leave" for a in c.args}
+        for node in ast.walk(method):
+            if isinstance(node, ast.Attribute) and node.attr in allowed and method.name not in allowed[node.attr]:
+                wrong.append("%s: %s" % (method.name, node.attr))
+            if (isinstance(node, ast.Attribute) and node.attr == "close" and id(node) not in passed_to_leave
+                    and not (isinstance(node.value, ast.Name) and node.value.id == "os")):      # os.close: a file, not a page
+                wrong.append("%s: close not through leave" % method.name)
+    assert wrong == []
+
+
+def test_a_page_of_the_site_declares_when_its_noise_is_done():
+    """With the noise, once the font stage and the last stage have loaded (window.__noiseDone); without it, at once."""
+    import urllib.request
+
+    from fakeweb import journey_site
+
+    a, o, stop = journey_site.start((0, 0))
+    try:
+        noisy, partner = (urllib.request.urlopen(u).read().decode() for u in (a + "/", o + "/partner/2"))
+        quiet = urllib.request.urlopen(a + "/?noise=0").read().decode()
+    finally:
+        stop()
+    for page in (noisy, partner):
+        assert "const noiseDone = () => { if (fontsDone && lastDone) window.__noiseDone = true; };" in page
+        assert page.count("l.addEventListener('load', ") == 2 and page.count("l.addEventListener('error', ") == 2
+        assert "document.fonts.ready.then(() => { fontsDone = true; noiseDone(); })" in page
+        assert "const last = () => { lastDone = true; noiseDone(); };" in page
+    assert "<script>window.__noiseDone = true;</script>" in quiet and "fontsDone" not in quiet
+
+
 # the workflow ------------------------------------------------------------------------------------------------------------
 WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb.yml").read_text(encoding="utf-8")
 

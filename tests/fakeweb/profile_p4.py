@@ -3,7 +3,10 @@
 One context, one page, 17 steps a person would make: click, hover, scroll, back, forward, a popstate filter, a
 `target=_blank` tab, a download, a keyboard search, a sign-in with a wrong then the right password, sign out, "load more".
 After every step the natural wait of the action runs and then `networkidle` is recorded as a boolean (never a failure).
-Every page also runs a deterministic ad noise (tests/fakeweb/journey_site.py). The verdict is "same outcome as stock
+Every page also runs a deterministic ad noise (tests/fakeweb/journey_site.py), on timers after `load`. The walk leaves a page
+(a click or a key that navigates, back or forward, closing a tab, the end of the walk) from one point, `Journey.leave`, and only
+once the page has declared its noise done (`window.__noiseDone`): a page left halfway sends a different set of requests in every
+run, for stock and for us alike. The verdict is "same outcome as stock
 Firefox, step by step": ok, url, title, marker, cookie names, history length, open pages, idle and the step's own values,
 with stock Firefox run by the same client in the same invocation. Chromium is not part of the verdict. Time is never compared.
 
@@ -21,6 +24,11 @@ from fakeweb import journey_site
 
 BLOCKED = ("image", "media")
 TIMEOUT_MS = 15000
+#: What a page of the site says once its noise is done (journey_site.DET_JS; at once on a page without noise).
+NOISE_DONE = "window.__noiseDone === true"
+#: The deadline of the wait for it: a condition that must come (within a second of `load`, a few seconds in the lab that makes the
+#: last stage long), never a pause.
+NOISE_DONE_TIMEOUT_MS = 30000
 FIELDS = ["ok", "url", "title", "marker", "cookies", "history_length", "pages", "idle"]
 
 
@@ -136,12 +144,24 @@ class Journey:
         return (url or "").replace(self.a, "A").replace(self.o, "O")
 
     # helpers -----------------------------------------------------------------
+    def leave(self, act, page=None):
+        """The one point from which the walk leaves a page (`page`, default the walk's page): it waits until the page has declared its
+        noise done (NOISE_DONE), then runs `act`, the click, the key, the back or forward, the close that leaves it."""
+        (page or self.page).wait_for_function(NOISE_DONE, timeout=NOISE_DONE_TIMEOUT_MS)
+        return act()
+
+    def navigate(self, act, **expect):
+        """Leave the page with `act` (a click, a key) and wait for the navigation it starts (`expect`: of expect_navigation)."""
+        def go():
+            with self.page.expect_navigation(**expect):
+                act()
+        self.leave(go)
+
     def nav_click(self, selector, hover_first=False):
         loc = self.page.locator(selector).first
         if hover_first:
             loc.hover()
-        with self.page.expect_navigation():
-            loc.click()
+        self.navigate(loc.click)
 
     def expect_path(self, pattern):
         path = re.sub(r"^[A-Z]", "", self.norm(self.page.url))
@@ -162,10 +182,7 @@ class Journey:
         presses = 0
         for _ in range(max_presses):
             presses += 1
-            try:
-                (p.go_back if direction == "back" else p.go_forward)(wait_until="commit", timeout=3000)
-            except Exception:
-                pass  # nothing committed in the main frame
+            self.leave(lambda: self._press(direction))
             if p.url != before:
                 break
         self.extra["presses"] = presses
@@ -175,6 +192,12 @@ class Journey:
             return False
         p.wait_for_load_state("load")
         return True
+
+    def _press(self, direction):
+        try:
+            (self.page.go_back if direction == "back" else self.page.go_forward)(wait_until="commit", timeout=3000)
+        except Exception:
+            pass  # nothing committed in the main frame
 
     def type_in(self, selector, text):
         self.page.locator(selector).click()
@@ -258,7 +281,7 @@ class Journey:
             raise AssertionError("unexpected marker in the new tab")
 
         def cleanup():
-            tab.close()
+            self.leave(tab.close, page=tab)
             self.extra["pages_after_close"] = len(self.ctx.pages)
 
         return tab, cleanup
@@ -292,8 +315,7 @@ class Journey:
         p.wait_for_selector("#msg")
         self.keep_check()
         self.type_in("#q", "quiet morning")
-        with p.expect_navigation():
-            p.keyboard.press("Enter")
+        self.navigate(lambda: p.keyboard.press("Enter"))
         p.wait_for_selector("#qshow")
         self.extra["qshow"] = p.inner_text("#qshow")
         self.extra["results"] = p.locator("a.result").count()
@@ -312,13 +334,11 @@ class Journey:
         self.expect_path(r"^/signin")
         self.type_in("#user", journey_site.USER)
         self.type_in("#pass", "not-the-password")
-        with p.expect_navigation():
-            p.keyboard.press("Enter")
+        self.navigate(lambda: p.keyboard.press("Enter"))
         p.wait_for_selector("#error")
         self.extra["error"] = p.inner_text("#error")
         self.type_in("#pass", journey_site.PASSWORD)
-        with p.expect_navigation(url=re.compile(r"/account")):
-            p.keyboard.press("Enter")
+        self.navigate(lambda: p.keyboard.press("Enter"), url=re.compile(r"/account"))
         self.expect_path(r"^/account")
         self.extra["user"] = p.inner_text("#user")
         return p, None
@@ -441,6 +461,13 @@ def run_round(j, tracer, round_no, idle_timeout_ms, step_log=None):
         out.append(rec)
         if step_log is not None:
             step_log.append(rec)
+    # The walk ends: the context then closes its last page, which is left like every other one, once its noise is done.
+    if out and out[-1]["ok"]:
+        try:
+            j.leave(lambda: None)
+        except Exception as exc:
+            out[-1]["ok"] = False
+            out[-1]["error"] = "end of the walk: " + first_line(exc)
     if tracer.events is not None:
         # read once, at the end: a request fired on pagehide reaches the server after its step's own work is done
         time.sleep(0.5)
