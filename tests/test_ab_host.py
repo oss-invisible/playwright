@@ -728,19 +728,19 @@ def with_warmup(fp, kinds=None, files=None, touched_by=None, spawned_by=None, se
 def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_then_its_measured_ones_and_the_idle_launch_last(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run_seed(binary, seed, work, name=None, idle=False):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
         calls.append((seed, name, idle))
         return seed_footprint(seed)
 
     monkeypatch.setattr(host, "run_seed", fake_run_seed)
     monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
     doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68")
-    assert calls == [(11, "warmup", False), (11, None, False), (12, None, False), (11, "idle", True)]
-    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["idle"]["seed"] == 11 and doc["problems"] == []
+    assert calls == [(11, "warmup", False), (11, None, False), (12, None, False), (11, "idle", True), (11, "bare", False)]
+    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["idle"]["seed"] == 11 and doc["bare"]["seed"] == 11 and doc["problems"] == []
 
 
 def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(monkeypatch):
-    def fake_run_seed(binary, seed, work, name=None, idle=False):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
         fp = seed_footprint(seed)
         if name == "warmup":
             fp["problems"] = ["the file trace did not see the end canary file of the oracle"]
@@ -1630,3 +1630,130 @@ def test_a_creator_pid_that_windows_reused_before_the_launch_is_not_in_its_tree(
         audit(10, 100, 1, FIREFOX, '"%s" -profile "D:\\t\\p"' % FIREFOX),
         audit(12, 102, 100, FIREFOX, '"%s" -contentproc tab' % FIREFOX)]))
     assert [e["pid"] for e in host.process_tree(events, {100})] == [100, 102], "record 5 came before the root (record 10): its creator is an older process that had the same pid"
+
+
+# -
+# The bare launch (no client, no page; never compared) and the evidence of how a browser ended and what a crash leaves; the creates of the host.
+
+def test_the_crash_files_are_read_when_they_appear_a_dmp_by_its_name_and_an_extra_by_its_content(tmp_path):
+    folder = tmp_path / "minidumps"
+    folder.mkdir()
+    (folder / "a1b2.dmp").write_bytes(b"MDMP" + b"0" * 100)
+    (folder / "a1b2.extra").write_text('{"MozCrashReason": "MOZ_CRASH(shutdown hang)", "ShutdownProgress": "profile-change-teardown", "CrashType": "SIGSEGV"}', encoding="utf-8")
+    (folder / "notes.txt").write_text("not a crash file", encoding="utf-8")
+    seen = {}
+    host.scan_crash_files([folder, tmp_path / "missing"], seen)
+    files = sorted(seen.values(), key=lambda f: f["name"])
+    assert [f["name"] for f in files] == ["a1b2.dmp", "a1b2.extra"] and files[0]["size"] == 104 and "content" not in files[0]
+    assert "MozCrashReason" in files[1]["content"] and "ShutdownProgress" in files[1]["content"]
+    (folder / "a1b2.extra").write_text("changed", encoding="utf-8")
+    host.scan_crash_files([folder], seen)
+    assert "MozCrashReason" in seen[str(folder / "a1b2.extra")]["content"], "a file is read once, when it appears"
+
+
+def test_the_watcher_keeps_what_it_read_though_the_launch_deletes_its_profile_afterwards(tmp_path):
+    folder = tmp_path / "profile" / "minidumps"
+    folder.mkdir(parents=True)
+    watcher = host.CrashWatcher(lambda: [folder], period=0.01)
+    watcher.start()
+    (folder / "x.extra").write_text('{"CrashType": "SIGSEGV"}', encoding="utf-8")
+    for _ in range(500):
+        if watcher.seen:
+            break
+        import time as _time
+
+        _time.sleep(0.01)
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / "profile")
+    got = watcher.stop()
+    assert [f["name"] for f in got["files"]] == ["x.extra"] and "SIGSEGV" in got["files"][0]["content"] and got["scans"] >= 1
+
+
+def test_the_crash_folders_are_the_profiles_minidumps_and_the_pending_reports_of_the_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+    win = host.crash_report_dirs(tmp_path / "invisible_profile_1", True)
+    assert win == [tmp_path / "invisible_profile_1" / "minidumps", tmp_path / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Crash Reports" / "pending"]
+    monkeypatch.setattr(host.os.path, "expanduser", lambda p: str(tmp_path / "home"))
+    lin = host.crash_report_dirs(None, False)
+    assert lin == [tmp_path / "home" / ".config" / "mozilla" / "firefox" / "Crash Reports" / "pending", tmp_path / "home" / ".mozilla" / "firefox" / "Crash Reports" / "pending"]
+
+
+def test_the_crash_evidence_says_how_the_parent_ended_who_the_crash_reporters_are_and_what_files_the_crash_left():
+    fp = {"lifecycle": [{"event": "start", "kind": "parent", "line": 0, "how": ""}, {"event": "end", "kind": "crashreporter", "line": 5, "how": "exited 0"},
+                        {"event": "end", "kind": "parent", "line": 9, "how": "killed by SIGSEGV"}],
+          "processes": [{"label": "parent", "exec": "firefox -profile /tmp/p"}, {"label": "crashreporter", "exec": "crashreporter --ping-cleanup /home/r/.config/mozilla/firefox/Crash Reports /tmp/p"},
+                        {"label": "minidump-analyzer", "exec": "minidump-analyzer /tmp/p/minidumps/x.dmp"}], "close": {"root_returncode": -11}}
+    got = host.crash_evidence({"files": [{"name": "x.dmp", "size": 5}], "scans": 7}, fp, {"core_pattern": "core", "cores": ["core.123"], "backtraces": {"core.123": "#0 0x0 in ?? ()"}})
+    assert got["parent_exits"] == ["killed by SIGSEGV"] and got["root_returncode"] == -11
+    assert [p["kind"] for p in got["crash_processes"]] == ["crashreporter", "minidump-analyzer"] and "--ping-cleanup" in got["crash_processes"][0]["argv"]
+    assert got["files"] == [{"name": "x.dmp", "size": 5}] and got["core"]["cores"] == ["core.123"]
+    summary = host._bare_summary({"notified": {"observed": False}, "crash": got})
+    assert summary["parent_exits"] == ["killed by SIGSEGV"] and summary["dump_files"] == ["x.dmp"] and summary["cores"] == ["core.123"]
+    assert host.crash_evidence({}, {"processes": []})["parent_exits"] is None, "no lifecycle: it is not said that the parent ended well"
+
+
+def test_a_linux_core_is_found_where_the_launch_ran_and_its_backtrace_is_asked_of_gdb(tmp_path, monkeypatch):
+    (tmp_path / "core.4242").write_bytes(b"\x7fELF")
+    (tmp_path / "other.txt").write_text("x", encoding="utf-8")
+
+    class Done:
+        stdout, stderr = "#0  0x00007f in mozilla::ShutdownXPCOM ()\n", ""
+
+    calls = []
+    monkeypatch.setattr(host.shutil, "which", lambda name: "/usr/bin/gdb")
+    got = host.core_info(tmp_path, "/e/firefox/firefox", run=lambda argv, **kw: calls.append(argv) or Done())
+    assert got["cores"] == ["core.4242"] and "ShutdownXPCOM" in got["backtraces"]["core.4242"]
+    assert calls == [["/usr/bin/gdb", "-batch", "-ex", "bt", "/e/firefox/firefox", str(tmp_path / "core.4242")]]
+    monkeypatch.setattr(host.shutil, "which", lambda name: None)
+    assert host.core_info(tmp_path, "/e/firefox/firefox")["backtraces"] == {"core.4242": "gdb is not installed"}
+    assert host.core_info(tmp_path / "empty-nowhere", "x")["cores"] == []
+
+
+def test_the_stand_in_of_the_bare_launch_allows_core_dumps_in_its_own_folder_and_the_others_do_not(tmp_path, monkeypatch):
+    import _strace_stand_in as stand_in
+
+    class Help:
+        stdout = "strace --kill-on-exit"
+
+    monkeypatch.setattr(stand_in.shutil, "which", lambda name: "/usr/bin/strace")
+    monkeypatch.setattr(stand_in.subprocess, "run", lambda *a, **k: Help())
+    real = tmp_path / "firefox-real" / "firefox"
+    real.parent.mkdir()
+    real.write_text("x", encoding="utf-8")
+    plain = Path(stand_in._stand_in(str(real), tmp_path / "t1", tmp_path / "l1", tmp_path / "p1"))
+    assert "ulimit" not in plain.read_text(encoding="utf-8")
+    cores = Path(stand_in._stand_in(str(real), tmp_path / "t2", tmp_path / "l2", tmp_path / "p2", core_dir=tmp_path / "cores"))
+    text = cores.read_text(encoding="utf-8")
+    assert "ulimit -c unlimited\ncd %s\nexec " % (tmp_path / "cores") in text
+
+
+def create_event(pid, name, options):
+    return ('<Event %s><System><EventID>12</EventID><Execution ProcessID="%d" ThreadID="7"/></System><EventData><Data Name="CreateOptions">0x%08x</Data>'
+            '<Data Name="FileName">%s</Data></EventData></Event>' % (NS, pid, options, name))
+
+
+def test_a_path_the_tree_asked_the_system_to_make_is_told_from_one_it_only_opened(tmp_path):
+    ini = "C:\\ProgramData\\Mozilla-1de4eec8\\firefox_S-1-5-21-500_shortcuts.ini"
+    xml = tmp_path / "files.xml"
+    xml.write_text("<Events>" + create_event(10, ini, 0x03000060) + create_event(10, "C:\\Windows\\System32\\kernel32.dll", 0x01000060)
+                   + create_event(11, "C:\\Users\\r\\x.lnk", 0x02000044) + create_event(10, "C:\\Users\\r\\old.tmp", 0x05000040) + "</Events>", encoding="utf-8")
+    dispositions = {}
+    host.etw_files(xml, {10, 11}, None, None, dispositions)
+    assert dispositions[(10, ini)] == {3} and dispositions[(10, "C:\\Windows\\System32\\kernel32.dll")] == {1}
+    got = host.creates_of({k: sorted(v) for k, v in dispositions.items()}, lambda pid: {10: "parent", 11: "tab"}[pid], host.Context("win32"))
+    assert got == [{"path": "c:\\programdata\\mozilla-1de4eec8\\firefox_s-1-5-21-500_shortcuts.ini", "kinds": ["parent"], "how": ["OPEN_IF"]},
+                   {"path": "c:\\users\\r\\old.tmp", "kinds": ["parent"], "how": ["OVERWRITE_IF"]}, {"path": "c:\\users\\r\\x.lnk", "kinds": ["tab"], "how": ["CREATE"]}]
+
+
+def test_the_report_carries_the_bare_launch_without_comparing_it(capsys):
+    a = footprint()
+    a["bare"] = {"seed": 11, "kinds": {"parent": 1, "crashreporter": 1}, "bare": {"notified": {"observed": False}, "crash": {
+        "parent_exits": ["exited 0"], "root_returncode": 0, "crash_processes": [{"kind": "crashreporter", "argv": "crashreporter --ping-cleanup /x /y"}], "files": [], "core": None}}}
+    b = footprint("again")
+    b["bare"] = {"seed": 11, "kinds": {"parent": 1}, "bare": {"notified": {"observed": False}, "crash": {"parent_exits": ["exited 0"], "root_returncode": 0, "crash_processes": [], "files": []}}}
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green", "the bare launch is evidence, not a leaf"
+    assert report["bare"]["A"]["crash_processes"] == [("crashreporter", "crashreporter --ping-cleanup /x /y")] and report["bare"]["B"]["crash_processes"] == []
+    host.print_report(report, "firefox-68", "firefox-68 again")
+    assert "BARE (no client, no page; not compared) firefox-68:" in capsys.readouterr().out

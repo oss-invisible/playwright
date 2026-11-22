@@ -42,7 +42,8 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
-              timestamps: bool = False, fd_paths: bool = False, network: bool = False, exit_status: bool = False) -> str:
+              timestamps: bool = False, fd_paths: bool = False, network: bool = False, exit_status: bool = False,
+              core_dir: Path | None = None) -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -59,7 +60,8 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
     seconds after each pid), which ``_LINE`` does not read: a caller that asks
     for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``);
     ``fd_paths`` adds ``-y`` (scripts/ci_ab_host.py reads the paths the tree touched, and knows a socket by its inode);
-    ``network`` adds the network calls to ``syscalls`` (scripts/ci_ab_host.py reads the netlink sockets and the public destinations)."""
+    ``network`` adds the network calls to ``syscalls`` (scripts/ci_ab_host.py reads the netlink sockets and the public destinations);
+    ``core_dir`` lets the tree dump core there (``ulimit -c unlimited``, and the working directory is that folder, where a plain ``core`` pattern writes)."""
     if network:
         syscalls = syscalls + "," + _NET_SYSCALLS
     real = Path(os.path.realpath(binary))
@@ -68,11 +70,13 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
         if entry.name != real.name:
             (tree / entry.name).symlink_to(entry)
     script = tree / real.name
+    cores = "ulimit -c unlimited\ncd %s\n" % core_dir if core_dir else ""
     script.write_text(
         "#!/bin/sh\n"
         "echo $$ > %s\n"
+        "%s"
         'exec %s %s -o %s -e trace=%s %s "$@"\n'
-        % (pidfile, shutil.which("strace"), _strace_options(fd_paths, exit_status) + (" -ttt" if timestamps else ""), log, syscalls, real))
+        % (pidfile, cores, shutil.which("strace"), _strace_options(fd_paths, exit_status) + (" -ttt" if timestamps else ""), log, syscalls, real))
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 

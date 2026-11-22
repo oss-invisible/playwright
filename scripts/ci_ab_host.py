@@ -44,6 +44,13 @@ proxy so the route is direct and a ping going to the telemetry host is the produ
 precondition, seen in a file of the launch; at most 120 s) and then closes. There the comparison is strict on what does not depend on the third party: the notification
 seen, three pingsender processes of the three types, always the background task, spawned by the parent. Behind a session proxy a direct pingsender is the network oracle's.
 
+A BARE launch ends each engine run, never compared: no client and no page (the idle launch of run 44988820319, in which a crash reporter ran on both systems; it was
+`crashreporter --ping-cleanup`, started by CrashManager 57 s after the launch, exit 0). It records how the browser ended (the exit code or signal of its parent
+processes), every crash reporter or minidump analyzer process with its command line, the `.dmp` names and `.extra` contents found in the profile's minidumps and the
+`Crash Reports/pending` of the user's application data (read while the launch lives, as the profile is deleted when it ends), and, on Linux, a core dump allowed in the
+launch's folder with its `gdb -batch -ex bt`. On Windows the footprint also lists the host paths a process of the tree asked the system to MAKE (`creates`: the Create
+event's disposition), the evidence of whether a file was written and not only looked for.
+
 How the trace is taken:
 
   * Linux: `strace -f -y` of the whole tree (the stand-in of tests/_strace_stand_in.py), calls execve, clone, fork, prctl, the file calls
@@ -487,6 +494,17 @@ def pingsender_surface(fp: dict) -> tuple:
     return files, nets
 
 
+def _bare_summary(bare: dict | None) -> dict | None:
+    """What the bare launch (never compared) says, for the report: how its parent ended, the crash reporter processes, the dump files, the cores."""
+    if not bare:
+        return None
+    crash = bare.get("crash") or {}
+    core = crash.get("core") or {}
+    return {"notified": (bare.get("notified") or {}).get("observed"), "parent_exits": crash.get("parent_exits"), "root_returncode": crash.get("root_returncode"),
+            "crash_processes": [(p["kind"], p["argv"]) for p in crash.get("crash_processes", [])], "dump_files": [f["name"] for f in crash.get("files", [])],
+            "cores": core.get("cores"), "core_pattern": core.get("core_pattern")}
+
+
 def _idle_summary(idle: dict | None) -> dict | None:
     """What the idle launch of one side shows, for the report: the notification, the pingsenders (count, types, parents), ."""
     if not idle:
@@ -691,6 +709,19 @@ def is_pingsender_part(kind: str) -> bool:
 #: `enumerateInstallShortcuts` (CustomIconManager.sys.mjs:189 -> nsWindowsShellService.cpp `EnumerateInstallShortcutsImpl` :2960): Mozilla code at startup idle, which a short
 #: launch may or may not have reached before it closed. The marker is a path of the places it walks.
 INVENTORY_MARKER = re.compile(r"(\\start menu\\|\\users\\public\\desktop|\\quick launch\\|_shortcuts\.ini$|\\implicitappshortcuts)")
+
+
+def creates_of(dispositions: dict, label_of, ctx: Context) -> list:
+    """`[{"path", "kinds", "how"}]` of the host paths a process of the tree asked the system to MAKE (create, open-or-create, overwrite, supersede: the Create
+    event's disposition, `DISPOSITIONS`), not only to open. Evidence of a write to the host; an open-if of a file that was there is in it too."""
+    found: dict = {}
+    for (pid, raw), values in dispositions.items():
+        got = classify(raw, ctx)
+        if got and got[0] == "host" and any(v in MAKING for v in values):
+            entry = found.setdefault(got[1], {"kinds": set(), "how": set()})
+            entry["kinds"].add(label_of(pid))
+            entry["how"].update(DISPOSITIONS.get(v, str(v)) for v in values if v in MAKING)
+    return [{"path": p, "kinds": sorted(v["kinds"]), "how": sorted(v["how"])} for p, v in sorted(found.items())]
 
 
 def inventory_of(order: dict, label_of, ctx: Context) -> list:
@@ -992,7 +1023,12 @@ def windows_processes(tree, real: str) -> dict:
     return out
 
 
-def etw_files(path, pids=None, exits=None, order=None) -> tuple:
+#: How a file was asked for (the high byte of the Create event's CreateOptions, FILE_OPEN = 1 ...): the dispositions that can make a file.
+DISPOSITIONS = {0: "SUPERSEDE", 1: "OPEN", 2: "CREATE", 3: "OPEN_IF", 4: "OVERWRITE", 5: "OVERWRITE_IF"}
+MAKING = (0, 2, 3, 4, 5)
+
+
+def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tuple:
     """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
     stream: the file has every open of the machine for the length of the run. With a list in `exits`, the process stops of the same file (Kernel-Process, event 2)
     are appended to it as `{"pid", "code", "time", "image"}`: how each process ended; with a dict in `order`, the position in the file (the order the system
@@ -1022,6 +1058,8 @@ def etw_files(path, pids=None, exits=None, order=None) -> tuple:
             seen.add((pid, name))
             if order is not None:
                 order.setdefault((pid, name), events)
+            if dispositions is not None and data.get("CreateOptions"):
+                dispositions.setdefault((pid, name), set()).add(_number(data["CreateOptions"]) >> 24)
         el.clear()
     return seen, events
 
@@ -1129,7 +1167,8 @@ class WindowsTrace:
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
         exits: list = []
         order: dict = {}
-        everything, events = etw_files(self.xml, None, exits, order)
+        dispositions: dict = {}
+        everything, events = etw_files(self.xml, None, exits, order, dispositions)
         tree_pids = {e["pid"] for e in tree}
         seen = {(p, n) for p, n in everything if p in tree_pids or p == os.getpid()}
         outside: dict = {}
@@ -1149,7 +1188,8 @@ class WindowsTrace:
             problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
         return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
                 "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids], "exits_available": self.exits_ok,
-                "order": {k: v for k, v in order.items() if k[0] in tree_pids}}
+                "order": {k: v for k, v in order.items() if k[0] in tree_pids},
+                "dispositions": {k: sorted(v) for k, v in dispositions.items() if k[0] in tree_pids}}
 
     def cleanup(self) -> None:
         """Put the machine back: the session closed, the audit as it was."""
@@ -1472,6 +1512,7 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
             "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))},
+            "bare": {side: _bare_summary((fp.get("bare") or {}).get("bare")) for side, fp in (("A", a), ("B", b))},
             "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
 
 
@@ -1491,6 +1532,10 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
                 print("WARMUP-ONLY %s seed %s file.%s (touched by: %s)" % (name, warm["seed"], f["path"], ", ".join(f["touched_by"]) or "-"))
             for entry in warm.get("net", [])[:100]:
                 print("WARMUP-ONLY %s seed %s net.%s" % (name, warm["seed"], entry))
+    for side, name in (("A", a_name), ("B", b_name)):
+        bare = (report.get("bare") or {}).get(side)
+        if bare:
+            print("BARE (no client, no page; not compared) %s: %s" % (name, json.dumps(bare, sort_keys=True)))
     for side, name in (("A", a_name), ("B", b_name)):
         idle = (report.get("idle") or {}).get(side)
         if idle:
@@ -1595,8 +1640,11 @@ def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dic
     return step
 
 
-def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False) -> dict:
+def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, bare: bool = False) -> dict:
     """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
+
+    `bare` is the old idle launch, kept as a case of its own and never compared: no client and no page, as the run 44988820319 made it (a crash reporter ran in it, on
+    both systems). It records how the browser ended and what a crash leaves (`crash_evidence`), on Linux with core dumps on, and waits as the idle launch does.
 
     `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey and no pref changed; the launch waits until the notification of the data
     policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and then closes; its footprint carries `idle` (what the wait saw)."""
@@ -1622,12 +1670,18 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     else:
         from _strace_stand_in import _stand_in
 
-        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True, exit_status=True)
+        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True, exit_status=True,
+                        core_dir=seed_work if bare else None)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
-    notified = None
+    notified, watcher = None, None
     before = set(Path(tempfile.gettempdir()).glob("invisible_profile_*"))
+
+    def crash_dirs():
+        new = sorted(set(Path(tempfile.gettempdir()).glob("invisible_profile_*")) - before)
+        return crash_report_dirs(new[0] if new else None, windows)
+
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
                                launch_timeout_ms=180_000)
@@ -1636,8 +1690,13 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             from _strace_stand_in import _group_of
 
             pgid = _group_of(pidfile)
-        with sync_playwright() as p:
-            if idle:
+        if bare:
+            watcher = CrashWatcher(crash_dirs)
+            watcher.start()
+        with (contextlib.nullcontext() if bare else sync_playwright()) as p:
+            if bare:
+                notified = wait_for_notification(profile_prefs_reader(before))  # nothing drives the bare browser: the launch the idle one was
+            elif idle:
                 # Run 44988820319: with no client and no page the notification was never recorded in 120 s on either system (no window, so no
                 # `sessionstore-windows-restored` for the policy to start from) and the launch had a crash reporter: the idle launch has the page of a launch, and nothing else.
                 browser = p.firefox.connect(server.ws_endpoint)
@@ -1680,12 +1739,17 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
         if idle:
             result["idle"] = {"notified": notified}
+        if bare:
+            result["bare"] = {"notified": notified, "crash": crash_evidence(watcher.stop(), result, core_info(seed_work, binary) if not windows else None)}
+            watcher = None
     except TraceError as e:
         result = {"seed": seed, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
                   "problems": ["the trace of the run could not be taken: %s" % e]}
     finally:
         stop_site()
         stop_geo()
+        if watcher is not None:
+            watcher.stop()
         if server is not None:
             try:
                 server.close()
@@ -1699,6 +1763,100 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             trace.cleanup()
     result["problems"] = result.get("problems", []) + problems
     return result
+
+
+#: The crash evidence of the BARE launch (no client, no page: the launch of run 44988820319 that had a crash reporter): where a crash leaves its files.
+CRASH_PROCESS = re.compile(r"crashreporter|minidump-analyzer", re.I)
+
+
+def crash_report_dirs(profile_dir, windows: bool) -> list:
+    """The folders a crash leaves its `.dmp` and `.extra` in: the profile's `minidumps` and the `Crash Reports/pending` of the user's application data."""
+    dirs = [Path(profile_dir) / "minidumps"] if profile_dir else []
+    if windows:
+        base = os.environ.get("APPDATA")
+        if base:
+            dirs.append(Path(base) / "Mozilla" / "Firefox" / "Crash Reports" / "pending")
+    else:
+        home = Path(os.path.expanduser("~"))
+        dirs += [home / ".config" / "mozilla" / "firefox" / "Crash Reports" / "pending", home / ".mozilla" / "firefox" / "Crash Reports" / "pending"]
+    return dirs
+
+
+def scan_crash_files(dirs, seen: dict) -> None:
+    """Adds to `seen` ({path: {"name", "dir", "size", "content"}}) every `.dmp` and `.extra` of `dirs` it has not seen: a `.extra` is read at once, as the
+    profile is deleted when the launch ends."""
+    for folder in dirs:
+        try:
+            entries = list(Path(folder).iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.suffix not in (".dmp", ".extra") or str(entry) in seen:
+                continue
+            try:
+                item = {"name": entry.name, "dir": str(entry.parent), "size": entry.stat().st_size}
+                if entry.suffix == ".extra":
+                    item["content"] = entry.read_text(encoding="utf-8", errors="replace")[:20000]
+            except OSError:
+                continue
+            seen[str(entry)] = item
+
+
+class CrashWatcher:
+    """A thread that looks at the crash folders while the launch lives, so that what a crash leaves is read before the launch deletes its profile."""
+
+    def __init__(self, dirs_fn, period: float = 0.25) -> None:
+        import threading
+
+        self.dirs_fn, self.period = dirs_fn, period
+        self.seen: dict = {}
+        self.scans = 0
+        self._halt = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ab-host-crash-watch", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._halt.is_set():
+            scan_crash_files(self.dirs_fn(), self.seen)
+            self.scans += 1
+            self._halt.wait(self.period)
+
+    def stop(self) -> dict:
+        self._halt.set()
+        self._thread.join(timeout=10)
+        scan_crash_files(self.dirs_fn(), self.seen)
+        return {"files": sorted(self.seen.values(), key=lambda f: f["name"]), "scans": self.scans}
+
+
+def core_info(core_dir: Path, binary: str, run=subprocess.run) -> dict:
+    """What a Linux core dump of the bare launch is: the kernel's core pattern (a pipe to apport or systemd-coredump puts no file in `core_dir`), the cores found there and
+    the backtrace of each (`gdb -batch -ex bt`) when gdb is installed."""
+    try:
+        pattern = Path("/proc/sys/kernel/core_pattern").read_text(encoding="utf-8").strip()
+    except OSError:
+        pattern = None
+    cores = sorted(p for p in Path(core_dir).glob("core*") if p.is_file())
+    out = {"core_pattern": pattern, "cores": [c.name for c in cores], "backtraces": {}}
+    gdb = shutil.which("gdb")
+    for core in cores[:3]:
+        if gdb:
+            done = run([gdb, "-batch", "-ex", "bt", str(binary), str(core)], capture_output=True, text=True, errors="replace", timeout=180)
+            out["backtraces"][core.name] = (done.stdout + done.stderr)[-8000:]
+        else:
+            out["backtraces"][core.name] = "gdb is not installed"
+    return out
+
+
+def crash_evidence(watched: dict, fp: dict, core: dict | None = None) -> dict:
+    """What the bare launch says about how the browser ended: the exit code or signal of its parent processes (from the lifecycle), every crash reporter or
+    minidump analyzer process with its command line, the `.dmp` names and `.extra` contents the watcher read, and the core dump if there is one."""
+    lifecycle = fp.get("lifecycle")
+    exits = [e["how"] for e in lifecycle or [] if e["event"] == "end" and e["kind"] == "parent"]
+    procs = [{"kind": p["label"], "argv": p.get("cmd") or p.get("exec")} for p in fp.get("processes", []) if CRASH_PROCESS.search(p["label"])]
+    return {"parent_exits": exits if lifecycle is not None else None, "root_returncode": (fp.get("close") or {}).get("root_returncode"), "crash_processes": procs,
+            "files": watched.get("files", []), "scans": watched.get("scans"), "core": core}
 
 
 def wait_for_notification(read, period=NOTIFY_PERIOD_S, limit_s=NOTIFY_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> dict:
@@ -1753,6 +1911,7 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         labels = derive_labels(labels, parents)
         label_of = lambda pid: labels.get(pid, "?")  # noqa: E731
         inventory = inventory_of(got["order"], label_of, ctx)
+        creates = creates_of(got["dispositions"], label_of, ctx)
         info = {"source": "etw+audit", "events": got["events"], "exited": got["exited"]["exited"], "reads": got["exited"]["reads"]}
         problems = list(got["problems"])
         if not got["exited"]["exited"]:
@@ -1771,7 +1930,7 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         parents = {pid: owner_of(p["parent"], owners) for pid, p in procs.items() if p["parent"] is not None}
         labels = derive_labels(labels, parents)
         label_of = lambda pid: labels.get(owner_of(pid, owners), "?")  # noqa: E731
-        inventory = []
+        inventory, creates = [], None
         calls = touched_calls(lines)
         lifecycle, fd_opens = process_lifecycle(lines, procs), proc_fd_opens(lines, owners, label_of)
         info, problems, outside = {"source": "strace", "exited": True}, [], {}  # strace follows our tree and nothing else
@@ -1785,7 +1944,7 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     info.update({"processes": len(procs), "paths": len(raw)})
     # touched_by, touched_calls and spawned_by are evidence, never compared: the process and the call to blame for a path or a kind that differs
     out = {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
-           "pingsenders": ping_records(procs, labels, parents, windows), "inventory": inventory,
+           "pingsenders": ping_records(procs, labels, parents, windows), "inventory": inventory, "creates": creates,
            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside,
            "net": net, "net_not_compared": net_skipped, "lifecycle": lifecycle, "proc_fd_opens": fd_opens, "close": close}
     if not windows:
@@ -1826,9 +1985,13 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
         problems += ["idle: %s" % p for p in idle.get("problems", [])]
         print("idle (seed %d): %s; notification %s" % (seeds[0], json.dumps(idle["kinds"], sort_keys=True), json.dumps((idle.get("idle") or {}).get("notified"))))
         sys.stdout.flush()
+        # The bare launch: the old idle launch (no client, no page), a case of its own that is never compared; what it records is evidence (`crash_evidence`).
+        bare = run_seed(binary, seeds[0], work, name="bare", bare=True)
+        print("bare (seed %d, not compared): %s; %s" % (seeds[0], json.dumps(bare["kinds"], sort_keys=True), json.dumps(_bare_summary(bare.get("bare")))))
+        sys.stdout.flush()
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "idle": idle, "problems": problems,
+    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "idle": idle, "bare": bare, "problems": problems,
             "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
 
 
