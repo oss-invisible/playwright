@@ -302,11 +302,27 @@ def frame_html(kind, own, other, params):
     ) % (kind, kind, body)
 
 
+#: Most records kept per start(): a long run of the fake web is not a memory leak.
+MAX_RECORDS = 50000
+
+
 class State:
     def __init__(self):
         self.origins = ["", ""]
         self.hits = {}
         self.lock = threading.Lock()
+        #: What the server itself saw, in order: one `accept` per TCP connection and one `request` per request, each with its
+        #: wall times (time.time(): arrival of the request, answer written, handler done; the Windows wall clock ticks every 15 ms, so
+        #: the same moments are also kept as `m_*`, time.perf_counter() of this process, the scale of the client's log) and, if the
+        #: client went away, the error.
+        #: Read by a test that saves it as evidence when it fails (`start(...)[2].state.records`); nothing else reads it.
+        self.records = []
+
+    def note(self, record):
+        with self.lock:
+            if len(self.records) < MAX_RECORDS:
+                self.records.append(record)
+        return record
 
     def hit(self, path):
         with self.lock:
@@ -322,6 +338,11 @@ class Site(ThreadingHTTPServer):
         super().__init__(addr, handler)
         self.idx = idx
         self.state = state
+
+    def process_request(self, request, client_address):
+        self.state.note({"ev": "accept", "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "site": self.idx,
+                         "peer": client_address[1]})
+        super().process_request(request, client_address)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -340,15 +361,34 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
+        rec = getattr(self, "_rec", None)
+        if rec is not None:
+            rec["status"] = code
         if body and self.command != "HEAD":
             self.wfile.write(body)
+        if rec is not None:
+            rec["t_answer"] = round(time.time(), 4)
+            rec["m_answer"] = round(time.perf_counter(), 6)
 
     def _guard(self, fn):
         # Browsers abort requests on purpose; a dropped socket is not an error here.
+        wanted = ("Host", "Origin", "Referer", "Content-Type", "Content-Length", "Sec-Fetch-Site", "Sec-Fetch-Dest")
+        rec = self._rec = self.server.state.note({
+            "ev": "request", "t_arrive": round(time.time(), 4), "m_arrive": round(time.perf_counter(), 6), "site": self.server.idx, "peer": self.client_address[1],
+            "method": self.command, "path": self.path,
+            "headers": {k: self.headers.get(k) for k in wanted if self.headers.get(k) is not None},
+            "status": None, "t_body": None, "t_answer": None, "t_done": None, "error": None})
         try:
             fn()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+            rec["error"] = type(exc).__name__
             self.close_connection = True
+        except BaseException as exc:
+            rec["error"] = type(exc).__name__
+            raise
+        finally:
+            rec["t_done"] = round(time.time(), 4)
+            rec["m_done"] = round(time.perf_counter(), 6)
 
     def do_GET(self):
         self._guard(self._get)
@@ -367,6 +407,7 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n:
             self.rfile.read(n)
+        self._rec["t_body"] = round(time.time(), 4)
         self.server.state.hit(u.path)
         self._send(204, None, b"")
 
@@ -453,6 +494,7 @@ def start(ports=(8311, 8312), bind="127.0.0.1", public_host=("127.0.0.1", "local
             s.shutdown()
             s.server_close()
 
+    stop.state = state      # the server's own record (`state.records`), kept after stop()
     return state.origins[0], state.origins[1], stop
 
 

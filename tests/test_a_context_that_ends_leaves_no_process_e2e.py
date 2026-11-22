@@ -16,7 +16,8 @@ from `http://127.0.0.1:<port>`; a site never includes the port). The browser sta
 counting every content process, or every one that hosts any site, read them as a leak ([2, 2, 2, 5, 5] on the e2e
 of the 0.50.0 commit, three "Web Content" and no site left; a process for a Mozilla site started by the New Tab
 page). If the name were not what the test expects, the count while the page is open would be 0 and the first assert
-says so. Off Linux the test skips: no other system names the process.
+says so. On Windows, which names no process, the engine is started with `LOG_ENV` and the type each process was given
+is read from its log (tests/_processes.py `remote_types`).
 
 The engine that does it is not published when this file is written: `engine_at_least` makes the test wait for
 it, and on an older engine it is skipped, never passed.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 
 import pytest
@@ -32,7 +34,7 @@ import pytest
 import websockets  # noqa: F401 - the dev extra installs it: a missing one is a failure, never a skip
 from websockets.asyncio.client import connect  # noqa: E402
 
-from _processes import NAMED_BY_SITE, site_processes_below  # noqa: E402
+from _processes import LOG_ENV, NAMED_BY_SITE, remote_types, site_processes_below  # noqa: E402
 from _servers import LocalServer  # noqa: E402
 from _waits import awatch  # noqa: E402
 
@@ -110,9 +112,15 @@ DEADLINE_S = 30
 REGISTERED = ("navigator.serviceWorker.getRegistration().then(r => !!r && !!(r.installing || r.waiting || r.active))")
 
 
-def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(firefox_binary, engine_at_least):
+def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(firefox_binary, engine_at_least, monkeypatch, tmp_path):
     engine_at_least(ENGINE_WITH_THE_FIX)
     from invisible_playwright import launch_server
+
+    # Windows names no process: the engine's own log says which type (so which site) each one was given
+    log_base = tmp_path / "process-types"
+    if sys.platform == "win32":
+        monkeypatch.setenv("MOZ_LOG", LOG_ENV["MOZ_LOG"])
+        monkeypatch.setenv("MOZ_LOG_FILE", str(log_base))
 
     server, base = _serve()
     launched = launch_server(host="127.0.0.1", port=0, headless=True, virtual_display=False, humanize=False,
@@ -120,7 +128,7 @@ def test_closed_contexts_with_a_never_stopping_service_worker_leave_no_process(f
                              extra_prefs=NAMED_BY_SITE)
 
     def sites():
-        return site_processes_below(launched.process.pid, SITE)
+        return site_processes_below(launched.process.pid, SITE, types=lambda: remote_types(log_base))
 
     async def drive():
         opened, left = [], []

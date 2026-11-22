@@ -30,10 +30,12 @@ import hashlib
 import ipaddress
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -116,17 +118,94 @@ def _engine_env(work: Path) -> dict:
     return env
 
 
-def _run_to_the_end(argv, env, cwd, timeout_s):
-    """Runs `argv` with nothing on stdout and stderr; (exit code, None) or (None, "timed out ...") with its whole tree ended."""
+def _run_to_the_end(argv, env, cwd, timeout_s, *, output_to=None, core_dumps=False):
+    """Runs `argv` with nothing on stdout and stderr (or, with `output_to`, with both written to files `<output_to>.stdout` and `<output_to>.stderr`, which is all
+    that changes); (exit code, None) or (None, "timed out ...") with its whole tree ended. `core_dumps` (Linux only) lifts the core size limit of the process, so that
+    a crash leaves a core file where `kernel.core_pattern` says (e2e.yml sets it)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, cwd=str(cwd), creationflags=flags)
+    if core_dumps and sys.platform.startswith("linux"):
+        argv = ["sh", "-c", 'ulimit -c unlimited 2>/dev/null; exec "$@"', "sh", *argv]
+    sinks = [subprocess.DEVNULL, subprocess.DEVNULL]
+    opened = []
+    if output_to is not None:
+        for index, suffix in enumerate((".stdout", ".stderr")):
+            opened.append(open(str(output_to) + suffix, "wb"))
+            sinks[index] = opened[-1]
     try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=sinks[0], stderr=sinks[1], env=env, cwd=str(cwd), creationflags=flags)
         try:
-            return proc.wait(timeout=timeout_s), None
-        except subprocess.TimeoutExpired:
-            return None, "did not finish within %s s" % timeout_s
+            try:
+                return proc.wait(timeout=timeout_s), None
+            except subprocess.TimeoutExpired:
+                return None, "did not finish within %s s" % timeout_s
+        finally:
+            _kill_tree(proc)
     finally:
-        _kill_tree(proc)
+        for sink in opened:
+            sink.close()
+
+
+def _evidence_folder(work):
+    """Where the e2e jobs pick up what a test saved (`$RUNNER_TEMP/invpw-evidence`), under this test's own name; the work folder outside a runner."""
+    base = os.environ.get("RUNNER_TEMP")
+    folder = (Path(base) / "invpw-evidence" if base else Path(work)) / "security-state-generate"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _save_what_the_failed_generation_left(ff, profile, work, output, started_at, code, why):
+    """ONLY after a generation that did not exit 0: the engine's stdout and stderr, what the profile holds (the result and the folder `security_state/`, with every file's
+    size), and, on Linux, the backtrace of every thread of the core the crash left (gdb), all in the evidence folder the e2e jobs upload. Saves; asserts nothing and never
+    raises (the assertion of the test is what reports the failure)."""
+    folder = _evidence_folder(work)
+    notes = ["exit code %r; %s" % (code, why or "the engine exited")]
+    try:
+        for suffix in (".stdout", ".stderr"):
+            source = Path(str(output) + suffix)
+            if source.is_file():
+                shutil.copyfile(str(source), str(folder / ("engine" + suffix)))
+                notes.append("%s: %d bytes" % (source.name, source.stat().st_size))
+        listing = ["%s\t%d" % (path.relative_to(profile).as_posix(), path.stat().st_size) for path in sorted(profile.rglob("*")) if path.is_file()]
+        (folder / "profile-files.tsv").write_text("\n".join(listing) + "\n", encoding="utf-8")
+        notes.append("profile files: %d" % len(listing))
+        for name in (RESULT_NAME, "user.js"):
+            if (profile / name).is_file():
+                shutil.copyfile(str(profile / name), str(folder / name))
+        if (profile / STATE_DIR).is_dir():
+            shutil.copytree(str(profile / STATE_DIR), str(folder / STATE_DIR), dirs_exist_ok=True)
+        if sys.platform.startswith("linux"):
+            notes.append(_core_backtrace(ff, work, folder, started_at))
+    except Exception as exc:  # the evidence is best effort: the test reports the failure
+        notes.append("saving the evidence failed: %r" % (exc,))
+    (folder / "notes.txt").write_text("\n".join(notes) + "\n", encoding="utf-8")
+
+
+def _core_backtrace(ff, work, folder, started_at):
+    """The core the generation left (in `$INVPW_CORE_DIR`, the folder e2e.yml points `kernel.core_pattern` at; else in the work folder, the engine's working directory):
+    gdb's `thread apply all bt` of it, written to `gdb-backtrace.txt`; the core itself is deleted (it is hundreds of MB). A one-line account of what was done."""
+    try:
+        pattern = Path("/proc/sys/kernel/core_pattern").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        pattern = "unreadable: %r" % (exc,)
+    where = Path(os.environ.get("INVPW_CORE_DIR") or work)
+    cores = sorted((path for path in where.glob("core*") if path.is_file() and path.stat().st_mtime >= started_at - 2), key=lambda path: path.stat().st_mtime)
+    if not cores:
+        return "no core file in %s (kernel.core_pattern is %r, INVPW_CORE_DIR is %r, gdb is %s)" % (where, pattern, os.environ.get("INVPW_CORE_DIR"), shutil.which("gdb"))
+    core = cores[-1]
+    size = core.stat().st_size
+    gdb = shutil.which("gdb")
+    if gdb is None:
+        return "core %s (%d bytes, kernel.core_pattern %r) but gdb is not installed" % (core.name, size, pattern)
+    try:
+        done = subprocess.run([gdb, "-batch", "-nx", "-ex", "set pagination off", "-ex", "bt", "-ex", "info registers", "-ex", "x/8i $pc", "-ex", "info sharedlibrary",
+                               "-ex", "thread apply all bt", ff, str(core)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        (folder / "gdb-backtrace.txt").write_bytes(done.stdout)
+        account = "core %s (%d bytes, kernel.core_pattern %r): gdb exited %d, %d bytes of backtrace" % (core.name, size, pattern, done.returncode, len(done.stdout))
+    except Exception as exc:
+        account = "core %s (%d bytes, kernel.core_pattern %r): gdb failed: %r" % (core.name, size, pattern, exc)
+    for leftover in cores:
+        leftover.unlink()
+    return account
 
 
 # --- the files the core would write ----------------------------------------------------------------------------------------------------------------------------
@@ -255,7 +334,11 @@ def test_the_engine_generates_the_security_state_it_is_given(ff, inputs, tmp_pat
     profile = work / "profile"
     profile.mkdir()
     (profile / "user.js").write_bytes(_user_js(files))
-    code, why = _run_to_the_end([ff, "-headless", "-no-remote", "-profile", str(profile)], _engine_env(work), work, GENERATE_TIMEOUT_S)
+    output = work / "engine-output"
+    started_at = time.time()
+    code, why = _run_to_the_end([ff, "-headless", "-no-remote", "-profile", str(profile)], _engine_env(work), work, GENERATE_TIMEOUT_S, output_to=output, core_dumps=True)
+    if code != 0:
+        _save_what_the_failed_generation_left(ff, profile, work, output, started_at, code, why)
     said = (profile / RESULT_NAME).read_bytes().decode("utf-8") if (profile / RESULT_NAME).is_file() else "no %s" % RESULT_NAME
     assert code == 0, "the engine in generate mode %s (exit code %r); its result: %s" % (why or "exited", code, said)
 

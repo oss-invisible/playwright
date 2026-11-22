@@ -68,10 +68,10 @@ return JSON.stringify(out);
 """
 
 
-def _marionette(port):
+def _marionette():
     import webfont_probe
 
-    m = webfont_probe._Marionette(port)
+    m = webfont_probe._Marionette(webfont_probe.marionette_active_port())
     m.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {}}})
     m.call("Marionette:SetContext", {"value": "chrome"})
     return m
@@ -108,16 +108,15 @@ def test_the_compositor_is_webrender_software_whatever_the_machine(firefox_binar
     from invisible_playwright import InvisiblePlaywright
 
     monkeypatch.setenv("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1")   # the chrome-scope reads below
-    port = webfont_probe.marionette_port()
     pref_names = ["zoom.stealth.gfx.feature_status", "gfx.webrender.software", "gfx.webrender.software.d3d11"]
     server, url = _a_page_server("<!doctype html><title>compositor</title><body>x</body>")
     marionette = None
     try:
         with InvisiblePlaywright(binary_path=firefox_binary, extra_args=MARIONETTE_ARGS,
-                                 extra_prefs={"marionette.port": port}, **LAUNCH) as browser:
+                                 extra_prefs={"marionette.port": 0}, **LAUNCH) as browser:
             page = browser.new_page()
             page.goto(url, wait_until="load", timeout=60000)
-            marionette = _marionette(port)
+            marionette = _marionette()
             # a window gets its layer manager a moment after it is shown: the same wait for the answer as about:support has none, so poll
             windows, end = [], time.time() + 30
             while time.time() < end:

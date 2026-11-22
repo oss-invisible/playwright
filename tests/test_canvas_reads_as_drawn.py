@@ -15,6 +15,9 @@ known-bad:
   same text canvas: what separates two machines is how they draw, never a
   per-seed change at readback.
 * A toDataURL PNG carries the deBG chunk retail 151 writes.
+* A WebGL canvas that is not premultiplied (premultipliedAlpha:false, half
+  transparent) reads the same pixels through toDataURL and toBlob, noised with the
+  engine on (hw_seed > 0); the control is the engine off (hw_seed 0: as drawn).
 
 Runs against about:blank and a local http page, no network/proxy. Part of the
 e2e release gate.
@@ -154,3 +157,84 @@ def test_two_seeds_on_the_same_machine_draw_the_same_text(firefox_binary):
     assert hashlib.sha256(bytes(a)).digest() == hashlib.sha256(bytes(b)).digest(), (
         "two seeds declaring the same display scale and ClearType tuning read "
         "different text pixels: something per-seed still changes a 2D canvas")
+
+
+_NON_PREMULTIPLIED_JS = """async () => {
+  const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+  const gl = c.getContext('webgl', {premultipliedAlpha: false, alpha: true,
+                                    preserveDrawingBuffer: true, antialias: true});
+  if (!gl) return null;
+  const alpha = 128 / 255;
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, 'attribute vec2 p; attribute vec3 c; varying vec3 v;'
+    + ' void main(){v=c;gl_Position=vec4(p,0.,1.);}');
+  gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, 'precision mediump float; varying vec3 v; void main(){gl_FragColor=vec4(v,'
+    + alpha.toFixed(8) + ');}');
+  gl.compileShader(fs);
+  const pr = gl.createProgram(); gl.attachShader(pr, vs); gl.attachShader(pr, fs);
+  gl.linkProgram(pr); gl.useProgram(pr);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(
+    [-0.9, -0.8, 1, 0, 0,  0.85, -0.6, 0, 1, 0,  0.1, 0.9, 0, 0, 1]), gl.STATIC_DRAW);
+  const pl = gl.getAttribLocation(pr, 'p'), cl = gl.getAttribLocation(pr, 'c');
+  gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 20, 0);
+  gl.enableVertexAttribArray(cl); gl.vertexAttribPointer(cl, 3, gl.FLOAT, false, 20, 8);
+  gl.clearColor(1, 1, 1, alpha); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+  const url = c.toDataURL();
+  const blob = await new Promise(resolve => c.toBlob(resolve, 'image/png'));
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  return {url, blob: btoa(binary), premultipliedAlpha: gl.getContextAttributes().premultipliedAlpha};
+}"""
+
+
+def _non_premultiplied(firefox_binary, hw_seed):
+    """(the pixels of toDataURL, the pixels of toBlob) of one half-transparent, non-premultiplied WebGL canvas,
+    as 128x128 RGBA bytes, with the engine on (hw_seed > 0) or off (0)."""
+    import base64
+
+    from _page_bytes import unfiltered
+
+    with InvisiblePlaywright(
+        seed=7, binary_path=firefox_binary, headless=True,
+        extra_prefs={"zoom.stealth.fpp.hw_seed": hw_seed},
+    ) as b:
+        p = b.new_context().new_page()
+        p.goto("about:blank", timeout=30_000)
+        got = p.evaluate(_NON_PREMULTIPLIED_JS)
+    assert got is not None, "webgl is unavailable: a WebGL canvas cannot be read"
+    assert got["premultipliedAlpha"] is False, "the context is premultiplied: %r" % got["premultipliedAlpha"]
+    images = [unfiltered(base64.b64decode(got["url"].split(",", 1)[1])), unfiltered(base64.b64decode(got["blob"]))]
+    for png in images:
+        assert (png["w"], png["h"], png["channels"]) == (128, 128, 4), png
+    return images[0]["data"], images[1]["data"]
+
+
+@pytest.mark.e2e
+def test_a_non_premultiplied_webgl_canvas_reads_the_same_through_todataurl_and_toblob(firefox_binary):
+    """toDataURL and toBlob of a premultipliedAlpha:false WebGL canvas give the same pixels, noised with the engine on.
+
+    The canvas noise is applied to the snapshot with its alpha type: a context that is not premultiplied stores
+    the colours as drawn, and a reader that took it for premultiplied would noise (or convert) them wrongly.
+    Both PNG readers go through the same hook (GetImageBuffer, GetInputStream in ClientWebGLContext.cpp). The
+    canvas is half transparent (alpha 128/255, colours as drawn), so a premultiplied reading changes the bytes.
+    Negative control, in the same test: with the engine off the two readers are the bytes as drawn, their alpha is
+    the 128 drawn, and the engine-on PNG differs from them."""
+    on_url, on_blob = _non_premultiplied(firefox_binary, 12345)
+    off_url, off_blob = _non_premultiplied(firefox_binary, 0)
+    alphas = {off_url[i] for i in range(3, len(off_url), 4)}
+    assert alphas <= set(range(126, 131)), (
+        "engine off: the alpha of the PNG is %s, not the 128 that was drawn" % sorted(alphas))
+    differing = lambda a, b: sum(1 for x, y in zip(a, b) if x != y)
+    assert off_blob == off_url, (
+        "engine off: %d of %d bytes of toBlob differ from toDataURL" % (differing(off_blob, off_url), len(off_url)))
+    assert differing(on_url, off_url), (
+        "toDataURL of a non-premultiplied WebGL canvas is the same with the engine on and off: no noise reaches "
+        "the page, so comparing the two readers says nothing")
+    assert on_blob == on_url, (
+        "engine on: %d of %d bytes of toBlob differ from toDataURL of the same non-premultiplied WebGL canvas"
+        % (differing(on_blob, on_url), len(on_url)))

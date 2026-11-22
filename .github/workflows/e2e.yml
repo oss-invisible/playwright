@@ -113,6 +113,12 @@ jobs:
           sudo apt-get install -y xvfb
           # the fontconfig e2e trace the opens of the browser: strace is not in the runner image (setsid is, util-linux)
           sudo apt-get install -y strace
+          # tests/test_security_state_engine_e2e.py, on a crash of the engine: a core file where kernel.core_pattern says, and gdb to read it (the test deletes the core and
+          # uploads the backtrace with the evidence). Only a process that lifts its own core limit leaves a core, the runner's default limit is 0.
+          sudo apt-get install -y gdb
+          mkdir -p "$RUNNER_TEMP/invpw-cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%e.%p"
+          echo "INVPW_CORE_DIR=$RUNNER_TEMP/invpw-cores" >> "$GITHUB_ENV"
           sudo "$(which python)" -m playwright install-deps firefox
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
       # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
@@ -318,6 +324,11 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     # `run:` blocks are PowerShell on Windows unless said otherwise (e2e-hunt.yml had a ParserError on its first launch there).
     defaults:
       run:
@@ -345,15 +356,22 @@ jobs:
 
   # THE SAME e2e ON WINDOWS (Federico, 12/11: every test of the product runs on Linux AND Windows; where Windows behaves
   # differently the test adapts to the system). Before this, 562 of the 808 e2e had never run on Windows in any round. The census
-  # of 12/11 (run 43307193708) took ~50 minutes in one job, so the files are split in four parts (the sorted list, every fourth
-  # file: a split that does not move when a file is added elsewhere). Left out, by name, are the suites ci/required-suites.json
-  # declares `linux_only` (the reason is on the row); tests/test_every_suite_runs_on_linux_and_windows.py holds both together.
+  # of 12/11 (run 43307193708) took ~50 minutes in one job, so the files are split in four parts: the rows `wrapper.e2e.suite.windows.1`
+  # to `.4` of ci/required-suites.json, balanced on the test times measured on Windows (a split that does not move when a file is added
+  # elsewhere: a new file is added by hand to a row). Left out of the rows, by name, are the suites ci/required-suites.json declares
+  # `linux_only` (the reason is on the row) and the tests that skip on Windows; tests/test_the_e2e_suite_is_accounted_for.py holds the
+  # partition whole and tests/test_every_suite_runs_on_linux_and_windows.py holds both systems together.
   e2e-windows:
     name: e2e (windows, part ${{ matrix.part }})
     needs: core-on-index
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 40
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     strategy:
       fail-fast: false
       matrix:
@@ -381,23 +399,11 @@ jobs:
       # The GeoIP database made by the repository, as on the Linux run (no download, the same bytes every run).
       - name: The GeoIP database (made by the repository, same bytes every run)
         run: python scripts/ci_lab_geoip.py build
-      - name: The files of this part, without the linux_only suites
-        run: |
-          set -e
-          python -m pytest --collect-only -q -m e2e -o addopts= -p no:cacheprovider 2>/dev/null | grep "::" | cut -d: -f1 | sort -u > "$RUNNER_TEMP/e2e_files.txt"
-          python - "${{ matrix.part }}" "$RUNNER_TEMP" <<'PY'
-          import json, os, sys
-          part, tmp = int(sys.argv[1]), sys.argv[2]
-          rows = json.load(open("ci/required-suites.json", encoding="utf-8"))
-          left_out = [t for r in rows if r.get("linux_only") for t in r["tests"]]
-          files = [l.strip() for l in open(os.path.join(tmp, "e2e_files.txt")) if l.strip()]
-          files = [f for f in files if f not in left_out]
-          mine = [f for i, f in enumerate(files) if i % 4 == part - 1]
-          nodes = [t for t in left_out if "::" in t and t.split("::")[0] in mine]
-          open(os.path.join(tmp, "e2e_args.txt"), "w").write("\n".join(mine + ["--deselect=" + n for n in nodes]) + "\n")
-          print("%d e2e files, %d left out as linux_only, %d in part %d, %d node(s) deselected"
-                % (len(files) + len([t for t in left_out if "::" not in t]), len(left_out), len(mine), part, len(nodes)))
-          PY
+      # The files of the part are the rows `wrapper.e2e.suite.windows.N` of ci/required-suites.json (files, and node ids where a file has tests that skip on
+      # Windows or run in another suite): the same list the gate of the candidate runs on the engine under test, so what is measured here and there is one
+      # partition. tests/test_the_e2e_suite_is_accounted_for.py holds it whole, and the suites declared `linux_only` are left out of it by name.
+      - name: The files of this part (the row of the suite, in ci/required-suites.json)
+        run: python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.windows.${{ matrix.part }}" --os windows > "$RUNNER_TEMP/e2e_args.txt"
       - name: Run this part of the e2e
         env:
           PYTHONUNBUFFERED: "1"

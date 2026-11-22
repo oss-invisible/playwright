@@ -602,7 +602,8 @@ class DohGateway(Gateway):
     * CONNECT to a loopback address is relayed for real (the pages and the echo servers of a test);
     * the egress endpoints of the base class (``api.ipify.org:80``) keep working;
     * any other CONNECT is refused (reply 2 "not allowed", for an address; 4 "host unreachable", for a name) and
-      listed in :attr:`refused`: the gateway never resolves a name and never reaches past the loopback.
+      listed in :attr:`refused` (and in ``guard``, the record every gateway of ``_socks_servers`` writes under ``$RUNNER_TEMP/invpw-evidence/``):
+      the gateway never resolves a name and never reaches past the loopback. Its UDP relay is the base one: only the lab's, the rest dropped and recorded.
 
     :attr:`connects` (inherited) lists EVERY CONNECT target in order, so ``("page-a.test", 80)`` in it means the
     browser sent a name where it should have sent an address. :attr:`credentials_seen` lists every
@@ -696,6 +697,7 @@ class DohGateway(Gateway):
         if not is_loopback(host):
             self.connects.append((host, port))
             self.refused.append((host, port))
+            self.guard.refuse(host, port, getattr(self._local, "atyp", 3), "tcp")
             self._send(c, self._reply(2 if _is_address(host) else 4))
             return
         self.connects.append((host, port))

@@ -17,13 +17,25 @@ def install_route(context):
     context.route("**/*", lambda route: route.abort() if route.request.resource_type in BLOCKED else route.continue_())
 
 
-def navigate(page, url, *, idle_timeout_ms):
+def navigate(page, url, *, idle_timeout_ms, client_log=None):
+    """`client_log`, a list (default None: nothing kept), gets one entry per event the client heard (wall time `t`, time.time(), and `m`, time.perf_counter()):
+    the navigation's start and end, and every request, its response and its end. A test that saves evidence when it fails passes it."""
     rec = {"idle": False, "err": None, "seconds": None}
     # The requests the client has heard of and not yet heard the end of: a navigation that does not idle says who is still in flight
     # (type, method, url, frame). The process that hosts a request is not readable by a client.
     open_requests = {}
 
+    def note(event, request=None, **more):
+        if client_log is None:
+            return
+        entry = {"ev": event, "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "url": url}
+        if request is not None:
+            entry.update(req=id(request), type=request.resource_type, method=request.method, target=request.url[:160])
+        entry.update(more)
+        client_log.append(entry)
+
     def started(request):
+        note("request", request)
         try:
             frame = request.frame.url[:100]
         except Exception:
@@ -33,11 +45,18 @@ def navigate(page, url, *, idle_timeout_ms):
 
     def ended(request):
         open_requests.pop(id(request), None)
+        note("ended", request)
+
+    def answered(response):
+        note("response", response.request, status=response.status)
 
     t0 = time.monotonic()
     page.on("request", started)
+    if client_log is not None:
+        page.on("response", answered)
     page.on("requestfinished", ended)
     page.on("requestfailed", ended)
+    note("navigation_start")
     try:
         page.goto(url, wait_until="commit", timeout=15000)
         page.wait_for_load_state("networkidle", timeout=idle_timeout_ms)
@@ -47,16 +66,17 @@ def navigate(page, url, *, idle_timeout_ms):
         rec["err"] = (text.splitlines()[0] if text else repr(exc))[:200]
         rec["in_flight"] = list(open_requests.values())[:30]
     finally:
-        for event, handler in (("request", started), ("requestfinished", ended), ("requestfailed", ended)):
+        for event, handler in (("request", started), ("response", answered), ("requestfinished", ended), ("requestfailed", ended)):
             try:
                 page.remove_listener(event, handler)
             except Exception:
                 pass
     rec["seconds"] = round(time.monotonic() - t0, 2)
+    note("navigation_end", idle=rec["idle"], err=rec["err"])
     return rec
 
 
-def drive(browser, origin, patterns, repetitions, idle_timeout_ms=10000):
+def drive(browser, origin, patterns, repetitions, idle_timeout_ms=10000, client_log=None):
     """Every pattern `repetitions` times, each followed by the canary. Returns a list of cells."""
     cells = []
     context = browser.new_context()
@@ -66,7 +86,7 @@ def drive(browser, origin, patterns, repetitions, idle_timeout_ms=10000):
         for rep in range(1, repetitions + 1):
             for name in patterns:
                 for pattern, canary in ((name, False), ("quiet", True)):
-                    cell = navigate(page, "%s/p/%s" % (origin, pattern), idle_timeout_ms=idle_timeout_ms)
+                    cell = navigate(page, "%s/p/%s" % (origin, pattern), idle_timeout_ms=idle_timeout_ms, client_log=client_log)
                     cell.update(round=rep, pattern=pattern, canary=canary, after=name if canary else None)
                     cells.append(cell)
     finally:

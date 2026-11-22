@@ -10,21 +10,24 @@ site changes its process.
   navigation and `go_back()` restore the page with its frame of another site, and the frame answers `evaluate`.
   The outcome asserted is what stock Firefox does (see the docstrings).
 * Processes. A context whose page had frames of other sites leaves no content process behind once it is closed:
-  the count of web content processes under the engine, read after each of several such contexts, stays within the
-  pool of spare processes retail Firefox keeps (see the test).
+  judged by identity (the processes that host the frames' sites, by name on Linux and by the engine's logged remote
+  type on Windows), not by a count that also holds the pool of spare processes (see the test).
 
 The first test proves the frame is in another process, so the file cannot turn into a same-process suite.
 """
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
 from _fission_frames import Sites, assert_other_process, launch, new_page, wait_for, wait_frame
-from _waits import spare_processes, watch
+from _processes import LOG_ENV, NAMED_BY_SITE, remote_types, site_processes_below
+from _waits import watch
 
 pytestmark = pytest.mark.e2e
 
@@ -138,98 +141,79 @@ def test_a_top_level_navigation_and_back_restore_the_page_with_its_frame_usable(
 # ---------------------------------------------------------------------------
 
 
-def _content_processes(engine_dir):
-    """The pids of the engine's web content processes (`-contentproc ... tab`) below this test."""
-    import psutil
-
-    found = set()
-    for child in psutil.Process(os.getpid()).children(recursive=True):
-        try:
-            if not os.path.normcase(child.exe()).startswith(os.path.normcase(engine_dir)):
-                continue
-            command = child.cmdline()
-        except psutil.Error:
-            continue
-        if "-contentproc" in command and command[-1] == "tab":
-            found.add(child.pid)
-    return found
-
-
-def _settled(engine_dir, seconds=2.0, limit=25.0):
-    """The set of content processes once it has not changed for ``seconds``."""
-    end = time.monotonic() + limit
-    last, since = _content_processes(engine_dir), time.monotonic()
-    while time.monotonic() < end:
-        time.sleep(0.25)
-        now = _content_processes(engine_dir)
-        if now != last:
-            last, since = now, time.monotonic()
-        elif time.monotonic() - since >= seconds:
-            break
-    return last
-
-
 CONTEXTS = 5
-#: How long a count of processes may take to reach what it must be (a process starts or ends in well under a
-#: second; this is the only clock the verdict has).
+#: How long a process may take to appear or to end (one starts or ends in well under a second; this is the only clock
+#: the verdict has).
 DEADLINE = 25.0
 
 
-def test_a_closed_context_with_frames_of_other_sites_leaves_no_content_process(firefox_binary, sites):
+def _site(url):
+    """The site of a url: scheme and host, never the port."""
+    parts = urlsplit(url)
+    return "%s://%s" % (parts.scheme, parts.hostname)
+
+
+def test_a_closed_context_with_frames_of_other_sites_leaves_no_content_process(
+        firefox_binary, sites, monkeypatch, tmp_path):
     """Five contexts in a row, each with a page whose frames are on B and (nested) on C. The processes the frames
     took are gone once the context is closed.
 
-    What retail Firefox does, and so what is allowed: with Fission on it keeps a pool of preallocated content
-    processes, `dom.ipc.processPrelaunch.fission.number` of them (3 on desktop, 1 on a machine of 4 GB or less),
-    refilled one at a time after a page takes one (`_waits.spare_processes` has the source). So between two looks
-    the number of content processes moves by up to that pool and no more: after the first context is closed
-    (``counts[0]``) every later count is at most ``counts[0]`` plus the pool, and a frame process that is never
-    released grows the count by at least one per context, so it passes the bound within the five (a pool that is
-    emptier at the last look than at the first could hide it: the bound is as wide as the pool, no wider). While a context
-    is open the count rises above ``counts[0]``: the frames' processes are on top of a refilled pool.
+    The verdict is told by identity, not by a count: the number of content processes under the engine also holds the
+    preallocated pool and whatever the browser starts for itself (the New Tab page's own Mozilla site), which move
+    with the load of the machine and are not what the test is about. A process that hosts a site says so: on Linux
+    its name is the site (`fission.processSiteNames`, test-only), on Windows the remote type the engine logs for
+    every process it creates (`webIsolated=<site>^userContextId=N`, `_processes.py`). So:
 
-    Each count is a WAIT for that bound (up to 25 s), not a look after a fixed pause; the message gives the counts
-    over time of every context."""
-    import psutil
+    * while a context is open the frames of B and C each have a content process of their own (the processes that host
+      B and C exist: a lookup that finds nothing cannot pass);
+    * once the context is closed no process that hosts B or C is left below this test (B and C are only ever framed,
+      by a context that is closed, so nothing may host them).
 
+    On Linux a name keeps 15 characters, so `http://127.0.0.2` is told from nothing but the start `http://127.0.0.` (the
+    site of A, which closes with the context as well): the lookup of C is then no narrower than that of A and B's is the
+    exact one.
+
+    Each look is a WAIT for that condition (up to 25 s), not a look after a fixed pause; the message gives what was
+    seen over time for every context."""
     sites.route("B", "/leak-b", "<!doctype html><title>b</title><iframe src='%s'></iframe>" % sites.url("C", "/h3"))
     sites.route("A", "/leak", "<!doctype html><title>leak</title><iframe id='b' src='%s'></iframe>"
                 % sites.url("B", "/leak-b"))
     engine_dir = str(Path(firefox_binary).resolve().parent)
-    spare = spare_processes(psutil.virtual_memory().total)
+    framed = {"B": _site(sites.url("B")), "C": _site(sites.url("C"))}
+    base = tmp_path / "process-types"
+    if sys.platform == "win32":
+        # Windows names no process: the engine's log tells the remote type of each one it creates
+        monkeypatch.setenv("MOZ_LOG", LOG_ENV["MOZ_LOG"])
+        monkeypatch.setenv("MOZ_LOG_FILE", str(base))
 
-    def number():
-        return len(_content_processes(engine_dir))
+    def hosting():
+        """`{name of the site: pids}` of the live processes below this test that host a framed site."""
+        return {name: site_processes_below(os.getpid(), site, engine_dir, types=lambda: remote_types(base))
+                for name, site in framed.items()}
+
+    def both_hosted(found):
+        return all(found.values())
+
+    def none_hosted(found):
+        return not any(found.values())
 
     def pause():
         time.sleep(0.25)
 
-    with launch(firefox_binary) as browser:
-        counts, during, trail = [], [], []
+    with launch(firefox_binary, extra_prefs=NAMED_BY_SITE) as browser:
+        trail = []
         for n in range(CONTEXTS):
             context, page = new_page(browser)
             page.goto(sites.url("A", "/leak"), wait_until="load")
             wait_frame(page, sites.url("C"), "/h3")
-            if not counts:
-                during.append(len(_settled(engine_dir)))
-                trail.append("context %d open: %d" % (n, during[-1]))
-            else:
-                opened = watch(number, lambda count: count > counts[0], DEADLINE, pause)
-                during.append(opened.history[-1][1])
-                trail.append("context %d open, waiting for more than %d: %s" % (n, counts[0], opened.render()))
-                assert opened.ok, (
-                    "the frames of other sites took no process of their own: %r while open, %r after; %s" % (
-                        during, counts, " | ".join(trail)))
+            opened = watch(hosting, both_hosted, DEADLINE, pause)
+            trail.append("context %d open: %s" % (n, opened.render()))
+            assert opened.ok, (
+                "the frames of B and C took no process of their own (a site with no process of its own shows an empty "
+                "set): %s" % " | ".join(trail))
             context.close()
-            if not counts:
-                counts.append(len(_settled(engine_dir)))
-                trail.append("context %d closed: %d (the reference)" % (n, counts[0]))
-            else:
-                closed = watch(number, lambda count: count <= counts[0] + spare, DEADLINE, pause)
-                counts.append(closed.history[-1][1])
-                trail.append("context %d closed, waiting for at most %d (%d + a pool of %d): %s" % (
-                    n, counts[0] + spare, counts[0], spare, closed.render()))
-                assert closed.ok, (
-                    "web content processes after each closed context: %r (open: %r); more than the %d the first "
-                    "left plus the pool of %d the engine keeps: %s" % (counts, during, counts[0], spare,
-                                                                        " | ".join(trail)))
+            closed = watch(hosting, none_hosted, DEADLINE, pause)
+            trail.append("context %d closed: %s" % (n, closed.render()))
+            assert closed.ok, (
+                "a process that hosts the site of a frame of the closed context is still there: %s"
+                % " | ".join(trail))

@@ -15,6 +15,7 @@ import pathlib
 
 import pytest
 
+from _evidence_on_failure import FailureEvidence
 from _waits import wait_until
 from fakeweb import profile_p2, sites
 
@@ -134,30 +135,35 @@ def test_the_page_that_leaves_with_beacons_reaches_networkidle_every_time_under_
     import tempfile
     import time
 
-    loader = pathlib.Path(__file__).resolve().parent / "fakeweb" / "loader.py"
-    ready_dir = pathlib.Path(tempfile.mkdtemp(prefix="fakeweb-loaders-"))
-    ready = [ready_dir / ("loader-%d.ready" % i) for i in range(LOADERS)]
-    procs = [subprocess.Popen([sys.executable, str(loader), firefox_binary, str(mark)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-             for mark in ready]
-    origin, _other, stop = sites.start((0, 0))
-    try:
-        # the loaders are up and loading when each has finished its first page and said so (a file), not after a fixed pause
-        assert wait_until(lambda: all(mark.exists() for mark in ready), 180, lambda: time.sleep(0.25)),             "the loaders did not start loading: %s" % [m.name for m in ready if not m.exists()]
-        cells = profile_p2.run_on_candidate(_stock_client(), firefox_binary, origin, ["leaving_beacons_subframe"], 10)
-    finally:
-        stop()
-        for proc in procs:
-            proc.terminate()
-        for proc in procs:
-            try:
-                proc.wait(timeout=60)
-            except Exception:
-                proc.kill()
-    if not engine_reaches("firefox-68"):
-        assert len(cells) == 20, "the run made %d navigations, not 20" % len(cells)
-        return
-    bad = ["round %d%s: %s -- in flight: %s" % (c["round"], " (canary)" if c["canary"] else "", c["err"],
-                                                 [(r["type"], r["method"], r["frame"]) for r in c.get("in_flight", [])[:3]])
-           for c in cells if not c["idle"]]
-    assert not bad, "%d of %d navigations did not reach networkidle under load:%s" % (
-        len(bad), len(cells), "".join("\n  " + line for line in bad[:6]))
+    with FailureEvidence("fakeweb-leaving-beacons-under-load") as evidence:
+        loader = pathlib.Path(__file__).resolve().parent / "fakeweb" / "loader.py"
+        ready_dir = pathlib.Path(tempfile.mkdtemp(prefix="fakeweb-loaders-"))
+        ready = [ready_dir / ("loader-%d.ready" % i) for i in range(LOADERS)]
+        procs = [subprocess.Popen([sys.executable, str(loader), firefox_binary, str(mark)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 for mark in ready]
+        origin, _other, stop = sites.start((0, 0))
+        evidence.watch_server(stop)
+        try:
+            # the loaders are up and loading when each has finished its first page and said so (a file), not after a fixed pause
+            assert wait_until(lambda: all(mark.exists() for mark in ready), 180, lambda: time.sleep(0.25)),             "the loaders did not start loading: %s" % [m.name for m in ready if not m.exists()]
+            evidence.arm()
+            cells = profile_p2.run_on_candidate(_stock_client(), firefox_binary, origin, ["leaving_beacons_subframe"], 10,
+                                                client_log=evidence.client_log)
+            evidence.note_cells(cells)
+        finally:
+            stop()
+            for proc in procs:
+                proc.terminate()
+            for proc in procs:
+                try:
+                    proc.wait(timeout=60)
+                except Exception:
+                    proc.kill()
+        if not engine_reaches("firefox-68"):
+            assert len(cells) == 20, "the run made %d navigations, not 20" % len(cells)
+            return
+        bad = ["round %d%s: %s -- in flight: %s" % (c["round"], " (canary)" if c["canary"] else "", c["err"],
+                                                     [(r["type"], r["method"], r["frame"]) for r in c.get("in_flight", [])[:3]])
+               for c in cells if not c["idle"]]
+        assert not bad, "%d of %d navigations did not reach networkidle under load:%s" % (
+            len(bad), len(cells), "".join("\n  " + line for line in bad[:6]))
