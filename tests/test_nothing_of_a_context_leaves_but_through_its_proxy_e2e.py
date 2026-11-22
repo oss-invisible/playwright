@@ -60,7 +60,9 @@ trust makes no OCSP request at all (the chain fails first), so a silent responde
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import time
 from typing import Callable, Dict, Optional
 
 import pytest
@@ -239,11 +241,28 @@ _TURN_KEPT_JS = """async ([host, port]) => {
 }"""
 
 #: Step 1 of the popup variant: a button whose handler opens the popup and closes it at once. It is CLICKED (a real click holds the user gesture; a
-#: ``window.open`` from an ``evaluate`` has none and the popup blocker answers null, which would test the blocker).
+#: ``window.open`` from an ``evaluate`` has none and the popup blocker answers null, which would test the blocker). The handler also writes down, in
+#: ``window.__probe``, the evidence of a popup that is not made (evidence only, it decides nothing and every statement of it swallows its own failure): when
+#: the pointer went down and when the click came (the gap: the transient activation of a click lasts a few seconds), whether the activation was active at the
+#: click, and whether ``window.open`` returned null or threw. A throw is recorded and rethrown, so ``window.__popup`` and the page's error stay what they were.
 _POPUP_BUTTON_JS = """() => {
   const b = document.createElement('button');
   b.id = 'open-dead'; b.textContent = 'open';
-  b.onclick = () => { window.__popup = window.open('about:blank'); if (window.__popup) window.__popup.close(); };
+  const probe = window.__probe = {};
+  try { b.addEventListener('pointerdown', () => { try { probe.down = performance.now(); } catch (e) {} }); } catch (e) {}
+  b.onclick = () => {
+    try {
+      probe.clickAt = performance.now();
+      const activation = navigator.userActivation;
+      probe.isActive = activation ? activation.isActive : null;
+      probe.hasBeenActive = activation ? activation.hasBeenActive : null;
+    } catch (e) {}
+    let opened;
+    try { opened = window.open('about:blank'); } catch (e) { try { probe.openThrew = String(e); } catch (e2) {} throw e; }
+    try { probe.openNull = opened === null; } catch (e) {}
+    window.__popup = opened;
+    if (window.__popup) window.__popup.close();
+  };
   document.body.append(b);
 }"""
 
@@ -258,6 +277,7 @@ _WINDOW_ICE_JS = """async ([how, stunHost, turnHost, port, gatherMs, closedMs]) 
   if (how === 'popup') {
     W = window.__popup || null;
     out.made = !!W;
+    try { out.popupIs = window.__popup === null ? 'null' : typeof window.__popup; out.probe = window.__probe || null; } catch (e) {}
     const t0 = Date.now();
     while (W && !W.closed && Date.now() - t0 < closedMs) await sleep(50);
     out.closed = !!W && W.closed === true;
@@ -474,10 +494,14 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
     with _launch(firefox_binary) as browser:
         context, page = _page_in(browser, proxy=proxy.proxy)
         page.goto(pages.url("page-a.test"), wait_until="load", timeout=30000)
+        click_s = None
         if case.window == "popup":
             page.evaluate(_POPUP_BUTTON_JS)
+            clicking = time.monotonic()
             page.click("#open-dead", timeout=30000)
+            click_s = time.monotonic() - clicking
         outcome = page.evaluate(_WINDOW_ICE_JS, [case.window, stun_host, turn_host, port, GATHER_MS, CLOSED_MS])
+        _note_the_click(outcome, click_s)
         if outcome["started"]:
             def done() -> bool:
                 # the TURN server over TCP was handed to the proxy, and the STUN name was asked of the DoH (SOCKS5: by the gateway of the context)
@@ -490,6 +514,32 @@ def _run_window_case(case: WindowCase, firefox_binary, lab: Lab, doh, pages, gat
         context.close()
     watcher.stop()
     return proxy, outcome, reached
+
+
+def _note_the_click(outcome, click_s) -> None:
+    """Evidence only: how long ``page.click`` took goes into the outcome next to the page's own probe. It never raises and decides nothing."""
+    try:
+        outcome["click_s"] = None if click_s is None else round(click_s, 3)
+    except Exception:  # noqa: BLE001 - a probe never changes the outcome of the test it observes
+        pass
+
+
+def _record_the_popup_probe(record_property, outcome) -> None:
+    """Evidence only, for a popup that is not made: whether the transient activation had expired (a gap of more than 5 s between ``pointerdown`` and the
+    click, under a stalled runner) or ``window.open`` returned null or threw with the activation still valid. Printed and recorded as the property
+    ``popup_probe``. Any failure of it is swallowed: it adds no assertion and no wait, and the test passes or fails exactly as it would without it."""
+    try:
+        if outcome.get("window") != "popup":
+            return
+        probe = outcome.get("probe")
+        said = {"made": outcome.get("made"), "popup_is": outcome.get("popupIs"), "click_s": outcome.get("click_s"), "probe": probe}
+        if isinstance(probe, dict) and "down" in probe and "clickAt" in probe:
+            said["down_to_click_ms"] = round(probe["clickAt"] - probe["down"], 1)
+        text = json.dumps(said, sort_keys=True, default=str)
+        print("POPUP-PROBE %s" % text)
+        record_property("popup_probe", text)
+    except Exception:  # noqa: BLE001 - a probe never changes the outcome of the test it observes
+        pass
 
 
 def _what_the_window_did(outcome: dict) -> str:
@@ -506,6 +556,7 @@ def _check_window_case(case: WindowCase, outcome: dict, proxy, reached, lab: Lab
     said = _what_the_window_did(outcome)
     print("DEAD-WINDOW %s: %s" % (case.id, said))
     record_property("dead_window_outcome", said)
+    _record_the_popup_probe(record_property, outcome)
     why = (_why(doh, proxy) + "\n  case %s: STUN %s, TURN %s, port %d, witness at %s\n  the window: %s"
            % (case.id, stun_host, turn_host, port, lab.witness.address, said))
     assert outcome["made"], "the lab could not make the window (a popup blocked, or an iframe with no window): %s" % outcome + why
