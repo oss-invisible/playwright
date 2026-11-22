@@ -35,6 +35,7 @@ import pytest
 
 from _e2e_verdicts import MDNS_RETRY_MS, opened_at_the_retry_problem
 from _evidence_with_files import FailureEvidenceWithFiles
+from _mdns_listener import MdnsListener
 from test_webrtc_realness import _e2e_binary, _launch, candidates, decode_priority, host_candidates, is_mdns  # noqa: F401
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
@@ -288,11 +289,17 @@ def test_two_connections_on_one_page_connect_in_the_time_of_retail(local_https_p
                 launch = {"run": n, "seed": 100 + n, "moz_log": MDNS_MOZ_LOG, "started_m": round(time.perf_counter(), 6),
                           "started_t": round(time.time(), 4)}
                 launches.append(launch)
+                # The lab's own ear on the mDNS group (tests/_mdns_listener.py), started BEFORE the browser so that the engine's socket is the later one:
+                # it only listens, and what it heard of this launch is ``mdns-wire-run-N.jsonl`` (``m`` is the scale of ``started_m`` above).
+                listener = MdnsListener().start()
                 try:
                     res = _session(V4_ONLY, socks5_tcp_only, local_https_page, monkeypatch, 100 + n,
                                    lambda page: page.evaluate(_LOOPBACK_JS), engine_log=str(log_dir))
                 finally:
                     launch.update(returned_m=round(time.perf_counter(), 6), returned_t=round(time.time(), 4))
+                    listener.stop()
+                    listener.write(evidence.files / ("mdns-wire-run-%d.jsonl" % n))
+                    launch["mdns_wire"] = listener.summary()
                 page_timeline = {key: res.pop(key, None) for key in ("events", "pairs", "origin", "started_at")}
                 launch.update(opened=res["opened"], echoed=res["echoed"], stalled=res["stalled"], pair=res["pair"], gathered=res["gathered"],
                               page=page_timeline)
