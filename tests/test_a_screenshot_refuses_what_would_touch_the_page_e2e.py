@@ -158,3 +158,52 @@ def test_no_caret_is_in_the_picture_when_the_caller_does_not_write_caret(page):
 
 def test_no_caret_is_in_the_picture_with_caret_hide(page):
     assert [_red_pixels(png) for png in _caret_shots(page, caret="hide")] == [0, 0, 0]
+
+
+# ── a refused call does not touch the page's scroll: the refusal comes before the element is scrolled into view ────────────────
+TALL = (
+    "<!doctype html><html style='background:#fff'><body style='margin:0;background:#fff'>"
+    "<div style='height:3000px;background:#eee'>above the fold</div>"
+    "<p id='below' style='margin:0;width:200px;height:40px;background:#0a0'>below the fold</p>"
+    "<div style='height:3000px;background:#eee'>after</div>"
+    "</body></html>"
+)
+SCROLLED_TO = 100
+
+
+@pytest.fixture
+def scrolled(page):
+    """A page scrolled to a known position with the element well below the fold."""
+    other = page.context.new_page()
+    other.set_content(TALL, wait_until="load")
+    other.evaluate("window.scrollTo(0, %d)" % SCROLLED_TO)
+    assert other.evaluate("window.scrollY") == SCROLLED_TO
+    assert other.evaluate("document.getElementById('below').getBoundingClientRect().top") > 400
+    yield other
+    other.close()
+
+
+REFUSALS = [
+    ("mask", r"screenshot\(mask=", lambda p: {"mask": [p.locator("#below")]}),
+    ("style", r"screenshot\(style=", lambda p: {"style": "p { visibility: hidden }"}),
+    ("animations", r'screenshot\(animations="disabled"\)', lambda p: {"animations": "disabled"}),
+    ("caret", r'screenshot\(caret="initial"\)', lambda p: {"caret": "initial"}),
+    ("omit_background", r"^Not implemented", lambda p: {"omit_background": True}),
+]
+
+
+@pytest.mark.parametrize("name,pattern,kwargs", REFUSALS, ids=[r[0] for r in REFUSALS])
+@pytest.mark.parametrize("way", ["locator", "handle"])
+def test_a_refused_element_screenshot_does_not_scroll_the_page(scrolled, way, name, pattern, kwargs):
+    from invisible_playwright.sync_api import Error
+
+    shoot = {
+        "locator": lambda **k: scrolled.locator("#below").screenshot(**k),
+        "handle": lambda **k: scrolled.query_selector("#below").screenshot(**k),
+    }[way]
+    with pytest.raises(Error, match=pattern):
+        shoot(**kwargs(scrolled))
+    assert scrolled.evaluate("window.scrollY") == SCROLLED_TO
+    # the control: the same call without the refused parameter DOES scroll the element in, so the unchanged scroll above is a measurement
+    assert shoot()[:4] == PNG
+    assert scrolled.evaluate("window.scrollY") != SCROLLED_TO

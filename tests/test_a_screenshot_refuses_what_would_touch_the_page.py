@@ -159,3 +159,40 @@ def test_the_first_refusal_wins_and_nothing_is_sent_when_several_are_asked():
     with pytest.raises(ProtocolException):
         page.op_screenshot({"mask": MASK, "style": "p {}", "animations": "disabled", "caret": "initial", "omitBackground": True})
     page.send.assert_not_called()
+
+
+# ── the refusal comes FIRST: a refused element's or locator's call neither scrolls nor measures the page ────────────────────
+REFUSED_ELEMENT = REFUSED + [({"omitBackground": True}, "omitBackground")]
+REFUSED_ELEMENT_IDS = REFUSED_IDS + ["omit_background_png"]
+
+
+@pytest.mark.parametrize("params,name", REFUSED_ELEMENT, ids=REFUSED_ELEMENT_IDS)
+def test_a_refused_element_screenshot_sends_nothing_to_the_engine_not_even_a_scroll_or_a_measure(params, name):
+    page = make_page()
+    handle = ElementHandleDispatcher(page.server, page.frame, "object-1")
+    page.injected.bounding_box.return_value = {"x": 10, "y": 20, "width": 30, "height": 40}
+    with pytest.raises(ProtocolException):
+        handle.op_screenshot(params)
+    # the scroll (`scroll_into_view`), the box (`bounding_box`) and the document's scroll (`evaluate`) all go through `injected`,
+    # the picture through `send`: not one of them was called
+    assert page.injected.mock_calls == []
+    page.send.assert_not_called()
+
+
+@pytest.mark.parametrize("params,name", REFUSED_ELEMENT, ids=REFUSED_ELEMENT_IDS)
+def test_a_refused_page_screenshot_measures_nothing_either(params, name):
+    page = make_page()
+    with pytest.raises(ProtocolException):
+        page.op_screenshot(params)
+    assert page.injected.mock_calls == []
+    page.send.assert_not_called()
+
+
+def test_the_element_screenshot_that_is_taken_still_scrolls_and_measures_first():
+    page = make_page()
+    page.injected.bounding_box.return_value = {"x": 10, "y": 20, "width": 30, "height": 40}
+    handle = ElementHandleDispatcher(page.server, page.frame, "object-1")
+    handle.op_screenshot({})
+    names = [call[0] for call in page.injected.mock_calls]
+    assert names[:2] == ["scroll_into_view", "bounding_box"]
+    assert page.send.call_args[0][0] == "Page.screenshot"
