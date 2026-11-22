@@ -52,6 +52,7 @@ import time
 import types
 
 import pytest
+import _moving_page
 from _moving_page import _goto, _landing, forget
 
 from _evidence_on_failure import FailureEvidence
@@ -68,6 +69,9 @@ _CLIENT_LOG: list = []
 def _note(what: str, **fields) -> None:
     """One line of the client's own view of the module: what the test sent or heard, on the clocks of the evidence (`t` wall, `m` perf_counter)."""
     _CLIENT_LOG.append({"t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "what": what, **fields})
+
+
+_moving_page.note = _note
 
 
 def _replace_after_load(ms: int, cross_site: bool) -> bytes:

@@ -22,6 +22,8 @@ User: alice / secret.
 import html
 import json
 import secrets
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +33,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from fakeweb import sites
 
 CACHE_PAGES = "no-cache"
+#: Most records kept per start(): a long run of the site is not a memory leak.
+MAX_RECORDS = 50000
 STATE = None   # the State of the running site (set by start): the walk tells it the current step
 USER, PASSWORD = "alice", "secret"
 N_ARTICLES = 30
@@ -152,6 +156,10 @@ addEventListener('pagehide', () => {
 # Page that stays "not idle" on purpose: its held request is released when the walk reaches this step.
 PARK_PAGES = {"category": 9}
 # Same with a keepalive fetch (a request the client must still count as in flight): the search page, until step 13.
+# The fetch starts from a task after `load`, never while the page is parsed: the engine announces a request at once, but the
+# commit of the document waits for the engine's handshake, so a request started during parsing can be announced before the
+# commit and the client drops it at the commit (the reference Juggler does the same). The step tests the rule "an open
+# keepalive holds networkidle", not that race.
 PARK_KEEPALIVE_PAGES = {"search": 13}
 
 
@@ -162,7 +170,7 @@ def noise_script(ctx, park_until=None, park_keepalive_until=None):
     if park_until:
         js += "\nget(A + '/hold?id=park' + tok + '&until=%d');\n" % park_until
     if park_keepalive_until:
-        js += ("\nfetch(A + '/hold?id=kapark' + tok + '&until=%d', {keepalive: true}).catch(noop);\n"
+        js += ("\nafterLoad(0, () => fetch(A + '/hold?id=kapark' + tok + '&until=%d', {keepalive: true}).catch(noop));\n"
                % park_keepalive_until)
     # Own <script> element: a failure in the noise cannot break the page's script.
     return "<script>(function(){const A=%s,O=%s;\n%s\ntry{\n%s\n}catch(e){}\n})();</script>" % (
@@ -365,6 +373,17 @@ class State:
         self.walk = 0
         self.cond = threading.Condition()
         self.released = set()
+        #: What the server itself saw, in order, for a test that saves it when it fails (`start(...)[2].state.records`; nothing else reads
+        #: it): one `accept` per TCP connection and one `request` per request, with `time.perf_counter()` of this process as `m_*` (the
+        #: scale of the client's log) and `time.time()` as `t_*`; for a held request (`/hold`) also when the hold began and ended, why
+        #: it ended, and when the server first saw the browser's end of the connection closed.
+        self.records = []
+
+    def note(self, record):
+        with self.lock:
+            if len(self.records) < MAX_RECORDS:
+                self.records.append(record)
+        return record
 
     def set_step(self, n):
         with self.cond:
@@ -388,13 +407,17 @@ class State:
             self.released.add(rid)
             self.cond.notify_all()
 
-    def hold(self, rid, until=0, failsafe=90.0):
+    def hold(self, rid, until=0, failsafe=90.0, watch=None):
         """Block until /release?id=rid arrives, or the walk reaches step `until`; the failsafe only
-        keeps a lost event from blocking a thread forever."""
+        keeps a lost event from blocking a thread forever. Returns why it ended (`released`, `step`, `failsafe`);
+        `watch`, if given, is called every half second while waiting (it only looks)."""
         end = time.time() + failsafe
         with self.cond:
             while rid not in self.released and not (until and self.step >= until) and time.time() < end:
                 self.cond.wait(0.5)
+                if watch is not None:
+                    watch()
+            return "released" if rid in self.released else "step" if (until and self.step >= until) else "failsafe"
 
     def record(self, idx, method, path, q):
         """Server-side log: what the server saw, tagged with the walk step that was current."""
@@ -425,6 +448,11 @@ class Site(ThreadingHTTPServer):
         self.idx = idx
         self.state = state
 
+    def process_request(self, request, client_address):
+        self.state.note({"ev": "accept", "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "site": self.idx,
+                         "peer": client_address[1]})
+        super().process_request(request, client_address)
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -451,6 +479,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
+        rec = getattr(self, "_rec", None)
+        if rec is not None:
+            rec["status"] = code
+            rec["t_answer"] = round(time.time(), 4)
+            rec["m_answer"] = round(time.perf_counter(), 6)
 
     def _html(self, text, code=200, headers=()):
         self._send(code, "text/html; charset=utf-8", text.encode(), headers, cache=CACHE_PAGES)
@@ -460,10 +493,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def _guard(self, fn):
         # Browsers abort requests on purpose; a dropped socket is not an error here.
+        state = self.server.state
+        rec = self._rec = state.note({
+            "ev": "request", "t_arrive": round(time.time(), 4), "m_arrive": round(time.perf_counter(), 6), "site": self.server.idx,
+            "peer": self.client_address[1], "method": self.command, "path": self.path, "walk": state.walk, "step": state.step,
+            "status": None, "t_answer": None, "m_answer": None, "t_done": None, "m_done": None, "error": None})
         try:
             fn()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+            rec["error"] = type(exc).__name__
             self.close_connection = True
+        except BaseException as exc:
+            rec["error"] = type(exc).__name__
+            raise
+        finally:
+            rec["t_done"] = round(time.time(), 4)
+            rec["m_done"] = round(time.perf_counter(), 6)
+
+    def _peer_closed(self):
+        """Whether the browser has closed its end of this connection (a peek: nothing is read from it)."""
+        try:
+            readable, _w, _x = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except (OSError, ValueError):
+            return True
 
     def do_GET(self):
         self._guard(self._get)
@@ -570,7 +625,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "text/plain", b"ok", cache="no-store")
         if p == "/hold":
             until = int(q.get("until", ["0"])[0] or 0)
-            self.server.state.hold(q.get("id", [""])[0], until)
+            rec = self._rec
+
+            def watch():
+                if rec.get("m_peer_closed_seen") is None and self._peer_closed():
+                    rec["t_peer_closed_seen"] = round(time.time(), 4)
+                    rec["m_peer_closed_seen"] = round(time.perf_counter(), 6)
+
+            rec["t_hold_start"], rec["m_hold_start"] = round(time.time(), 4), round(time.perf_counter(), 6)
+            rec["hold_until_step"], rec["m_peer_closed_seen"] = until, None
+            rec["hold_ended_by"] = self.server.state.hold(q.get("id", [""])[0], until, watch=watch)
+            rec["t_hold_end"], rec["m_hold_end"], rec["step_at_hold_end"] = round(time.time(), 4), round(time.perf_counter(), 6), self.server.state.step
+            watch()
             return self._send(200, "application/json", b'{"held":true}', cache="no-store")
         if p == "/stream":
             # headers and 10 of 20 body bytes at once; the rest after a short wait
@@ -635,6 +701,7 @@ def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_h
             s.shutdown()
             s.server_close()
 
+    stop.state = state      # the server's own record (`state.records`), kept after stop()
     global STATE
     STATE = state
     return state.origins[0], state.origins[1], stop
