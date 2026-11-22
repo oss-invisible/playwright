@@ -46,7 +46,7 @@ class Tracer:
         context.on("requestfinished", lambda r: self._ended(r, "finished"))
         context.on("requestfailed", lambda r: self._ended(r, "failed"))
         if log is not None:
-            context.on("response", lambda response: self._logged(response.request, "response", status=response.status))
+            context.on("response", self._answered)
             context.on("page", self._page_opened)
 
     def _started(self, r):
@@ -74,29 +74,45 @@ class Tracer:
                                 "url": "/" + r.url.split("/", 3)[-1][:90], "t": round(time.monotonic() - self.t0, 3)})
 
     def _logged(self, r, kind, **more):
+        """One entry of the log; a failure of the recording is never the client's (the walk goes on, the entry is missing)."""
         if self.log is None:
             return None
         try:
-            frame = r.frame.url[:160]
+            try:
+                frame = r.frame.url[:160]
+            except Exception:
+                frame = None
+            entry = {"ev": kind, "step": self.step, "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "req": id(r),
+                     "type": r.resource_type, "method": r.method, "url": r.url[:200], "frame": frame}
+            entry.update(more)
+            self.log.append(entry)
+            return entry
         except Exception:
-            frame = None
-        entry = {"ev": kind, "step": self.step, "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "req": id(r),
-                 "type": r.resource_type, "method": r.method, "url": r.url[:200], "frame": frame}
-        entry.update(more)
-        self.log.append(entry)
-        return entry
+            return None
+
+    def _answered(self, response):
+        try:
+            self._logged(response.request, "response", status=response.status)
+        except Exception:
+            pass
 
     def _page_opened(self, page):
-        for name in ("framenavigated", "domcontentloaded", "load"):
-            page.on(name, lambda arg, name=name: self._page_event(page, name, arg))
-        self._page_event(page, "page", None)
+        try:
+            for name in ("framenavigated", "domcontentloaded", "load"):
+                page.on(name, lambda arg, name=name: self._page_event(page, name, arg))
+            self._page_event(page, "page", None)
+        except Exception:
+            pass
 
     def _page_event(self, page, name, arg):
         try:
             url = (arg.url if name == "framenavigated" else page.url)[:200]
         except Exception:
             url = None
-        self.log.append({"ev": name, "step": self.step, "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "page": id(page), "url": url})
+        try:
+            self.log.append({"ev": name, "step": self.step, "t": round(time.time(), 4), "m": round(time.perf_counter(), 6), "page": id(page), "url": url})
+        except Exception:
+            pass
 
     def snapshot(self):
         return sorted(self.open.values())[:12]
