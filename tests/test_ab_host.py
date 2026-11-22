@@ -1258,3 +1258,108 @@ def test_the_stock_command_is_for_windows_only(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(host, "_windows", lambda: False)
     assert host.main(["stock", "--leg", "linux-x86_64", "--out", str(tmp_path / "s.json")]) == 3
     assert "Linux has no Windows location provider" in capsys.readouterr().out
+
+
+# -
+# The evidence that proves WHEN in the shutdown a process came and HOW the browser ended, and who opens /proc/self/fd/<n>.
+
+SHUTDOWN_LOG = """\
+100 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-profile", "/tmp/p"], 0x1) = 0
+100 fork() = 101
+101 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-contentproc", "-sandboxingKind", "0", "utility"], 0x1) = 0
+100 fork() = 102
+102 execve("/e/firefox/firefox", ["/e/firefox/firefox", "--backgroundtask", "pingsender", "https://t.example/x", "/tmp/p/ping"], 0x1) = 0
+101 +++ exited with 0 +++
+100 +++ exited with 0 +++
+102 +++ exited with 0 +++
+"""
+
+
+def test_the_lifecycle_says_when_each_process_came_and_how_it_ended_by_the_line_of_the_log():
+    lines = SHUTDOWN_LOG.splitlines()
+    procs = host.spawned_processes(lines, REAL)
+    got = host.process_lifecycle(lines, procs)
+    assert [(e["event"], e["kind"], e["how"]) for e in got] == [
+        ("start", "parent", ""), ("start", "utility/sandboxingKind=0", ""), ("start", "backgroundtask/pingsender", ""),
+        ("end", "utility/sandboxingKind=0", "exited 0"), ("end", "parent", "exited 0"), ("end", "backgroundtask/pingsender", "exited 0")]
+    assert [e["line"] for e in got] == sorted(e["line"] for e in got), "the order is the log's"
+    killed = host.process_lifecycle(lines[:-3] + ["100 +++ killed by SIGKILL +++"], procs)
+    assert killed[-1] == {"line": 5, "event": "end", "kind": "parent", "how": "killed by SIGKILL"}, "a browser that was killed says so"
+
+
+def test_the_open_of_a_proc_self_fd_names_the_process_the_line_and_the_memfd_that_made_the_descriptor():
+    lines = ['100 memfd_create("mozilla-ipc", MFD_CLOEXEC|MFD_ALLOW_SEALING) = 31</memfd:mozilla-ipc (deleted)>',
+             '100 openat(AT_FDCWD, "/proc/self/fd/31", O_RDONLY|O_CLOEXEC) = 32</memfd:mozilla-ipc (deleted)>',
+             '100 openat(AT_FDCWD, "/proc/self/fd/40", O_RDONLY|O_CLOEXEC) = -1 ENOENT',
+             '100 openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3']
+    got = host.proc_fd_opens(lines, {}, lambda pid: "parent")
+    assert [(o["pid"], o["kind"], o["made_by"] is not None) for o in got] == [(100, "parent", True), (100, "parent", False)]
+    assert "memfd_create(\"mozilla-ipc\"" in got[0]["made_by"] and "/proc/self/fd/31" in got[0]["line"]
+    assert host.STRACE_CALLS.split(",").count("memfd_create") == 1
+
+
+def test_the_strace_stand_in_keeps_the_exit_lines_and_drops_the_signals_when_asked(monkeypatch):
+    import _strace_stand_in as stand_in
+
+    class Help:
+        stdout = "strace --kill-on-exit"
+
+    monkeypatch.setattr(stand_in.shutil, "which", lambda name: "/usr/bin/strace")
+    monkeypatch.setattr(stand_in.subprocess, "run", lambda *a, **k: Help())
+    assert " -qq " in stand_in._strace_options() + " " and "-e signal=none" not in stand_in._strace_options()
+    asked = stand_in._strace_options(exit_status=True)
+    assert "-q " in asked and "-qq" not in asked and "-e signal=none" in asked
+
+
+def etw_stop(pid, code, time, image="firefox.exe"):
+    return ('<Event %s><System><Provider Name="Microsoft-Windows-Kernel-Process"/><EventID>2</EventID><TimeCreated SystemTime="%s"/><Execution ProcessID="4" ThreadID="8"/></System>'
+            '<EventData><Data Name="ProcessID">%d</Data><Data Name="ExitCode">%d</Data><Data Name="ImageName">%s</Data></EventData></Event>' % (NS, time, pid, code, image))
+
+
+def test_the_process_stops_of_the_etw_file_are_read_with_their_exit_code(tmp_path):
+    xml = tmp_path / "files.xml"
+    xml.write_text("<Events>" + etw((100, "C:\\x.dll")).replace("<Events>", "").replace("</Events>", "")
+                   + etw_stop(102, 0, "2026-11-22T10:00:02.5Z") + etw_stop(103, 1, "2026-11-22T10:00:03.1Z") + "</Events>", encoding="utf-8")
+    exits = []
+    seen, events = host.etw_files(xml, {100}, exits)
+    assert seen == {(100, "C:\\x.dll")} and events == 3
+    assert exits == [{"pid": 102, "code": 0, "time": "2026-11-22T10:00:02.5Z", "image": "firefox.exe"},
+                     {"pid": 103, "code": 1, "time": "2026-11-22T10:00:03.1Z", "image": "firefox.exe"}]
+    assert host.etw_files(xml, {100})[0] == seen, "the caller that asks for no exits gets what it did"
+
+
+def test_the_windows_lifecycle_orders_the_starts_and_the_stops_by_their_time_and_says_how_each_ended():
+    stamped = [dict(e, time="2026-11-22T10:00:0%d.0Z" % i) for i, e in enumerate(host.process_tree(host.parse_audit_events("\n".join(TREE)), {100}))]
+    procs = host.windows_processes(stamped, FIREFOX)
+    exits = [{"pid": 107, "code": 0, "time": "2026-11-22T10:00:09.0Z", "image": "pingsender.exe"}, {"pid": 100, "code": 1, "time": "2026-11-22T10:00:08.0Z", "image": "firefox.exe"}]
+    got = host.windows_lifecycle(stamped, exits, procs)
+    assert [(e["event"], e["kind"], e["how"]) for e in got][-2:] == [("end", "parent", "exited 1"), ("end", "pingsender.exe", "exited 0")]
+    assert got[0]["event"] == "start" and got[0]["kind"] == "parent" and len(got) == len(stamped) + 2
+
+
+def test_a_windows_session_that_cannot_add_the_process_provider_says_so_and_is_not_red(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+
+    def refusing(argv, timeout=300.0):
+        if argv[:3] == ["logman", "update", "trace"]:
+            raise host.TraceError("logman update failed")
+        return fake(argv, timeout)
+
+    monkeypatch.setattr(host, "_tool", refusing)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+    assert got["exits_available"] is False and got["problems"] == []
+    trace, _fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES)
+    assert trace.exits_ok is True and trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["exits_available"] is True
+
+
+def test_a_closed_linux_run_keeps_the_lifecycle_the_close_and_the_proc_fd_opens(tmp_path, monkeypatch):
+    log = tmp_path / "strace.log"
+    log.write_text(SHUTDOWN_LOG + '100 openat(AT_FDCWD, "/proc/self/fd/7", O_RDONLY) = 8\n', encoding="utf-8")
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    monkeypatch.setattr(host, "_context", lambda binary, windows, work: host.Context("linux", app=["/e/firefox"], temp=["/tmp/ab-host-tmp-x"]))
+    fp = host._seed_result(REAL, 11, tmp_path, [], log, None, None, False, {"root_returncode": 0, "close_s": 1.5})
+    assert fp["close"] == {"root_returncode": 0, "close_s": 1.5}
+    assert [e["kind"] for e in fp["lifecycle"] if e["event"] == "start"] == ["parent", "utility/sandboxingKind=0", "backgroundtask/pingsender"]
+    assert fp["proc_fd_opens"][0]["kind"] == "parent" and "/proc/self/fd/7" in fp["proc_fd_opens"][0]["line"]

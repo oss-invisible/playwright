@@ -321,7 +321,7 @@ _DIRFD_STR = re.compile(r'^(AT_FDCWD|\d+(?:<([^>]*)>)?),\s*"((?:[^"\\]|\\.)*)"')
 PATH_CALLS = ("execve", "open", "creat", "stat", "lstat", "access", "readlink", "statfs")
 PATH_AT_CALLS = ("openat", "openat2", "newfstatat", "statx", "faccessat", "faccessat2", "readlinkat")
 #: What strace traces here: the processes the tree makes and what they run, and every path they touch.
-STRACE_CALLS = "clone,clone3,fork,vfork,prctl," + ",".join(PATH_CALLS + PATH_AT_CALLS)
+STRACE_CALLS = "clone,clone3,fork,vfork,prctl,memfd_create," + ",".join(PATH_CALLS + PATH_AT_CALLS)
 #: A path relative to the working directory, which the strace log does not carry: the same text on every run, so the same on both sides.
 CWD = "<cwd>"
 
@@ -332,6 +332,12 @@ def _unescape(text: str) -> str:
 
 def _path_calls(lines):
     """(pid, base, raw path) of every call of a strace log that names a path: `base` is what a relative path is relative to."""
+    for pid, base, raw, _call in _named_calls(lines):
+        yield pid, base, raw
+
+
+def _named_calls(lines):
+    """(pid, base, raw path, call name) of every call of a strace log that names a path."""
     for line in lines:
         m = _LINE.match(line)
         if not m:
@@ -347,7 +353,7 @@ def _path_calls(lines):
         else:
             continue
         if raw:
-            yield int(m.group(1)), base, raw
+            yield int(m.group(1)), base, raw, call
 
 
 def _joined(base: str, raw: str) -> str:
@@ -367,6 +373,66 @@ def touched_by_pid(lines) -> dict:
     out: dict = {}
     for pid, base, raw in set(_path_calls(lines)):
         out.setdefault(_joined(base, raw), set()).add(pid)
+    return out
+
+
+_EXIT = re.compile(r"^(\d+)\s+\+\+\+ (?:exited with (\d+)|killed by (\w+))")
+_OPEN_PROC_FD = re.compile(r'^(\d+)\s+openat?\(.*"/proc/self/fd/(\d+)"')
+_MEMFD = re.compile(r'^(\d+)\s+memfd_create\("[^"]*".*=\s+(\d+)')
+
+
+def process_lifecycle(lines, procs: dict) -> list:
+    """The order in which the processes of the tree started and ended, from a strace log read as lines (with `exit_status`): `[{"line", "event":
+    "start"|"end", "kind", "how"}]`, `how` being `exited N` or `killed by SIGKILL`. Evidence of WHEN in the shutdown a process came and of whether the
+    browser was ended by itself or by a kill; the position is the line of the log, never a time."""
+    first, ended = {}, {}
+    for i, line in enumerate(lines):
+        m = _EXIT.match(line)
+        if m:
+            ended[int(m.group(1))] = (i, "exited %s" % m.group(2) if m.group(2) is not None else "killed by %s" % m.group(3))
+            continue
+        m = _LINE.match(line) or _RESUMED.match(line)
+        if m:
+            first.setdefault(int(m.group(1)), i)
+    events = []
+    for pid, p in procs.items():
+        if pid in first:
+            events.append((first[pid], 0, p["label"], ""))
+        if pid in ended:
+            events.append((ended[pid][0], 1, p["label"], ended[pid][1]))
+    return [{"line": i, "event": "end" if e else "start", "kind": k, "how": h} for i, e, k, h in sorted(events)]
+
+
+def windows_lifecycle(tree, exits, procs: dict) -> list:
+    """The order in which the processes of the tree started (the 4688 events) and ended (the Kernel-Process stops, with the exit code), by the time each event
+    carries (ISO text, so the order is the text's): `[{"time", "event", "kind", "how"}]`. Evidence of when in the shutdown a process came and of whether it
+    ended by itself (`exited 0`) or was ended (`exited 1`, the core's TerminateProcess)."""
+    events = [(e.get("time", ""), 0, procs[e["pid"]]["label"], "") for e in tree if e["pid"] in procs]
+    events += [(x["time"], 1, procs[x["pid"]]["label"], "exited %d" % x["code"]) for x in exits if x["pid"] in procs]
+    return [{"time": t, "event": "end" if e else "start", "kind": k, "how": h} for t, e, k, h in sorted(events)]
+
+
+def proc_fd_opens(lines, owners: dict, label_of) -> list:
+    """Every open of `/proc/self/fd/<n>` of a strace log, with the process that made it, the line, and the `memfd_create` that made the descriptor when
+    the same process did (Firefox opens it to make a read-only copy of a frozen shared memory: ipc/glue/SharedMemoryPlatform_posix.cpp `DupReadOnly`)."""
+    made, out = {}, []
+    for line in lines:
+        m = _MEMFD.match(line)
+        if m:
+            made[(owner_of(int(m.group(1)), owners), int(m.group(2)))] = line[:200]
+            continue
+        m = _OPEN_PROC_FD.match(line)
+        if m:
+            pid, fd = int(m.group(1)), int(m.group(2))
+            out.append({"pid": pid, "kind": label_of(pid), "line": line[:300], "made_by": made.get((owner_of(pid, owners), fd))})
+    return out[:20]
+
+
+def touched_calls(lines) -> dict:
+    """{path: {names of the calls that touched it}} of a strace log (open, openat, stat, readlink, ...): which call, the evidence of a path that differs."""
+    out: dict = {}
+    for _pid, base, raw, call in set(_named_calls(lines)):
+        out.setdefault(_joined(base, raw), set()).add(call)
     return out
 
 
@@ -674,6 +740,7 @@ AUDIT_GUID = "{0CCE922B-69AE-11D9-BED3-505054503030}"  # the subcategory "Proces
 AUDIT_KEY = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit"
 AUDIT_VALUE = "ProcessCreationIncludeCmdLine_Enabled"
 FILE_PROVIDER, FILE_CREATE_KEYWORD = "Microsoft-Windows-Kernel-File", "0x80"  # KERNEL_FILE_KEYWORD_CREATE
+PROCESS_PROVIDER, PROCESS_KEYWORD = "Microsoft-Windows-Kernel-Process", "0x10"  # WINEVENT_KEYWORD_PROCESS: starts and stops, with the exit code
 
 
 class TraceError(RuntimeError):
@@ -733,8 +800,9 @@ def parse_audit_events(xml_text: str) -> list:
         rid = next((int(e.text) for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "EventRecordID" and e.text), 0)
         if "NewProcessId" not in data:
             continue
+        when = next((e.get("SystemTime", "") for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "TimeCreated"), "")
         out.append({"rid": rid, "pid": _number(data["NewProcessId"]), "ppid": _number(data.get("ProcessId", "")),
-                    "image": data.get("NewProcessName", ""), "cmd": data.get("CommandLine", "")})
+                    "image": data.get("NewProcessName", ""), "cmd": data.get("CommandLine", ""), "time": when})
     return out
 
 
@@ -760,22 +828,31 @@ def windows_processes(tree, real: str) -> dict:
     return out
 
 
-def etw_files(path, pids=None) -> tuple:
+def etw_files(path, pids=None, exits=None) -> tuple:
     """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
-    stream: the file has every open of the machine for the length of the run."""
+    stream: the file has every open of the machine for the length of the run. With a list in `exits`, the process stops of the same file (Kernel-Process, event 2)
+    are appended to it as `{"pid", "code", "time", "image"}`: how each process ended."""
     seen, events = set(), 0
     for _ev, el in ET.iterparse(path, events=("end",)):
         if el.tag.rsplit("}", 1)[-1] != "Event":
             continue
         events += 1
-        pid, name = None, None
+        pid, name, data, when, event_id = None, None, {}, "", ""
         for child in el.iter():
             tag = child.tag.rsplit("}", 1)[-1]
             if tag == "Execution":
                 raw = child.get("ProcessID") or child.get("ProcessId")
                 pid = _number(raw) if raw else None
-            elif tag == "Data" and child.get("Name") == "FileName":
-                name = child.text
+            elif tag == "Data":
+                data[child.get("Name")] = child.text or ""
+                if child.get("Name") == "FileName":
+                    name = child.text
+            elif tag == "TimeCreated":
+                when = child.get("SystemTime", "")
+            elif tag == "EventID":
+                event_id = (child.text or "").strip()
+        if exits is not None and event_id == "2" and "ExitCode" in data and data.get("ProcessID"):
+            exits.append({"pid": _number(data["ProcessID"]), "code": _number(data["ExitCode"]), "time": when, "image": data.get("ImageName", "")})
         if name and pid is not None and (pids is None or pid in pids):
             seen.add((pid, name))
         el.clear()
@@ -816,6 +893,7 @@ class WindowsTrace:
         self.before = None
         self.session = False
         self.images: dict = {}
+        self.exits_ok = False
 
     def _canary(self, which: str) -> str:
         """A file of the oracle's own, written and read now: the session must have a Create event of it."""
@@ -835,6 +913,11 @@ class WindowsTrace:
         _tool(["logman", "create", "trace", self.name, "-p", FILE_PROVIDER, FILE_CREATE_KEYWORD, "0xff", "-o", str(self.etl), "-ets",
                "-bs", "1024", "-nb", "64", "256"])
         self.session = True
+        try:  # how each process ended (the exit code: 0 by itself, 1 for the core's TerminateProcess) is evidence: without it the run is not red, it says so
+            _tool(["logman", "update", "trace", self.name, "-p", PROCESS_PROVIDER, PROCESS_KEYWORD, "0xff", "-ets"])
+            self.exits_ok = True
+        except TraceError:
+            self.exits_ok = False
         # The provider is enabled a moment after the session exists (the first canary of the first launch of run 44963364060 was not seen): the canaries are written
         # with a round trip to the session between them, and it is the LAST one, written just before the launch, that must be in the trace.
         for n in (1, 2, 3):
@@ -877,7 +960,8 @@ class WindowsTrace:
         self.session = False
         summary = self.work / "files.txt"
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
-        everything, events = etw_files(self.xml)
+        exits: list = []
+        everything, events = etw_files(self.xml, None, exits)
         tree_pids = {e["pid"] for e in tree}
         seen = {(p, n) for p, n in everything if p in tree_pids or p == os.getpid()}
         outside: dict = {}
@@ -896,7 +980,7 @@ class WindowsTrace:
         if missing:
             problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
         return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
-                "exited": exited, "events": events, "problems": problems}
+                "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids], "exits_available": self.exits_ok}
 
     def cleanup(self) -> None:
         """Put the machine back: the session closed, the audit as it was."""
@@ -1038,8 +1122,17 @@ def warmup_only(fp: dict) -> dict | None:
 
 
 def _by_text(d: dict) -> str:
-    by = d.get("by") or {}
-    return " (by A: %s | B: %s)" % (", ".join(by.get("A", [])) or "-", ", ".join(by.get("B", [])) or "-") if by.get("A") or by.get("B") else ""
+    by, calls = d.get("by") or {}, d.get("calls") or {}
+    if not (by.get("A") or by.get("B")):
+        return ""
+    via = ", via %s" % ", ".join(sorted(set(calls.get("A", [])) | set(calls.get("B", [])))) if calls.get("A") or calls.get("B") else ""
+    return " (by A: %s | B: %s%s)" % (", ".join(by.get("A", [])) or "-", ", ".join(by.get("B", [])) or "-", via)
+
+
+def _calls(seed_footprint: dict, leaf: str) -> list:
+    """The calls (Linux) that touched a path of a seed's footprint: which one opened it."""
+    category, _dot, name = leaf.partition(".")
+    return list(seed_footprint.get("touched_calls", {}).get(name, [])) if category == "file" else []
 
 
 def _by(seed_footprint: dict, leaf: str) -> list:
@@ -1132,7 +1225,8 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
             if va != vb:
                 differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb),
-                                    "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)}})
+                                    "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)},
+                                    "calls": {"A": _calls(seeds_a[seed], leaf), "B": _calls(seeds_b[seed], leaf)}})
     if os_name == "windows" and not a_a:
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
             problems += geolocation_problems(fp, where)
@@ -1311,7 +1405,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
     else:
         from _strace_stand_in import _stand_in
 
-        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True)
+        exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True, exit_status=True)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
@@ -1344,12 +1438,17 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None) -> dic
             context.close()
             browser.close()
         # The close: the run ends with the exit of the browser, and the trace is read after it.
+        root = server.process
+        started = time.monotonic()
         server.close()
         server = None
+        # evidence of HOW the browser ended, never a threshold: the core closes the pipe and waits for the browser to exit by itself (`Connection.close`), and only
+        # ends it when it does not (`terminate`, exit code 1 on Windows, SIGTERM on Linux); the return code of the root says which one happened
+        close = {"root_returncode": root.poll() if root is not None else None, "close_s": round(time.monotonic() - started, 2)}
         exited = _wait_for_tree_exit(pgid)
         if exited is not None and not exited:
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
-        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows)
+        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
     except TraceError as e:
         result = {"seed": seed, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
                   "problems": ["the trace of the run could not be taken: %s" % e]}
@@ -1381,7 +1480,7 @@ def _wait_for_tree_exit(pgid):
     return not _wait_for_exit(pgid, EXIT_LIMIT_S)
 
 
-def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool) -> dict:
+def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool, close: dict | None = None) -> dict:
     real = os.path.realpath(binary)
     ctx = _context(binary, windows, seed_work)
     if windows:
@@ -1397,6 +1496,7 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
         detail = sorted(({"label": p["label"], "cmd": p["cmd"][:300]} for p in procs.values()), key=lambda d: (d["label"], d["cmd"]))
         outside = got["outside"]
+        lifecycle, fd_opens = (windows_lifecycle(got["tree"], got["exits"], procs) if got["exits_available"] else None), None
         net, net_skipped = None, None  # NET_WINDOWS
     else:
         lines = list(_read_lines(log))
@@ -1407,6 +1507,8 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
         labels = {pid: p["label"] for pid, p in procs.items()}
         parents = {pid: owner_of(p["parent"], owners) for pid, p in procs.items() if p["parent"] is not None}
         label_of = lambda pid: labels.get(owner_of(pid, owners), "?")  # noqa: E731
+        calls = touched_calls(lines)
+        lifecycle, fd_opens = process_lifecycle(lines, procs), proc_fd_opens(lines, owners, label_of)
         info, problems, outside = {"source": "strace", "exited": True}, [], {}  # strace follows our tree and nothing else
         events, net_skipped = network_events(lines)
         net = net_by_kind(events, label_of)
@@ -1416,10 +1518,18 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     host, ours = classify_paths(raw, ctx)
     kinds = dict(sorted(collections.Counter(p["label"] for p in procs.values()).items()))
     info.update({"processes": len(procs), "paths": len(raw)})
-    # touched_by and spawned_by are evidence, never compared: the process to blame for a path or a kind that differs
-    return {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
-            "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside,
-            "net": net, "net_not_compared": net_skipped}
+    # touched_by, touched_calls and spawned_by are evidence, never compared: the process and the call to blame for a path or a kind that differs
+    out = {"seed": seed, "steps": steps, "kinds": kinds, "files": host, "ours": ours, "trace": info, "problems": problems, "processes": detail,
+           "touched_by": by_kind(pairs, label_of, ctx), "spawned_by": spawners(labels, parents), "outside_tree": outside,
+           "net": net, "net_not_compared": net_skipped, "lifecycle": lifecycle, "proc_fd_opens": fd_opens, "close": close}
+    if not windows:
+        named: dict = {}
+        for path, names in calls.items():
+            got = classify(path, ctx)
+            if got and got[0] == "host":
+                named.setdefault(got[1], set()).update(names)
+        out["touched_calls"] = {path: sorted(v) for path, v in sorted(named.items())}
+    return out
 
 
 def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:

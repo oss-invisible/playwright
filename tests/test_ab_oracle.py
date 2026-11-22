@@ -611,14 +611,14 @@ def _job(text, name):
 def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
-    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows")}
+    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows")}
     step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
             "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
             '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
-    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows"], "the jobs that run the oracles' tests, and only those"
-    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows"):
+    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows"], "the jobs that run the oracles' tests, and only those"
+    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows"):
         assert legs[name].index("actions/setup-python") < legs[name].index(step) < legs[name].index("Fetch the published firefox binary")
-    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 4 and "uses:" not in step
+    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 6 and "uses:" not in step
     for variable, source in (("AB_ORACLE_PR_SEEDS", "test_ab_oracle_e2e.py"), ("AB_NETWORK_PR_SEEDS", "test_ab_network_e2e.py"), ("AB_HOST_PR_SEEDS", "test_ab_host_e2e.py")):
         assert 'pr_seed_count("%s"' % variable in (root / "tests" / source).read_text(encoding="utf-8")
         assert variable in pr.ORACLES
@@ -636,9 +636,25 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     assert "xvfb-run -a" in linux
     shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
     assert "OWN_JOB_FILES: " + network in shared_linux and "$ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES" in shared_linux
-    assert 'own_job = ["%s"]' % network in shared_windows and "f not in left_out and f not in own_job" in shared_windows
+    host_file = "tests/test_ab_host_e2e.py"
+    assert "OWN_JOB_FILES: %s %s" % (network, host_file) in shared_linux
+    assert 'own_job = ["%s", "%s"]' % (network, host_file) in shared_windows and "f not in left_out and f not in own_job" in shared_windows
     assert network not in _job(text, "e2e-windows-control-a")
     # the budget of the test itself fits the job: 5 seeds, two engine runs, with its own setup
     import test_ab_network_e2e as network_e2e
 
     assert network_e2e.budget_s(5, 2) == 1800 and network_e2e.budget_s(5, 2) + 10 * 60 <= 40 * 60
+
+
+def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_traces_with():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    linux, windows = _job(text, "e2e-host"), _job(text, "e2e-host-windows")
+    assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
+    for body in (linux, windows):
+        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and "needs: core-on-index" in body
+        assert "      - name: Run the host oracle's A/A\n" in body and "skipped\": 0" in body
+    assert "apt-get install -y strace" in linux and "xvfb-run -a" in linux, "Linux traces the tree with strace"
+    import test_ab_host_e2e as host_e2e
+
+    assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the job"

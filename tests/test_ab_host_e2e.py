@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import ci_ab_host as host  # noqa: E402
 from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 
-TIMEOUT_S = 25 * 60
+TIMEOUT_S = 35 * 60  # the job of its own (e2e-host, e2e-host-windows) has 45 minutes
 #: The seeds of the A/A on a pull request: the first two of the candidate set, or every one when the pull request touches this oracle (AB_HOST_PR_SEEDS).
 PR_SEEDS = 2
 

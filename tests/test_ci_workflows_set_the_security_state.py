@@ -23,12 +23,14 @@ RUNS_PYTEST = {
     "e2e.yml#control-a": "      - name: The keyboard shortcut selects all",
     "e2e.yml#network": "      - name: Run the network oracle's A/A\n",
     "e2e.yml#network-windows": "      - name: Run the network oracle's A/A\n",
+    "e2e.yml#host": "      - name: Run the host oracle's A/A\n",
+    "e2e.yml#host-windows": "      - name: Run the host oracle's A/A\n",
     "fakeweb.yml": "      - name: Profile P2, stock first and ours second",
 }
 
 
 JOBS = {"e2e.yml": "e2e", "e2e.yml#windows": "e2e-windows", "e2e.yml#control-a": "e2e-windows-control-a", "e2e.yml#network": "e2e-network",
-        "e2e.yml#network-windows": "e2e-network-windows"}
+        "e2e.yml#network-windows": "e2e-network-windows", "e2e.yml#host": "e2e-host", "e2e.yml#host-windows": "e2e-host-windows"}
 
 
 def _scope(name):
@@ -51,7 +53,7 @@ def test_the_security_state_is_set_once_before_the_step_that_runs_the_tests(name
     assert text.index(SET) < text.index(pytest_step), "%s sets the security state after the tests started" % name
 
 
-@pytest.mark.parametrize("name", ["e2e.yml", "e2e.yml#windows", "e2e.yml#control-a", "e2e.yml#network", "e2e.yml#network-windows", "fakeweb.yml"])
+@pytest.mark.parametrize("name", ["e2e.yml", "e2e.yml#windows", "e2e.yml#control-a", "e2e.yml#network", "e2e.yml#network-windows", "e2e.yml#host", "e2e.yml#host-windows", "fakeweb.yml"])
 def test_the_security_state_is_set_before_the_engine_is_fetched(name):
     text = _scope(name)
     assert FETCH in text, "the fetch step of %s moved: update this test with it" % name

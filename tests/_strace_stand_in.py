@@ -21,13 +21,14 @@ _SYSCALLS = ("execve,clone,clone3,fork,vfork,open,openat,stat,lstat,"
 _NET_SYSCALLS = "socket,connect,bind,sendto,sendmsg,sendmmsg"
 
 
-def _strace_options(fd_paths: bool = False) -> str:
+def _strace_options(fd_paths: bool = False, exit_status: bool = False) -> str:
     """strace's own flags: quiet, follow forks, and die with the traced process
     when this build knows --kill-on-exit; ``fd_paths`` adds ``-y``, which prints the path of every file descriptor
-    (``3</usr/share/fonts>``), so that a path relative to a directory descriptor is known."""
+    (``3</usr/share/fonts>``), so that a path relative to a directory descriptor is known; ``exit_status`` keeps the lines that say how each process ended
+    (``+++ exited with 0 +++``, ``+++ killed by SIGKILL +++``: ``-q`` and not ``-qq``) and drops the signal lines."""
     help_text = subprocess.run([shutil.which("strace"), "-h"], capture_output=True,
                                text=True).stdout
-    return "-f -qq -s 4096" + (" -y" if fd_paths else "") + (" --kill-on-exit" if "--kill-on-exit" in help_text else "")
+    return ("-f -q -e signal=none -s 4096" if exit_status else "-f -qq -s 4096") + (" -y" if fd_paths else "") + (" --kill-on-exit" if "--kill-on-exit" in help_text else "")
 
 
 def _require_strace_can_trace(tmp: Path) -> None:
@@ -41,7 +42,7 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
-              timestamps: bool = False, fd_paths: bool = False, network: bool = False) -> str:
+              timestamps: bool = False, fd_paths: bool = False, network: bool = False, exit_status: bool = False) -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -71,7 +72,7 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
         "#!/bin/sh\n"
         "echo $$ > %s\n"
         'exec %s %s -o %s -e trace=%s %s "$@"\n'
-        % (pidfile, shutil.which("strace"), _strace_options(fd_paths) + (" -ttt" if timestamps else ""), log, syscalls, real))
+        % (pidfile, shutil.which("strace"), _strace_options(fd_paths, exit_status) + (" -ttt" if timestamps else ""), log, syscalls, real))
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 
