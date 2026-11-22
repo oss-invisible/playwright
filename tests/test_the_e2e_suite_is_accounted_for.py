@@ -53,6 +53,8 @@ EXCLUDED = {
         (_BOTH, "wrapper.e2e.ab_network: the network oracle has its own row and job (e2e-network-* in e2e.yml)"),
     "tests/test_ab_host_e2e.py":
         (_BOTH, "wrapper.e2e.ab_host: the host oracle has its own row and job (e2e-host-* in e2e.yml)"),
+    "tests/test_ab_host_crash_linux_e2e.py":
+        (_BOTH, "wrapper.e2e.ab_host_crash: the host oracle's recorder on a launch that dies on purpose has its own row (Linux only) and runs in the host oracle's job"),
     "tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py":
         (_BOTH, "wrapper.e2e.udp.exit: the lab's exit is an address held on lo as root (Linux only), run in the root step"),
     "tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick":
@@ -89,7 +91,7 @@ EXCLUDED = {
         (("windows",), "skips on Windows: the Linux text path"),
 }
 #: Changed by hand, together with the list above: an exclusion is a test the candidate does not run, and it may not be added in silence.
-EXCLUDED_COUNT = 20
+EXCLUDED_COUNT = 21
 
 
 @functools.lru_cache(maxsize=None)

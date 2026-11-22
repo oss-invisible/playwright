@@ -15,6 +15,7 @@ import inspect
 import json
 import shutil
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ pytestmark = pytest.mark.unit
 
 SMALL = {"proc": 2, "file": 3}
 SEEDS = (11, 12)
-KINDS = {"parent": 1, "tab/isForBrowser": 2, "gpu": 1, "glxtest": 1}
+KINDS = {"parent": 1, "tab/isForBrowser": 2, "gpu": 1, "gfxtest": 1}
 FILES = ["/etc/fonts/fonts.conf", "/etc/hosts", "/usr/lib/x86_64-linux-gnu/libc.so.6"]
 
 LIN = host.Context("linux", app=["/srv/lab/runner/.cache/invisible/engines/firefox-68/firefox"],
@@ -48,8 +49,8 @@ def footprint(engine="firefox-68", platform="linux", kinds=None, files=None):
             "seeds": [seed_footprint(s, copy.deepcopy(kinds), copy.deepcopy(files)) for s in SEEDS]}
 
 
-def a_candidate_without_glxtest():
-    return footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "glxtest"})
+def a_candidate_without_gfxtest():
+    return footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "gfxtest"})
 
 
 def judge(a, b, **kw):
@@ -59,6 +60,22 @@ def judge(a, b, **kw):
 
 def expected():
     return host.load_expected()
+
+
+def fake_engine(root, package, payload=b"engine bytes"):
+    """A package of an engine as a folder with a binary, its omni.ja and a link, under `root/package`; returns the path of the binary."""
+    folder = Path(root) / package
+    (folder / "browser").mkdir(parents=True)
+    (folder / "firefox").write_bytes(payload)
+    (folder / "omni.ja").write_bytes(payload + b" omni")
+    (folder / "browser" / "omni.ja").write_bytes(payload + b" browser omni")
+    return str(folder / "firefox")
+
+
+@pytest.fixture(autouse=True)
+def staging_in_the_test_folder(tmp_path, monkeypatch):
+    """The engines of an `ab` are staged at `<RUNNER_TEMP>/ab-host/engine/firefox`: here, a folder of the test."""
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path / "runner_temp"))
 
 
 # -
@@ -179,21 +196,21 @@ def test_nothing_is_excused_there_is_no_list_of_noise():
 # -
 # The declared differences.
 
-def test_the_declared_difference_is_the_glxtest_of_linux_by_kind_and_there_is_one_only():
+def test_the_declared_difference_is_the_gfxtest_of_linux_by_kind_and_there_is_one_only():
     entries = expected()
-    assert [(e["id"], e["os"], e["category"], e["name"]) for e in entries] == [("glxtest-69", "linux", "proc", "glxtest")]
-    assert "0e896e4ee1" in entries[0]["reason"] and "glxtest never reads the host" in entries[0]["reason"]
+    assert [(e["id"], e["os"], e["category"], e["name"]) for e in entries] == [("gfxtest-69", "linux", "proc", "gfxtest")]
+    assert "0e896e4ee1" in entries[0]["reason"] and "GfxInfo.cpp:55" in entries[0]["reason"]
     assert len(entries) <= 1, "the list of declared differences may only shrink"
 
 
-def test_the_declared_glxtest_difference_passes_in_an_a_b():
-    report = judge(footprint(), a_candidate_without_glxtest(), expected=expected())
+def test_the_declared_gfxtest_difference_passes_in_an_a_b():
+    report = judge(footprint(), a_candidate_without_gfxtest(), expected=expected())
     assert report["verdict"] == "green", report["problems"]
-    assert [d["leaf"] for d in report["declared"]] == ["proc.glxtest", "proc.glxtest"] and report["stale"] == []
+    assert [d["leaf"] for d in report["declared"]] == ["proc.gfxtest", "proc.gfxtest"] and report["stale"] == []
 
 
 def test_a_difference_next_to_the_declared_one_is_still_red():
-    c = a_candidate_without_glxtest()
+    c = a_candidate_without_gfxtest()
     c["seeds"][0]["kinds"]["utility/sandboxingKind=1"] = 1
     report = judge(footprint(), c, expected=expected())
     assert report["verdict"] == "red"
@@ -201,14 +218,14 @@ def test_a_difference_next_to_the_declared_one_is_still_red():
 
 
 def test_the_declared_difference_the_other_way_round_is_red():
-    report = judge(a_candidate_without_glxtest(), footprint(), expected=expected())
-    assert report["verdict"] == "red" and any(d["leaf"] == "proc.glxtest" for d in report["differences"])
+    report = judge(a_candidate_without_gfxtest(), footprint(), expected=expected())
+    assert report["verdict"] == "red" and any(d["leaf"] == "proc.gfxtest" for d in report["differences"])
 
 
 def test_a_declared_difference_that_does_not_show_is_red_as_stale():
     report = judge(footprint(), footprint("candidate"), expected=expected())
-    assert report["verdict"] == "red" and report["stale"] == ["glxtest-69"]
-    assert any("stale" in p and "glxtest-69" in p for p in report["problems"])
+    assert report["verdict"] == "red" and report["stale"] == ["gfxtest-69"]
+    assert any("stale" in p and "gfxtest-69" in p for p in report["problems"])
 
 
 def test_a_declared_difference_of_another_os_is_not_applied_and_not_stale_there():
@@ -217,13 +234,13 @@ def test_a_declared_difference_of_another_os_is_not_applied_and_not_stale_there(
 
 
 def test_in_the_a_a_the_declared_list_is_not_applied():
-    report = judge(footprint(), a_candidate_without_glxtest(), expected=expected(), a_a=True)
+    report = judge(footprint(), a_candidate_without_gfxtest(), expected=expected(), a_a=True)
     assert report["verdict"] == "red" and report["declared"] == [] and report["stale"] == []
-    assert [d["leaf"] for d in report["differences"]] == ["proc.glxtest", "proc.glxtest"]
+    assert [d["leaf"] for d in report["differences"]] == ["proc.gfxtest", "proc.gfxtest"]
 
 
-def test_the_declared_glxtest_does_not_cover_a_path():
-    c = a_candidate_without_glxtest()
+def test_the_declared_gfxtest_does_not_cover_a_path():
+    c = a_candidate_without_gfxtest()
     c["seeds"][0]["files"] = FILES + ["/usr/lib/x86_64-linux-gnu/libglx.so.0"]
     report = judge(footprint(), c, expected=expected())
     assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./usr/lib/x86_64-linux-gnu/libglx.so.0"]
@@ -231,7 +248,7 @@ def test_the_declared_glxtest_does_not_cover_a_path():
 
 def test_the_cli_says_broken_control_for_an_a_a_difference(tmp_path, capsys):
     a, b = tmp_path / "a.json", tmp_path / "b.json"
-    for path, doc in ((a, footprint()), (b, a_candidate_without_glxtest())):
+    for path, doc in ((a, footprint()), (b, a_candidate_without_gfxtest())):
         path.write_text(json.dumps(doc), encoding="utf-8")
     assert host.main(["compare", str(a), str(b), "--a-a"]) == 2
     out = capsys.readouterr().out
@@ -758,13 +775,15 @@ def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(mon
 
 def test_the_runs_of_an_ab_follow_one_another_in_the_same_order_each_with_its_own_warm_up(tmp_path, monkeypatch):
     runs = []
-    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub-binary", "pub-seal"))
-    monkeypatch.setattr(host, "run_subprocess", lambda exe, seal, leg, out, label, seeds: runs.append((label, exe, list(seeds))) or 1)
-    assert host.ab("cand-binary", Path("cand-seal"), "linux-x86_64", tmp_path / "o1", "firefox-68", [11, 12]) == 2
-    assert [(r[0], r[1]) for r in runs] == [("firefox-68", "pub-binary"), ("firefox-68 again", "pub-binary"), ("candidate", "cand-binary")]
+    pub = fake_engine(tmp_path / "fetch" / "engines", "firefox-68_x", b"published")
+    cand = fake_engine(tmp_path / "checkout" / "ff", ".", b"candidate")
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
+    monkeypatch.setattr(host, "run_subprocess", lambda exe, seal, leg, out, label, seeds: runs.append((label, Path(exe).read_bytes(), list(seeds))) or 1)
+    assert host.ab(cand, Path("cand-seal"), "linux-x86_64", tmp_path / "o1", "firefox-68", [11, 12]) == 2
+    assert [(r[0], r[1]) for r in runs] == [("firefox-68", b"published"), ("firefox-68 again", b"published"), ("candidate", b"candidate")]
     runs.clear()
     assert host.ab(None, None, "linux-x86_64", tmp_path / "o2", "firefox-68", [11, 12]) == 2
-    assert [(r[0], r[1]) for r in runs] == [("firefox-68", "pub-binary"), ("firefox-68 again", "pub-binary")], "the A/A: the published engine twice, in the same order"
+    assert [(r[0], r[1]) for r in runs] == [("firefox-68", b"published"), ("firefox-68 again", b"published")], "the A/A: the published engine twice, in the same order"
 
 
 def test_what_only_the_warm_up_did_is_listed_with_the_process_that_did_it():
@@ -1028,9 +1047,9 @@ def test_the_same_request_from_another_kind_is_a_difference_too():
 
 
 def test_a_public_destination_only_the_candidate_reaches_is_red_and_the_declared_list_does_not_cover_it():
-    c = with_net(a_candidate_without_glxtest(), PARENT_NET + ["socket: connect tcp AF_INET 8.8.4.4:80"])
+    c = with_net(a_candidate_without_gfxtest(), PARENT_NET + ["socket: connect tcp AF_INET 8.8.4.4:80"])
     report = judge(with_net(footprint(), PARENT_NET), c, expected=expected())
-    assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["glxtest-69", "glxtest-69"]
+    assert report["verdict"] == "red" and [d["id"] for d in report["declared"]] == ["gfxtest-69", "gfxtest-69"]
     assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [
         (11, "net.socket: connect tcp public:80", host.MISSING, 1), (12, "net.socket: connect tcp public:80", host.MISSING, 1)]
 
@@ -1278,8 +1297,10 @@ def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
 
 def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_verdict_and_a_broken_one_is_exit_2(tmp_path, monkeypatch):
     order = []
+    pub = fake_engine(tmp_path / "fetch", "pub")
+    cand = fake_engine(tmp_path / "checkout", "cand")
     monkeypatch.setattr(host, "_windows", lambda: True)
-    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub-binary", "pub-seal"))
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
     monkeypatch.setattr(host, "print_report", lambda *a, **k: None)
     monkeypatch.setattr(host, "load_expected", lambda path: [])
     stock = {"doc": a_stock(WIN_KINDS)}
@@ -1301,11 +1322,11 @@ def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_
     monkeypatch.setattr(host, "run_subprocess", fake_run)
     monkeypatch.setattr(host, "run_stock_subprocess", fake_stock)
     monkeypatch.setattr(host, "judge", fake_judge)
-    assert host.ab("cand", Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
+    assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
     assert order == [("run", "firefox-68"), ("run", "firefox-68 again"), ("run", "candidate"), ("judge", "a-a"), ("stock", "windows-x86_64")]
     order.clear()
     stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}))
-    assert host.ab("cand", Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
+    assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
     assert order[-2:] == [("stock", "windows-x86_64"), ("judge", "a-b")]
     order.clear()
     assert host.ab(None, None, "windows-x86_64", tmp_path / "o3", "firefox-68", [11]) == 0
@@ -1356,7 +1377,7 @@ def test_the_open_of_a_proc_self_fd_names_the_process_the_line_and_the_memfd_tha
     assert host.STRACE_CALLS.split(",").count("memfd_create") == 1
 
 
-def test_the_strace_stand_in_keeps_the_exit_lines_and_drops_the_signals_when_asked(monkeypatch):
+def test_the_strace_stand_in_keeps_the_exit_lines_and_records_the_fatal_signals_when_asked(monkeypatch):
     import _strace_stand_in as stand_in
 
     class Help:
@@ -1364,9 +1385,25 @@ def test_the_strace_stand_in_keeps_the_exit_lines_and_drops_the_signals_when_ask
 
     monkeypatch.setattr(stand_in.shutil, "which", lambda name: "/usr/bin/strace")
     monkeypatch.setattr(stand_in.subprocess, "run", lambda *a, **k: Help())
-    assert " -qq " in stand_in._strace_options() + " " and "-e signal=none" not in stand_in._strace_options()
+    assert " -qq " in stand_in._strace_options() + " " and "-e signal" not in stand_in._strace_options()
     asked = stand_in._strace_options(exit_status=True)
-    assert "-q " in asked and "-qq" not in asked and "-e signal=none" in asked
+    assert "-q " in asked and "-qq" not in asked.replace("SIGQUIT", ""), "-q keeps the `+++ exited with N +++` lines"
+    assert "-e signal=none" not in asked and "-e signal=%s " % stand_in.RECORDED_SIGNALS in asked + " ", "the signals are recorded now: the line that says who sent SIGSEGV and where it faulted"
+    assert {"SIGSEGV", "SIGBUS", "SIGABRT", "SIGILL", "SIGTERM"} <= set(stand_in.RECORDED_SIGNALS.split(","))
+
+
+def test_the_signal_lines_the_trace_now_records_are_not_data_of_the_comparison(tmp_path):
+    """The known-bad input is a log with the lines `-e signal=none` used to drop: read as data they would be a process, a path, a call. They are dropped where the log is read, and
+    the footprint of a log with them is the footprint of the log without."""
+    clean = tmp_path / "clean.log"
+    clean.write_text(SHUTDOWN_LOG, encoding="utf-8")
+    lines = SHUTDOWN_LOG.splitlines()
+    noisy = tmp_path / "noisy.log"
+    signals = ["100 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=104, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---",
+               "100 --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=0x7f00dead} ---"]
+    noisy.write_text("\n".join([lines[0]] + signals + lines[1:]) + "\n", encoding="utf-8")
+    assert list(host._read_lines(noisy)) == list(host._read_lines(clean)) and not any("---" in x for x in host._read_lines(noisy))
+    assert any("--- SIGSEGV" in x for x in noisy.read_text(encoding="utf-8").splitlines()), "the log itself keeps them: the evidence of a crash reads it"
 
 
 def etw_stop(pid, code, time, image="firefox.exe"):
@@ -1726,7 +1763,7 @@ def test_a_linux_core_is_found_where_the_launch_ran_and_its_backtrace_is_asked_o
     assert host.core_info(tmp_path / "empty-nowhere", "x")["cores"] == []
 
 
-def test_the_stand_in_of_the_bare_launch_allows_core_dumps_in_its_own_folder_and_the_others_do_not(tmp_path, monkeypatch):
+def test_the_stand_in_allows_core_dumps_in_every_launch_and_only_the_bare_one_moves_to_its_own_folder(tmp_path, monkeypatch):
     import _strace_stand_in as stand_in
 
     class Help:
@@ -1738,7 +1775,9 @@ def test_the_stand_in_of_the_bare_launch_allows_core_dumps_in_its_own_folder_and
     real.parent.mkdir()
     real.write_text("x", encoding="utf-8")
     plain = Path(stand_in._stand_in(str(real), tmp_path / "t1", tmp_path / "l1", tmp_path / "p1"))
-    assert "ulimit" not in plain.read_text(encoding="utf-8")
+    assert "ulimit" not in plain.read_text(encoding="utf-8"), "the font tests' stand-in is as it was"
+    every = Path(stand_in._stand_in(str(real), tmp_path / "t3", tmp_path / "l3", tmp_path / "p3", cores=True)).read_text(encoding="utf-8")
+    assert "ulimit -c unlimited\nexec " in every and "\ncd " not in every, "a measured launch may dump core and its working directory is the launcher's (the paths the trace reads are the same)"
     cores = Path(stand_in._stand_in(str(real), tmp_path / "t2", tmp_path / "l2", tmp_path / "p2", core_dir=tmp_path / "cores"))
     text = cores.read_text(encoding="utf-8")
     assert "ulimit -c unlimited\ncd %s\nexec " % (tmp_path / "cores") in text
@@ -1934,7 +1973,9 @@ def test_the_system_class_is_system32_syswow64_and_winsxs_and_everything_else_st
 
 def test_the_ab_passes_the_other_run_of_the_68_to_the_judge(tmp_path, monkeypatch):
     seen = {}
-    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: ("pub", None))
+    pub = fake_engine(tmp_path / "fetch", "pub")
+    cand = fake_engine(tmp_path / "checkout", "cand")
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, None))
     docs = {"footprint-68.json": win(), "footprint-68-again.json": win("again"), "footprint-candidate.json": win("candidate")}
 
     def fake_run(exe, seal, leg, out, label, seeds):
@@ -1947,7 +1988,7 @@ def test_the_ab_passes_the_other_run_of_the_68_to_the_judge(tmp_path, monkeypatc
     monkeypatch.setattr(host, "run_stock_control", lambda leg, out: {"stock": True})
     real = host.judge
     monkeypatch.setattr(host, "judge", lambda a, b, **kw: seen.update(kw) or real(a, b, **kw))
-    host.ab("cand", Path("seal"), "win-x86_64", tmp_path / "o", "firefox-68", [11, 12])
+    host.ab(cand, Path("seal"), "win-x86_64", tmp_path / "o", "firefox-68", [11, 12])
     assert seen["also_68"][0]["engine"] == "again"
 
 
@@ -2036,3 +2077,779 @@ def test_in_an_ab_the_excused_files_stay_listed_per_run_and_a_new_library_shows_
     assert mui("old") in system["listed_mui_and_cat"]["68"] and CATDIR + "old.cat" in system["listed_mui_and_cat"]["68"] and mui("newlib") in system["listed_mui_and_cat"]["candidate"]
     orphan = judge(published, with_system(win("candidate"), {11: [dll("old"), mui("lonely")]}), expected=[])
     assert [d["leaf"] for d in orphan["differences"]] == ["file." + mui("lonely")] and orphan["system_modules"]["orphans"] == [mui("lonely")]
+
+
+# -
+# A launch whose parent did not end with 0 is red in EVERY launch of the oracle, and what it left is saved (scripts/ci_crash_evidence.py: run 45030727459 had a firefox-68 parent
+# die with -11 in a normal close and nothing was kept). Each recorder is shown on the input that makes it fail: a launch that died.
+
+import ci_crash_evidence as crash  # noqa: E402
+
+CRASH_LOG = "".join('%d openat(AT_FDCWD, "/usr/lib/x%d", O_RDONLY) = 3\n' % (100, i) for i in range(300)) + (
+    "100 --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_USER, si_pid=4000, si_uid=1000} ---\n"
+    + "".join('100 write(2, "crash reporter line %d\\n", 20) = 20\n' % i for i in range(150))
+    + "100 +++ killed by SIGSEGV (core dumped) +++\n")
+
+
+class Run:
+    """A stand-in for `subprocess.run` that answers by the tool it is asked for, and keeps what it was asked."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        text = self.answers.get(os.path.basename(argv[0]), "")
+
+        class Done:
+            stdout, stderr = text, ""
+
+        return Done()
+
+
+def with_tools(*names):
+    return lambda name: "/usr/bin/" + name if name in names else None
+
+
+def test_the_exit_code_of_a_parent_is_told_by_its_signal_on_linux_and_by_its_status_on_windows():
+    assert crash.describe_exit(-11, False) == "-11 (SIGSEGV)" and crash.describe_exit(-6, False) == "-6 (SIGABRT)" and crash.describe_exit(1, False) == "1"
+    assert crash.describe_exit(3221225477, True) == "0xC0000005 (access violation)" and crash.describe_exit(-1073741819, True) == "0xC0000005 (access violation)"
+    assert "not seen" in crash.describe_exit(None, False)
+
+
+def test_a_launch_that_did_not_end_with_0_is_a_red_line_that_names_the_seed_the_launch_and_the_code():
+    assert crash.exit_problem(0, False, seed=5, launch="measured") is None
+    line = crash.exit_problem(-11, False, seed=5, launch="measured")
+    assert line == "the parent process exited with code -11 (SIGSEGV): seed 5, launch measured"
+    assert "not seen" in crash.exit_problem(None, False, seed=5, launch="idle"), "an oracle that did not see how its browser ended did not see it"
+    launches = [{"n": 1, "label": {"seed": 7, "dpr": 1.5, "launch": "visit"}, "returncode": 0},
+                {"n": 2, "label": {"seed": 7, "launch": "relaunch-second"}, "returncode": -11, "evidence": "crash/02-7-relaunch-second"}]
+    got = crash.exit_problems(launches, "firefox-68-again", False)
+    assert len(got) == 1 and "code -11 (SIGSEGV)" in got[0] and "run firefox-68-again" in got[0] and "side B" in got[0] and "seed 7" in got[0] and "launch relaunch-second" in got[0]
+    assert "(evidence: crash/02-7-relaunch-second)" in got[0]
+    assert "side A" in crash.exit_problems(launches, "firefox-68", False)[0] and "side B" in crash.exit_problems(launches, "candidate", False)[0]
+    assert "side A" in crash.exit_problems(launches, "x", False, side="A")[0]
+
+
+def test_a_parent_the_lifecycle_says_did_not_exit_0_is_red_when_the_root_code_said_nothing_of_it():
+    lifecycle = [{"event": "start", "kind": "parent", "how": ""}, {"event": "end", "kind": "tab", "how": "exited 1"}, {"event": "end", "kind": "parent", "how": "exited 3221225477"}]
+    got = crash.parent_exit_problems(lifecycle, 0, seed=4, launch="measured")
+    assert len(got) == 1 and "exited 3221225477" in got[0] and "seed 4" in got[0]
+    assert crash.parent_exit_problems(lifecycle, -11, seed=4) == [], "the root's own code already said it"
+    assert crash.parent_exit_problems([{"event": "end", "kind": "parent", "how": "exited 0"}], 0) == []
+
+
+def test_the_strace_tail_is_the_last_100_lines_and_the_signal_line_that_is_further_back_is_kept_apart(tmp_path):
+    log = tmp_path / "strace.log"
+    log.write_text(CRASH_LOG, encoding="utf-8")
+    tail = crash.strace_tail(log)
+    assert len(tail) == 100 and tail[-1].endswith("+++ killed by SIGSEGV (core dumped) +++") and not any("--- SIGSEGV" in x for x in tail)
+    signals = crash.strace_signals(log)
+    assert len(signals) == 1 and signals[0][0] == 301 and "si_pid=4000" in signals[0][1], "the signal line is there though the crash reporter's calls pushed it out of the tail"
+    short = tmp_path / "short.log"
+    short.write_text('1 execve("/e", [], 0x1) = 0\n', encoding="utf-8")
+    assert crash.strace_tail(short) == ['1 execve("/e", [], 0x1) = 0']
+
+
+def test_the_core_is_run_through_gdb_with_the_three_commands_and_the_build_ids_are_asked_of_readelf_and_eu_unstrip(tmp_path):
+    core = tmp_path / "core.firefox.4242.1"
+    core.write_bytes(b"\x7fELF")
+    binary = tmp_path / "engine" / "firefox"
+    binary.parent.mkdir()
+    binary.write_bytes(b"x")
+    (binary.parent / "libxul.so").write_bytes(b"x")
+    run = Run({"gdb": 'Thread 1 (Thread 0x7f (LWP 4242) "firefox"):\n#0  0x0 in mozilla::ShutdownXPCOM ()\n$1: 0x1 "MOZ_CRASH(shutdown)"\nFrom To Syms Read Shared Object Library\n',
+               "readelf": "    Build ID: abc123\n", "eu-unstrip": "0x1+0x2 deadbeef@0x3 /usr/lib/libc.so.6 libc.so.6\n"})
+    got = crash.collect(-11, str(binary), strace_log=None, watched={"files": [], "scans": 3}, core_folders=[tmp_path], since=0, windows=False, run=run,
+                        which=with_tools("gdb", "readelf", "eu-unstrip"))
+    gdb = [c for c in run.calls if c[0].endswith("gdb")][0]
+    assert gdb[:2] == ["/usr/bin/gdb", "-batch"] and gdb[-2:] == [str(binary), str(core)]
+    commands = [gdb[i + 1] for i, a in enumerate(gdb) if a == "-ex"]
+    assert commands == ["thread apply all bt", "x/s *(char**)&gMozCrashReason", "info sharedlibrary"]
+    assert "Thread 1 (" in got["cores"]["backtraces"][core.name] and "MOZ_CRASH(shutdown)" in got["cores"]["backtraces"][core.name]
+    ids = got["cores"]["build_ids"][core.name]
+    assert ids["binary"] == "Build ID: abc123" and ids["libxul"] == "Build ID: abc123" and "deadbeef" in ids["core"]
+    assert [c for c in run.calls if c[0].endswith("eu-unstrip")][0][1:] == ["-n", "--core", str(core)]
+
+
+def test_a_collector_that_finds_nothing_says_so_and_never_stays_silent(tmp_path):
+    binary = tmp_path / "firefox"
+    binary.write_bytes(b"x")
+    got = crash.collect(-11, str(binary), strace_log=None, watched={"files": [], "scans": 0}, core_folders=[tmp_path / "cores"], since=0, windows=False, run=Run({}),
+                        which=with_tools())
+    said = " | ".join(got["said"])
+    assert "runs no strace" in said and "no core file written" in said and "no minidump and no `.extra`" in said
+    assert got["cores"]["cores"] == [] and got["cores"]["build_ids"]["binary only (no core)"]["binary"] == "readelf is not installed"
+    core = tmp_path / "cores" / "core.firefox.1.1"
+    core.parent.mkdir()
+    core.write_bytes(b"\x7fELF")
+    got = crash.collect(-11, str(binary), strace_log=None, watched={"files": []}, core_folders=[core.parent], since=0, windows=False, run=Run({}), which=with_tools())
+    assert got["cores"]["backtraces"][core.name] == "gdb is not installed" and got["cores"]["build_ids"][core.name]["core"] == "eu-unstrip is not installed"
+    missing = crash.collect(-11, str(binary), strace_log=tmp_path / "nowhere.log", watched={"files": []}, core_folders=[], windows=False, run=Run({}), which=with_tools())
+    assert any("strace log could not be read" in s for s in missing["said"])
+    quiet = tmp_path / "quiet.log"
+    quiet.write_text("1 +++ exited with 1 +++\n", encoding="utf-8")
+    assert any("no fatal signal line" in s
+               for s in crash.collect(1, str(binary), strace_log=quiet, watched={"files": []}, core_folders=[], windows=False, run=Run({}), which=with_tools())["said"])
+    files = [{"name": "a.dmp", "dir": "d", "size": 5}, {"name": "a.extra", "dir": "d", "size": 9, "content": '{"CrashType": "ACCESS"}'}]
+    windows = crash.collect(3221225477, str(binary), strace_log=None, watched={"files": files}, windows=True)
+    assert windows["strace"] is None and windows["cores"] is None and windows["crash_files"]["dmp"] == ["a.dmp"] and windows["crash_files"]["extra"][0]["name"] == "a.extra"
+    assert windows["exit"]["text"] == "0xC0000005 (access violation)" and any("no strace and no core on Windows" in s for s in windows["said"])
+    assert not any("no minidump" in s for s in windows["said"])
+
+
+def test_a_core_of_an_earlier_launch_is_not_this_one_s(tmp_path):
+    old, new = tmp_path / "core.old.1.1", tmp_path / "core.new.2.2"
+    old.write_bytes(b"x")
+    new.write_bytes(b"x")
+    os.utime(old, (1000, 1000))
+    now = new.stat().st_mtime
+    assert crash.find_cores([tmp_path, tmp_path / "missing"], since=now - 1) == [new] and crash.find_cores([tmp_path], since=None) == [new, old]
+    assert crash.core_dirs({crash.CORE_DIR_ENV: "/cores"}, pattern="|/usr/share/apport/apport -p%p") == [Path("/cores")], "a pipe leaves no file to look for"
+    assert crash.core_dirs({}, pattern="/var/cores/core.%e.%p") == [Path("/var/cores")] and crash.core_dirs({}, pattern=None) == []
+
+
+def test_the_evidence_is_written_as_files_a_person_can_read_in_the_artifact(tmp_path):
+    log = tmp_path / "strace.log"
+    log.write_text(CRASH_LOG, encoding="utf-8")
+    core = tmp_path / "core.firefox.4242.1"
+    core.write_bytes(b"\x7fELF")
+    run = Run({"gdb": 'Thread 2 (Thread 0x7f (LWP 4243) "Socket Thread"):\n', "readelf": "Build ID: aa\n", "eu-unstrip": "x\n"})
+    binary = tmp_path / "engine" / "firefox"
+    binary.parent.mkdir()
+    binary.write_bytes(b"x")
+    watched = {"files": [{"name": "u.extra", "dir": "d", "size": 9, "content": '{"MozCrashReason": "MOZ_CRASH(x)"}'}, {"name": "u.dmp", "dir": "d", "size": 4}], "scans": 5}
+    evidence = crash.collect(-11, str(binary), strace_log=log, watched=watched, core_folders=[tmp_path], since=0, windows=False, run=run,
+                             which=with_tools("gdb", "readelf", "eu-unstrip"))
+    written = crash.write_crash_files(evidence, tmp_path / "out" / "crash")
+    assert {"strace-tail.txt", "strace-signals.txt", "gdb-core.firefox.4242.1.txt", "build-ids.txt", "u.extra.txt", "minidumps.txt", "said.txt", "crash.json"} <= set(written)
+    folder = tmp_path / "out" / "crash"
+    assert "--- SIGSEGV" in (folder / "strace-signals.txt").read_text(encoding="utf-8")
+    assert "killed by SIGSEGV (core dumped)" in (folder / "strace-tail.txt").read_text(encoding="utf-8")
+    assert "Thread 2 (" in (folder / "gdb-core.firefox.4242.1.txt").read_text(encoding="utf-8") and "MOZ_CRASH(x)" in (folder / "u.extra.txt").read_text(encoding="utf-8")
+    assert (folder / "minidumps.txt").read_text(encoding="utf-8") == "u.dmp\n"
+    assert json.loads((folder / "crash.json").read_text(encoding="utf-8"))["exit"]["code"] == -11
+
+
+def test_a_fake_launch_that_died_with_minus_11_is_a_red_line_with_the_evidence_and_one_that_ended_with_0_is_neither(tmp_path):
+    log = tmp_path / "strace.log"
+    log.write_text(CRASH_LOG, encoding="utf-8")
+    watched = {"files": [{"name": "u.extra", "dir": "d", "size": 9, "content": '{"CrashType": "SIGSEGV"}'}], "scans": 2}
+    problems, left = host.end_of_launch(-11, False, 11, "measured", [], "/e/firefox", log, watched, None, 0.0, folders=[], run=Run({}))
+    assert problems == ["the parent process exited with code -11 (SIGSEGV): seed 11, launch measured"]
+    assert left["exit"] == {"code": -11, "text": "-11 (SIGSEGV)"} and left["strace"]["signals"][0][1].startswith("100 --- SIGSEGV")
+    assert left["crash_files"]["extra"][0]["name"] == "u.extra"
+    assert host.end_of_launch(0, False, 11, "measured", [], "/e/firefox", log, watched, None, 0.0, folders=[]) == ([], None)
+    problems, left = host.end_of_launch(None, False, 11, "idle", [], "/e/firefox", log, {}, None, 0.0, folders=[], run=Run({}))
+    assert "not seen" in problems[0] and left is not None
+    windows, kept = host.end_of_launch(3221225477, True, 11, "bare", [], "D:\\e\\firefox.exe", None, {"files": []}, None, 0.0, run=Run({}))
+    assert "0xC0000005 (access violation)" in windows[0] and "launch bare" in windows[0] and kept["strace"] is None
+
+
+def test_the_bare_launch_looks_in_its_own_folder_for_a_core_as_well(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(host.crash, "collect", lambda code, binary, **kw: seen.update(kw) or {"exit": {}, "said": []})
+    monkeypatch.setattr(host.crash, "core_dirs", lambda *a, **k: [Path("/job/cores")])
+    host.end_of_launch(-11, False, 1, "bare", [], "b", tmp_path / "l", {}, tmp_path, 5.0)
+    assert seen["core_folders"] == [Path("/job/cores"), tmp_path] and seen["since"] == 5.0
+
+
+def test_a_launch_that_did_not_end_with_0_is_in_the_verdict_of_the_run_named_by_side_seed_and_launch_whatever_launch_it_was(monkeypatch, tmp_path):
+    bad = crash.exit_problem(-11, False, seed=12, launch="measured")
+
+    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
+        fp = seed_footprint(seed)
+        if name is None and seed == 12:
+            fp["problems"] = [bad]
+            fp["crash"] = {"exit": {"code": -11, "text": "-11 (SIGSEGV)"}, "said": ["no core file written"], "strace": None, "cores": None, "crash_files": {"dmp": [], "extra": []}}
+        if name == "bare":
+            fp["exit_problems"] = [crash.exit_problem(-6, False, seed=11, launch="bare")]
+        if name == "idle":
+            fp["problems"] = [crash.exit_problem(1, False, seed=11, launch="idle")]
+        return fp
+
+    monkeypatch.setattr(host, "run_seed", fake_run_seed)
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68", tmp_path / "x.crash")
+    assert "idle: the parent process exited with code 1: seed 11, launch idle" in doc["problems"]
+    assert "bare: the parent process exited with code -6 (SIGABRT): seed 11, launch bare" in doc["problems"]
+    assert (tmp_path / "x.crash" / "seed12" / "crash.json").is_file()
+    assert (tmp_path / "x.crash" / "seed12" / "said.txt").read_text(encoding="utf-8") == "no core file written\n"
+    other = footprint()
+    other["seeds"][1] = doc["seeds"][1]
+    red = judge(footprint(), other, a_a=True)
+    assert red["verdict"] == "red" and "seed 12 side B: the parent process exited with code -11 (SIGSEGV): seed 12, launch measured" in red["problems"]
+    named = judge(dict(footprint(), problems=doc["problems"]), footprint(), a_a=True)
+    assert "side A: idle: the parent process exited with code 1: seed 11, launch idle" in named["problems"]
+
+
+def test_the_signal_the_recorder_is_tested_with_goes_to_the_browser_s_parent_and_not_to_strace_or_a_content_process():
+    class Child:
+        def __init__(self, pid, cmd):
+            self.pid, self._cmd = pid, cmd
+
+        def cmdline(self):
+            return self._cmd
+
+    assert host.browser_parent(1, lambda: [Child(7, ["firefox", "-contentproc", "tab"]), Child(8, ["firefox", "-profile", "/tmp/p"])]) == 8
+    with pytest.raises(RuntimeError, match="no browser parent"):
+        host.browser_parent(1, lambda: [Child(7, ["firefox", "-contentproc", "tab"])])
+    sent = []
+
+    class Process:
+        polls = 0
+
+        def poll(self):
+            Process.polls += 1
+            return -11 if Process.polls > 2 else None
+
+    assert host.crash_the_parent(1, Process(), 11, kill=lambda pid, sig: sent.append((pid, sig)), parent=8, sleep=lambda s: None) == 8
+    assert sent == [(8, 11)] and Process.polls == 3, "it waits for the root to end, and sends the signal once"
+
+
+def test_the_crash_probe_is_red_when_the_launch_that_died_is_in_the_footprint_and_fails_when_the_recorder_did_not_see_it(tmp_path, capsys):
+    def made(problems):
+        def run(binary, seal, leg, out, label, seeds, crash_with=None):
+            assert crash_with == "SIGSEGV" and seeds == [11]
+            Path(out).write_text(json.dumps({"format": host.FORMAT, "problems": problems, "seeds": []}), encoding="utf-8")
+            return 0
+        return run
+
+    red = host.crash_probe("ff", "linux-x86_64", tmp_path / "a", 11, run=made([crash.exit_problem(-11, False, seed=11, launch="crash")]))
+    assert red == 1 and "AB HOST CRASH PROBE FAILED" in capsys.readouterr().out
+    assert host.crash_probe("ff", "linux-x86_64", tmp_path / "b", 11, run=made([])) == 0, "a recorder that saw nothing in a launch that died: the e2e test fails on this"
+    assert "AB HOST CRASH PROBE OK" in capsys.readouterr().out
+    assert host.crash_probe("ff", "linux-x86_64", tmp_path / "c", 11, run=lambda *a: 3) == 2
+
+
+class FakeProcess:
+    pid = 4242
+
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+    def terminate(self):
+        pass
+
+
+def a_launch_through_the_core(probe, code, label, folder=None):
+    """A launch as the core makes it: a `Connection` over two pipes whose process ended with `code`, closed as the wrapper closes it."""
+    from invisible_core.juggler.connection import Connection, ProcessOutput
+
+    probe.set_label(**label)
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
+    out_r, out_w = os.pipe()
+    output = ProcessOutput(os.fdopen(out_r, "rb"))  # what `launch` makes before the connection: one reader of the browser's output, for the whole life of the process
+    os.write(out_w, b"browser says: launch of seed %d\n" % label.get("seed", 0))
+    os.close(out_w)
+    conn = Connection(to_w, from_r, FakeProcess(code))
+    conn.output = output
+    if folder is not None:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "u.extra").write_text('{"CrashType": "SIGSEGV", "MozCrashReason": "MOZ_CRASH(glean)"}', encoding="utf-8")
+    conn.close()
+    os.close(from_w)
+    os.close(to_r)
+    return conn
+
+
+def test_the_probe_sees_every_launch_the_core_makes_and_the_one_that_died_is_red_with_its_crash_files_while_the_others_are_not(tmp_path):
+    from invisible_core.juggler.connection import Connection
+
+    folder = tmp_path / "profile" / "minidumps"
+    probe = crash.LaunchProbe("/e/firefox", tmp_path / "out" / "crash", windows=False, folders=[folder], which=with_tools(), run=Run({}))
+    before = (Connection.__init__, Connection.close)
+    probe.install()
+    try:
+        assert (Connection.__init__, Connection.close) != before
+        a_launch_through_the_core(probe, 0, {"seed": 1, "launch": "visit"})
+        a_launch_through_the_core(probe, -11, {"seed": 2, "launch": "relaunch-second"}, folder)
+        a_launch_through_the_core(probe, 0, {"seed": 3, "launch": "visit"})
+    finally:
+        probe.uninstall()
+    assert (Connection.__init__, Connection.close) == before
+    assert [x["returncode"] for x in probe.launches] == [0, -11, 0]
+    lines = crash.exit_problems(probe.launches, "firefox-68", False)
+    assert len(lines) == 1 and "code -11 (SIGSEGV)" in lines[0] and "seed 2" in lines[0] and "launch relaunch-second" in lines[0] and "side A" in lines[0]
+    evidence = [x for x in probe.launches if x["returncode"]][0]
+    saved = tmp_path / "out" / "crash" / evidence["evidence"].split("/", 1)[1]
+    assert "MOZ_CRASH(glean)" in (saved / "u.extra.txt").read_text(encoding="utf-8")
+    assert "no core file written" in " | ".join(evidence["said"]) and "runs no strace" in " | ".join(evidence["said"])
+    exits = tmp_path / "out" / "crash" / "exits.json"
+    assert probe.write() == exits and crash.read_exits(exits)["launches"][1]["returncode"] == -11
+    assert len([p for p in (tmp_path / "out" / "crash").iterdir() if p.is_dir() and p.name != crash.STDERR_DIR]) == 1, "a launch that ended with 0 leaves no evidence folder"
+    assert sorted(f.name for f in (tmp_path / "out" / "crash" / crash.STDERR_DIR).iterdir()) == ["01-1-visit.txt", "02-2-relaunch-second.txt", "03-3-visit.txt"], "what the browser wrote is kept for every launch"
+    assert crash.exits_of_run(tmp_path / "out" / "crash", "firefox-68", False) == lines
+
+
+def test_a_run_whose_probe_wrote_nothing_is_red_because_the_oracle_did_not_see_its_browsers(tmp_path):
+    assert "left no record" in crash.exits_of_run(tmp_path / "out" / "crash" / "firefox-68", "firefox-68")[0]
+    folder = tmp_path / "crash" / "firefox-68"
+    folder.mkdir(parents=True)
+    (folder / "exits.json").write_text(json.dumps({"format": crash.FORMAT, "launches": []}), encoding="utf-8")
+    assert "recorded no launch" in crash.exits_of_run(folder, "firefox-68")[0]
+    assert crash.exits_of_run(folder, "firefox-68", needed=False) == [] and crash.exits_of_run(None, "x") == []
+    (folder / "exits.json").write_text("not json", encoding="utf-8")
+    assert "left no record" in crash.exits_of_run(folder, "firefox-68")[0]
+
+
+def test_a_crash_watcher_does_not_take_the_reports_of_earlier_crashes_for_the_launch_s(tmp_path):
+    pending = tmp_path / "Crash Reports" / "pending"
+    pending.mkdir(parents=True)
+    (pending / "old.extra").write_text('{"CrashType": "OLD"}', encoding="utf-8")
+    already = crash.existing_crash_files([pending])
+    watcher = crash.CrashWatcher(lambda: [pending], ignore=already)
+    (pending / "new.extra").write_text('{"CrashType": "NEW"}', encoding="utf-8")
+    got = watcher.stop()
+    assert [f["name"] for f in got["files"]] == ["new.extra"]
+
+
+# -
+# Run from the same folder: where the engine sits is a variable of the experiment, not a difference of the paths.
+
+def _ancestors(exe) -> tuple:
+    return tuple(str(p) for p in Path(exe).parents)
+
+
+def test_every_engine_run_of_an_ab_is_launched_from_the_same_folder_whatever_the_root_the_engine_came_from(tmp_path, monkeypatch):
+    """The content processes call realpath(<install>/omni.ja), which reads the link of every ancestor of the install folder: run 45043617981 saw `readlink /srv/lab/work/...`
+    for the candidate and `readlink /tmp/ab-host-fetch-<random>/engines` for the 68. Both come from different roots here, and what each run is given is one path."""
+    seen = []
+    pub = fake_engine(tmp_path / "tmp" / "ab-host-fetch-dc0cc7qh" / "engines", "firefox-68_x", b"published")
+    cand = fake_engine(tmp_path / "srv" / "lab" / "work" / "checkout" / "checkout", "ff", b"candidate")
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
+
+    def run(exe, seal, leg, out, label, seeds):
+        folder = Path(exe).parent
+        seen.append((label, exe, _ancestors(exe), sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*")), Path(exe).read_bytes(), (folder / "omni.ja").read_bytes()))
+        return 1
+
+    monkeypatch.setattr(host, "run_subprocess", run)
+    assert host.ab(cand, Path("cand-seal"), "linux-x86_64", tmp_path / "o", "firefox-68", [11]) == 2
+    assert [s[0] for s in seen] == ["firefox-68", "firefox-68 again", "candidate"]
+    assert len({s[1] for s in seen}) == 1, "one absolute path for every run"
+    assert len({s[2] for s in seen}) == 1, "so the links read are of the same ancestors"
+    assert Path(seen[0][1]) == host.stage_dir() / "firefox" and Path(seen[0][1]).parent.parent == Path(os.environ["RUNNER_TEMP"]) / "ab-host" / "engine"
+    assert [s[4] for s in seen] == [b"published", b"published", b"candidate"] and [s[5] for s in seen] == [b"published omni", b"published omni", b"candidate omni"]
+    assert seen[0][3] == seen[2][3] == ["browser", "browser/omni.ja", "firefox", "omni.ja"], "the whole package tree is copied"
+    assert not host.stage_dir().exists(), "and removed after each run"
+    assert Path(pub).read_bytes() == b"published" and Path(cand).read_bytes() == b"candidate", "the engine itself is not touched"
+
+
+def test_the_folder_of_the_engine_is_part_of_the_ours_class_and_its_ancestors_are_the_same_host_leaves_in_every_run(tmp_path):
+    """What the oracle records of the install: the package root is `ours`, its ancestors are host leaves, and they are the same set for the 68 and for the candidate."""
+    leaves = []
+    for root, package, payload in ((tmp_path / "a" / "ab-host-fetch-x" / "engines", "firefox-68_y", b"1"), (tmp_path / "b" / "srv" / "lab" / "work", "ff", b"2")):
+        with host.staged_engine(fake_engine(root, package, payload)) as exe:
+            folder = os.path.dirname(exe)
+            ctx = host.Context("linux", app=[folder])
+            ancestors = [str(p).replace("\\", "/") for p in Path(folder).parents if str(p) != str(Path(folder).anchor)]
+            leaves.append((host.classify(folder, ctx)[0], host.classify_paths(ancestors, host.Context("linux")), len(ancestors)))
+    assert leaves[0][0] == leaves[1][0] == "package" and leaves[0] == leaves[1]
+
+
+def test_a_host_path_outside_the_root_is_still_red_nothing_is_normalised():
+    """The comparison is not told to ignore the ancestors of the install: one extra path outside the package root on one side is a difference."""
+    c = footprint("candidate")
+    for seed in c["seeds"]:
+        seed["files"] = FILES + ["/srv/lab/work"]
+        seed["touched_by"] = {"/srv/lab/work": ["Web Content", "forkserver"]}
+        seed["touched_calls"] = {"/srv/lab/work": ["readlink"]}
+    report = judge(footprint(), c, expected=expected())
+    assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./srv/lab/work"] * 2
+    assert any("file./srv/lab/work" in p and "via readlink" in p for p in report["problems"])
+
+
+def test_the_staged_package_is_a_copy_of_the_whole_tree_with_its_links_and_a_leftover_of_an_earlier_run_does_not_stay(tmp_path):
+    engine = fake_engine(tmp_path / "src", "pkg", b"bytes")
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink("omni.ja", str(Path(engine).parent / "link.ja"))
+        except OSError:
+            pass
+    stale = host.stage_dir() / "leftover.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("an earlier run", encoding="utf-8")
+    with host.staged_engine(engine) as exe:
+        folder = Path(exe).parent
+        assert folder == host.stage_dir() and not (folder / "leftover.txt").exists()
+        assert sorted(p.name for p in folder.iterdir()) == sorted(p.name for p in Path(engine).parent.iterdir())
+        assert (folder / "browser" / "omni.ja").read_bytes() == b"bytes browser omni" and os.access(exe, os.R_OK)
+        if (Path(engine).parent / "link.ja").is_symlink():
+            assert (folder / "link.ja").is_symlink()
+    assert not host.stage_dir().exists()
+
+
+# -
+# The graphics probe is `gfxtest`: the declared difference names the real process, and covers what only that process touched.
+
+GFX_PCI = ["/sys/bus/pci", "/sys/bus/pci/"]
+GFX_ONLY = {path: ["gfxtest"] for path in GFX_PCI}
+
+
+def with_files(fp, files, touched_by, calls=None, seeds=None):
+    """`fp` whose seeds (every one, or `seeds`) also touched `files`, with the kinds `touched_by` says touched each of them."""
+    for seed in fp["seeds"]:
+        if seeds is None or seed["seed"] in seeds:
+            seed["files"] = list(seed["files"]) + list(files)
+            seed["touched_by"] = dict(seed.get("touched_by", {}), **touched_by)
+            seed["touched_calls"] = dict(seed.get("touched_calls", {}), **(calls or {path: ["access"] for path in files}))
+    return fp
+
+
+def test_the_probe_of_the_68_is_named_gfxtest_by_what_it_ran_in_every_spelling_the_engine_runs_it():
+    argv = ["gfxtest", "glx", "-f", "18"]
+    assert host.label_of_exec("/srv/lab/work/checkout/checkout/ff/gfxtest", argv, REAL) == "gfxtest"
+    assert host.label_of_exec("/proc/self/exe", argv, REAL) == "gfxtest"
+    assert host.label_of_exec(REAL, argv, REAL) == "gfxtest" and host.label_of_exec(REAL, ["/e/firefox/firefox"], REAL) == "parent"
+    log = ['100 execve("/e/firefox/firefox", ["/e/firefox/firefox", "-profile", "/tmp/p"], 0x7ffd /* 40 vars */) = 0',
+           "100 fork() = 101", '101 execve("/proc/self/exe", ["gfxtest", "glx", "-f", "18"], 0x7ffd /* 40 vars */) = 0']
+    procs = host.spawned_processes(log, REAL)
+    assert {pid: p["label"] for pid, p in procs.items()} == {100: "parent", 101: "gfxtest"} and host.spawned_counts(procs)["gfxtest"] == 1
+
+
+def test_the_declared_difference_covers_the_gfxtest_process_and_the_paths_only_it_touched_in_the_seeds_where_the_candidate_has_none_of_it():
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    report = judge(a, a_candidate_without_gfxtest(), expected=expected())
+    assert report["verdict"] == "green", report["problems"]
+    assert report["stale"] == [] and {d["id"] for d in report["declared"]} == {"gfxtest-69"}
+    assert sorted({d["leaf"] for d in report["declared"]}) == ["file./sys/bus/pci", "file./sys/bus/pci/", "proc.gfxtest"]
+    assert [d["seed"] for d in report["declared"] if d["leaf"] == "proc.gfxtest"] == list(SEEDS)
+
+
+def test_a_path_the_gfxtest_touched_with_another_process_stays_a_difference():
+    a = with_files(footprint(), GFX_PCI + ["/sys/devices/pci0000:00"], dict(GFX_ONLY, **{"/sys/devices/pci0000:00": ["gfxtest", "parent"]}))
+    report = judge(a, a_candidate_without_gfxtest(), expected=expected())
+    assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./sys/devices/pci0000:00"] * len(SEEDS)
+    assert report["differences"][0]["by"]["A"] == ["gfxtest", "parent"]
+    assert {d["leaf"] for d in report["declared"]} == {"proc.gfxtest", "file./sys/bus/pci", "file./sys/bus/pci/"}
+
+
+def test_a_path_only_another_process_touched_or_only_the_candidate_has_is_not_covered_by_the_gfxtest_entry():
+    a = with_files(footprint(), ["/etc/only-the-parent-has"], {"/etc/only-the-parent-has": ["parent"]})
+    report = judge(a, a_candidate_without_gfxtest(), expected=expected())
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./etc/only-the-parent-has"}
+    c = with_files(a_candidate_without_gfxtest(), ["/sys/bus/pci/candidate"], {"/sys/bus/pci/candidate": ["gfxtest"]})
+    report = judge(footprint(), c, expected=expected())
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./sys/bus/pci/candidate"}, "the entry is the published engine having it, never the candidate"
+
+
+def test_a_path_only_the_gfxtest_touched_in_a_seed_where_both_sides_have_it_is_a_difference():
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    report = judge(a, footprint("candidate"), expected=expected())
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} >= {"file./sys/bus/pci", "file./sys/bus/pci/"}
+    assert report["stale"] == ["gfxtest-69"]
+
+
+def test_the_entry_covers_only_the_seeds_where_the_process_is_gone_and_the_path_of_another_seed_is_red():
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    c = footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "gfxtest"})
+    c["seeds"][1]["kinds"] = dict(KINDS)
+    report = judge(a, c, expected=expected())
+    assert report["verdict"] == "red" and {(d["seed"], d["leaf"]) for d in report["differences"]} == {(SEEDS[1], "file./sys/bus/pci"), (SEEDS[1], "file./sys/bus/pci/")}
+    assert {d["seed"] for d in report["declared"]} == {SEEDS[0]}
+
+
+def test_the_declared_list_may_only_shrink_and_stays_applied_by_kind():
+    entries = expected()
+    assert len(entries) == 1 and entries[0]["category"] == "proc" and entries[0]["name"] == "gfxtest" and "glxtest" not in json.dumps(entries)
+    a = with_files(footprint(), GFX_PCI, GFX_ONLY)
+    assert judge(a, a_candidate_without_gfxtest(), expected=expected(), a_a=True)["declared"] == [], "the A/A applies none"
+    assert judge(footprint(platform="win32"), footprint("candidate", platform="win32"), expected=expected())["verdict"] == "green", "another OS: not applied, not stale"
+
+
+# -
+# Windows: the WOF stream of a file is the file.
+
+WOF = ":wofcompresseddata"
+SYS = "c:\\windows\\system32\\"
+REAL_PLAIN = [SYS + "msauddecmft.dll", SYS + "en-us\\ole32.dll.mui", SYS + "ole32.dll"]
+REAL_STREAMS = [SYS + "msauddecmft.dll" + WOF, SYS + "en-us\\ole32.dll.mui" + WOF]
+
+
+def test_the_wof_stream_of_a_file_is_the_file_the_process_opened(tmp_path):
+    """Run 45043617981: 31 paths `...:wofcompresseddata` only the first run of the 68 had (the files were opened by all three runs: the stream is read when the decompressed data
+    is not cached, the first access after boot)."""
+    def read(name, *events):
+        xml = tmp_path / name
+        xml.write_text(etw(*events), encoding="utf-8")
+        return host.etw_files(xml, {100})[0]
+
+    plain = read("plain.xml", *[(100, p) for p in REAL_PLAIN])
+    streams = read("streams.xml", *[(100, p) for p in REAL_PLAIN + REAL_STREAMS])
+    assert plain == {(100, p) for p in REAL_PLAIN}
+    assert streams == plain, "a run with the stream variants and the plain paths is a run with the plain paths"
+    assert read("only.xml", (100, REAL_STREAMS[0])) == {(100, REAL_PLAIN[0])}, "the stream alone is the file it belongs to"
+    assert read("case.xml", (100, REAL_PLAIN[0] + ":WofCompressedData")) == {(100, REAL_PLAIN[0])}
+
+
+def test_another_alternate_stream_is_a_path_of_its_own(tmp_path):
+    names = [REAL_PLAIN[2], REAL_PLAIN[2] + ":Zone.Identifier", REAL_PLAIN[2] + ":other", WOF, "c:\\x" + WOF + "x"]
+    xml = tmp_path / "other.xml"
+    xml.write_text(etw(*[(100, n) for n in names]), encoding="utf-8")
+    assert host.etw_files(xml, {100})[0] == {(100, n) for n in names}
+
+
+# -
+# The real lines of run 45060573559 (engine candidate, built with a wrapper without the fixes above), as data: the Windows A/A (job 137346793388) and the Linux A/B (job 137346793511).
+
+def bs(paths):
+    """The paths of the data below, written with `/`, as Windows spells them."""
+    return [p.replace("/", chr(92)) for p in paths]
+
+
+#: The 13 paths of the red of the Windows A/A "the system modules only run A has in its measured launches are 13, more than 5": every one is `<file>:wofcompresseddata`, only in the
+#: warm-up of the first run of the 68 (7 of a resource file or a catalog, 6 of a library).
+WIN_STREAMS = bs([
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package011~31bf3856ad364e35~amd64~~10.0.26100.1742.cat:wofcompresseddata",
+    "c:/windows/system32/en-us/avrt.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/networkexplorer.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/powrprof.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/windows.applicationmodel.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/windows.system.launcher.dll.mui:wofcompresseddata",
+    "c:/windows/system32/en-us/wpnapps.dll.mui:wofcompresseddata",
+    "c:/windows/system32/evr.dll:wofcompresseddata",
+    "c:/windows/system32/mfperfhelper.dll:wofcompresseddata",
+    "c:/windows/system32/mp3dmod.dll:wofcompresseddata",
+    "c:/windows/system32/msauddecmft.dll:wofcompresseddata",
+    "c:/windows/system32/msdmo.dll:wofcompresseddata",
+    "c:/windows/system32/msmpeg2vdec.dll:wofcompresseddata",
+])
+#: The plain paths that same warm-up has and the second run does not: the files of 7 of the 13 above, and 10 more (13 resource files and 4 catalogs in all).
+WIN_ONLY_A = bs([
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package011~31bf3856ad364e35~amd64~~10.0.26100.1742.cat",
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package012~31bf3856ad364e35~amd64~~10.0.26100.33828.cat",
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package013~31bf3856ad364e35~amd64~~10.0.26100.33828.cat",
+    "c:/windows/system32/catroot/{f750e6c3-38ee-11d1-85e5-00c04fc295ee}/microsoft-windows-server-features-package03~31bf3856ad364e35~amd64~~10.0.26100.33828.cat",
+    "c:/windows/system32/en-us/avrt.dll.mui",
+    "c:/windows/system32/en-us/explorerframe.dll.mui",
+    "c:/windows/system32/en-us/fwpuclnt.dll.mui",
+    "c:/windows/system32/en-us/iertutil.dll.mui",
+    "c:/windows/system32/en-us/mmdevapi.dll.mui",
+    "c:/windows/system32/en-us/mscms.dll.mui",
+    "c:/windows/system32/en-us/networkexplorer.dll.mui",
+    "c:/windows/system32/en-us/powrprof.dll.mui",
+    "c:/windows/system32/en-us/setupapi.dll.mui",
+    "c:/windows/system32/en-us/urlmon.dll.mui",
+    "c:/windows/system32/en-us/windows.applicationmodel.dll.mui",
+    "c:/windows/system32/en-us/windows.system.launcher.dll.mui",
+    "c:/windows/system32/en-us/wpnapps.dll.mui",
+])
+#: The libraries of those resource files (in both runs, but networkexplorer.dll, which only the first has; three of them are in a long launch) and the 6 libraries the streams belong to.
+WIN_LIBS = bs([
+    "c:/windows/system32/avrt.dll",
+    "c:/windows/system32/explorerframe.dll",
+    "c:/windows/system32/fwpuclnt.dll",
+    "c:/windows/system32/iertutil.dll",
+    "c:/windows/system32/mmdevapi.dll",
+    "c:/windows/system32/mscms.dll",
+    "c:/windows/system32/networkexplorer.dll",
+    "c:/windows/system32/powrprof.dll",
+    "c:/windows/system32/setupapi.dll",
+    "c:/windows/system32/urlmon.dll",
+    "c:/windows/system32/windows.applicationmodel.dll",
+    "c:/windows/system32/windows.system.launcher.dll",
+    "c:/windows/system32/wpnapps.dll",
+])
+WIN_LIBS_LATE = bs(["c:/windows/system32/networkexplorer.dll", "c:/windows/system32/iertutil.dll", "c:/windows/system32/urlmon.dll"])
+WIN_STREAM_LIBS = bs([
+    "c:/windows/system32/evr.dll",
+    "c:/windows/system32/mfperfhelper.dll",
+    "c:/windows/system32/mp3dmod.dll",
+    "c:/windows/system32/msauddecmft.dll",
+    "c:/windows/system32/msdmo.dll",
+    "c:/windows/system32/msmpeg2vdec.dll",
+])
+
+
+def etw_names(tmp_path, name, names):
+    """What the oracle reads of one launch: the names of the file events of an ETW export, through `etw_files` (where a WOF stream becomes its file), sorted."""
+    xml = tmp_path / name
+    xml.write_text(etw(*[(100, n) for n in names]), encoding="utf-8")
+    return sorted({n for _pid, n in host.etw_files(xml, {100})[0]})
+
+
+def real_win_runs(tmp_path):
+    """The two runs of the 68 of the A/A as the oracle reads them (the footprint of each launch is what `etw_files` returns): run A has the stream variants and the plain paths in its
+    warm-up, run B the plain libraries only. Returns the run A, the run B and the warm-up of A."""
+    first = [p for p in WIN_LIBS if p not in WIN_LIBS_LATE]
+    a_warm = etw_names(tmp_path, "a_warm.xml", WIN_STREAMS + WIN_ONLY_A + first + WIN_STREAM_LIBS)
+    a_idle = etw_names(tmp_path, "a_idle.xml", WIN_LIBS_LATE)
+    b_warm = etw_names(tmp_path, "b_warm.xml", first + WIN_STREAM_LIBS)
+    b_idle = etw_names(tmp_path, "b_idle.xml", [p for p in WIN_LIBS_LATE if not p.endswith("networkexplorer.dll")])
+    return with_system(win(), {"warmup": a_warm, "idle": a_idle}), with_system(win("again"), {"warmup": b_warm, "idle": b_idle}), a_warm
+
+
+def test_the_13_wof_streams_of_run_45060573559_are_their_files_and_the_a_a_has_no_problem(tmp_path):
+    a, b, a_warm = real_win_runs(tmp_path)
+    assert len(WIN_STREAMS) == 13 and not any(p.endswith(host.WOF_STREAM) for p in a_warm), "no stream is left in the footprint of the run"
+    assert all(host.wof_base(p) in a_warm for p in WIN_STREAMS), "each of the 13 is a file the run has"
+    report = judge(a, b, a_a=True)
+    assert report["problems"] == [] and report["verdict"] == "green" and report["differences"] == []
+    counts = report["system_modules"]["counts"]["measured"]
+    assert counts["A"] == {"counted": 0, "mui_excused": 13, "cat_excused": 4, "orphans": 0} and counts["B"]["counted"] == 0
+    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": []}, "none of the 13 is rare: the 6 libraries are in both runs, the 7 others are the excused files"
+
+
+def test_the_same_13_streams_are_red_without_the_mapping_of_a_stream_to_its_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(host, "wof_base", lambda name: name)
+    a, b, a_warm = real_win_runs(tmp_path)
+    assert [p for p in a_warm if p.endswith(host.WOF_STREAM)] == sorted(WIN_STREAMS)
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "red" and report["system_modules"]["rare"]["measured"]["A"] == sorted(WIN_STREAMS), "the real 13"
+    assert len(report["problems"]) == 1 and "the system modules only run A has in its measured launches are 13, more than 5: the class is growing" in report["problems"][0]
+
+
+# -
+# Linux: the 45 differences of the A/B (5 seeds, 9 each): 15 of the probe gfxtest, 30 of where the two engines were installed.
+
+#: The DIFF lines of the job as the oracle printed them. The root of the runner's checkout is a neutral one here (the structure is kept: `/home` is `/srv`, `/home/<user>/work` is
+#: `/srv/ci/work`), because the disclosure scanner refuses local paths.
+REAL_AB_LINES = """
+seed 0 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 0 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 0 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 0 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 0 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 0 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 2 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Web Content, WebExtensions, forkserver, via readlink)
+seed 2 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 2 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 2 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 2 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 2 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 4 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 4 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 4 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 4 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 4 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 4 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 6 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 6 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 6 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 6 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 6 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 6 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+seed 63 file./srv: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./srv/ci/work: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./srv/ci/work/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./srv/ci/work/firefox_antidetect_patch/firefox_antidetect_patch: firefox-68 "<missing>" | candidate 1 (by A: - | B: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver, via readlink)
+seed 63 file./sys/bus/pci: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 63 file./sys/bus/pci/: firefox-68 1 | candidate "<missing>" (by A: gfxtest | B: -, via access)
+seed 63 file./tmp/ab-host-fetch-rhvlva0e: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 63 file./tmp/ab-host-fetch-rhvlva0e/engines: firefox-68 1 | candidate "<missing>" (by A: Isolated Web Co, Privileged Cont, Web Content, WebExtensions, forkserver | B: -, via readlink)
+seed 63 proc.gfxtest: firefox-68 1 | candidate "<missing>" (by A: parent | B: -)
+""".strip().splitlines()
+
+REAL_LINE = re.compile(r'^seed (\d+) ((?:file|proc)\.\S+): firefox-68 ("<missing>"|\d+) \| candidate ("<missing>"|\d+) \(by A: (.*?) \| B: (.*?)(?:, via (\w+))?\)$')
+NO_PROBE = {k: n for k, n in KINDS.items() if k != "gfxtest"}
+
+
+def real_ab_entries():
+    """The 45 lines as {seed, leaf, a, b, by: {A, B}, via}."""
+    out = []
+    for line in REAL_AB_LINES:
+        m = REAL_LINE.match(line)
+        assert m, line
+        seed, leaf, a, b, by_a, by_b, via = m.groups()
+        value = lambda v: host.MISSING if v == '"<missing>"' else int(v)
+        names = lambda text: [] if text == "-" else text.split(", ")
+        out.append({"seed": int(seed), "leaf": leaf, "a": value(a), "b": value(b), "by": {"A": names(by_a), "B": names(by_b)}, "via": via})
+    return out
+
+
+def is_gfx(entry):
+    return entry["leaf"] in ("proc.gfxtest", "file./sys/bus/pci", "file./sys/bus/pci/")
+
+
+def real_ab_footprints(entries):
+    """The footprints of the 68 and of the candidate: the seeds of `entries`, the same base in both, and where a line says one side has a leaf, that side has it (with who touched it
+    and the call, or who spawned it)."""
+    seeds = sorted({e["seed"] for e in entries})
+    a = {"format": host.FORMAT, "engine": "firefox-68", "platform": "linux", "problems": [], "seeds": [seed_footprint(s, kinds=KINDS) for s in seeds]}
+    b = {"format": host.FORMAT, "engine": "candidate", "platform": "linux", "problems": [], "seeds": [seed_footprint(s, kinds=NO_PROBE) for s in seeds]}
+    for e in entries:
+        for side, fp, value in (("A", a, e["a"]), ("B", b, e["b"])):
+            if value == host.MISSING:
+                continue
+            seed = next(s for s in fp["seeds"] if s["seed"] == e["seed"])
+            category, _dot, name = e["leaf"].partition(".")
+            if category == "proc":
+                seed["spawned_by"] = dict(seed.get("spawned_by", {}), **{name: e["by"][side]})
+            else:
+                seed["files"] = seed["files"] + [name]
+                seed["touched_by"] = dict(seed.get("touched_by", {}), **{name: e["by"][side]})
+                seed["touched_calls"] = dict(seed.get("touched_calls", {}), **{name: [e["via"]]})
+    return a, b
+
+
+LOOSE = {"proc": 1, "file": 1}
+
+
+def test_the_45_real_lines_are_5_seeds_by_15_of_the_probe_and_30_of_the_install_and_the_footprints_built_from_them_give_them_back():
+    entries = real_ab_entries()
+    assert len(entries) == 45 and {e["seed"] for e in entries} == {0, 2, 4, 6, 63}
+    assert sum(is_gfx(e) for e in entries) == 15 and sum(not is_gfx(e) for e in entries) == 30
+    a, b = real_ab_footprints(entries)
+    report = judge(a, b, expected=[], floors=LOOSE)
+    got = sorted((d["seed"], d["leaf"], d["a"], d["b"], d["by"]["A"], d["by"]["B"]) for d in report["differences"])
+    assert got == sorted((e["seed"], e["leaf"], e["a"], e["b"], e["by"]["A"], e["by"]["B"]) for e in entries), "the same 45, nothing is normalised"
+
+
+def test_the_15_real_gfxtest_lines_are_covered_by_the_declared_entry_and_the_entry_is_not_stale():
+    entries = [e for e in real_ab_entries() if is_gfx(e)]
+    assert len(entries) == 15 and sorted({e["leaf"] for e in entries}) == ["file./sys/bus/pci", "file./sys/bus/pci/", "proc.gfxtest"]
+    assert all(e["by"] == {"A": ["gfxtest"], "B": []} for e in entries if e["leaf"].startswith("file.")) and all(e["a"] == 1 and e["b"] == host.MISSING for e in entries)
+    a, b = real_ab_footprints(entries)
+    report = judge(a, b, expected=expected(), floors=LOOSE)
+    assert report["verdict"] == "green", report["problems"]
+    assert report["differences"] == [] and report["stale"] == [] and {d["id"] for d in report["declared"]} == {"gfxtest-69"}
+    assert sorted((d["seed"], d["leaf"]) for d in report["declared"]) == sorted((e["seed"], e["leaf"]) for e in entries), "all 15, none more"
+    assert len(judge(a, b, expected=[], floors=LOOSE)["differences"]) == 15, "without the entry they are red"
+
+
+def test_the_30_real_install_lines_are_red_from_two_roots_and_gone_when_both_engines_run_from_the_staged_folder(monkeypatch):
+    """The fix is at the source: every engine is run from `stage_dir()`, so the links read of its ancestors are the same leaves in both runs. The comparison is as strict as it was: the
+    footprints of two different roots still give the 30; each engine run from the staged folder is the footprint of the same ancestors in both, and nothing is left."""
+    monkeypatch.setenv("RUNNER_TEMP", "/srv/ci/work/_temp")
+    entries = [e for e in real_ab_entries() if not is_gfx(e)]
+    assert len(entries) == 30
+    a, b = real_ab_footprints(entries)
+    red = judge(a, b, expected=expected(), floors=LOOSE)
+    assert red["verdict"] == "red" and len(red["differences"]) == 30 and len(red["declared"]) == 5, "from two roots they are still red (the probe is declared, the 5 seeds of it)"
+    stage = Path(host.stage_dir().as_posix())
+    ancestors = [p.as_posix() for p in stage.parents if p.as_posix() not in ("/", ".")]
+    assert ancestors == ["/srv/ci/work/_temp/ab-host/engine", "/srv/ci/work/_temp/ab-host", "/srv/ci/work/_temp", "/srv/ci/work", "/srv/ci", "/srv"]
+    install = {e["leaf"][len("file."):] for e in entries}
+    for side, fp in (("A", a), ("B", b)):
+        for seed in fp["seeds"]:
+            by = next(e["by"][side] for e in entries if e["seed"] == seed["seed"] and e["by"][side])
+            seed["files"] = [p for p in seed["files"] if p not in install] + ancestors
+            seed["touched_by"] = dict({p: v for p, v in seed.get("touched_by", {}).items() if p not in install}, **{p: by for p in ancestors})
+            seed["touched_calls"] = dict({p: v for p, v in seed.get("touched_calls", {}).items() if p not in install}, **{p: ["readlink"] for p in ancestors})
+    staged = judge(a, b, expected=expected(), floors=LOOSE)
+    assert staged["verdict"] == "green" and staged["differences"] == [] and staged["problems"] == [], "no difference left"
+    assert len(entries) + sum(is_gfx(e) for e in real_ab_entries()) == len(real_ab_entries()) == 45
+
+
+def test_a_staged_ancestor_that_only_one_run_read_is_still_a_difference(monkeypatch):
+    monkeypatch.setenv("RUNNER_TEMP", "/srv/ci/work/_temp")
+    a = with_files(footprint(), ["/srv/ci/work/_temp"], {"/srv/ci/work/_temp": ["forkserver"]}, {"/srv/ci/work/_temp": ["readlink"]})
+    report = judge(a, footprint("candidate"), expected=[])
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./srv/ci/work/_temp"}

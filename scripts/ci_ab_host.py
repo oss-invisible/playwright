@@ -59,7 +59,17 @@ How the trace is taken:
     are). Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
     see them is red, not empty.
 
+EVERY launch is also judged by how its parent ended (scripts/ci_crash_evidence.py): the warm-up, each measured seed, the idle and the bare launch alike. A root exit code other
+than 0, or one that was not seen, is a RED line that names the seed, the run side, the launch and the code; the verdict of a closed run is not "the trace is equal" alone. A launch
+that did not end with 0 keeps what it left in `<footprint>.crash/<launch>/`, next to the footprint (the artifact): the last 100 lines of the strace log and the fatal signal lines of
+the whole log (`--- SIGSEGV {si_addr=...} ---`: the trace records the fatal signals now, `tests/_strace_stand_in.py` RECORDED_SIGNALS, and the lines are dropped where the log is read, so they
+are never data of the comparison), the core run through `gdb -batch` (`thread apply all bt`, the MOZ_CRASH reason, `info sharedlibrary`) with the build ids, the crash reporter's `.extra` and
+the minidump names, and `said.txt` for every collector that found nothing. Cores are enabled in every launch (`ulimit -c unlimited` in the stand-in; the working directory is not touched, the
+job's `kernel.core_pattern` decides where the kernel writes them: INVPW_CORE_DIR), and a crash watcher reads the crash folders in every launch, as it did in the bare one. On Windows the `.extra`
+files and the minidump names are collected the same way. `crash-probe` is the recorder's own test (one launch, its parent sent SIGSEGV; red is the right answer, tests/test_ab_host_crash_linux_e2e.py).
+
     python ci_ab_host.py run <firefox> [--seal SEAL] --leg linux-x86_64 --out footprint.json [--seeds 11,12,13]
+    python ci_ab_host.py crash-probe <firefox> --leg linux-x86_64 --out DIR
     python ci_ab_host.py compare A.json B.json --out diff.json [--a-a]
     python ci_ab_host.py ab [<candidate> --candidate-seal SEAL] --leg L --out DIR [--published-binary B [--published-seal S]]
 
@@ -67,7 +77,11 @@ How the trace is taken:
 candidate. Exit 0 green, 1 red, 2 the control is broken (A/A differs: what is compared is not stable, the A/B says nothing). Nothing here reads
 the clock for a verdict, and nothing excuses a difference: the A/A is green or the comparison is not stable.
 
-Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, by kind, and one that does not show is red as stale.
+Every engine run (the published engine, again, the candidate) is launched from the SAME absolute folder, `<RUNNER_TEMP>/ab-host/engine/firefox` (`staged_engine`: the package is copied
+there and removed after the run): the browser's processes read the link of every ancestor of the install folder, so where the engine sits would otherwise be a difference of the paths.
+
+Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, by kind, and one that does not show is red as stale. A declared `proc` difference covers the
+process kind and the file leaves whose only toucher on the published side is that kind (a leaf another process touched too is still a difference).
 """
 from __future__ import annotations
 
@@ -96,6 +110,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "tests"))
 import ci_ab_oracle as oracle  # noqa: E402  (fetch_published, ENGINE_TAG)
 import ci_host_gate as gate  # noqa: E402  (SEEDS)
+import ci_crash_evidence as crash  # noqa: E402  (the exit code is red, and what a bad end left is saved)
+from ci_crash_evidence import CrashWatcher, core_info, crash_report_dirs, scan_crash_files  # noqa: E402,F401  (the bare launch's collectors, shared by every launch)
 
 FORMAT = "ab-host/2"
 EXPECTED_FORMAT = "ab-host-expected/1"
@@ -209,8 +225,12 @@ def _base(path: str) -> str:
     return re.split(r"[\\/]", path)[-1]
 
 
+#: The graphics probe the 68 spawns on Linux is called `gfxtest` (widget/gtk/GfxInfo.cpp:55 GFX_PROBE_BINARY; `gfxtest glx -f 18`), not `glxtest`: its kind is that name.
+GFX_PROBE = "gfxtest"
+
+
 def label_of_exec(path: str, argv: list, real: str) -> str:
-    """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), else the
+    """What a process that ran `path` with `argv` is called: the engine's kinds, `glxtest` (argv0 or `-glxtest`), `gfxtest` (argv0 or the file it ran), else the
     program's name (lower case); a background task of the engine (`firefox.exe --backgroundtask pingsender ...`) is `backgroundtask/<name>`."""
     if "-contentproc" in argv:
         return kind_of(argv)  # whatever path it was started by (the binary, /proc/self/exe)
@@ -220,6 +240,8 @@ def label_of_exec(path: str, argv: list, real: str) -> str:
             return "backgroundtask/%s" % (argv[i + 1].lower() if i + 1 < len(argv) else "?")
     if any(a.lstrip("-") == "glxtest" for a in argv[1:]) or _base(argv[0] if argv else "").lower() == "glxtest":
         return "glxtest"
+    if GFX_PROBE in (_base(path).lower(), _base(argv[0] if argv else "").lower()):
+        return GFX_PROBE
     if path == real or _base(path).lower() == _base(real).lower():
         return "parent"
     return _base(path).lower() or path
@@ -1042,8 +1064,12 @@ def net_by_kind(events, label_of) -> list:
 
 
 def _read_lines(log: Path):
+    """The lines of a strace log that are calls and exits. The signal lines (`1234 --- SIGSEGV {si_addr=...} ---`, recorded so that a crash can be told, tests/_strace_stand_in.py
+    RECORDED_SIGNALS) are evidence of a bad end and never data of the comparison: they are dropped here, the one place the log is read for it."""
     with open(log, encoding="utf-8", errors="replace") as f:
         for line in f:
+            if crash.SIGNAL_LINE.match(line):
+                continue
             yield line.rstrip("\n")
 
 
@@ -1149,6 +1175,18 @@ DISPOSITIONS = {0: "SUPERSEDE", 1: "OPEN", 2: "CREATE", 3: "OPEN_IF", 4: "OVERWR
 MAKING = (0, 2, 3, 4, 5)
 
 
+#: The Windows Overlay Filter (WOF) keeps a system file compressed (Compact OS) and serves its decompressed bytes from a cache; when they are not cached (the first access
+#: after the boot) the open of the file is followed by an open of its stream `<file>:WofCompressedData`, the compressed data of the SAME file. That stream is not a path the
+#: process chose: it is the file the process opened, read from where Windows keeps it. The footprint spells it as the file (the run 45043617981: 31 system paths only the first
+#: run of the 68 had, all `<file>:wofcompresseddata`, while every one of the files was opened by all three runs). Any other stream (`:Zone.Identifier`, ...) is a path of its own.
+WOF_STREAM = ":wofcompresseddata"
+
+
+def wof_base(name: str) -> str:
+    """`name` with the WOF compressed-data stream of a file taken off (the file itself), see WOF_STREAM; any other name is itself."""
+    return name[:-len(WOF_STREAM)] if len(name) > len(WOF_STREAM) and name.lower().endswith(WOF_STREAM) else name
+
+
 def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tuple:
     """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
     stream: the file has every open of the machine for the length of the run. With a list in `exits`, the process stops of the same file (Kernel-Process, event 2)
@@ -1173,6 +1211,8 @@ def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tup
                 when = child.get("SystemTime", "")
             elif tag == "EventID":
                 event_id = (child.text or "").strip()
+        if name:
+            name = wof_base(name)
         if exits is not None and event_id == "2" and "ExitCode" in data and data.get("ProcessID"):
             exits.append({"pid": _number(data["ProcessID"]), "code": _number(data["ExitCode"]), "time": when, "image": data.get("ImageName", "")})
         if name and pid is not None and (pids is None or pid in pids):
@@ -1445,13 +1485,21 @@ def load_expected(path: Path = EXPECTED_FILE) -> list:
     return document["differences"]
 
 
-def _declared_covers(entry: dict, diff: dict) -> bool:
-    """A declared difference covers a difference of `proc.<name>` that is the published engine having it (count >= 1) and the candidate not
-    having it: by kind."""
-    if entry.get("category") != "proc" or diff["leaf"] != "proc." + entry["name"]:
+def _declared_covers(entry: dict, diff: dict, probe_seeds=()) -> bool:
+    """A declared difference covers, by kind (a `proc` entry, the name of the process):
+
+      * the leaf `proc.<name>` that is the published engine having it (count >= 1) and the candidate not having it;
+      * a file leaf of a seed in `probe_seeds` (the seeds where that leaf above differs) that only the published engine has and whose ONLY toucher on that side is that kind:
+        what a process the candidate no longer spawns alone touched goes with it. A leaf another process touched too stays a difference, and so does a leaf the
+        candidate touches or one the candidate alone has."""
+    if entry.get("category") != "proc":
         return False
     published, candidate = diff["a"], diff["b"]
-    return (published != MISSING and published >= 1) and candidate == MISSING
+    if diff["leaf"] == "proc." + entry["name"]:
+        return (published != MISSING and published >= 1) and candidate == MISSING
+    by = diff.get("by") or {}
+    return (diff["category"] == "file" and diff["seed"] in probe_seeds and published != MISSING and candidate == MISSING
+            and by.get("A") == [entry["name"]] and not by.get("B"))
 
 
 def warmup_only(fp: dict) -> dict | None:
@@ -1615,8 +1663,9 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
         for entry in expected or []:
             if entry.get("os") != os_name:
                 continue
-            hit = [d for d in differences if _declared_covers(entry, d)]
-            if not hit:
+            probe_seeds = {d["seed"] for d in differences if d["leaf"] == "proc." + entry.get("name", "") and _declared_covers(entry, d)}
+            hit = [d for d in differences if _declared_covers(entry, d, probe_seeds)]
+            if not any(d["leaf"] == "proc." + entry.get("name", "") for d in hit):
                 stale.append(entry)
                 problems.append("the declared difference %r (%s) does not show in this run: it is stale, remove it"
                                 % (entry.get("id", entry.get("name")), entry.get("reason", "")))
@@ -1791,14 +1840,20 @@ def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dic
     return step
 
 
-def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, bare: bool = False) -> dict:
+def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, bare: bool = False, crash_with: int | None = None) -> dict:
     """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
 
     `bare` is the old idle launch, kept as a case of its own and never compared: no client and no page, as the run 44988820319 made it (a crash reporter ran in it, on
     both systems). It records how the browser ended and what a crash leaves (`crash_evidence`), on Linux with core dumps on, and waits as the idle launch does.
 
     `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey and no pref changed; the launch waits until the notification of the data
-    policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and then closes; its footprint carries `idle` (what the wait saw)."""
+    policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and then closes; its footprint carries `idle` (what the wait saw).
+
+    EVERY launch is judged by how its parent ended: a root exit code other than 0 is a problem of the launch (`crash.exit_problem`) and the launch keeps what it left
+    (`result["crash"]`, `crash.collect`: the strace tail with the signal line, the core through gdb, the build ids, the `.extra` and the minidump names). The cores are
+    enabled in every launch (`ulimit -c unlimited` in the stand-in, the working directory untouched) and a crash watcher reads the crash folders while any launch lives.
+
+    `crash_with` is the recorder's own test (`crash-probe`): the signal sent to the parent of the browser once it is up, to show that a launch that dies is red and keeps its evidence."""
     from playwright.sync_api import sync_playwright
 
     from fakeweb import journey_site, profile_p4
@@ -1822,7 +1877,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         from _strace_stand_in import _stand_in
 
         exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True, exit_status=True,
-                        core_dir=seed_work if bare else None)
+                        core_dir=seed_work if bare else None, cores=True)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
@@ -1835,6 +1890,9 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         new = sorted(set(Path(tempfile.gettempdir()).glob("invisible_profile_*")) - before)
         return crash_report_dirs(new[0] if new else None, windows)
 
+    started_at = time.time()
+    already = crash.existing_crash_files(crash_dirs())  # the reports of earlier crashes are not this launch's
+
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
                                launch_timeout_ms=180_000)
@@ -1843,11 +1901,12 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             from _strace_stand_in import _group_of
 
             pgid = _group_of(pidfile)
-        if bare:
-            watcher = CrashWatcher(crash_dirs)
-            watcher.start()
-        with (contextlib.nullcontext() if bare else sync_playwright()) as p:
-            if bare:
+        watcher = CrashWatcher(crash_dirs, ignore=already)
+        watcher.start()
+        with (contextlib.nullcontext() if (bare or crash_with is not None) else sync_playwright()) as p:
+            if crash_with is not None:
+                crash_the_parent(root_pid, server.process, crash_with)  # the recorder's own test: the browser is up, its parent is sent a fatal signal
+            elif bare:
                 notified = wait_for_notification(profile_prefs_reader(before))  # nothing drives the bare browser: the launch the idle one was
             elif idle:
                 # Run 44988820319: with no client and no page the notification was never recorded in 120 s on either system (no window, so no
@@ -1892,9 +1951,15 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
         if idle:
             result["idle"] = {"notified": notified, "shortcut_changes": diff_snapshots(shortcuts_before, snapshot_places(places)) if places else None}
+        watched, watcher = watcher.stop(), None
         if bare:
-            result["bare"] = {"notified": notified, "crash": crash_evidence(watcher.stop(), result, core_info(seed_work, binary) if not windows else None)}
-            watcher = None
+            result["bare"] = {"notified": notified, "crash": crash_evidence(watched, result, core_info(seed_work, binary) if not windows else None)}
+        bad, left = end_of_launch(close["root_returncode"], windows, seed, name or "measured", result.get("lifecycle"), binary, log, watched,
+                                  seed_work if bare else None, started_at)
+        problems += bad
+        result["exit_problems"] = bad
+        if left:
+            result["crash"] = left
     except TraceError as e:
         result = {"seed": seed, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
                   "problems": ["the trace of the run could not be taken: %s" % e]}
@@ -1918,96 +1983,48 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     return result
 
 
+def end_of_launch(code, windows: bool, seed: int, launch: str, lifecycle, binary: str, log, watched: dict, bare_dir, started_at: float, folders=None, run=subprocess.run) -> tuple:
+    """How a launch ended, as the verdict reads it: `(problems, evidence)`. A root exit code other than 0 (or not seen) is a problem that names the seed, the launch and the
+    code (`crash.exit_problem`), and so is a process of the kind parent that the lifecycle says did not exit 0 when the root said nothing of it (Windows: the core's spawn
+    may be a launcher). A launch with a problem keeps what it left (`crash.collect`): the strace tail and the fatal signal lines, the cores through gdb with the build ids
+    (the folders of the job's core pattern, and the launch's own when it moved there: the bare one), the `.extra` and the minidump names the watcher read. A launch that
+    ended with 0 has none and costs nothing."""
+    bad = [x for x in [crash.exit_problem(code, windows, seed=seed, launch=launch)] + crash.parent_exit_problems(lifecycle, code, seed=seed, launch=launch) if x]
+    if not bad:
+        return [], None
+    if folders is None:
+        folders = [] if windows else crash.core_dirs() + ([bare_dir] if bare_dir else [])
+    return bad, crash.collect(code, binary, strace_log=None if windows else log, watched=watched, windows=windows, core_folders=folders, since=started_at, run=run)
+
+
+def browser_parent(root_pid: int, children=None) -> int:
+    """The pid of the browser's own parent process: under the stand-in the root is strace, whose child is the browser (a content process is not it)."""
+    if children is None:
+        import psutil
+
+        children = psutil.Process(root_pid).children
+    for child in children():
+        try:
+            if "-contentproc" not in [str(a) for a in child.cmdline()]:
+                return child.pid
+        except Exception:  # noqa: BLE001 - a child that is already gone
+            continue
+    raise RuntimeError("the root process %s has no browser parent to send the signal to" % root_pid)
+
+
+def crash_the_parent(root_pid: int, process, signum: int, limit_s: float = 60.0, kill=os.kill, parent=None, sleep=time.sleep, now=time.monotonic) -> int:
+    """The recorder's own test: `signum` is sent to the browser's parent process with `os.kill`, and the launch waits for the root to end (a limit of acquisition, never a
+    verdict: what ended it is read from the code the close sees). Returns the pid it was sent to."""
+    pid = parent if parent is not None else browser_parent(root_pid)
+    kill(pid, signum)
+    end = now() + limit_s
+    while process.poll() is None and now() < end:
+        sleep(0.1)
+    return pid
+
+
 #: The crash evidence of the BARE launch (no client, no page: the launch of run 44988820319 that had a crash reporter): where a crash leaves its files.
 CRASH_PROCESS = re.compile(r"crashreporter|minidump-analyzer", re.I)
-
-
-def crash_report_dirs(profile_dir, windows: bool) -> list:
-    """The folders a crash leaves its `.dmp` and `.extra` in: the profile's `minidumps` and the `Crash Reports/pending` of the user's application data."""
-    dirs = [Path(profile_dir) / "minidumps"] if profile_dir else []
-    if windows:
-        base = os.environ.get("APPDATA")
-        if base:
-            dirs.append(Path(base) / "Mozilla" / "Firefox" / "Crash Reports" / "pending")
-    else:
-        home = Path(os.path.expanduser("~"))
-        dirs += [home / ".config" / "mozilla" / "firefox" / "Crash Reports" / "pending", home / ".mozilla" / "firefox" / "Crash Reports" / "pending"]
-    return dirs
-
-
-def scan_crash_files(dirs, seen: dict) -> None:
-    """Adds to `seen` ({path: {"name", "dir", "size", "content"}}) every `.dmp` and `.extra` of `dirs`: a `.extra` is read at once, as the profile is deleted when the
-    launch ends, and again while its size keeps changing (a file seen half written)."""
-    for folder in dirs:
-        try:
-            entries = list(Path(folder).iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.suffix not in (".dmp", ".extra"):
-                continue
-            try:
-                size = entry.stat().st_size
-                if str(entry) in seen and seen[str(entry)]["size"] == size:
-                    continue
-                item = {"name": entry.name, "dir": str(entry.parent), "size": size}
-                if entry.suffix == ".extra":
-                    item["content"] = entry.read_text(encoding="utf-8", errors="replace")[:20000]
-            except OSError:
-                continue
-            seen[str(entry)] = item
-
-
-class CrashWatcher:
-    """A thread that looks at the crash folders while the launch lives, so that what a crash leaves is read before the launch deletes its profile."""
-
-    def __init__(self, dirs_fn, period: float = 0.25) -> None:
-        import threading
-
-        self.dirs_fn, self.period = dirs_fn, period
-        self.seen: dict = {}
-        self.scans = 0
-        self._halt = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="ab-host-crash-watch", daemon=True)
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def scan_once(self) -> None:
-        """One look at the crash folders (what the thread does every period, and `stop` once more): a file seen empty or half written is read again when its size changes."""
-        scan_crash_files(self.dirs_fn(), self.seen)
-        self.scans += 1
-
-    def _run(self) -> None:
-        while not self._halt.is_set():
-            self.scan_once()
-            self._halt.wait(self.period)
-
-    def stop(self) -> dict:
-        self._halt.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=10)
-        self.scan_once()
-        return {"files": sorted(self.seen.values(), key=lambda f: f["name"]), "scans": self.scans}
-
-
-def core_info(core_dir: Path, binary: str, run=subprocess.run) -> dict:
-    """What a Linux core dump of the bare launch is: the kernel's core pattern (a pipe to apport or systemd-coredump puts no file in `core_dir`), the cores found there and
-    the backtrace of each (`gdb -batch -ex bt`) when gdb is installed."""
-    try:
-        pattern = Path("/proc/sys/kernel/core_pattern").read_text(encoding="utf-8").strip()
-    except OSError:
-        pattern = None
-    cores = sorted(p for p in Path(core_dir).glob("core*") if p.is_file())
-    out = {"core_pattern": pattern, "cores": [c.name for c in cores], "backtraces": {}}
-    gdb = shutil.which("gdb")
-    for core in cores[:3]:
-        if gdb:
-            done = run([gdb, "-batch", "-ex", "bt", str(binary), str(core)], capture_output=True, text=True, errors="replace", timeout=180)
-            out["backtraces"][core.name] = (done.stdout + done.stderr)[-8000:]
-        else:
-            out["backtraces"][core.name] = "gdb is not installed"
-    return out
 
 
 def crash_evidence(watched: dict, fp: dict, core: dict | None = None) -> dict:
@@ -2183,8 +2200,23 @@ def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path
     return out
 
 
-def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
+def keep_crash(fp: dict, launch: str, crash_dir) -> None:
+    """The evidence of a launch that did not end with 0 (`result["crash"]`) as files in the oracle's artifact, `<crash_dir>/<launch>/`, and said on the output."""
+    if not fp.get("crash"):
+        return
+    where = None
+    if crash_dir:
+        where = Path(crash_dir) / launch
+        crash.write_crash_files(fp["crash"], where)
+    print("CRASH EVIDENCE %s (seed %s): exit %s; %s%s" % (launch, fp.get("seed"), fp["crash"]["exit"]["text"], "saved in %s" % where if where else "not saved (no folder)",
+                                                        "; NOT FOUND: " + " | ".join(fp["crash"]["said"]) if fp["crash"]["said"] else ""))
+    sys.stdout.flush()
+
+
+def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None) -> dict:
     """The footprint document of one engine. A discarded WARM-UP launch first, of the first seed, then every seed's journey, one browser at a time.
+
+    Every launch (the warm-up, each seed, the idle and the bare ones) that does not end with 0 is a problem of the run, and what it left is kept in `crash_dir` (`keep_crash`).
 
     The warm-up is a control of the experiment and not an excuse: what a machine does the first time it runs an engine (its files scanned, its caches
     cold, a first-run behaviour of the engine) is in a launch that is not compared, whose trace is kept in the document (`warmup`) so that what it
@@ -2194,12 +2226,14 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
     problems, out_seeds = [], []
     try:
         warm = run_seed(binary, seeds[0], work, name="warmup")
+        keep_crash(warm, "warmup", crash_dir)
         problems += ["warm-up: %s" % p for p in warm.get("problems", [])]
         problems += ["warm-up: seed %d: step %d (%s) failed: %s" % (seeds[0], st["n"], st["name"], st.get("error")) for st in warm["steps"] if not st["ok"]]
         print("warm-up (seed %d, discarded): %s; %d host paths" % (seeds[0], json.dumps(warm["kinds"], sort_keys=True), len(warm["files"])))
         sys.stdout.flush()
         for seed in seeds:
             fp = run_seed(binary, seed, work)
+            keep_crash(fp, "seed%d" % seed, crash_dir)
             out_seeds.append(fp)
             for step in fp["steps"]:
                 if not step["ok"]:
@@ -2208,11 +2242,14 @@ def run_engine(binary: str, leg: str, seeds: list, label: str) -> dict:
                                                                       len(fp.get("net") or []), json.dumps(fp.get("ours", {}), sort_keys=True)))
             sys.stdout.flush()
         idle = run_seed(binary, seeds[0], work, name="idle", idle=True)
+        keep_crash(idle, "idle", crash_dir)
         problems += ["idle: %s" % p for p in idle.get("problems", [])]
         print("idle (seed %d): %s; notification %s" % (seeds[0], json.dumps(idle["kinds"], sort_keys=True), json.dumps((idle.get("idle") or {}).get("notified"))))
         sys.stdout.flush()
         # The bare launch: the old idle launch (no client, no page), a case of its own that is never compared; what it records is evidence (`crash_evidence`).
         bare = run_seed(binary, seeds[0], work, name="bare", bare=True)
+        keep_crash(bare, "bare", crash_dir)
+        problems += ["bare: %s" % p for p in bare.get("exit_problems", [])]  # the bare launch is never compared, but how its parent ended is red like any other's
         print("bare (seed %d, not compared): %s; %s" % (seeds[0], json.dumps(bare["kinds"], sort_keys=True), json.dumps(_bare_summary(bare.get("bare")))))
         sys.stdout.flush()
     finally:
@@ -2275,9 +2312,42 @@ def read_json(path: Path) -> dict:
 # -
 # The run of an engine as a subprocess (the seal a process runs under is read at import), and the orchestration.
 
-def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: str, seeds: list) -> int:
+#: Where the engine under test is run from, whichever engine it is: `<RUNNER_TEMP>/ab-host/engine/firefox` (the temp root of the machine without it). The content processes and the
+#: forkserver call `realpath(<install>/omni.ja)` (Omnijar::ChildProcessInit -> XRE_GetFileFromPath -> nsToolkitProfileService.cpp realpath), which reads the link of EVERY ancestor of
+#: the install folder: the oracle sees `readlink /srv`, `/srv/lab/work`, ... for an engine that sits in the checkout and `readlink /tmp/ab-host-fetch-<random>/engines` for one
+#: that was fetched (run 45043617981: 10 leaves of that on each of 5 seeds). The place of the install is a variable of the experiment, so it is the same in the three runs of an
+#: A/B, and the ancestors of the package are the same leaves in each: nothing is normalised in the comparison.
+STAGE_ENGINE = ("ab-host", "engine")
+STAGE_PACKAGE = "firefox"
+
+
+def stage_dir(base=None) -> Path:
+    """The folder the engine under test is run from: the same absolute path for every engine and every run."""
+    return Path(base or os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()).joinpath(*STAGE_ENGINE) / STAGE_PACKAGE
+
+
+@contextlib.contextmanager
+def staged_engine(binary: str, base=None):
+    """The whole package of `binary` (its folder, every file, links kept, the bytes as they are) copied to `stage_dir`, yielding the path of the binary there; the copy is
+    removed when the run is over, so the next engine is staged at the very same path."""
+    source = Path(os.path.abspath(binary))
+    dest = stage_dir(base)
+    shutil.rmtree(dest, ignore_errors=True)
+    if dest.exists():
+        raise OSError("the folder the engine is run from, %s, could not be emptied" % dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source.parent, dest, symlinks=True)
+    try:
+        yield str(dest / source.name)
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
+
+
+def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: str, seeds: list, crash_with: str | None = None) -> int:
     """`run` in a process of its own, with a cache folder and a temp root of its own: they are the run's, so what the engine does in them is `ours`
-    (the cache of the bundle's fonts, the profile and the temp dirs of the launch) and the rest of the machine is the host's."""
+    (the cache of the bundle's fonts, the profile and the temp dirs of the launch) and the rest of the machine is the host's.
+
+    `crash_with` (a signal name) makes the run the recorder's own test: one launch, whose parent is sent that signal (`crash-probe`)."""
     env = dict(os.environ, INVISIBLE_CORE_AUTOFIX="off", INVISIBLE_CORE_PIN="allow")
     if seal:
         env["INVISIBLE_SEAL_FILE"] = str(seal)
@@ -2285,6 +2355,8 @@ def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: s
         env.pop(name, None)
     cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "run", binary, "--leg", leg, "--out", str(out), "--label", label,
            "--seeds", ",".join(str(s) for s in seeds)]
+    if crash_with:
+        cmd += ["--crash-with", crash_with]
     try:
         with tempfile.TemporaryDirectory(prefix="ab-host-cache-") as cache, tempfile.TemporaryDirectory(prefix="ab-host-tmp-") as temp:
             env = oracle.own_cache_env(env, cache)
@@ -2292,6 +2364,37 @@ def run_subprocess(binary: str, seal: Path | None, leg: str, out: Path, label: s
             return subprocess.run(cmd, env=env, timeout=RUN_TIMEOUT_S).returncode
     except subprocess.TimeoutExpired:
         return 124
+
+
+def run_crash_probe(binary: str, leg: str, seed: int, label: str, crash_dir=None, signame: str = "SIGSEGV") -> dict:
+    """The recorder's own test: ONE launch of the engine whose parent process is sent a fatal signal with `os.kill` once the browser is up. The footprint's problems must
+    name the code (`exit_problem`) and `crash` must hold what the launch left (`keep_crash`): a recorder that does not turn this into a red line with its evidence is broken."""
+    import signal
+
+    work = Path(tempfile.mkdtemp(prefix="ab-host-"))
+    try:
+        fp = run_seed(binary, seed, work, name="crash", crash_with=getattr(signal, signame))
+        keep_crash(fp, "crash", crash_dir)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": [], "probe": fp, "signal": signame, "problems": list(fp.get("problems", []))}
+
+
+def crash_probe(binary: str, leg: str, out: Path, seed: int, run=None) -> int:
+    """`crash-probe`: the engine is launched once, its parent is sent SIGSEGV, and this reports what the oracle says of it. 1 is RED, which is what a launch that dies must
+    be (the e2e test asserts it, with the evidence); 0 means the recorder did not see the crash (the test fails on that); 2 the probe itself did not run."""
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "footprint-crash.json"
+    rc = (run or run_subprocess)(binary, None, leg, path, "crash probe", [seed], "SIGSEGV")
+    if rc != 0 or not path.exists():
+        print("FAIL the crash probe did not run: its process ended with %s" % rc)
+        return 2
+    document = read_json(path)
+    for line in document["problems"]:
+        print("FAIL " + line)
+    exit_lines = [x for x in document["problems"] if x.startswith("the parent process exited with code")]
+    print("AB HOST CRASH PROBE %s: %d problems, %d of them a parent that did not end with 0" % ("FAILED" if exit_lines else "OK", len(document["problems"]), len(exit_lines)))
+    return 1 if exit_lines else 0
 
 
 def run_stock_subprocess(leg: str, out: Path) -> int:
@@ -2341,9 +2444,14 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             runs.append((oracle.CANDIDATE, "footprint-candidate.json", candidate, candidate_seal))
         failed = []
         for label, name, exe, seal_file in runs:
-            print("=== footprint with %s: %s" % (label, exe))
+            print("=== footprint with %s: %s (run from %s)" % (label, exe, stage_dir()))
             sys.stdout.flush()
-            rc = run_subprocess(exe, Path(seal_file) if seal_file else None, leg, out / name, label, seeds)
+            try:
+                with staged_engine(exe) as staged:
+                    rc = run_subprocess(staged, Path(seal_file) if seal_file else None, leg, out / name, label, seeds)
+            except OSError as e:
+                print("the engine of %s could not be staged: %s" % (label, e))
+                rc = 125
             if rc != 0 or not (out / name).exists():
                 failed.append("the run with %s ended with %s" % (label, rc))
         if failed:
@@ -2384,6 +2492,7 @@ def main(argv=None) -> int:
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--label", default="engine")
     r.add_argument("--seeds", default=None, help="comma separated (default: ci/persona-seeds.json 'candidate', else the host gate's)")
+    r.add_argument("--crash-with", choices=["SIGSEGV"], default=None, help="the recorder's own test: one launch, its parent sent this signal (see crash-probe)")
     k = sub.add_parser("stock", help="the negative control of the geolocation step (Windows): Playwright's own Firefox")
     k.add_argument("--leg", required=True)
     k.add_argument("--out", type=Path, required=True)
@@ -2393,6 +2502,11 @@ def main(argv=None) -> int:
     c.add_argument("--out", type=Path)
     c.add_argument("--a-a", action="store_true", help="the control: no declared difference is applied; a difference is a broken control (exit 2)")
     c.add_argument("--expected", type=Path, default=EXPECTED_FILE)
+    q = sub.add_parser("crash-probe", help="the recorder's own test: one launch whose parent is sent SIGSEGV; exit 1 (red, with the evidence) is the right answer")
+    q.add_argument("binary")
+    q.add_argument("--leg", required=True)
+    q.add_argument("--out", type=Path, required=True)
+    q.add_argument("--seed", type=int, default=None)
     x = sub.add_parser("ab", help="A/A, then with a candidate the published engine against it")
     x.add_argument("candidate", nargs="?")
     x.add_argument("--candidate-seal", type=Path, default=os.environ.get("INVISIBLE_SEAL_FILE"))
@@ -2418,12 +2532,21 @@ def main(argv=None) -> int:
             return 3
         write_json(args.out, run_stock(args.leg))
         return 0
+    if args.cmd == "crash-probe":
+        if not sys.platform.startswith("linux"):
+            print("the crash probe sends a signal to the parent of the browser: Linux only")
+            return 3
+        return crash_probe(args.binary, args.leg, args.out, args.seed if args.seed is not None else default_seeds()[0])
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else default_seeds()
     if args.cmd == "run":
         if sys.platform.startswith("linux") and not shutil.which("strace"):
             print("needs strace (apt install strace): without it the processes and the files of the run are not seen")
             return 3
-        document = run_engine(args.binary, args.leg, seeds, args.label)
+        crash_dir = args.out.parent / (args.out.stem + ".crash")  # footprint-68.json -> footprint-68.crash/<launch>/: what a launch that did not end with 0 left
+        if args.crash_with:
+            document = run_crash_probe(args.binary, args.leg, seeds[0], args.label, crash_dir, args.crash_with)
+        else:
+            document = run_engine(args.binary, args.leg, seeds, args.label, crash_dir)
         write_json(args.out, document)
         return 0
     if args.candidate and not args.candidate_seal:

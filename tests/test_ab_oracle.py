@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import ci_ab_oracle as ab  # noqa: E402
+import ci_crash_evidence as crash  # noqa: E402
 import ci_host_gate as gate  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -205,6 +207,16 @@ def write_gate_dump(directory, engine_visits):
     for (dpr, seed), its in engine_visits.items():
         (directory / ("leg_dpr%s_seed%d.json" % (dpr, seed))).write_text(
             json.dumps({"leg": "leg", "dpr": dpr, "seed": seed, "result": {"format": gate.FORMAT, "items": its}}), encoding="utf-8")
+    write_exits(0)
+
+
+def write_exits(code, launches=1):
+    """What the probe of the dump process writes where the oracle told it (`AB_CRASH_DIR`): how each launch's parent ended."""
+    where = os.environ.get(crash.CRASH_DIR_ENV)
+    if where:
+        Path(where).mkdir(parents=True, exist_ok=True)
+        (Path(where) / "exits.json").write_text(json.dumps({"format": crash.FORMAT, "launches": [
+            {"n": n + 1, "label": {"seed": 0, "dpr": 1.0, "launch": "visit"}, "pid": 100 + n, "returncode": code} for n in range(launches)]}), encoding="utf-8")
 
 
 def test_the_visits_read_back_from_the_gate_s_dump_and_from_the_packed_file(tmp_path):
@@ -236,7 +248,8 @@ def test_a_run_writes_the_three_files_and_is_green_when_the_engines_agree(tmp_pa
     rc = _fake_run(tmp_path, monkeypatch, candidate=visits())
     out = capsys.readouterr().out
     assert rc == 0 and "AB ORACLE OK" in out
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir() if p.is_file()) == ["diff.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out" / "crash").iterdir()) == ["candidate", "firefox-68"], "how each engine's browsers ended is in the artifact, a folder per run"
     diff = json.loads((tmp_path / "out" / "diff.json").read_text(encoding="utf-8"))
     assert diff["verdict"] == "green" and diff["engine"] == "firefox-68" and diff["differences"] == []
 
@@ -446,7 +459,8 @@ def test_the_a_a_alone_runs_the_published_engine_twice_and_is_green_when_it_repe
     out = capsys.readouterr().out
     assert rc == 0 and "AB ORACLE A/A OK" in out
     assert [c[0] for c in calls] == ["pub", "pub"] and all(c[1] is None and len(c[3]) == 2 for c in calls)
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff-a-a.json", "dump-68-again.json", "dump-68.json"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir() if p.is_file()) == ["diff-a-a.json", "dump-68-again.json", "dump-68.json"]
+    assert sorted(p.name for p in (tmp_path / "out" / "crash").iterdir()) == ["firefox-68", "firefox-68-again"]
     diff = json.loads((tmp_path / "out" / "diff-a-a.json").read_text(encoding="utf-8"))
     assert diff["verdict"] == "green" and diff["control"] is True and len(diff["visits"]) == 2
 
@@ -477,7 +491,8 @@ def test_with_a_candidate_the_a_a_comes_first_and_the_a_b_is_against_the_first_d
     out = capsys.readouterr().out
     assert rc == 0 and "AB ORACLE A/A OK" in out and "AB ORACLE OK" in out
     assert [(c[0], c[1]) for c in calls] == [("pub", None), ("pub", None), ("cand", str(tmp_path / "cand.seal.json"))]
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir() if p.is_file()) == ["diff-a-a.json", "diff.json", "dump-68-again.json", "dump-68.json", "dump-candidate.json"]
+    assert sorted(p.name for p in (tmp_path / "out" / "crash").iterdir()) == ["candidate", "firefox-68", "firefox-68-again"]
 
 
 def test_with_a_candidate_that_differs_the_a_b_is_red_exit_1_not_a_broken_control(tmp_path, monkeypatch, capsys):
@@ -559,7 +574,7 @@ def test_a_pull_request_that_touches_the_files_of_one_oracle_runs_every_seed_of_
     assert got == dict(DEFAULT, **{only: 5}), got
 
 
-@pytest.mark.parametrize("path", ["scripts/ci_ab_oracle.py", "scripts/persona_cover.py", "ci/persona-seeds.json", "scripts/ci_ab_pr_seeds.py"])
+@pytest.mark.parametrize("path", ["scripts/ci_ab_oracle.py", "scripts/ci_crash_evidence.py", "scripts/persona_cover.py", "ci/persona-seeds.json", "scripts/ci_ab_pr_seeds.py"])
 def test_what_the_oracles_share_runs_every_seed_of_all_of_them(path):
     assert pr.pr_seed_counts([path], every=5) == ALL
 
@@ -614,14 +629,14 @@ def _job(text, name):
 def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
-    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows")}
+    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows")}
     step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
             "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
             '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
-    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows"], "the jobs that run the oracles' tests, and only those"
-    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows"):
+    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"], "the jobs that run the oracles' tests, and only those"
+    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"):
         assert legs[name].index("actions/setup-python") < legs[name].index(step) < legs[name].index("Fetch the published firefox binary")
-    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 6 and "uses:" not in step
+    assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 8 and "uses:" not in step
     for variable, source in (("AB_ORACLE_PR_SEEDS", "test_ab_oracle_e2e.py"), ("AB_NETWORK_PR_SEEDS", "test_ab_network_e2e.py"), ("AB_HOST_PR_SEEDS", "test_ab_host_e2e.py")):
         assert 'pr_seed_count("%s"' % variable in (root / "tests" / source).read_text(encoding="utf-8")
         assert variable in pr.ORACLES
@@ -640,7 +655,8 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
     assert "OWN_JOB_FILES: " + network in shared_linux and "$ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES" in shared_linux
     host_file = "tests/test_ab_host_e2e.py"
-    assert "OWN_JOB_FILES: %s %s" % (network, host_file) in shared_linux
+    page_file = "tests/test_ab_oracle_e2e.py"
+    assert "OWN_JOB_FILES: %s %s %s" % (network, host_file, page_file) in shared_linux
     # The Windows parts take their files from the rows wrapper.e2e.suite.windows.N of ci/required-suites.json (one partition with the candidate's
     # gate); the oracles' files are in none of those rows (tests/test_the_e2e_suite_is_accounted_for.py names them as excluded: their own jobs).
     assert 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
@@ -648,7 +664,7 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
 
     rows = json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))
     suite_entries = [t for r in rows if r["id"].startswith("wrapper.e2e.suite.") for t in r["tests"]]
-    assert not [t for t in suite_entries if t.split("::")[0] in (network, host_file)]
+    assert not [t for t in suite_entries if t.split("::")[0] in (network, host_file, page_file, "tests/test_ab_host_crash_linux_e2e.py")]
     assert network not in _job(text, "e2e-windows-control-a")
     # the budget of the test itself fits the job: 5 seeds, two engine runs, with its own setup
     import test_ab_network_e2e as network_e2e
@@ -661,13 +677,73 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
     linux, windows = _job(text, "e2e-host"), _job(text, "e2e-host-windows")
     assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
-    for body in (linux, windows):
-        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and "needs: core-on-index" in body
+    for body, minutes in ((linux, 65), (windows, 45)):
+        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: %d" % minutes in body and "needs: core-on-index" in body
         assert "      - name: Run the host oracle's A/A\n" in body and "skipped\": 0" in body
     assert "apt-get install -y strace" in linux and "xvfb-run -a" in linux, "Linux traces the tree with strace"
     import test_ab_host_e2e as host_e2e
+    import test_ab_host_crash_linux_e2e as crash_e2e
 
-    assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the job"
+    assert host_e2e.TIMEOUT_S + crash_e2e.TIMEOUT_S + 10 * 60 <= 65 * 60, "the A/A and the recorder's own test, one after the other, fit the Linux job"
+    assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the Windows job"
+
+
+def test_the_linux_jobs_of_the_three_oracles_install_gdb_and_elfutils_and_point_the_kernel_s_core_pattern_at_a_folder_of_the_job():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    for name in ("e2e-network", "e2e-host", "e2e-page", "e2e-page-final"):
+        body = _job(text, name)
+        step = body[body.index("      - name: Cores of a browser that did not end with 0"):]
+        step = step[:step.index("      - name: The security state")]
+        assert "apt-get install -y gdb elfutils" in step and 'sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"' in step, name
+        assert 'INVPW_CORE_DIR=$RUNNER_TEMP/cores' in step, name
+        assert body.index("System deps (xvfb") < body.index("Cores of a browser") < body.index("Fetch the published firefox binary"), "after the apt update, before any launch"
+        assert "MOZ_CRASHREPORTER" not in body and "extra_prefs" not in step, "no environment variable of the browser, no pref, no crash reporter option"
+    for name in ("e2e-network-windows", "e2e-host-windows", "e2e-page-windows", "e2e-page-final-windows"):
+        assert "Cores of a browser" not in _job(text, name), "Windows reads the `.extra` and the minidump names: no core, no gdb"
+
+
+def test_the_recorders_own_test_runs_in_the_host_job_after_the_a_a_and_is_left_out_of_the_shared_job_and_has_its_own_linux_row():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    crash_file = "tests/test_ab_host_crash_linux_e2e.py"
+    host_job = _job(text, "e2e-host")
+    assert host_job.index("Run the host oracle's A/A") < host_job.index("The host oracle's recorder of a browser that dies") < host_job.index("The leg ran with the pinned GeoIP database")
+    step = host_job[host_job.index("      - name: The host oracle's recorder"):host_job.index("      - name: The leg ran with the pinned GeoIP database")]
+    assert step.count(crash_file) == 1 and "if: success() || failure()" in step and "xvfb-run -a" in step and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in step
+    assert "host-crash-e2e.xml" in host_job.split("Upload what the test saved")[1]
+    shared = _job(text, "e2e")
+    assert crash_file not in _job(text, "e2e-host-windows") and crash_file in shared.split("OWN_JOB_FILES: ")[1].splitlines()[0]
+    rows = {r["id"]: r for r in json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))}
+    row = rows["wrapper.e2e.ab_host_crash"]
+    assert row["os"] == ["linux"] and row["linux_only"].strip() and row["tests"] == [crash_file] and row["min_tests"] == 1 and row["exact"] is True and row["marker"] == "e2e"
+    assert rows["wrapper.e2e.ab_host"]["min_tests"] == 1 and rows["wrapper.e2e.ab_host"]["tests"] == ["tests/test_ab_host_e2e.py"], "the A/A is still the one test of its row"
+
+
+def test_the_page_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs_leave_its_file_out():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    page = "tests/test_ab_oracle_e2e.py"
+    code = lambda job: "\n".join(line for line in job.splitlines() if not line.lstrip().startswith("#"))  # the comment that follows the last job is the next one's
+    linux, windows = code(_job(text, "e2e-page")), code(_job(text, "e2e-page-windows"))
+    assert "name: e2e (page oracle, linux)" in linux and "name: e2e (page oracle, windows)" in windows
+    assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
+    for body in (linux, windows):
+        assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and "needs: core-on-index" in body
+        assert "AB_ORACLE_SEED_SET" not in body, "the A/A of a pull request, not a shard of the final seeds (those have their own jobs)"
+        assert "      - name: Run the page oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
+    assert "xvfb-run -a" in linux
+    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
+    assert page in shared_linux.split("OWN_JOB_FILES: ")[1].splitlines()[0] and 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
+    import json
+
+    rows = json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))
+    assert not [t for r in rows if r["id"].startswith("wrapper.e2e.suite.") for t in r["tests"] if t.split("::")[0] == page], "the page oracle's file is in no row of the shared suite"
+    assert page not in _job(text, "e2e-windows-control-a")
+    import test_ab_oracle_e2e as page_e2e
+
+    # the A/A of a pull request that touches the oracle: 5 seeds, two engine runs, the second launch of seed 0; the guard of the test plus its margin fits the job with the setup
+    assert page_e2e.budget_s(5, 2, True) + 120 + 12 * 60 <= 45 * 60, "the test's own limit fits the job"
 
 
 # --- the second launch of seed 0 on a reused profile (H7) -----------------------------------------------------------------------------------------
@@ -977,3 +1053,513 @@ def test_the_final_set_is_four_shards_of_five_that_reach_every_seed_once_and_see
     parts = [ab.select_visits("final", "%d/4" % i) for i in (1, 2, 3, 4)]
     assert [len(p) for p in parts] == [5, 5, 5, 5] and [seed for _, seed in parts[0]][0] == 0
     assert [i + 1 for i, p in enumerate(parts) if ab.relaunch_visits(p)] == [1]
+
+
+# --- a launch whose parent did not end with 0 is red in the page oracle (scripts/ci_crash_evidence.py) --------------------------------------------------
+
+def a_launch_through_the_core(code, folder=None):
+    """A launch as the core makes it: a `Connection` over two pipes whose process ended with `code`, closed as the wrapper closes it."""
+    from invisible_core.juggler.connection import Connection
+
+    class Process:
+        pid = 4242
+
+        def poll(self):
+            return code
+
+        def terminate(self):
+            pass
+
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
+    conn = Connection(to_w, from_r, Process())
+    conn.close()
+    os.close(from_w)
+    os.close(to_r)
+
+
+def test_a_dump_with_a_launch_that_died_is_red_and_names_the_side_the_seed_the_launch_and_the_code(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        if len(calls) == 1:  # the second dump of the published engine: its launch of seed 12 died
+            where = Path(os.environ[crash.CRASH_DIR_ENV])
+            (where / "exits.json").write_text(json.dumps({"format": crash.FORMAT, "launches": [
+                {"n": 1, "label": {"seed": 11, "dpr": 1.0, "launch": "visit"}, "returncode": 0},
+                {"n": 2, "label": {"seed": 12, "dpr": 1.5, "launch": "visit"}, "returncode": -11, "evidence": "crash/firefox-68-again/02-12-1.5-visit"}]}), encoding="utf-8")
+        calls.append(binary)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out", "firefox-68", ("pub", None), None, None, ab.select_visits(limit=2))
+    out = capsys.readouterr().out
+    assert rc == 2 and "BROKEN CONTROL" in out
+    line = [x for x in out.splitlines() if x.startswith("FAIL the parent process exited with code")]
+    assert len(line) == 1
+    for part in ("code -11 (SIGSEGV)", "run firefox-68-again", "side B", "seed 12", "dpr 1.5", "launch visit", "(evidence: crash/firefox-68-again/02-12-1.5-visit)"):
+        assert part in line[0], part
+    diff = json.loads((tmp_path / "out" / "diff-a-a.json").read_text(encoding="utf-8"))
+    assert diff["verdict"] == "red" and diff["differences"] == [], "the dumps are equal: it is the launch that is red"
+
+
+def test_a_dump_whose_probe_wrote_nothing_is_red_and_an_a_b_with_a_candidate_that_died_is_red_not_a_broken_control(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        where = Path(os.environ[crash.CRASH_DIR_ENV])
+        if len(calls) == 0:
+            (where / "exits.json").unlink()
+        calls.append(binary)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out", "firefox-68", ("pub", None), "cand", tmp_path / "s.json", ab.select_visits(limit=2))
+    out = capsys.readouterr().out
+    assert rc == 2 and "left no record of how its browsers ended" in out and "the probe did not see them" in out
+
+    def fake_again(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        if binary == "cand":
+            write_exits(-6)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_again)
+    rc = ab.run_ab("linux-x86_64", tmp_path / "out2", "firefox-68", ("pub", None), "cand", tmp_path / "s.json", ab.select_visits(limit=2))
+    out = capsys.readouterr().out
+    assert rc == 1 and "BROKEN CONTROL" not in out and "code -6 (SIGABRT): run candidate, side B" in out
+    assert json.loads((tmp_path / "out2" / "diff.json").read_text(encoding="utf-8"))["verdict"] == "red"
+
+
+def test_the_published_engine_dump_of_a_run_that_died_is_red_in_the_old_run_too(tmp_path, monkeypatch, capsys):
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        write_exits(-11 if binary == "cand" else 0, launches=2)
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.setattr(ab, "MIN_LEAVES", SMALL)
+    rc = ab.run("cand", tmp_path / "cand.seal.json", "linux-x86_64", tmp_path / "out", "firefox-68", published=("pub", tmp_path / "pub.seal.json"), visits=list(VISITS))
+    out = capsys.readouterr().out
+    assert rc == 1 and out.count("FAIL the parent process exited with code -11") == 2 and "run candidate, side B" in out
+
+
+def test_the_dump_process_names_each_launch_and_writes_how_it_ended_where_the_oracle_said(tmp_path, monkeypatch, capsys):
+    """The dump of the page, with the browser replaced by launches through the core's own `Connection` (no browser): the probe sees each one, the labels come from the dump
+    (the visit, and the two launches of the pair on one profile), and `exits.json` is there whatever the dump says of the page."""
+    codes = iter([0, 0, -11])
+
+    def read(options, port, dpr, timeout_ms):
+        a_launch_through_the_core(next(codes))
+        return {"format": gate.FORMAT, "items": {"surface": {"x": 1}}}
+
+    monkeypatch.setattr(gate, "read_page", read)
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    monkeypatch.setenv(crash.CRASH_DIR_ENV, str(tmp_path / "crash"))
+    try:
+        assert gate.dump("/e/firefox", "linux-x86_64", tmp_path / "dump", tmp_path / "reference", visits=[(1.0, 0)], pin_dpr=False, relaunch_seeds=(0,)) == 0
+    finally:
+        crash.stop_probe()
+    exits = crash.read_exits(tmp_path / "crash" / "exits.json")
+    assert [(x["label"]["launch"], x["returncode"]) for x in exits["launches"]] == [("visit", 0), ("relaunch-first", 0), ("relaunch-second", -11)]
+    assert [x["label"]["seed"] for x in exits["launches"]] == [0, 0, 0]
+    assert "EXIT the parent process exited with code -11 (SIGSEGV): run this dump, side A, seed 0, dpr 1.0, launch relaunch-second" in capsys.readouterr().out
+    assert (tmp_path / "crash" / "03-0-1.0-relaunch-second" / "crash.json").is_file() and not (tmp_path / "crash" / "01-0-1.0-visit").exists()
+
+
+def test_a_dump_that_was_not_given_a_folder_installs_no_probe_and_launches_as_the_host_gate_always_did(tmp_path, monkeypatch):
+    from invisible_core.juggler.connection import Connection
+
+    before = (Connection.__init__, Connection.close)
+    monkeypatch.delenv(crash.CRASH_DIR_ENV, raising=False)
+    seen = []
+    monkeypatch.setattr(gate, "read_page", lambda *a: seen.append((Connection.__init__, Connection.close)) or {"format": gate.FORMAT, "items": {}})
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    assert gate.dump("ff", "leg", tmp_path / "dump", tmp_path / "reference", visits=[(1.0, 2)], pin_dpr=False) == 0
+    assert seen == [before] and not (tmp_path / "dump" / "exits.json").exists()
+
+
+def test_the_dump_of_an_oracle_run_is_given_its_own_folder_for_the_probe_and_the_environment_is_put_back(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_dump(binary, seal, leg, out, visits_asked):
+        seen.append(os.environ.get(crash.CRASH_DIR_ENV))
+        write_gate_dump(out, {key: items(key[1]) for key in visits_asked})
+        return 0
+
+    monkeypatch.setattr(ab, "run_dump", fake_dump)
+    monkeypatch.delenv(crash.CRASH_DIR_ENV, raising=False)
+    rc, problems = ab.dump_with_exits("firefox-68-again", "pub", None, "linux-x86_64", [(1.0, 0)], tmp_path / "t", tmp_path / "out")
+    assert rc == 0 and problems == [] and seen == [str(tmp_path / "out" / "crash" / "firefox-68-again")]
+    assert crash.CRASH_DIR_ENV not in os.environ, "the variable is the dump's, not the run's"
+    monkeypatch.setattr(ab, "run_dump", lambda *a: (_ for _ in ()).throw(ab.subprocess.TimeoutExpired("x", 1)))
+    rc, problems = ab.dump_with_exits("firefox-68", "pub", None, "linux-x86_64", [(1.0, 0)], tmp_path / "t", tmp_path / "out")
+    assert rc == "timeout" and problems == [], "a dump that timed out is red already (the dump ended with timeout); its missing record is not said twice"
+
+
+# --- what every launch leaves, a tab that died, a core with a parent that ended with 0 (scripts/ci_crash_evidence.py, scripts/ci_host_gate.py) ---------------------------------
+
+class ProcessOf:
+    pid = 4242
+
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+    def terminate(self):
+        pass
+
+
+class Tools:
+    """`subprocess.run` that answers `gdb` with a backtrace and keeps what it was asked; every other tool of the evidence is not installed."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+
+        class Done:
+            stdout, stderr = "#0 0x00007f in mozilla::dom::ContentChild::Crash ()\n", ""
+
+        return Done()
+
+    which = staticmethod(lambda name: "/usr/bin/gdb" if name == "gdb" else None)
+
+
+def a_launch(probe, code, label, text=b"", during=None):
+    """A launch as `launch` makes it: the reader of the browser's output first (`ProcessOutput`, over a pipe the browser writes on), then the `Connection`, closed as the wrapper closes it."""
+    from invisible_core.juggler.connection import Connection, ProcessOutput
+
+    probe.set_label(**label)
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
+    out_r, out_w = os.pipe()
+    output = ProcessOutput(os.fdopen(out_r, "rb"))
+    conn = Connection(to_w, from_r, ProcessOf(code))
+    conn.output = output
+    os.write(out_w, text)
+    os.close(out_w)
+    output.settle()
+    if during:
+        during()
+    conn.close()
+    os.close(from_w)
+    os.close(to_r)
+
+
+@pytest.fixture()
+def probe_of(tmp_path):
+    made = []
+
+    def make(**kw):
+        tools = Tools()
+        probe = crash.LaunchProbe("/e/firefox", tmp_path / "out" / "crash", windows=False, folders=[], core_folders=[tmp_path / "cores"], run=tools, which=tools.which, **kw)
+        (tmp_path / "cores").mkdir(exist_ok=True)
+        probe.tools = tools
+        made.append(probe.install())
+        return probe
+
+    yield make
+    for probe in made:
+        probe.uninstall()
+
+
+def test_what_the_browser_wrote_is_saved_for_every_launch_even_when_all_of_them_end_with_0(tmp_path, probe_of):
+    probe = probe_of()
+    lines = b"".join(b"line %d of the browser\n" % n for n in range(1, 301))  # the core's own reader keeps the last 200
+    a_launch(probe, 0, {"seed": 11, "dpr": 1.0, "launch": "visit"}, lines)
+    a_launch(probe, 0, {"seed": 12, "dpr": 1.5, "launch": "visit"}, b"[GFX1-]: a warning on stderr\n")
+    exits = probe.write()
+    folder = tmp_path / "out" / "crash"
+    assert sorted(p.name for p in (folder / "stderr").iterdir()) == ["01-11-1.0-visit.txt", "02-12-1.5-visit.txt"]
+    first = (folder / "stderr" / "01-11-1.0-visit.txt").read_text(encoding="utf-8")
+    assert "line 1 of the browser\n" in first and "line 300 of the browser\n" in first
+    assert "[GFX1-]: a warning on stderr" in (folder / "stderr" / "02-12-1.5-visit.txt").read_text(encoding="utf-8")
+    document = crash.read_exits(exits)
+    assert [x["returncode"] for x in document["launches"]] == [0, 0] and all(x["stderr"].startswith("crash/stderr/") for x in document["launches"])
+    assert not [p for p in folder.iterdir() if p.is_dir() and p.name != "stderr"], "a green launch leaves no evidence folder: only its output"
+    assert crash.exits_of_run(folder, "firefox-68", False) == [], "green stays green"
+
+
+def test_the_tee_gives_the_reader_the_same_lines_and_the_probe_a_copy():
+    from invisible_core.juggler.connection import ProcessOutput
+
+    class Stream:
+        def __init__(self):
+            self.lines = iter([b"one\n", b"two\n", b""])
+
+        def readline(self):
+            return next(self.lines)
+
+    record = crash.OutputRecord(1, {}, 0.0)
+    output = ProcessOutput(crash.OutputTee(Stream(), record))
+    output.settle()
+    assert output.tail() == ["one", "two"] and record.text() == "one\ntwo\n"
+
+
+def test_a_launch_whose_output_the_probe_could_not_keep_is_red_not_silent(tmp_path):
+    from invisible_core.juggler.connection import Connection
+
+    probe = crash.LaunchProbe("/e/firefox", tmp_path / "out" / "crash", windows=False, folders=[], core_folders=[tmp_path / "cores"]).install(Connection, output=None)
+    try:
+        a_launch(probe, 0, {"seed": 1, "launch": "visit"}, b"said something\n")
+    finally:
+        probe.uninstall()
+    probe.write()
+    lines = crash.exits_of_run(tmp_path / "out" / "crash", "candidate", False)
+    assert len(lines) == 2 and "could not save what its browsers wrote" in lines[0] and "did not save what the browser of launch 1 wrote" in lines[1]
+    assert not (tmp_path / "out" / "crash" / "stderr").exists()
+
+
+def test_a_launch_that_ended_while_starting_still_has_its_output_in_the_artifact(tmp_path, probe_of):
+    from invisible_core.juggler.connection import ProcessOutput
+
+    probe = probe_of()
+    probe.set_label(seed=3, dpr=1.0, launch="visit")
+    out_r, out_w = os.pipe()
+    output = ProcessOutput(os.fdopen(out_r, "rb"))  # `launch` raised after this: no Connection was made over it
+    os.write(out_w, b"Gtk-WARNING: cannot open display\n")
+    os.close(out_w)
+    output.settle()
+    probe.write()
+    document = crash.read_exits(tmp_path / "out" / "crash" / "exits.json")
+    assert document["launches"] == [] and [x["label"]["seed"] for x in document["launches_without_connection"]] == [3]
+    assert "cannot open display" in (tmp_path / "out" / "crash" / "stderr" / "01-3-1.0-visit-no-connection.txt").read_text(encoding="utf-8")
+
+
+def test_the_core_of_a_content_process_goes_through_gdb_though_the_parent_ended_with_0_and_is_red(tmp_path, probe_of):
+    probe = probe_of()
+    cores = tmp_path / "cores"
+    a_launch(probe, 0, {"seed": 11, "dpr": 1.0, "launch": "visit"}, b"fine\n")
+    a_launch(probe, 0, {"seed": 12, "dpr": 1.5, "launch": "visit"}, b"[Child 77] ###!!! ABORT: tab\n", during=lambda: (cores / "core.Web Content.77.1700000000").write_bytes(b"\x7fELF"))
+    a_launch(probe, 0, {"seed": 13, "dpr": 1.0, "launch": "visit"}, b"fine\n")
+    probe.write()
+    launches = crash.read_exits(tmp_path / "out" / "crash" / "exits.json")["launches"]
+    assert [x["cores"] for x in launches] == [[], ["core.Web Content.77.1700000000"], []], "a core is one launch's: the next launch does not get it again"
+    gdb = [c for c in probe.tools.calls if c[0].endswith("gdb")]
+    assert len(gdb) == 1 and all(command in gdb[0] for command in crash.GDB_COMMANDS)
+    saved = tmp_path / "out" / launches[1]["evidence"] / "gdb-core.Web_Content.77.1700000000.txt"
+    assert "ContentChild::Crash" in saved.read_text(encoding="utf-8")
+    lines = crash.exits_of_run(tmp_path / "out" / "crash", "candidate", False)
+    assert len(lines) == 1 and "a process of the browser crashed while the parent ended with 0" in lines[0] and "seed 12" in lines[0] and "core core.Web Content.77" in lines[0]
+    assert "(evidence: crash/02-12-1.5-visit)" in lines[0] and "run candidate" in lines[0]
+
+
+def test_a_missing_core_is_said_where_it_was_looked_for_and_never_left_silent(tmp_path, probe_of, monkeypatch):
+    monkeypatch.setenv(crash.CORE_DIR_ENV, str(tmp_path / "cores"))
+    probe = probe_of()
+    a_launch(probe, 0, {"seed": 11, "dpr": 1.0, "launch": "visit"})
+    a_launch(probe, -11, {"seed": 12, "dpr": 1.0, "launch": "visit"})
+    probe.write()
+    green, died = crash.read_exits(tmp_path / "out" / "crash" / "exits.json")["launches"]
+    assert "no core file written since the launch began, in %s" % (tmp_path / "cores") in green["core_said"]
+    assert "no core file written since the launch began" in " | ".join(died["said"]), "and the launch that died says it too, in its evidence"
+    monkeypatch.setenv(crash.CORE_DIR_ENV, "/job/cores")
+    assert "the kernel does not write into INVPW_CORE_DIR, so a core would not have been seen there" in crash.core_said([Path("/job/cores")], "|/usr/share/apport/apport %p", False)
+    assert "no core folder to look in" in crash.core_said([], "core", False) and "not seen" in crash.core_said([], "core", False)
+    assert "Windows" in crash.core_said([], None, True)
+
+
+# the tab that died: a visit whose session was lost is a leaf of its own, and the comparison is red with that line first
+
+def a_browser(monkeypatch, fail_on=None, error="Page.evaluate: cannot find session"):
+    """`invisible_playwright.InvisiblePlaywright` as a fake whose page answers the host gate's page and the states, and raises `error` at the call whose text contains `fail_on`."""
+    import types
+
+    answers = {"window.__hostGate": {"format": gate.FORMAT, "items": {"surface": {"x": 1}}}, "__hostGateStates.prepare()": {"x": 5, "y": 6},
+               "[innerWidth, innerHeight]": [100, 80], "__hostGateStates.measure()": {"innerWidth": 100}}
+
+    class Mouse:
+        def move(self, *a):
+            pass
+
+        def click(self, *a):
+            pass
+
+    class Page:
+        mouse = Mouse()
+
+        def goto(self, url, timeout=None):
+            if fail_on == "goto":
+                raise RuntimeError("Page.goto: Target page, context or browser has been closed")
+
+        def wait_for_function(self, expression, timeout=None):
+            pass
+
+        def evaluate(self, expression):
+            if fail_on and fail_on in expression:
+                raise RuntimeError(error)
+            return json.loads(json.dumps(answers.get(expression)))
+
+    class Browser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def new_context(self):
+            return self
+
+        def new_page(self):
+            return Page()
+
+    module = types.ModuleType("invisible_playwright")
+    module.InvisiblePlaywright = lambda **options: Browser()
+    monkeypatch.setitem(sys.modules, "invisible_playwright", module)
+
+
+def test_a_session_lost_during_the_states_is_the_leaf_crash_tab_with_the_error_and_the_step(monkeypatch):
+    a_browser(monkeypatch, fail_on="__hostGateStates.measure()")
+    gate._LAUNCH[0] = "visit"
+    result = gate.read_page({"seed": 12}, 1, 1.5, 1000)
+    leaf = result["items"]["crash.tab.visit"]
+    assert result["format"] == gate.FORMAT and "cannot find session" in leaf["error"] and leaf["step"] == "states: evaluate __hostGateStates.measure()"
+    assert result["items"]["surface"] == {"x": 1}, "what the page had read before the tab died is kept"
+    assert gate.tab_crash_lines("leg dpr 1.5 seed 12", result["items"]) == ["TAB CRASH leg dpr 1.5 seed 12 crash.tab.visit: %s, at the step states: evaluate __hostGateStates.measure()" % leaf["error"]]
+
+
+def test_a_tab_that_died_before_the_page_answered_is_the_leaf_alone_and_the_dump_goes_on(monkeypatch):
+    a_browser(monkeypatch, fail_on="goto")
+    gate._LAUNCH[0] = "relaunch-second"
+    try:
+        result = gate.read_page({"seed": 0}, 1, 1.0, 1000)
+    finally:
+        gate._LAUNCH[0] = "visit"
+    assert list(result["items"]) == ["crash.tab.relaunch-second"] and result["items"]["crash.tab.relaunch-second"]["step"] == "goto"
+
+
+def test_an_error_that_is_not_a_lost_tab_is_still_raised_as_it_always_was(monkeypatch):
+    a_browser(monkeypatch, fail_on="__hostGateStates.measure()", error="the page threw a TypeError")
+    gate._LAUNCH[0] = "visit"
+    result = gate.read_page({"seed": 12}, 1, 1.5, 1000)
+    assert "crash.tab.visit" not in result["items"] and "error" in result["items"]["state.normal"], "the states say it, as before"
+    a_browser(monkeypatch, fail_on="window.__hostGate", error="the page threw a TypeError")
+    with pytest.raises(RuntimeError, match="TypeError"):
+        gate.read_page({"seed": 12}, 1, 1.5, 1000)
+
+
+def test_the_second_launch_keeps_the_tab_that_died_in_the_first():
+    seen = iter([{"format": gate.FORMAT, "items": {"crash.tab.relaunch-first": {"error": "cannot find session", "step": "goto"}}}, {"format": gate.FORMAT, "items": {"surface": {"x": 1}}}])
+    got = gate.second_launch({"seed": 0}, 1, 1.0, 1000, read=lambda *a: next(seen))
+    assert got["items"]["crash.tab.relaunch-first"]["step"] == "goto" and got["items"]["surface"] == {"x": 1}
+
+
+def test_the_ab_visit_records_the_tab_that_died_and_goes_no_further(monkeypatch):
+    import types
+
+    log = []
+
+    class Page:
+        def goto(self, url, timeout=None):
+            pass
+
+        def go_back(self, timeout=None):
+            raise RuntimeError("Page.goBack: cannot find session")
+
+        def wait_for_function(self, expression, timeout=None):
+            pass
+
+        def evaluate(self, expression):
+            return {"top": 1} if expression == "window.__abResult" else {"n": 2, "persisted": False, "data": 1}
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            log.append("closed")
+            raise RuntimeError("Context.close: Target closed")  # closing the context of a dead tab says nothing more
+
+    class Browser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def new_context(self, **options):
+            return Context()
+
+    module = types.ModuleType("invisible_playwright")
+    module.InvisiblePlaywright = lambda **options: Browser()
+    monkeypatch.setitem(sys.modules, "invisible_playwright", module)
+    got = gate.ab_visit("ff", 0, "UTC", 1.0, timeout_ms=10)
+    assert list(got) == ["crash.tab.ab-visit"] and got["crash.tab.ab-visit"]["step"] == "go back (context launch)" and log == ["closed"]
+
+
+def a_visit_where_the_tab_died(error="Page.evaluate: cannot find session"):
+    """The visit as the dead side dumped it: what the page read before, the leaf of the crash, and the states the drive did not reach, each `{"error": ...}`."""
+    its = items(12)
+    its.update(crash.tab_crash_item("visit", "states: evaluate __hostGateStates.measure()", RuntimeError(error)))
+    for name in gate.STATES:
+        its[gate.STATE + name] = {"error": "RuntimeError: " + error}
+    return its
+
+
+def test_a_visit_whose_tab_died_is_red_with_the_tab_crash_first_and_no_cascade_of_missing_leaves():
+    a, b = visits(), visits()
+    for side in (a, b):
+        for key in side:
+            for name in gate.STATES:
+                side[key][gate.STATE + name] = {"innerWidth": 1920, "innerHeight": 1000, "screen": {"width": 1920}}
+    b[(1.5, 12)] = a_visit_where_the_tab_died()
+    report = run(a, b)
+    assert report["verdict"] == "red"
+    assert report["problems"][0].startswith("TAB CRASH side B seed 12 dpr 1.5 launch visit at step states: evaluate __hostGateStates.measure()")
+    assert "cannot find session" in report["problems"][0] and "are not compared" in report["problems"][0]
+    assert report["differences"] == [] and len(report["problems"]) == 1, "no leaf of the dead visit is listed: the cascade is one line"
+    assert "<missing>" not in json.dumps(report) and report["tab_crashes"][0]["launch"] == "visit"
+
+
+def test_the_leaf_alone_makes_the_comparison_red_though_every_other_leaf_is_equal():
+    a, b = visits(), visits()
+    b[(1.0, 11)].update(crash.tab_crash_item("visit", "goto", RuntimeError("Target page, context or browser has been closed")))
+    report = run(a, b)
+    assert report["verdict"] == "red" and report["differences"] == [] and len(report["problems"]) == 1
+    assert report["problems"][0] == "TAB CRASH side B seed 11 dpr 1.0 launch visit at step goto: RuntimeError: Target page, context or browser has been closed"
+    assert run(visits(), visits())["verdict"] == "green", "and without the leaf the same dumps are green"
+
+
+def test_a_tab_that_died_on_the_published_side_is_named_on_side_a_and_a_second_launch_that_died_is_named_by_its_launch():
+    a, b = {(1.0, 0): items(0)}, {(1.0, 0): items(0)}
+    a[(1.0, 0)].update(crash.tab_crash_item("visit", "goto", RuntimeError("cannot find session")))
+    b[(1.0, 0)].update({gate.RELAUNCH + k: v for k, v in crash.tab_crash_item("relaunch-second", "goto", RuntimeError("cannot find session")).items()})
+    problems = ab.compare_visits(a, b, [], SMALL, expected=((1.0, 0),))["problems"]
+    assert problems[0].startswith("TAB CRASH side A seed 0 dpr 1.0 launch visit") and problems[1].startswith("TAB CRASH side B seed 0 dpr 1.0 launch relaunch-second")
+
+
+def test_the_tab_crash_comes_before_the_exit_of_the_dump_it_left_and_before_the_leaves():
+    b = visits()
+    b[(1.5, 12)] = a_visit_where_the_tab_died()
+    b[(1.0, 13)]["surface"]["navigator"]["language"] = "it-IT"
+    report = ab.judge(visits(), b, [], extra_problems=["the dump with candidate ended with 1"], expected=VISITS)
+    assert report["verdict"] == "red"
+    assert report["problems"][0].startswith("TAB CRASH") and report["problems"][1] == "the dump with candidate ended with 1"
+    assert report["problems"][-1].startswith("seed 13 dpr 1.0 surface.navigator.language"), "the differences stay the last lines"
+
+
+def test_a_dump_prints_the_tab_crash_and_writes_the_visit_with_its_leaf(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv(crash.CRASH_DIR_ENV, raising=False)
+    monkeypatch.setattr(gate, "read_page", lambda *a: {"format": gate.FORMAT, "items": a_visit_where_the_tab_died()})
+    monkeypatch.setattr(gate, "reference_zone", lambda reference: "UTC")
+    assert gate.dump("ff", "linux-x86_64", tmp_path / "dump", tmp_path / "reference", visits=[(1.5, 12)], pin_dpr=False) == 0
+    assert "TAB CRASH linux-x86_64 dpr 1.5 seed 12 crash.tab.visit: RuntimeError: Page.evaluate: cannot find session" in capsys.readouterr().out
+    written = json.loads((tmp_path / "dump" / "linux-x86_64_dpr1.5_seed12.json").read_text(encoding="utf-8"))
+    assert written["result"]["items"]["crash.tab.visit"]["step"].startswith("states:")
+
+
+def test_every_page_oracle_job_uploads_the_folder_where_the_oracle_keeps_what_each_launch_left_whatever_the_result():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    for name in ("e2e-page", "e2e-page-windows", "e2e-page-final", "e2e-page-final-windows"):
+        body = _job(text, name)
+        step = body[body.index("      - name: Upload what the test saved"):]
+        assert "if: always()" in step and "${{ runner.temp }}/invpw-evidence\n" in step, "%s: the evidence folder (ab-oracle/crash/<run>/stderr, exits.json, gdb files) is uploaded green or red" % name
+    assert "RUNNER_TEMP" in (root / "tests" / "test_ab_oracle_e2e.py").read_text(encoding="utf-8") and '"invpw-evidence" / "ab-oracle"' in (root / "tests" / "test_ab_oracle_e2e.py").read_text(encoding="utf-8")

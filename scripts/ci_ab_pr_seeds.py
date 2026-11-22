@@ -24,8 +24,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-#: What every oracle depends on: the page oracle's driver (the others use its fetch of the published engine and its cache folder), this file and the seeds.
-SHARED = ("scripts/ci_ab_oracle.py", "scripts/ci_ab_pr_seeds.py", "scripts/persona_cover.py", "ci/persona-seeds.json")
+#: What every oracle depends on: the page oracle's driver (the others use its fetch of the published engine and its cache folder), the recorder of how a launch ended, this file and the seeds.
+SHARED = ("scripts/ci_ab_oracle.py", "scripts/ci_crash_evidence.py", "scripts/ci_ab_pr_seeds.py", "scripts/persona_cover.py", "ci/persona-seeds.json")
 #: variable -> (oracle, seeds by default on a pull request that does not touch it, the files of the oracle: exact paths or fnmatch patterns).
 ORACLES = {
     "AB_ORACLE_PR_SEEDS": ("page", 2, SHARED + ("scripts/ci_host_gate.py", "scripts/ci_poison_host.py", "scripts/host_gate/*", "tests/test_ab_oracle*", "tests/test_ci_host_gate*",

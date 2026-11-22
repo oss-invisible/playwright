@@ -60,6 +60,12 @@ the same rule.
 
     python ci_host_gate.py dump <firefox> --leg linux-x86_64 --out dumps/
     python ci_host_gate.py compare dumps/          (reference: host_gate/reference/firefox-159)
+    python ci_host_gate.py compare dumps/ --junit gate-junit/host-gate.xml
+
+--junit writes the verdict as a junit (xunit2) file, one testcase per invariant
+(name `invariant:<name>`) and one per other check (`check:<name>`), classname
+`scripts.ci_host_gate`: a failed check is a <failure>, a check with nothing to look at
+(no dumps) is a <skipped/>, never a pass. The exit status is the gate's own.
 """
 from __future__ import annotations
 
@@ -68,14 +74,19 @@ import base64
 import fnmatch
 import gzip
 import json
+import os
 import shutil
 import sys
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_crash_evidence as crash  # noqa: E402  (how each launch's parent ended: the A/B oracle of the page turns a code other than 0 into a red line)
 
 HERE = Path(__file__).resolve().parent / "host_gate"
 PAGE = HERE / "host_gate_page.html"
@@ -420,21 +431,79 @@ def visit_options(firefox: str, seed: int, dpr: float | None, zone: str, profile
     return options
 
 
+#: Which launch of the dump is being made, for the name of the leaf a tab that died is recorded under (`crash.tab.<launch>`): the visit, the two launches of the pair on one profile,
+#: the ab visit. Set with the probe's own label (`_mark`), so that the leaf and the evidence of the launch have one name.
+_LAUNCH = ["visit"]
+
+
+def _mark(seed, dpr, launch: str) -> None:
+    _LAUNCH[0] = launch
+    crash.mark(seed=seed, dpr=dpr, launch=launch)
+
+
+class Steps:
+    """Which step of a launch is being made, so that a tab that dies says WHERE: `step` is the last one begun, and `failed` the (step, error) of the last call of `wrap` that raised."""
+
+    def __init__(self, step: str = "launch") -> None:
+        self.step, self.failed = step, None
+
+    def wrap(self, name: str, fn: Callable) -> Callable:
+        def run(*args, **kwargs):
+            self.step = "%s %s" % (name, ", ".join(str(a)[:60] for a in args))
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - noted, and raised again
+                self.failed = (self.step, e)
+                raise
+        return run
+
+
+def leaves_of_crash(items: dict) -> dict:
+    """{key: {"error", "step"}} of the items that record a tab that died or a session that was lost (also those of the second launch, under RELAUNCH)."""
+    out = {}
+    for key, value in items.items():
+        bare = key[len(RELAUNCH):] if key.startswith(RELAUNCH) else key
+        if bare.startswith(crash.TAB_PREFIX) and isinstance(value, dict):
+            out[key] = value
+    return out
+
+
+def tab_crash_lines(visit: str, items: dict) -> list:
+    """The tab crashes a visit's items hold, as the lines a dump prints."""
+    return ["TAB CRASH %s %s: %s, at the step %s" % (visit, k, v.get("error"), v.get("step")) for k, v in sorted(leaves_of_crash(items).items())]
+
+
 def read_page(options: dict, port: int, dpr: float, timeout_ms: int) -> dict:
     """One launch: the page's result (with the states driven when the page answered the format), the browser closed. With a profile_dir in
-    `options` the wrapper hands back a persistent context, not a browser, and the page is opened in it."""
+    `options` the wrapper hands back a persistent context, not a browser, and the page is opened in it.
+
+    A tab that died, or a session that was lost, while the page was read (the error says it: `crash.tab_lost`) is not an exception of the dump: it is the leaf
+    `crash.tab.<launch>` of this visit, with the error and the step, and the dump goes on. It used to be a `{"error": ...}` in each state the drive had not reached, which the
+    comparison read as a cascade of leaves that were missing (candidate run: «cannot find session» in every `state.*`)."""
     from invisible_playwright import InvisiblePlaywright
 
+    launch, trace, result = _LAUNCH[0], Steps("new page"), None
     with InvisiblePlaywright(**options) as browser:
-        page = browser.new_page() if "profile_dir" in options else browser.new_context().new_page()
-        # The same budget as the wait below: a cold Windows runner took
-        # more than goto's default 30 s to reach `load` on the first
-        # visit (candidate 42410156024), and passed locally 6/6.
-        page.goto("http://127.0.0.1:%d/?dpr%s" % (port, dpr), timeout=timeout_ms)
-        page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
-        result = page.evaluate("window.__hostGate")
-        if result.get("format") == FORMAT:
-            result["items"].update(drive_states(page.evaluate, page.mouse.move, page.mouse.click))
+        try:
+            page = browser.new_page() if "profile_dir" in options else browser.new_context().new_page()
+            # The same budget as the wait below: a cold Windows runner took
+            # more than goto's default 30 s to reach `load` on the first
+            # visit (candidate 42410156024), and passed locally 6/6.
+            trace.step = "goto"
+            page.goto("http://127.0.0.1:%d/?dpr%s" % (port, dpr), timeout=timeout_ms)
+            trace.step = "wait for the page's result"
+            page.wait_for_function("document.title === 'done'", timeout=timeout_ms)
+            trace.step = "read the page's result"
+            result = page.evaluate("window.__hostGate")
+            if result.get("format") == FORMAT:
+                result["items"].update(drive_states(trace.wrap("evaluate", page.evaluate), trace.wrap("mouse move", page.mouse.move), trace.wrap("mouse click", page.mouse.click)))
+                if trace.failed is not None and crash.tab_lost(trace.failed[1]):
+                    result["items"].update(crash.tab_crash_item(launch, "states: " + trace.failed[0], trace.failed[1]))
+        except Exception as e:  # noqa: BLE001 - only a tab that died is recorded; anything else is raised as it always was
+            if not crash.tab_lost(e):
+                raise
+            result = {"format": FORMAT, "items": dict(result["items"]) if isinstance(result, dict) and isinstance(result.get("items"), dict) else {}}
+            result["items"].update(crash.tab_crash_item(launch, trace.step, e))
     return result
 
 
@@ -446,10 +515,15 @@ def second_launch(options: dict, port: int, dpr: float, timeout_ms: int, read=No
     profile = tempfile.mkdtemp(prefix="host-gate-profile-")
     try:
         with_profile = dict(options, profile_dir=profile)
+        _mark(options.get("seed"), dpr, "relaunch-first")
         first = read(with_profile, port, dpr, timeout_ms)
         if first.get("format") != FORMAT:
             return first
-        return read(with_profile, port, dpr, timeout_ms)
+        _mark(options.get("seed"), dpr, "relaunch-second")
+        again = read(with_profile, port, dpr, timeout_ms)
+        if again.get("format") == FORMAT:  # a tab that died in the first launch is not lost because the second one was read
+            again["items"].update(leaves_of_crash(first.get("items") or {}))
+        return again
     finally:
         shutil.rmtree(profile, ignore_errors=True)
 
@@ -460,8 +534,13 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     False the DPR is not pinned: it is the one the seed's persona has, and `dpr` of a visit only names the file and
     the page's query. A seed of `relaunch_seeds` is visited once more, launched twice on one profile folder, and the
     items of that second launch are added to the visit under RELAUNCH (the visit's own items stay those of a fresh profile).
-    With `ab`, the seeds of AB_SEEDS also get the extra visit of the A/B oracle (ab_visit): its leaves join the visit's items."""
+    With `ab`, the seeds of AB_SEEDS also get the extra visit of the A/B oracle (ab_visit): its leaves join the visit's items.
+
+    When the oracle that runs this dump names a folder for it (`AB_CRASH_DIR`, scripts/ci_ab_oracle.py), a probe sees how each launch's parent ends (scripts/ci_crash_evidence.py)
+    and writes it to `exits.json` there, whatever the dump's own result: a launch that did not end with 0 is red in the oracle, and what it left is saved in that folder."""
     out.mkdir(parents=True, exist_ok=True)
+    crash_dir = os.environ.get(crash.CRASH_DIR_ENV)
+    probe = crash.start_probe(firefox, crash_dir) if crash_dir else None
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
@@ -470,6 +549,7 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
     try:
         for dpr, seed in (visits if visits is not None else [(d, sd) for d in DPRS for sd in SEEDS]):
             options = visit_options(firefox, seed, dpr if pin_dpr else None, zone)
+            _mark(seed, dpr, "visit")
             result = read_page(options, port, dpr, timeout_ms)
             if result.get("format") != FORMAT:
                 print("the page answered format %r, not %r" % (result.get("format"), FORMAT))
@@ -482,12 +562,15 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
                 result["items"].update(relaunch_items(again["items"]))
                 print("second launch of seed %d on a reused profile: %d items" % (seed, len(again["items"])))
             if ab and seed in AB_SEEDS:
+                _mark(seed, dpr, "ab-visit")
                 result["items"].update(ab_visit(firefox, seed, zone, dpr if pin_dpr else None))
             path = out / ("%s_dpr%s_seed%d.json" % (leg, dpr, seed))
             path.write_text(json.dumps({"leg": leg, "dpr": dpr, "seed": seed, "result": result}),
                             encoding="utf-8")
             print("dumped %s: %d items" % (path.name, len(result["items"])))
             visit = "%s dpr %s seed %d" % (leg, dpr, seed)
+            for line in tab_crash_lines(visit, result["items"]):
+                print(line)
             for line in diag_report(visit, result["items"], first_diag):
                 print(line)
             # told here too, so the job log says it without the compare step
@@ -498,6 +581,11 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
                 first_diag = {k: v for k, v in leaves(result["items"]).items() if is_diag(k)}
     finally:
         server.shutdown()
+        if probe is not None:
+            crash.stop_probe()
+            probe.write()
+            for line in crash.exit_problems(probe.launches, "this dump", windows=leg.startswith("win")):
+                print("EXIT " + line)
     return 0
 
 
@@ -590,22 +678,44 @@ def ab_visit(firefox: str, seed: int, zone: str, dpr: float | None = None, timeo
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:%d/ab/" % server.server_address[1]
     items = {}
+    lost = None
     try:
         with InvisiblePlaywright(**ab_options(firefox, seed, dpr, zone)) as browser:
             for name, options in AB_CONTEXTS:
-                context = browser.new_context(**options)
+                context, step = None, "new context"
                 try:
+                    context = browser.new_context(**options)
+                    step = "new page"
                     page = context.new_page()
+                    step = "goto surfaces"
                     page.goto(base + "surfaces.html?ctx=" + name, timeout=timeout_ms)
+                    step = "wait for the page's result"
                     page.wait_for_function("document.title === 'ab-done'", timeout=timeout_ms)
+                    step = "read the page's result"
                     result = page.evaluate("window.__abResult")
                     # away and back: the page that comes back reads again (pageshow), restored from the cache or loaded anew
+                    step = "goto leave"
                     page.goto(base + "leave.html?ctx=" + name, timeout=timeout_ms)
+                    step = "go back"
                     page.go_back(timeout=timeout_ms)
+                    step = "wait for the page that came back"
                     page.wait_for_function("window.__abBf && window.__abBf.n >= 2", timeout=timeout_ms)
+                    step = "read the page that came back"
                     back = page.evaluate("window.__abBf")
+                except Exception as e:  # noqa: BLE001 - a tab that died is the leaf `crash.tab.ab-visit`; anything else is raised as it always was
+                    if not crash.tab_lost(e):
+                        raise
+                    lost = crash.tab_crash_item("ab-visit", "%s (context %s)" % (step, name), e)
                 finally:
-                    context.close()
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:  # noqa: BLE001 - closing a context whose tab died says nothing more
+                            if lost is None:
+                                raise
+                if lost is not None:
+                    items.update(lost)
+                    break
                 items.update(ab_items(name, result, back))
     finally:
         server.shutdown()
@@ -808,6 +918,61 @@ def compare(dumps: Path, reference: Path, exceptions: dict, notes: list | None =
     return failures
 
 
+# -
+# The junit: the verdict of compare() as one testcase per invariant and per
+# other check, so a judge can ask "did this invariant pass" by name.
+
+#: The classname is the script's path as a dotted module (the hook tests judge turns it back into
+#: scripts/ci_host_gate.py, the file a hook names).
+JUNIT_CLASSNAME = "scripts.ci_host_gate"
+
+#: The checks of compare() other than the invariants, with the prefix of the
+#: failure lines each one owns.
+CHECKS = (
+    ("dumps_complete", ("no dumps", "no retail reference")),
+    ("host_independence", ("host ",)),
+    ("retail_equality", ("retail ",)),
+    ("exceptions_current", ("known defect",)),
+)
+
+
+def junit_cases(failures: list, dumps_seen: int) -> list:
+    """The verdict as [(name, status, lines)], status being passed, failed or
+    skipped. Nothing to look at (no dump) skips an invariant; a failure line
+    is owned by the invariant or check it names."""
+    cases = []
+    for inv in INVARIANTS:
+        lines = [f for f in failures if f.startswith("invariant %s " % inv.name)]
+        cases.append(("invariant:" + inv.name, "failed" if lines else ("passed" if dumps_seen else "skipped"), lines))
+    no_dumps = any(f.startswith("no dumps") for f in failures)
+    no_reference = any(f.startswith("no retail reference") for f in failures)
+    for name, prefixes in CHECKS:
+        lines = [f for f in failures if f.startswith(prefixes) or (name == "dumps_complete" and ": no dump for seeds" in f)]
+        skipped = no_dumps or (no_reference and name != "dumps_complete")
+        cases.append(("check:" + name, "failed" if lines else ("skipped" if skipped else "passed"), lines))
+    return cases
+
+
+def write_junit(path: Path, cases: list, suite: str = "host-gate") -> None:
+    """cases: [(name, status, lines)] as a junit (xunit2) file at path."""
+    root = ET.Element("testsuites")
+    counts = {"failed": 0, "skipped": 0}
+    for _, status, _lines in cases:
+        if status in counts:
+            counts[status] += 1
+    ts = ET.SubElement(root, "testsuite", name=suite, tests=str(len(cases)), failures=str(counts["failed"]),
+                       errors="0", skipped=str(counts["skipped"]), time="0")
+    for name, status, lines in cases:
+        tc = ET.SubElement(ts, "testcase", classname=JUNIT_CLASSNAME, name=name, time="0")
+        if status == "failed":
+            f = ET.SubElement(tc, "failure", message=lines[0][:300] if lines else "failed")
+            f.text = "\n".join(lines[:50])
+        elif status == "skipped":
+            ET.SubElement(tc, "skipped", message="nothing to check: the gate had no dumps or no reference")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -827,6 +992,7 @@ def main(argv=None) -> int:
     c = sub.add_parser("compare")
     c.add_argument("dumps", type=Path)
     c.add_argument("--reference", type=Path, default=REFERENCE)
+    c.add_argument("--junit", type=Path, help="also write the verdict as a junit (xunit2) file")
     args = ap.parse_args(argv)
     if args.cmd == "dump":
         visits = None
@@ -840,6 +1006,8 @@ def main(argv=None) -> int:
         print("NOTE " + n)
     for f in failures:
         print("FAIL " + f)
+    if args.junit:
+        write_junit(args.junit, junit_cases(failures, len(list(args.dumps.glob("*.json")))))
     print("HOST GATE %s: %d failures" % ("OK" if not failures else "FAILED", len(failures)))
     return 1 if failures else 0
 

@@ -865,6 +865,150 @@ def test_the_tee_writes_down_each_request_head_as_it_was_written_and_changes_no_
     assert events[1]["headers"] == [["Host", "h"], ["Content-Length", "3"], ["Accept", "*/*"]]
 
 
+def test_the_tee_says_which_connection_carried_each_request_and_when_so_that_a_run_that_differs_from_itself_can_be_explained():
+    """A/A run 45025164169 (Windows): a request of step 15 counted twice in one run and once in the other, and the transcript, which folds a request into a count, could not say which page sent it
+    or when. The tee knows the connection each head came on (its own number, in the order they were accepted) and the moment, and the request summary still leaves both out."""
+    rec = ab.Recorder()
+    server = _http_server()
+    tee = ab.RawTee(rec, server.server_address[1], "A")
+    try:
+        first = socket.create_connection(("127.0.0.1", tee.port), timeout=60)
+        first.sendall(b"GET /one HTTP/1.1\r\nHost: h\r\nReferer: http://h/\r\n\r\n")
+        _read_response(first, b"/one")
+        second = socket.create_connection(("127.0.0.1", tee.port), timeout=60)
+        second.sendall(b"GET /two HTTP/1.1\r\nHost: h\r\n\r\n")
+        _read_response(second, b"/two")
+        first.sendall(b"GET /three HTTP/1.1\r\nHost: h\r\n\r\n")
+        _read_response(first, b"/three")
+        first.close()
+        second.close()
+    finally:
+        tee.close()
+        server.shutdown()
+        server.server_close()
+    events = rec.of("launch", "http")
+    assert [(e["target"], e["connection"]) for e in events] == [("/one", 0), ("/two", 1), ("/three", 0)]
+    assert [e["t"] for e in events] == sorted(e["t"] for e in events) and all(isinstance(e["t"], float) for e in events)
+    summary = ab.request_summary(events, ab.Normalizer())
+    assert sorted(summary) == ["GET A/one", "GET A/three", "GET A/two"] and "connection" not in json.dumps(summary) and '"t"' not in json.dumps(summary)
+
+
+def _client_context():
+    import ssl
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
+    context.set_alpn_protocols(["http/1.1"])
+    return context
+
+
+def _http1_round(server, context, session=None, watch_end=False):
+    """One request on a new TLS connection to ``server`` (a session belongs to the context that made it): ``(answer, the session the client holds, whether the server ended the connection after the answer)``.
+    The end is watched only when asked: a connection read to its unclean end (no close_notify) makes OpenSSL refuse to resume its session, which is a fact about this client and not the browser's."""
+    raw = socket.create_connection((server.address, server.port), timeout=60)
+    tls = context.wrap_socket(raw, server_hostname="wire.test", session=session)
+    tls.settimeout(60)
+    try:
+        tls.sendall(b"GET /wire.css HTTP/1.1\r\nHost: wire.test\r\n\r\n")
+        answer = b""
+        while b"p{color" not in answer:
+            chunk = tls.recv(4096)
+            assert chunk, "closed before the answer: %r" % answer
+            answer += chunk
+        session, ended = tls.session, None
+        if watch_end:
+            tls.settimeout(5)
+            try:
+                ended = tls.recv(4096) == b""
+            except socket.timeout:
+                ended = False
+            except OSError:
+                ended = True
+        return answer, session, ended
+    finally:
+        tls.close()
+
+
+def test_an_http1_server_that_ends_each_connection_after_its_answer_makes_every_next_request_a_resumed_connection_by_construction():
+    """A/A run 45025164169 (Linux): the HTTP/1.1 site had a resumed connection on one seed of one run and on none of the five of the other, because whether a second connection opened while the
+    first was still busy, before it had read the session ticket, is the pool's race. A server that says ``Connection: close`` and ends the connection leaves the client no choice: its next request
+    rides a new connection, opened after the answer (and the ticket that came with it) was read, so it offers the session. The default stays keep-alive, for every other user of the server."""
+    with wc.WireServer(alpn=("http/1.1",), dns_names=("wire.test",), close_after_response=True) as server:
+        context = _client_context()
+        answer, held, _ = _http1_round(server, context)
+        assert b"Connection: close" in answer
+        assert held is not None and held.has_ticket, "the first answer carries the ticket the next connection offers"
+        _http1_round(server, context, session=held)
+        _answer, _held, ended = _http1_round(server, context, watch_end=True)
+        assert ended is True, "the server ends the connection after its answer"
+        snapshot = server.snapshot()
+    first, second, third = snapshot["connections"]
+    assert not ab._resumed(first["tls"]) and ab._resumed(second["tls"]), "the second connection of the walk offers the session of the first"
+    assert [len(c["http1"]) for c in snapshot["connections"]] == [1, 1, 1]
+    wire = {"connections": [{"alpn": c["alpn"], "tls": c["tls"], "http1": [{k: r[k] for k in ("request_line", "headers", "body_length")} for r in c["http1"]]}
+                            for c in snapshot["connections"]], "quic": []}
+    folded = ab.fold_wire(ab.Normalizer().walk(wire))
+    assert len(folded["resumed_connections"]) == 1 and len(folded["connections"]) == 1, "one fresh fingerprint and one resumed one, as the oracle folds them"
+    with wc.WireServer(alpn=("http/1.1",), dns_names=("wire.test",)) as keep_alive:
+        answer, _held, ended = _http1_round(keep_alive, _client_context(), watch_end=True)
+        assert b"Connection: close" not in answer and not ended, "without the option the connection stays open"
+
+
+def test_the_lab_ends_the_connections_of_its_http1_site_and_only_those():
+    with ab.Lab(wire=True, host="127.0.0.1") as lab:
+        assert lab.h1.close_after_response is True
+        assert lab.h2.close_after_response is False and lab.h3.close_after_response is False
+
+
+def test_the_evidence_of_a_seed_keeps_the_requests_of_the_journey_with_their_connection_and_referer_and_the_connections_of_the_https_site_with_their_moment_and_resumption():
+    from fakeweb import journey_site
+
+    with ab.Lab(journey=True, wire=True, host="127.0.0.1") as lab:
+        journey_site.STATE.set_step(15)
+        port_a = int(lab.origin_a.rsplit(":", 1)[1])
+        sock, code = _socks_connect(lab.gateway.port, "127.0.0.1", port_a)
+        assert code == 0
+        sock.sendall(b"GET /release?id=lpabc123 HTTP/1.1\r\nHost: journey-a.test:%d\r\nReferer: http://journey-a.test:%d/account\r\n\r\n" % (port_a, port_a))
+        _read_response(sock, b"ok")
+        sock.close()
+        lab.rec.set_phase("https.h1.v1")
+        context = _client_context()
+        _answer, held, _ended = _http1_round(lab.h1, context)
+        _http1_round(lab.h1, context, session=held)
+        evidence = ab.wire_evidence(lab)
+    (request,) = evidence["journey"]
+    assert request["phase"] == "journey.15" and request["connection"] == 0 and isinstance(request["t"], float)
+    assert request["request"] == "GET A/release?id=lp<TOK>" and request["referer"] == "http://journey-a.test:A/account"
+    first, second = evidence["https"]["h1"]
+    assert (first["resumed"], second["resumed"]) == (False, True) and first["phase"] == second["phase"] == "https.h1.v1"
+    assert first["requests"][0]["request"] == "GET /wire.css HTTP/1.1" and second["t"] >= first["t"]
+    assert evidence["https"]["h2"] == []
+    json.dumps(evidence)
+
+
+def test_a_run_writes_what_each_seed_saw_request_by_request_outside_the_leaves_that_are_compared(tmp_path, monkeypatch):
+    import _lab_egress
+    import ci_crash_evidence as crash
+
+    def walk_seed(binary, seed, with_idle, patch):
+        ab.EVIDENCE[str(seed)] = {"journey": [{"t": 1.5, "connection": 3, "phase": "journey.15", "request": "GET A/release?id=lp<TOK>", "referer": "http://journey-a.test:A/"}], "https": {}}
+        return {"journey": {}}
+
+    monkeypatch.setattr(ab, "walk_seed", walk_seed)
+    monkeypatch.setattr(_lab_egress, "install", lambda patch, work: None)
+    monkeypatch.setenv(crash.CRASH_DIR_ENV, str(tmp_path / "t.crash"))
+    try:
+        assert ab.run("/e/firefox", "firefox-68", (11, 12), tmp_path / "t.json") == 0
+    finally:
+        crash.stop_probe()
+    document = json.loads((tmp_path / "t.json").read_text(encoding="utf-8"))
+    assert document["evidence"]["format"] == ab.EVIDENCE_FORMAT and sorted(document["evidence"]["seeds"]) == ["11", "12"]
+    assert document["evidence"]["seeds"]["11"]["journey"][0]["connection"] == 3
+    other = json.loads(json.dumps(document))
+    other["evidence"]["seeds"]["11"]["journey"][0]["t"] = 99.0
+    assert compare(document, other)["differences"] == [] and compare(document, other)["leaves"] == compare(document, document)["leaves"], "evidence is never compared"
+
+
 def _socks_connect(proxy_port: int, host: str, port: int):
     """A SOCKS5 CONNECT by address, no authentication: ``(socket, reply code)``."""
     sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=60)
@@ -1539,3 +1683,100 @@ def test_a_candidate_that_differs_from_a_sound_control_is_red_and_the_a_a_alone_
     args[2] = str(tmp_path / "aa")
     assert ab.main(args) == 0 and [c[2] for c in calls] == ["firefox-68", "firefox-68-again"]
     assert ab.main(_ab_args(tmp_path)) == 2, "neither a candidate nor --a-a: nothing to run"
+
+
+# ----------------------------------------------------------------------------------------------------------------- how each launch's parent ended
+def exits_of(*codes, platform=None):
+    """The `exits` a run writes (scripts/ci_crash_evidence.py): one launch per code, named as the oracle names its launches."""
+    names = [("main", 11), ("idle-c1", 11), ("idle-c2", 11), ("exit-pings", 11), ("main", 12)]
+    return {"format": "launch-exits/1", "launches": [{"n": n + 1, "label": {"seed": names[n][1], "launch": names[n][0]}, "pid": 100 + n, "returncode": code}
+                                                     for n, code in enumerate(codes)]}
+
+
+def test_a_transcript_whose_launches_all_ended_with_0_is_green_with_or_without_the_record():
+    a, b = transcript("a"), transcript("b")
+    a["exits"], b["exits"] = exits_of(0, 0, 0, 0, 0), exits_of(0, 0, 0, 0, 0)
+    assert compare(a, b)["verdict"] == "green" and compare(a, transcript("b"))["verdict"] == "green"
+    assert "exits" not in ab.flatten(a["seeds"]) and not any(p.startswith("exits") for p in ab.flatten(a))
+
+
+def test_a_launch_that_died_is_red_and_names_the_side_the_seed_the_launch_and_the_code_on_either_side():
+    a, b = transcript("firefox-68"), transcript("firefox-68-again")
+    a["exits"], b["exits"] = exits_of(0, 0, 0, 0, 0), exits_of(0, 0, -11, 0, 0)
+    b["platform"] = "linux"
+    report = compare(a, b)
+    assert report["verdict"] == "red" and report["differences"] == [], "the leaves are equal: the launch is what is red"
+    [line] = report["problems"]
+    for part in ("code -11 (SIGSEGV)", "run firefox-68-again", "side B", "seed 11", "launch idle-c2"):
+        assert part in line, part
+    swapped = compare(b, a)
+    assert "side A" in swapped["problems"][0] and "run firefox-68-again" in swapped["problems"][0]
+    windows = transcript("candidate")
+    windows["platform"] = "win32"
+    windows["exits"] = exits_of(3221225477)
+    assert "0xC0000005 (access violation)" in compare(transcript("firefox-68"), windows)["problems"][0]
+
+
+def test_a_run_that_recorded_no_launch_is_red_because_its_probe_did_not_see_a_browser():
+    a, b = transcript("a"), transcript("b")
+    a["exits"], b["exits"] = exits_of(0), {"format": "launch-exits/1", "launches": []}
+    report = compare(a, b)
+    assert report["verdict"] == "red" and "recorded no launch (side B)" in report["problems"][0]
+
+
+def test_the_run_writes_how_every_launch_ended_into_the_transcript_and_prints_the_one_that_died(tmp_path, monkeypatch, capsys):
+    import os
+
+    import ci_crash_evidence as crash
+    import _lab_egress
+
+    def walk_seed(binary, seed, with_idle, patch):
+        for code, launch in ((0, "main"), (-11, "idle-c1")) if with_idle else ((0, "main"),):
+            crash.mark(seed=seed, launch=launch)
+            from invisible_core.juggler.connection import Connection
+
+            class Process:
+                pid = 4242
+
+                def poll(self):
+                    return code
+
+                def terminate(self):
+                    pass
+
+            to_r, to_w = os.pipe()
+            from_r, from_w = os.pipe()
+            conn = Connection(to_w, from_r, Process())
+            conn.close()
+            os.close(from_w)
+            os.close(to_r)
+        return {"journey": {}}
+
+    monkeypatch.setattr(ab, "walk_seed", walk_seed)
+    monkeypatch.setattr(_lab_egress, "install", lambda patch, work: None)
+    monkeypatch.setenv(crash.CRASH_DIR_ENV, str(tmp_path / "t.crash"))
+    try:
+        assert ab.run("/e/firefox", "firefox-68", (11, 12), tmp_path / "t.json") == 0
+    finally:
+        crash.stop_probe()
+    document = json.loads((tmp_path / "t.json").read_text(encoding="utf-8"))
+    assert [(x["label"]["seed"], x["label"]["launch"], x["returncode"]) for x in document["exits"]["launches"]] == [(11, "main", 0), (11, "idle-c1", -11), (12, "main", 0)]
+    assert "EXIT the parent process exited with code" in capsys.readouterr().out
+    assert (tmp_path / "t.crash" / "exits.json").is_file() and (tmp_path / "t.crash" / "02-11-idle-c1" / "crash.json").is_file()
+    other = transcript("firefox-68-again")
+    other["exits"] = exits_of(0, 0, 0)
+    document["platform"] = "linux"
+    assert compare(document, other)["verdict"] == "red"
+
+
+def test_the_engine_run_is_given_a_folder_for_what_a_launch_that_died_leaves_beside_its_transcript(tmp_path, monkeypatch):
+    import ci_crash_evidence as crash
+
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append(env.get(crash.CRASH_DIR_ENV)) or Done())
+    assert ab.run_engine("ff", None, "firefox-68-again", (0,), tmp_path / "out" / "transcript-68-again.json") == 0
+    assert seen == [str(tmp_path / "out" / "transcript-68-again.crash")]

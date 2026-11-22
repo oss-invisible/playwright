@@ -23,11 +23,14 @@ RUNS_PYTEST = {
     "e2e.yml#network-windows": "      - name: Run the network oracle's A/A\n",
     "e2e.yml#host": "      - name: Run the host oracle's A/A\n",
     "e2e.yml#host-windows": "      - name: Run the host oracle's A/A\n",
+    "e2e.yml#page": "      - name: Run the page oracle's A/A\n",
+    "e2e.yml#page-windows": "      - name: Run the page oracle's A/A\n",
 }
 
 
 JOBS = {"e2e.yml": "e2e", "e2e.yml#windows": "e2e-windows", "e2e.yml#control-a": "e2e-windows-control-a", "e2e.yml#network": "e2e-network",
-        "e2e.yml#network-windows": "e2e-network-windows", "e2e.yml#host": "e2e-host", "e2e.yml#host-windows": "e2e-host-windows"}
+        "e2e.yml#network-windows": "e2e-network-windows", "e2e.yml#host": "e2e-host", "e2e.yml#host-windows": "e2e-host-windows",
+        "e2e.yml#page": "e2e-page", "e2e.yml#page-windows": "e2e-page-windows"}
 
 
 def _scope(name):

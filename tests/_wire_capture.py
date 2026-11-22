@@ -363,9 +363,10 @@ class Http1Parser:
 
 
 def serve_http1(sock: Any, responder: Callable[[Dict[str, Any]], Tuple[int, List[Tuple[str, str]], bytes]],
-                on_request: Callable[[Dict[str, Any]], None], alt_svc: Optional[str] = None) -> None:
+                on_request: Callable[[Dict[str, Any]], None], alt_svc: Optional[str] = None, close_after_response: bool = False) -> None:
     """Serve the requests of a connection (a TLS socket, or a plain one) until the peer closes: each request is handed to ``on_request`` and answered by
-    ``responder(request) -> (status, headers, body)``."""
+    ``responder(request) -> (status, headers, body)``. With ``close_after_response`` the answer says ``Connection: close`` and the connection ends after it: the client
+    needs a new connection for its next request, and by then it has read the session ticket the server sent with the first answer."""
     parser = Http1Parser()
     while True:
         data = sock.recv(65536)
@@ -377,9 +378,13 @@ def serve_http1(sock: Any, responder: Callable[[Dict[str, Any]], Tuple[int, List
             if alt_svc:
                 headers = list(headers) + [("alt-svc", alt_svc)]
             lines = ["HTTP/1.1 %d %s" % (status, "OK" if status == 200 else "Status")]
-            lines += ["%s: %s" % (n, v) for n, v in headers if n.lower() != "content-length"]
+            lines += ["%s: %s" % (n, v) for n, v in headers if n.lower() not in ("content-length", "connection")]
             lines.append("Content-Length: %d" % len(body))
+            if close_after_response:
+                lines.append("Connection: close")
             sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
+            if close_after_response:
+                return
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------- HTTP/2
@@ -635,11 +640,14 @@ class WireServer:
 
     def __init__(self, address: str = "127.0.0.1", *, alpn: Tuple[str, ...] = ("h2", "http/1.1"), h3: bool = False,
                  responder: Callable[[Dict[str, Any]], Tuple[int, List[Tuple[str, str]], bytes]] = default_responder,
-                 phase: Callable[[], str] = lambda: "-", dns_names: Tuple[str, ...] = ("wire.test",)) -> None:
+                 phase: Callable[[], str] = lambda: "-", dns_names: Tuple[str, ...] = ("wire.test",), close_after_response: bool = False) -> None:
         from _doh_servers import make_certificate
         from _ports import bind_tcp_and_hold_udp
 
         self.address, self.alpn, self.responder, self.phase = address, tuple(alpn), responder, phase
+        #: HTTP/1.1 only: every answer says ``Connection: close`` and ends its connection (see :func:`serve_http1`).
+        self.close_after_response = close_after_response
+        self._t0 = time.monotonic()
         self.connections: List[Dict[str, Any]] = []
         self.quic: List[Dict[str, Any]] = []
         self.refused: List[str] = []
@@ -668,7 +676,7 @@ class WireServer:
 
     # --- TCP ------------------------------------------------------------------------------------------------------------------------------
     def _connection(self, sock: socket.socket) -> None:
-        record: Dict[str, Any] = {"phase": self.phase(), "tls": None, "alpn": None}
+        record: Dict[str, Any] = {"phase": self.phase(), "tls": None, "alpn": None, "t": self._now()}
         with self._lock:
             record["id"] = len(self.connections)
             self.connections.append(record)
@@ -683,7 +691,7 @@ class WireServer:
                 connection.serve(tls)
             else:
                 record["http1"] = []
-                serve_http1(tls, self.responder, lambda r: record["http1"].append(dict(r, phase=self.phase())), self.alt_svc)
+                serve_http1(tls, self.responder, lambda r: record["http1"].append(dict(r, phase=self.phase(), t=self._now())), self.alt_svc, self.close_after_response)
         except (ssl.SSLError, OSError, ConnectionError, NotAClientHello, TimeoutError) as exc:
             record["error"] = "%s: %s" % (type(exc).__name__, exc)
         finally:
@@ -693,6 +701,10 @@ class WireServer:
                         s.close()
                 except OSError:
                     pass
+
+    def _now(self) -> float:
+        """Seconds since the server started: when a connection or a request arrived (evidence for a run that differs from itself; never compared)."""
+        return round(time.monotonic() - self._t0, 3)
 
     # --- QUIC -----------------------------------------------------------------------------------------------------------------------------
     def _start_quic(self, certificate: Path, key: Path) -> None:
@@ -773,7 +785,7 @@ class WireServer:
             quic = list(self.quic)
         out: List[Dict[str, Any]] = []
         for c in connections:
-            item = {"id": c["id"], "phase": c["phase"], "tls": c["tls"], "alpn": c["alpn"]}
+            item = {"id": c["id"], "phase": c["phase"], "tls": c["tls"], "alpn": c["alpn"], "t": c.get("t")}
             if "h2" in c:
                 item["h2"] = c["h2"].summary()
             if "http1" in c:
