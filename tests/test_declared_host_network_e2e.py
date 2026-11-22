@@ -25,11 +25,16 @@ retail and died with no usable interface. Hermetic: a local TCP-only SOCKS5 prox
 """
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import statistics
+import time
 
 import pytest
 
 from _e2e_verdicts import MDNS_RETRY_MS, opened_at_the_retry_problem
+from _evidence_with_files import FailureEvidenceWithFiles
 from test_webrtc_realness import _e2e_binary, _launch, candidates, decode_priority, host_candidates, is_mdns  # noqa: F401
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
@@ -64,24 +69,45 @@ _GATHER_JS = r"""async () => {
 }"""
 
 # Two connections on one page, connected to each other in script (the loopback test many demos use).
+# ``events`` is the page's own timeline for the failure evidence (``at``: ``performance.now()`` since the start of the script, ``origin``:
+# ``performance.timeOrigin``, so the wall clock of an event is ``origin + at``): every ``icecandidate`` of both connections with the candidate string,
+# every state change, when each ``addIceCandidate`` was called and when it settled. It only listens: nothing waits on it.
 _LOOPBACK_JS = r"""async () => {
   const t0 = performance.now();
+  const events = [];
+  const at = (what, extra) => { events.push(Object.assign({at: Math.round((performance.now() - t0) * 10) / 10, what}, extra || {})); };
   const pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection();
-  pc1.onicecandidate = e => { if (e.candidate) pc2.addIceCandidate(e.candidate).catch(() => {}); };
-  pc2.onicecandidate = e => { if (e.candidate) pc1.addIceCandidate(e.candidate).catch(() => {}); };
+  for (const [name, pc] of [['pc1', pc1], ['pc2', pc2]]) {
+    pc.addEventListener('icecandidate', e => at('icecandidate', {pc: name, candidate: e.candidate ? e.candidate.candidate : null}));
+    pc.addEventListener('iceconnectionstatechange', () => at('iceconnectionstatechange', {pc: name, state: pc.iceConnectionState}));
+    pc.addEventListener('connectionstatechange', () => at('connectionstatechange', {pc: name, state: pc.connectionState}));
+    pc.addEventListener('icegatheringstatechange', () => at('icegatheringstatechange', {pc: name, state: pc.iceGatheringState}));
+    pc.addEventListener('signalingstatechange', () => at('signalingstatechange', {pc: name, state: pc.signalingState}));
+  }
+  const add = (target, targetName, candidate) => {
+    at('addIceCandidate called', {to: targetName, candidate: candidate.candidate});
+    return target.addIceCandidate(candidate).then(
+      () => at('addIceCandidate resolved', {to: targetName, candidate: candidate.candidate}),
+      err => at('addIceCandidate rejected', {to: targetName, candidate: candidate.candidate, error: String(err)}));
+  };
+  pc1.onicecandidate = e => { if (e.candidate) add(pc2, 'pc2', e.candidate); };
+  pc2.onicecandidate = e => { if (e.candidate) add(pc1, 'pc1', e.candidate); };
   const gathered = {pc1: [], pc2: []};
   const keep = (name, e) => { if (e.candidate && e.candidate.candidate) gathered[name].push(e.candidate.candidate); };
   pc1.addEventListener('icecandidate', e => keep('pc1', e));
   pc2.addEventListener('icecandidate', e => keep('pc2', e));
   const dc = pc1.createDataChannel('x');
   let opened = null, echoed = false;
-  dc.onopen = () => { opened = Math.round(performance.now() - t0); dc.send('ping'); };
-  pc2.ondatachannel = ev => { ev.channel.onmessage = m => ev.channel.send('pong:' + m.data); };
-  dc.onmessage = m => { echoed = (m.data === 'pong:ping'); };
+  dc.onopen = () => { opened = Math.round(performance.now() - t0); at('datachannel open'); dc.send('ping'); };
+  pc2.ondatachannel = ev => { at('datachannel announced on pc2'); ev.channel.onmessage = m => ev.channel.send('pong:' + m.data); };
+  dc.onmessage = m => { echoed = (m.data === 'pong:ping'); at('datachannel echo', {echoed}); };
   await pc1.setLocalDescription(await pc1.createOffer());
+  at('pc1 local description set');
   await pc2.setRemoteDescription(pc1.localDescription);
   await pc2.setLocalDescription(await pc2.createAnswer());
+  at('pc2 local description set');
   await pc1.setRemoteDescription(pc2.localDescription);
+  at('pc1 remote description set');
   // Until the channel has opened and echoed, for 30 s (the deadline of the wait). The loop also keeps the longest time it did not run: a page that
   // was stopped by the machine says so, and the time the connection took is not judged then (`_e2e_verdicts.opened_at_the_retry_problem`).
   const deadline = performance.now() + 30000;
@@ -92,13 +118,20 @@ _LOOPBACK_JS = r"""async () => {
     stalled = Math.max(stalled, now - last);
     last = now;
   }
+  at('wait over', {opened, echoed});
   // The road the connection took, read from the browser's own statistics: the nominated pair, and the protocol of each end.
   let pair = null;
+  const pairs = [];
   try {
     const stats = await pc1.getStats();
     const byId = {};
     stats.forEach(r => { byId[r.id] = r; });
     stats.forEach(r => {
+      if (r.type === 'candidate-pair') {
+        const l = byId[r.localCandidateId] || {}, rm = byId[r.remoteCandidateId] || {};
+        pairs.push({state: r.state, nominated: r.nominated, local: [l.protocol, l.candidateType, l.address, l.port],
+                    remote: [rm.protocol, rm.candidateType, rm.address, rm.port], requestsSent: r.requestsSent, responsesReceived: r.responsesReceived});
+      }
       if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || !pair)) {
         const l = byId[r.localCandidateId] || {}, rm = byId[r.remoteCandidateId] || {};
         pair = {local: l.protocol, remote: rm.protocol, localType: l.candidateType, remoteType: rm.candidateType,
@@ -107,7 +140,7 @@ _LOOPBACK_JS = r"""async () => {
     });
   } catch (e) {}
   pc1.close(); pc2.close();
-  return {opened, echoed, pair, gathered, stalled: Math.round(stalled)};
+  return {opened, echoed, pair, gathered, stalled: Math.round(stalled), events, pairs, origin: performance.timeOrigin, started_at: Math.round(t0 * 10) / 10};
 }"""
 
 # Retail 159 on Windows, 12 cold launches (``captures/mdns-loopback/retail-159-win-12``): 37-52 ms in ten of twelve, two
@@ -117,14 +150,28 @@ _LOOPBACK_JS = r"""async () => {
 # the machine. What the test judges is the ROAD, which the machine cannot change (see the test), and a ceiling under the
 # first retry of the mDNS responder (3 s), which no machine is slow enough to reach by being slow.
 RETAIL_MEDIAN_WINDOW_MS = (30, 55)       # printed beside the measure, for the reader
+# What the engine logs for the failure evidence of the loopback test, by its own names (MOZ_LOG; the file is MOZ_LOG_FILE, one per process and
+# per launch). ``mdns_service::*`` is the Rust crate of the mDNS responder (dom/media/webrtc/transport/mdns_service/src/lib.rs, crate ``mdns_service``,
+# which logs with the ``log`` macros at the crate root, so the module path is ``mdns_service``): a Rust module reaches MOZ_LOG only by a name that
+# contains ``::`` (xpcom/base/Logging.cpp, ``LogModule::SetLevel`` calls ``set_rust_log_level`` only then). ``mtransport`` is the module of nICEr's own
+# log and of the transport layers (``MOZ_MTLOG_MODULE("mtransport")``, dom/media/webrtc/transport/nricectx.cpp:100, nriceresolver.cpp:67 ...), ML_DEBUG is level 5.
+# The engine's ``log`` crate is built with ``release_max_level_info`` (toolkit/library/rust/shared/Cargo.toml:41): a release engine keeps the info, warn and
+# error lines of the responder (the ``warn!`` of a failed send, a bad packet, an interface it could not use), not its ``trace!`` lines (questions, answers,
+# registrations). ``timestamp`` writes the wall clock (UTC) on each line, ``sync`` writes each line at once, ``rotate:30`` keeps at most 30 MB per process.
+MDNS_MOZ_LOG = "timestamp,sync,rotate:30,mdns_service::*:5,mtransport:5"
 
 
-def _session(declaration, socks, page_url, monkeypatch, seed, script):
-    """One proxied launch with the declaration in the environment; runs ``script`` on the page and returns the result."""
+def _session(declaration, socks, page_url, monkeypatch, seed, script, engine_log=None):
+    """One proxied launch with the declaration in the environment; runs ``script`` on the page and returns the result.
+    ``engine_log``: a folder where the engine writes its own log of this launch (failure evidence, ``MDNS_MOZ_LOG``)."""
     binary = _e2e_binary()
     if not binary:
         pytest.skip("no patched binary (set STEALTHFOX_E2E_BINARY)")
     monkeypatch.setenv(NETWORK_ENV, declaration)
+    if engine_log is not None:
+        os.makedirs(engine_log, exist_ok=True)
+        monkeypatch.setenv("MOZ_LOG", MDNS_MOZ_LOG)
+        monkeypatch.setenv("MOZ_LOG_FILE", os.path.join(engine_log, "engine-%PID.log"))
     prefs = {"network.proxy.allow_hijacking_localhost": True, "network.proxy.no_proxies_on": ""}
     proxy = {"server": "socks5://127.0.0.1:%d" % socks.port}
     with _launch(binary_path=binary, proxy=proxy, extra_prefs=prefs, seed=seed) as browser:
@@ -231,29 +278,48 @@ def test_two_connections_on_one_page_connect_in_the_time_of_retail(local_https_p
     The time itself is printed with the retail window beside it: a fast machine shows 30-55 ms, a runner shows more, and
     neither is a verdict (an absolute time failed on both GitHub runners with a healthy engine)."""
     runs = []
-    for n in range(5):
-        res = _session(V4_ONLY, socks5_tcp_only, local_https_page, monkeypatch, 100 + n,
-                       lambda page: page.evaluate(_LOOPBACK_JS))
-        assert res["echoed"] and res["opened"] is not None, "run %d: the data channel did not open: %r" % (n, res)
-        runs.append(res)
-        for side in ("pc1", "pc2"):
-            hosts = [c for c in res["gathered"][side] if " typ host" in c]
-            udp = [c for c in hosts if " UDP " in c.upper() or " udp " in c]
-            assert udp, "run %d: %s gathered no UDP host candidate (the road without UDP): %r" % (n, side, res["gathered"][side])
-            assert any(c.split()[4].endswith(".local") for c in udp), (
-                "run %d: %s has no mDNS name among its UDP host candidates: %r" % (n, side, udp))
-        pair = res["pair"]
-        assert pair, "run %d: the browser reports no nominated pair: %r" % (n, res)
-        assert pair["local"] == "udp" and pair["remote"] == "udp", (
-            "run %d: the connection did not take UDP at both ends (the road through TCP): %r" % (n, pair))
-        # DIRECT and local: each end is a host candidate, or a peer-reflexive one. The remote end is prflx when the other connection's mDNS
-        # name was not resolved yet and its connectivity check arrived first: the address the check came from is learned as prflx, and
-        # that is the same road. What it must never be is a relay or a server-reflexive candidate (a road through the proxy or the
-        # network), and never TCP (checked above).
-        assert pair["localType"] in ("host", "prflx") and pair["remoteType"] in ("host", "prflx"), (
-            "run %d: the pair is not direct and local (a relay or a server-reflexive road): %r" % (n, pair))
-        problem = opened_at_the_retry_problem(res["opened"], res["stalled"], MDNS_RETRY_MS)
-        assert problem is None, "run %d: %s" % (n, problem)
+    launches = []
+    # Failure evidence (tests/_evidence_with_files.py): per launch, the engine's own log (the mDNS responder and mtransport), kept only for the launch that
+    # fails; and ``launches.json``, the timings and the page's timeline of EVERY launch up to it (the loop stops at the first red).
+    with FailureEvidenceWithFiles("declared-host-two-connections-open-in-time") as evidence:
+        try:
+            for n in range(5):
+                log_dir = evidence.files / ("engine-log-run-%d" % n)
+                launch = {"run": n, "seed": 100 + n, "moz_log": MDNS_MOZ_LOG, "started_m": round(time.perf_counter(), 6),
+                          "started_t": round(time.time(), 4)}
+                launches.append(launch)
+                try:
+                    res = _session(V4_ONLY, socks5_tcp_only, local_https_page, monkeypatch, 100 + n,
+                                   lambda page: page.evaluate(_LOOPBACK_JS), engine_log=str(log_dir))
+                finally:
+                    launch.update(returned_m=round(time.perf_counter(), 6), returned_t=round(time.time(), 4))
+                page_timeline = {key: res.pop(key, None) for key in ("events", "pairs", "origin", "started_at")}
+                launch.update(opened=res["opened"], echoed=res["echoed"], stalled=res["stalled"], pair=res["pair"], gathered=res["gathered"],
+                              page=page_timeline)
+                assert res["echoed"] and res["opened"] is not None, "run %d: the data channel did not open: %r" % (n, res)
+                runs.append(res)
+                for side in ("pc1", "pc2"):
+                    hosts = [c for c in res["gathered"][side] if " typ host" in c]
+                    udp = [c for c in hosts if " UDP " in c.upper() or " udp " in c]
+                    assert udp, "run %d: %s gathered no UDP host candidate (the road without UDP): %r" % (n, side, res["gathered"][side])
+                    assert any(c.split()[4].endswith(".local") for c in udp), (
+                        "run %d: %s has no mDNS name among its UDP host candidates: %r" % (n, side, udp))
+                pair = res["pair"]
+                assert pair, "run %d: the browser reports no nominated pair: %r" % (n, res)
+                assert pair["local"] == "udp" and pair["remote"] == "udp", (
+                    "run %d: the connection did not take UDP at both ends (the road through TCP): %r" % (n, pair))
+                # DIRECT and local: each end is a host candidate, or a peer-reflexive one. The remote end is prflx when the other connection's mDNS
+                # name was not resolved yet and its connectivity check arrived first: the address the check came from is learned as prflx, and
+                # that is the same road. What it must never be is a relay or a server-reflexive candidate (a road through the proxy or the
+                # network), and never TCP (checked above).
+                assert pair["localType"] in ("host", "prflx") and pair["remoteType"] in ("host", "prflx"), (
+                    "run %d: the pair is not direct and local (a relay or a server-reflexive road): %r" % (n, pair))
+                problem = opened_at_the_retry_problem(res["opened"], res["stalled"], MDNS_RETRY_MS)
+                assert problem is None, "run %d: %s" % (n, problem)
+                # This launch is right: its engine log is no evidence of anything.
+                shutil.rmtree(log_dir, ignore_errors=True)
+        finally:
+            (evidence.files / "launches.json").write_text(json.dumps(launches, indent=1, default=str), encoding="utf-8")
     times = sorted(r["opened"] for r in runs)
     low, high = RETAIL_MEDIAN_WINDOW_MS
     with capsys.disabled():
