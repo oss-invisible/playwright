@@ -629,12 +629,12 @@ def _job(text, name):
 def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
-    legs = {name: _job(text, name) for name in ("e2e", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows")}
+    legs = {name: _job(text, name) for name in ("e2e-linux", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows")}
     step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
             "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
             '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
-    assert [name for name, body in legs.items() if step in body] == ["e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"], "the jobs that run the oracles' tests, and only those"
-    for name in ("e2e", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"):
+    assert [name for name, body in legs.items() if step in body] == ["e2e-linux", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"], "the jobs that run the oracles' tests, and only those"
+    for name in ("e2e-linux", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"):
         assert legs[name].index("actions/setup-python") < legs[name].index(step) < legs[name].index("Fetch the published firefox binary")
     assert text.count("run: python scripts/ci_ab_pr_seeds.py") == 8 and "uses:" not in step
     for variable, source in (("AB_ORACLE_PR_SEEDS", "test_ab_oracle_e2e.py"), ("AB_NETWORK_PR_SEEDS", "test_ab_network_e2e.py"), ("AB_HOST_PR_SEEDS", "test_ab_host_e2e.py")):
@@ -652,11 +652,11 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
         assert body.count(network) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 40" in body and "needs: core-on-index" in body
         assert "      - name: Run the network oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
     assert "xvfb-run -a" in linux
-    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
-    assert "OWN_JOB_FILES: " + network in shared_linux and "$ROOT_FILES $SANDBOX_FILES $OWN_JOB_FILES" in shared_linux
+    shared_linux, shared_windows = _job(text, "e2e-linux"), _job(text, "e2e-windows")
     host_file = "tests/test_ab_host_e2e.py"
     page_file = "tests/test_ab_oracle_e2e.py"
-    assert "OWN_JOB_FILES: %s %s %s" % (network, host_file, page_file) in shared_linux
+    # The Linux parts take their files from the rows wrapper.e2e.suite.linux.N, as the Windows parts do from theirs (below).
+    assert 'wrapper.e2e.suite.linux.${{ matrix.part }}' in shared_linux
     # The Windows parts take their files from the rows wrapper.e2e.suite.windows.N of ci/required-suites.json (one partition with the candidate's
     # gate); the oracles' files are in none of those rows (tests/test_the_e2e_suite_is_accounted_for.py names them as excluded: their own jobs).
     assert 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
@@ -712,8 +712,8 @@ def test_the_recorders_own_test_runs_in_the_host_job_after_the_a_a_and_is_left_o
     step = host_job[host_job.index("      - name: The host oracle's recorder"):host_job.index("      - name: The leg ran with the pinned GeoIP database")]
     assert step.count(crash_file) == 1 and "if: success() || failure()" in step and "xvfb-run -a" in step and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in step
     assert "host-crash-e2e.xml" in host_job.split("Upload what the test saved")[1]
-    shared = _job(text, "e2e")
-    assert crash_file not in _job(text, "e2e-host-windows") and crash_file in shared.split("OWN_JOB_FILES: ")[1].splitlines()[0]
+    shared = _job(text, "e2e-linux")
+    assert crash_file not in _job(text, "e2e-host-windows") and crash_file not in shared and 'wrapper.e2e.suite.linux.${{ matrix.part }}' in shared
     rows = {r["id"]: r for r in json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))}
     row = rows["wrapper.e2e.ab_host_crash"]
     assert row["os"] == ["linux"] and row["linux_only"].strip() and row["tests"] == [crash_file] and row["min_tests"] == 1 and row["exact"] is True and row["marker"] == "e2e"
@@ -733,8 +733,8 @@ def test_the_page_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs
         assert "AB_ORACLE_SEED_SET" not in body, "the A/A of a pull request, not a shard of the final seeds (those have their own jobs)"
         assert "      - name: Run the page oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
     assert "xvfb-run -a" in linux
-    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
-    assert page in shared_linux.split("OWN_JOB_FILES: ")[1].splitlines()[0] and 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
+    shared_linux, shared_windows = _job(text, "e2e-linux"), _job(text, "e2e-windows")
+    assert page not in shared_linux and 'wrapper.e2e.suite.linux.${{ matrix.part }}' in shared_linux and 'wrapper.e2e.suite.windows.${{ matrix.part }}' in shared_windows
     import json
 
     rows = json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))
@@ -1045,7 +1045,7 @@ def test_the_final_set_has_jobs_of_its_own_in_four_shards_on_each_system_and_the
         assert "skipped\": 0" in body and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in body, "one test, passed: a skipped one is red"
         assert "matrix.shard" in body.split("name: invpw-evidence-page-final", 1)[1].split("path:", 1)[0], "four shards, four artifact names"
     assert "scripts/ci_ab_oracle.py touched" in touched and "pull_request" in touched and "outputs:" in touched
-    shared_linux, shared_windows = _job(text, "e2e"), _job(text, "e2e-windows")
+    shared_linux, shared_windows = _job(text, "e2e-linux"), _job(text, "e2e-windows")
     assert "AB_ORACLE_SEED_SET" not in shared_linux + shared_windows + _job(text, "e2e-windows-control-a"), "the shared jobs run the candidate set and do not grow"
 
 
