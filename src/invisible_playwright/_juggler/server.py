@@ -462,6 +462,19 @@ _CALL = "(f, ...a) => f(...a)"
 _READ = "o => o"
 #: The receivers of `eval_on_selector_all`: one array, in the caller's world.
 _ARRAY = "(...a) => a"
+#: The queries of a selector with an ELEMENT as root, which the core's `InjectedScript.query_selector` and `query_selector_all` cannot be asked (they pass `document`):
+#: the injected script's own `querySelector(parsed, root, strict)` and `querySelectorAll(parsed, root)`, the ones stock runs with `scope || document`
+#: (`FrameSelectors.query`, `queryAll`). The list of a `querySelectorAll` is read by its length and its places, and released by the caller.
+_QUERY_IN = ("(injected, root, selector, strict) => injected.querySelector("
+             "injected.parseSelector(selector), root, strict) || null")
+_QUERY_ALL_IN = ("(injected, root, selector) => injected.querySelectorAll("
+                 "injected.parseSelector(selector), root)")
+_LENGTH = "(injected, list) => list.length"
+_PLACE = "(injected, list, i) => list[i]"
+#: Playwright's own sentence for a node that is no longer in the document (`throwElementIsNotAttached`).
+_NOT_ATTACHED = "Element is not attached to the DOM"
+#: The waits between the turns of an action that retries, in seconds (`ElementHandle._retryAction`: 0, 20, 100, 100, then 500 ms for every turn after).
+_RETRY_WAITS = (0.0, 0.02, 0.1, 0.1, 0.5)
 
 
 def _object_lookup(dispatcher):
@@ -636,6 +649,26 @@ class ElementHandleDispatcher(Dispatcher):
         "uncheck": "op_uncheck",
         "selectOption": "op_select_option",
         "setInputFiles": "op_set_input_files",
+        # What the client sends a handle and this table lacked, each through the
+        # path its sibling has: the Frame's queries with this element as root,
+        # the injected script's state of THIS node, the actions of THIS node,
+        # the caller's code with this element as its receiver.
+        "querySelector": "op_query_selector",
+        "querySelectorAll": "op_query_selector_all",
+        "evalOnSelector": "op_eval_on_selector",
+        "evalOnSelectorAll": "op_eval_on_selector_all",
+        "evaluateExpressionHandle": "op_evaluate_handle",
+        "isVisible": "op_is_visible",
+        "isHidden": "op_is_hidden",
+        "isEnabled": "op_is_enabled",
+        "isDisabled": "op_is_disabled",
+        "isChecked": "op_is_checked",
+        "isEditable": "op_is_editable",
+        "waitForElementState": "op_wait_for_element_state",
+        "dblclick": "op_dblclick",
+        "tap": "op_tap",
+        "selectText": "op_select_text",
+        "dispatchEvent": "op_dispatch_event",
     }
 
     def __init__(self, server, frame: "FrameDispatcher", object_id: str,
@@ -772,6 +805,93 @@ class ElementHandleDispatcher(Dispatcher):
                 by_value=True, objects=_object_lookup(self))))}
         return {"value": _serialize(self.frame._call_on_elements(
             self.frame.frame_id, [self.object_id], params))}
+
+    def op_evaluate_handle(self, params: Dict) -> Any:
+        """`handle.evaluate_handle(fn, arg)`: `fn(element, arg)` in the
+        caller's world, as `op_evaluate`, and a HANDLE of what it returned
+        (`_handle_from_caller`, as the frame's `evaluate_handle`)."""
+        if self.world == "caller":
+            remote = _run_callers_code(
+                self.injected, self.frame.frame_id, params, [self.object_id],
+                by_value=False, objects=_object_lookup(self))
+        else:
+            remote = self.frame._call_on_elements(
+                self.frame.frame_id, [self.object_id], params, by_value=False)
+        return {"handle": self.frame._handle_from_caller(remote).channel}
+
+    # ── the queries and the state of THIS element ───────────────────────────
+    #
+    # ⛔ THE FRAME'S, WITH THE ELEMENT AS ROOT. A selector asked of a handle is
+    # looked for inside it (stock: `selectors.query(selector, options, this)`),
+    # which is the Frame's own query with a root: one definition of how a
+    # selector is resolved, entering frames included.
+    def op_query_selector(self, params: Dict) -> Any:
+        return self.frame._query_selector(params, root=self.object_id)
+
+    def op_query_selector_all(self, params: Dict) -> Any:
+        return self.frame._query_selector_all(params, root=self.object_id)
+
+    def op_eval_on_selector(self, params: Dict) -> Any:
+        return self.frame._eval_on_selector(params, root=self.object_id)
+
+    def op_eval_on_selector_all(self, params: Dict) -> Any:
+        return self.frame._eval_on_selector_all(params, root=self.object_id)
+
+    def _state(self, state: str, *, if_detached: Optional[bool] = None) -> bool:
+        """The state of THIS node, read once and not waited for (stock's
+        `Frame._elementState` with `:scope`). A node that is not in the
+        document has none: Playwright's own error, or `if_detached` for the
+        state that is only a "no" (`isVisible`)."""
+        try:
+            return self.injected.element_state(
+                self.frame.frame_id, self.object_id, state)
+        except EvaluationError as failure:
+            if "error:notconnected" not in str(failure):
+                raise
+            if if_detached is None:
+                raise ProtocolException(_NOT_ATTACHED) from failure
+            return if_detached
+
+    def op_is_visible(self, params: Dict) -> Any:
+        return {"value": self._state("visible", if_detached=False)}
+
+    def op_is_hidden(self, params: Dict) -> Any:
+        return {"value": not self._state("visible", if_detached=False)}
+
+    def op_is_enabled(self, params: Dict) -> Any:
+        return {"value": self._state("enabled")}
+
+    def op_is_disabled(self, params: Dict) -> Any:
+        return {"value": self._state("disabled")}
+
+    def op_is_checked(self, params: Dict) -> Any:
+        return {"value": self._state("checked")}
+
+    def op_is_editable(self, params: Dict) -> Any:
+        return {"value": self._state("editable")}
+
+    def op_wait_for_element_state(self, params: Dict) -> Any:
+        """Wait until THIS node is in `state`: the injected script's own
+        actionability check, asked again after 0, 20, 100, 100 and then 500 ms
+        (stock's `ElementHandle.waitForElementState` through `_retryAction`).
+        A node that left the document is not waited for: it never will be, and
+        stock says so at once."""
+        state = params["state"]
+        deadline = Deadline(self.frame._timeout(params))
+        turn = 0
+        while True:
+            verdict = self.injected.element_states(
+                self.frame.frame_id, self.object_id, [state])
+            if verdict.get("ok"):
+                return None
+            if verdict.get("missing") == "error:notconnected":
+                raise ProtocolException(_NOT_ATTACHED)
+            if deadline.passed():
+                raise TimeoutError(
+                    "Timeout %dms exceeded waiting for the element to be %s"
+                    % (round(deadline.seconds * 1000), state))
+            time.sleep(deadline.slice(_RETRY_WAITS[min(turn, len(_RETRY_WAITS) - 1)]))
+            turn += 1
 
     def op_text_content(self, params: Dict) -> Any:
         return {"value": self.injected.text_content(
@@ -975,6 +1095,30 @@ class ElementHandleDispatcher(Dispatcher):
     def op_hover(self, params: Dict) -> Any:
         self.frame.actions.hover(_HANDLE, position=self.frame._position(params),
                                  **self._act_args(params))
+        return None
+
+    def op_dblclick(self, params: Dict) -> Any:
+        pointer = self.frame._pointer(params)
+        # dblclick sets its own clickCount; the caller's is not a second one.
+        pointer.pop("clicks", None)
+        self.frame.actions.dblclick(
+            _HANDLE, position=self.frame._position(params), **pointer,
+            **self._act_args(params))
+        return None
+
+    def op_tap(self, params: Dict) -> Any:
+        self.frame.actions.tap(_HANDLE, position=self.frame._position(params),
+                               **self._act_args(params))
+        return None
+
+    def op_select_text(self, params: Dict) -> Any:
+        self.frame.actions.select_text(_HANDLE, **self._act_args(params))
+        return None
+
+    def op_dispatch_event(self, params: Dict) -> Any:
+        self.frame.actions.dispatch_event(
+            _HANDLE, params["type"], self.frame._event_init(params),
+            **self._act_args(params))
         return None
 
     def op_check(self, params: Dict) -> Any:
@@ -1248,13 +1392,63 @@ class FrameDispatcher(Dispatcher):
         return {"value": self.injected.content(self.frame_id)}
 
     def op_query_selector(self, params: Dict) -> Any:
-        frame_id, selector = self.enter_frames(params["selector"])
-        object_id = self.injected.query_selector(frame_id, selector)
+        return self._query_selector(params)
+
+    def _query_selector(self, params: Dict, root: Optional[str] = None) -> Any:
+        """`querySelector`, of the frame (`root` None: the document) or of an
+        element handle (`root`: its objectId, so the match is looked for
+        inside it, as stock's `FrameSelectors.query` with `scope`)."""
+        frame_id, selector = self._enter(params["selector"], root)
+        object_id = self._first(frame_id, selector, self._scope(frame_id, root),
+                                self._act_opts(params)["strict"])
         if not object_id:
             return {"element": None}
         handle = ElementHandleDispatcher(
             self.server, self.page.frame_for(frame_id), object_id)
         return {"element": handle.channel}
+
+    def _enter(self, selector: str, root: Optional[str]):
+        """`enter_frames`, with `root` the element the selector is looked for
+        in (None: the document, and the call is the one a frame has always made)."""
+        if root is None:
+            return self.enter_frames(selector)
+        return self.enter_frames(selector, root=root)
+
+    def _scope(self, frame_id: str, root: Optional[str]) -> Optional[str]:
+        """The root a selector's last chunk runs in: the element when the
+        selector stayed in the element's frame, none once it entered another
+        (stock's `resolveFrameForSelector`: `if (frame !== this.frame) scope =
+        undefined`)."""
+        return root if frame_id == self.frame_id else None
+
+    def _first(self, frame_id: str, selector: str, root: Optional[str] = None,
+               strict: bool = False) -> Optional[str]:
+        """The objectId of the first match of `selector` in `frame_id`'s world
+        (a node the caller must dispose), inside `root` when there is one and
+        in the document when there is not. THE ONE PLACE a selector is
+        resolved with an element as root."""
+        if root is None:
+            return self.injected.query_selector(frame_id, selector)
+        return self.injected.call(frame_id, _QUERY_IN, {"objectId": root},
+                                  selector, strict, by_value=False)
+
+    def _all(self, frame_id: str, selector: str,
+             root: Optional[str] = None) -> List[str]:
+        """Every match of `selector`, as objectIds the caller must dispose;
+        inside `root` when there is one. The list that held them is released
+        here."""
+        if root is None:
+            return self.injected.query_selector_all(frame_id, selector)
+        found = self.injected.call(frame_id, _QUERY_ALL_IN, {"objectId": root},
+                                   selector, by_value=False)
+        try:
+            count = self.injected.call(frame_id, _LENGTH, {"objectId": found})
+            places = [self.injected.call(frame_id, _PLACE, {"objectId": found},
+                                         index, by_value=False)
+                      for index in range(count)]
+            return [place for place in places if place]
+        finally:
+            self.injected.dispose(frame_id, found)
 
     def _read(self, params: Dict, what: str, *args) -> Any:
         """A read of the element `params["selector"]` names, as Playwright's
@@ -1385,8 +1579,12 @@ class FrameDispatcher(Dispatcher):
     # ⛔ frame-crossing selectors
     ENTER_FRAME = " >> internal:control=enter-frame >> "
 
-    def enter_frames(self, selector: str):
+    def enter_frames(self, selector: str, root: Optional[str] = None):
         """`(frame_id, tail)` for a selector that crosses into an iframe.
+
+        `root` is the element an element handle looks inside: the owner of the
+        FIRST frame is looked for in it, and nothing after (stock's
+        `scope: i === 0 ? scope : undefined`).
 
         ⛔ THE HOP IS SERVER-SIDE, and that is not an implementation detail:
         the injected script lives in ONE document and cannot reach inside an
@@ -1408,7 +1606,8 @@ class FrameDispatcher(Dispatcher):
             head, _, tail = selector.partition(self.ENTER_FRAME)
             if not tail:
                 return frame.frame_id, head
-            owner = frame.page.injected.query_selector(frame.frame_id, head)
+            owner = frame._first(frame.frame_id, head, root)
+            root = None
             if not owner:
                 raise ProtocolException(
                     "the frame owner %r matched nothing, so there is nothing "
@@ -1674,24 +1873,32 @@ class FrameDispatcher(Dispatcher):
 
     def op_dispatch_event(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
-        # ⛔ THE ARGUMENT ARRIVES IN PLAYWRIGHT'S SERIALISED ENVELOPE, not as
-        # a plain value: `{"value": {...}, "handles": []}`. Passing it through
-        # is rejected by Juggler's closed-world schema with `Found property
-        # "<root>.args[3].handles" - [] which is not described in this scheme`,
-        # and the message names a field the caller never wrote. Nothing to do
-        # with frames: it failed on the main frame too, and only an iframe test
-        # happened to exercise it.
-        # ⛔ A HANDLE IN THE INIT IS REFUSED, NOT SENT AS null: the event is built
-        # in the utility world by the core, where the handle's object does not
-        # exist (stock takes it to the page's own world).
-        refuse_handles(params.get("eventInit"), "dispatch_event's eventInit",
-                       "the utility world, through the core")
         self.actions.dispatch_event(
-            selector, params["type"],
-            _deserialize(params.get("eventInit")) or {},
+            selector, params["type"], self._event_init(params),
             timeout=self._timeout(params), frame_id=frame_id,
             **self._act_opts(params))
         return None
+
+    @staticmethod
+    def _event_init(params: Dict) -> Dict:
+        """The `eventInit` of a `dispatchEvent`, as the plain dictionary the
+        core builds the event from. THE ONE PLACE it is read, for a frame's
+        selector and for an element handle.
+
+        ⛔ THE ARGUMENT ARRIVES IN PLAYWRIGHT'S SERIALISED ENVELOPE, not as a
+        plain value: `{"value": {...}, "handles": []}`. Passing it through is
+        rejected by Juggler's closed-world schema with `Found property
+        "<root>.args[3].handles" - [] which is not described in this scheme`,
+        and the message names a field the caller never wrote. Nothing to do
+        with frames: it failed on the main frame too, and only an iframe test
+        happened to exercise it.
+
+        ⛔ A HANDLE IN THE INIT IS REFUSED, NOT SENT AS null: the event is built
+        in the utility world by the core, where the handle's object does not
+        exist (stock takes it to the page's own world)."""
+        refuse_handles(params.get("eventInit"), "dispatch_event's eventInit",
+                       "the utility world, through the core")
+        return _deserialize(params.get("eventInit")) or {}
 
     def op_drag_and_drop(self, params: Dict) -> Any:
         self.actions.drag_and_drop(params["source"], params["target"],
@@ -1758,7 +1965,8 @@ class FrameDispatcher(Dispatcher):
         return {"element": handle.channel}
 
     def _call_on_elements(self, frame_id: str, elements: List[str],
-                          params: Dict, *, as_array: bool = False) -> Any:
+                          params: Dict, *, as_array: bool = False,
+                          by_value: bool = True) -> Any:
         """The caller's code on elements this server holds in the utility
         world, run in the caller's world by `_run_callers_code` with the
         elements as its receivers, or as ONE array of them (`as_array`, for
@@ -1774,7 +1982,11 @@ class FrameDispatcher(Dispatcher):
         node, in the other world) and the copies are released after the call.
         The caller's code is sent once ([B285]); finding the elements is this
         package's read, made before it. The caller's code never sees this
-        package's script."""
+        package's script.
+
+        `by_value=False` answers the engine's RemoteObject of what the code
+        returned instead of its value, for `_handle_from_caller`
+        (`evaluate_handle` of an element handle)."""
         context = self.injected.caller_context(frame_id)
         adopted: List[str] = []
         array: Optional[str] = None
@@ -1782,7 +1994,7 @@ class FrameDispatcher(Dispatcher):
             for element in elements:
                 copy = self.injected.node_to_caller(frame_id, element)
                 if not copy:
-                    raise ProtocolException("Element is not attached to the DOM")
+                    raise ProtocolException(_NOT_ATTACHED)
                 adopted.append(copy)
             receivers = adopted
             if as_array:
@@ -1790,9 +2002,10 @@ class FrameDispatcher(Dispatcher):
                     context, _ARRAY, [{"objectId": a} for a in adopted],
                     by_value=False)["objectId"]
                 receivers = [array]
-            return _remote_value(_run_callers_code(
-                self.injected, frame_id, params, receivers, by_value=True,
-                objects=_object_lookup(self)))
+            remote = _run_callers_code(
+                self.injected, frame_id, params, receivers, by_value=by_value,
+                objects=_object_lookup(self))
+            return _remote_value(remote) if by_value else remote
         finally:
             if array:
                 self.injected.release(context, array)
@@ -2241,23 +2454,31 @@ class FrameDispatcher(Dispatcher):
         return {"value": self.injected.count(frame_id, selector)}
 
     def op_query_selector_all(self, params: Dict) -> Any:
-        frame_id, selector = self.enter_frames(params["selector"])
+        return self._query_selector_all(params)
+
+    def _query_selector_all(self, params: Dict, root: Optional[str] = None) -> Any:
+        frame_id, selector = self._enter(params["selector"], root)
         target = self.page.frame_for(frame_id)
-        ids = self.injected.query_selector_all(frame_id, selector)
+        ids = self._all(frame_id, selector, self._scope(frame_id, root))
         handles = [ElementHandleDispatcher(self.server, target, oid)
                    for oid in ids]
         return {"elements": [h.channel for h in handles]}
 
     def op_eval_on_selector(self, params: Dict) -> Any:
+        return self._eval_on_selector(params)
+
+    def _eval_on_selector(self, params: Dict, root: Optional[str] = None) -> Any:
         """`page.eval_on_selector`: ONE attempt, as Playwright's `$eval`. It
         does not wait, and an element that is not there is an error; a frame
         that navigates between the query and the call is `ContextDestroyed`,
-        which says so in Playwright's words."""
-        frame_id, selector = self.enter_frames(params["selector"])
-        object_id = self.injected.query_selector(frame_id, selector)
+        which says so in Playwright's words. With `root` (an element handle's
+        `eval_on_selector`) the match is looked for inside that element."""
+        frame_id, selector = self._enter(params["selector"], root)
+        object_id = self._first(frame_id, selector, self._scope(frame_id, root),
+                                self._act_opts(params)["strict"])
         if not object_id:
             raise ProtocolException(
-                "failed to find element matching selector %r" % selector)
+                'Failed to find element matching selector "%s"' % params["selector"])
         try:
             return {"value": _serialize(self._call_on_elements(
                 frame_id, [object_id], params))}
@@ -2280,11 +2501,15 @@ class FrameDispatcher(Dispatcher):
         return {"value": self.injected.read_all(frame_id, selector, what)}
 
     def op_eval_on_selector_all(self, params: Dict) -> Any:
+        return self._eval_on_selector_all(params)
+
+    def _eval_on_selector_all(self, params: Dict, root: Optional[str] = None) -> Any:
         """`page.eval_on_selector_all`: the caller's function, sent ONCE. A
         frame that navigates under it is `ContextDestroyed`, as Playwright
-        raises; sending it again ran it twice ([B285])."""
-        frame_id, selector = self.enter_frames(params["selector"])
-        ids = self.injected.query_selector_all(frame_id, selector)
+        raises; sending it again ran it twice ([B285]). With `root` the
+        matches are looked for inside that element."""
+        frame_id, selector = self._enter(params["selector"], root)
+        ids = self._all(frame_id, selector, self._scope(frame_id, root))
         try:
             return {"value": _serialize(self._call_on_elements(
                 frame_id, ids, params, as_array=True))}
