@@ -89,11 +89,7 @@ EXCLUDED = {
         (("windows",), "skips on Windows: the Linux text path"),
 }
 #: Changed by hand, together with the list above: an exclusion is a test the candidate does not run, and it may not be added in silence.
-<<<<<<< HEAD
-EXCLUDED_COUNT = 19
-=======
-EXCLUDED_COUNT = 17
->>>>>>> origin/char69/glxtest
+EXCLUDED_COUNT = 20
 
 
 @functools.lru_cache(maxsize=None)
