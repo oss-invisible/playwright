@@ -125,11 +125,12 @@ def test_every_test_waits_for_the_release_that_carries_its_property():
 
 
 def test_the_release_being_made_carries_only_its_own_properties():
-    """firefox-68 holds the tests of the property it carries (networkidle: the held cut of a committed navigation); no later release has a row until
-    a test waits for it."""
+    """firefox-68 holds the tests of the property it carries (networkidle: the held cut of a committed navigation); firefox-69 has a row only for the
+    test that waits for it (generate mode does not start Glean); no later release has a row until a test waits for it."""
     registry = _registry()
-    assert sorted(registry) == ["firefox-68"]
+    assert sorted(registry) == ["firefox-68", "firefox-69"]
     assert sorted(registry["firefox-68"]["files"]) == ["tests/test_a_page_that_moves_on_e2e.py", "tests/test_fakeweb_p2_e2e.py"]
+    assert sorted(registry["firefox-69"]["files"]) == ["tests/test_security_state_engine_e2e.py"]
 
 
 def test_a_test_of_the_accumulated_line_gated_on_the_release_being_made_is_named():
