@@ -131,7 +131,7 @@ def test_the_release_being_made_carries_only_its_own_properties():
     registry = _registry()
     assert sorted(registry) == ["firefox-68", "firefox-69"]
     assert sorted(registry["firefox-68"]["files"]) == ["tests/test_a_page_that_moves_on_e2e.py", "tests/test_fakeweb_p2_e2e.py"]
-    assert sorted(registry["firefox-69"]["files"]) == ["tests/test_a_navigation_that_moved_is_told_by_the_engine_e2e.py", "tests/test_security_state_engine_e2e.py"]
+    assert sorted(registry["firefox-69"]["files"]) == ["tests/test_a_held_ice_port_blinds_the_loopback_checks_e2e.py", "tests/test_a_navigation_that_moved_is_told_by_the_engine_e2e.py", "tests/test_security_state_engine_e2e.py"]
 
 
 def test_a_test_of_the_accumulated_line_gated_on_the_release_being_made_is_named():
