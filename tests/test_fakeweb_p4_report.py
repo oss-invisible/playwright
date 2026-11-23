@@ -243,10 +243,11 @@ def _request(m, site, method, path, referer=None, status=200, ctype=None, step=1
 
 
 def _noise(m, site, path):
-    """The last stage of a page and its five woff2, from moment `m` on."""
+    """The last stage of a page, its five woff2 and the release that ends its fetch chain, from moment `m` on."""
     referrer = ([A, O][site]) + path      # a page asks its own origin for the stylesheet: same origin, the whole URL
     return [_request(m, 0, "GET", "/r?kind=css&id=ld3", referrer)] + [
-        _request(m + 0.01 * (k + 1), 1, "GET", "/r?kind=woff2&id=font", O + "/r?kind=fontcss&id=fc", ctype="font/woff2") for k in range(5)]
+        _request(m + 0.01 * (k + 1), 1, "GET", "/r?kind=woff2&id=font", O + "/r?kind=fontcss&id=fc", ctype="font/woff2") for k in range(5)] + [
+        _request(m + 0.07, site, "GET", "/release?id=lpq7x1z2", referrer, ctype="text/plain")]
 
 
 def test_a_walk_that_leaves_every_page_after_its_noise_has_no_problem():
@@ -267,8 +268,8 @@ def test_a_page_left_before_its_late_stylesheet_and_its_fonts_is_found():
     records = ([_request(1, 0, "GET", "/", step=15), _request(1.1, 0, "GET", "/account", step=15)] + _noise(1.2, 0, "/")
                + _noise(2, 0, "/account"))
     left = journey_site.pages_left_before_their_noise(records, [A, O])
-    assert len(left) == 2 and all("GET A/ (step 15)" in line for line in left)
-    assert "ld3" in left[0] and "0 woff2" in left[1]
+    assert len(left) == 3 and all("GET A/ (step 15)" in line for line in left)
+    assert "ld3" in left[0] and "release that ends its fetch chain" in left[1] and "0 woff2" in left[2]
 
 
 def test_a_late_stylesheet_of_another_page_does_not_count_for_the_page():
@@ -281,12 +282,25 @@ def test_a_late_stylesheet_of_another_page_does_not_count_for_the_page():
         "GET A/article/2 (step 1): its stylesheet ld3 (referrer %s/article/2) had not arrived when the walk left the page" % A]
 
 
+def test_a_page_left_before_the_release_that_ends_its_fetch_chain_is_found():
+    """The network oracle of the run 45088980743 (Windows, job 137413984973): the home page of step 15 had sent its last stage and its fonts, but
+    its chain of seven fetches had not yet sent `release?id=lp...` when /account was requested; the other run of the same engine had it."""
+    from fakeweb import journey_site
+
+    home = _noise(2, 0, "/")
+    records = ([_request(1, 0, "GET", "/")] + home[:-1] + [_request(3, 0, "GET", "/account")] + _noise(4, 0, "/account"))
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == [
+        "GET A/ (step 1): the release that ends its fetch chain (referrer %s/) had not arrived when the walk left the page" % A]
+    late = records + [_request(3.5, 0, "GET", "/release?id=lpq7x1z2", A + "/", ctype="text/plain")]      # after /account was asked for
+    assert len(journey_site.pages_left_before_their_noise(late, [A, O])) == 1
+
+
 def test_the_page_of_the_other_origin_counts_its_fonts_with_the_page_open_beside_it():
     """The partner tab opens while the article is open: the stretch until the next navigation holds both pages, so ten woff2."""
     from fakeweb import journey_site
 
     records = ([_request(1, 0, "GET", "/article/2")] + _noise(2, 0, "/article/2") + [_request(3, 1, "GET", "/partner/2")]
-               + _noise(4, 1, "/partner/2")[:3] + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search"))
+               + _noise(4, 1, "/partner/2")[:3] + _noise(4, 1, "/partner/2")[-1:] + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search"))
     left = journey_site.pages_left_before_their_noise(records, [A, O])
     assert left == ["GET A/article/2 (step 1), GET O/partner/2 (step 1): 7 woff2 had arrived when the walk left, 10 expected "
                     "(5 @font-face per page)"]
@@ -552,7 +566,8 @@ def test_every_navigation_back_forward_and_close_of_the_walk_goes_through_its_on
 
 
 def test_a_page_of_the_site_declares_when_its_noise_is_done():
-    """With the noise, once the font stage and the last stage have loaded (window.__noiseDone); without it, at once."""
+    """With the noise, once the font stage and the last stage have loaded and the fetch chain and the three streams have sent their release
+    (window.__noiseDone); without it, at once. A held request of a parked page is not part of it."""
     import urllib.request
 
     from fakeweb import journey_site
@@ -564,7 +579,9 @@ def test_a_page_of_the_site_declares_when_its_noise_is_done():
     finally:
         stop()
     for page in (noisy, partner):
-        assert "const noiseDone = () => { if (fontsDone && lastDone) window.__noiseDone = true; };" in page
+        assert "const noiseDone = () => { if (fontsDone && lastDone && chainDone && streamsOpen === 0) window.__noiseDone = true; };" in page
+        assert "rel('lp' + tok).then(() => { chainDone = true; noiseDone(); })" in page
+        assert "return rel('stream-ab' + i); }).catch(noop)" in page and "streamsOpen--; noiseDone();" in page
         assert page.count("l.addEventListener('load', ") == 2 and page.count("l.addEventListener('error', ") == 2
         assert "document.fonts.ready.then(() => { fontsDone = true; noiseDone(); })" in page
         assert "const last = () => { lastDone = true; noiseDone(); };" in page

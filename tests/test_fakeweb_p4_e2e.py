@@ -10,7 +10,7 @@ compares our engine with it field by field, step by step.
 The walk leaves a page (a click or a key that navigates, back or forward, closing a tab, the end of the walk) only once the page says
 its noise is done: the noise runs on timers after `load`, and a page left before its last stage sends a different set of requests in
 every run. The second test makes that last stage long (LONG_LAST_STAGE_MS after `load`) and reads the site's own record: every page's
-late stylesheet and its five woff2 must reach the site before the walk's next navigation.
+late stylesheet, its five woff2 and the release that ends its fetch chain must reach the site before the walk's next navigation.
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def test_the_journey_succeeds_on_every_step_and_idles_where_stock_does(firefox_b
 
 def test_the_journey_leaves_every_page_only_once_its_noise_is_done(firefox_binary):
     """The last stage of every page's noise starts LONG_LAST_STAGE_MS after `load`. The site's own record must show, for every page of
-    the walk, its stylesheet `ld3` (with the page as its referrer) and the woff2 of its five @font-face rules arriving before the
+    the walk, its stylesheet `ld3` and the `release?id=lp...` that ends its fetch chain (with the page as their referrer) and the woff2 of its five @font-face rules arriving before the
     walk's next navigation (journey_site.pages_left_before_their_noise). When it fails it saves, under
     `invpw-evidence/fakeweb-journey-leaves-a-page-when-its-noise-is-done/`, `fakeweb-server-record.jsonl` (every request with its
     referrer and the moment it arrived), `client-request-log.jsonl` and `cells.json` (each step's moments)."""

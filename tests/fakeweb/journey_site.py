@@ -89,9 +89,11 @@ DET_JS = r"""
 const tok = Math.random().toString(36).slice(2, 8);
 const rel = (id) => get(A + '/release?id=' + id);
 // 0. the end of the noise, declared: window.__noiseDone is true once the font stage is done (its stylesheet has loaded and
-// document.fonts.ready has resolved after it) and the last stage has loaded its stylesheet ld3. The walk leaves the page only then.
-let fontsDone = false, lastDone = false;
-const noiseDone = () => { if (fontsDone && lastDone) window.__noiseDone = true; };
+// document.fonts.ready has resolved after it), the last stage has loaded its stylesheet ld3, the fetch chain has sent its release
+// (stage 5) and the three aborted streams have sent theirs (stage 9). The walk leaves the page only then. A request held until the
+// walk reaches a step (PARK_PAGES) is not part of it: it is the page that stays open on purpose.
+let fontsDone = false, lastDone = false, chainDone = false, streamsOpen = 3;
+const noiseDone = () => { if (fontsDone && lastDone && chainDone && streamsOpen === 0) window.__noiseDone = true; };
 // 1. beacons and keepalive fetches
 afterLoad(300, () => {
   navigator.sendBeacon(O + '/beacon?src=load&n=1', 'a=1');
@@ -127,7 +129,7 @@ get(O + '/r?kind=json&redirect=2&id=rc2');
 get(A + '/hold?id=lp' + tok);
 let late = 0;
 const nextLate = () => {
-  if (++late > 7) { rel('lp' + tok); return; }
+  if (++late > 7) { rel('lp' + tok).then(() => { chainDone = true; noiseDone(); }); return; }
   get(A + '/r?kind=json&id=late' + late).then(nextLate);
 };
 nextLate();
@@ -163,7 +165,8 @@ afterLoad(LAST_MS, () => {
 // 9. aborts that cannot race: the server sends headers and part of the body, the page aborts on the headers
 for (let i = 0; i < 3; i++) {
   const c = new AbortController();
-  fetch(A + '/stream?id=ab' + i, {signal: c.signal}).then(() => { c.abort(); rel('stream-ab' + i); }).catch(noop);
+  fetch(A + '/stream?id=ab' + i, {signal: c.signal}).then(() => { c.abort(); return rel('stream-ab' + i); }).catch(noop)
+    .then(() => { streamsOpen--; noiseDone(); });
 }
 // 10. leaving the page: one sendBeacon and one keepalive POST
 addEventListener('pagehide', () => {
@@ -752,7 +755,8 @@ def pages_left_before_their_noise(records, origins):
     A page is an HTML answer to a navigation. The walk leaves a page of the site's tab (origin A) at its next navigation request to A; the
     one page of the other origin (the partner tab) is closed before the walk's next navigation of A; the last page is left when the walk
     ends. Before that moment the last stage of the page must have arrived: its stylesheet `ld3` with the page as its referrer (a page asks
-    its own origin for it, A or O: a same-origin request, so the whole URL of the page), and the woff2 of its five @font-face
+    its own origin for it, A or O: a same-origin request, so the whole URL of the page), the `release?id=lp...` that ends its fetch chain
+    (the same referrer), and the woff2 of its five @font-face
     rules. Those all have the font stylesheet as their referrer, so they are counted per stretch that ends where the walk leaves: every
     page that starts in a stretch brings five."""
     requests = sorted((r for r in records if r.get("ev") == "request"), key=lambda r: r["m_arrive"])
@@ -761,6 +765,7 @@ def pages_left_before_their_noise(records, origins):
     leaves = [r["m_arrive"] for r in navigations if r["site"] == 0]
     resources = [(r, _query(r["path"])) for r in requests if r["path"].startswith("/r?")]
     late_css = [r for r, q in resources if q.get("kind") == "css" and q.get("id") == "ld3"]
+    chain_ends = [r for r in requests if r["path"].startswith("/release?id=lp")]
     fonts = [r["m_arrive"] for r, q in resources if q.get("kind") == "woff2"]
     problems, stretches = [], {}
     for page in pages:
@@ -769,6 +774,9 @@ def pages_left_before_their_noise(records, origins):
         referrer = origins[page["site"]] + page["path"]
         if not any(r.get("referer") == referrer and page["m_arrive"] < r["m_arrive"] < left_at for r in late_css):
             problems.append("%s: its stylesheet ld3 (referrer %s) had not arrived when the walk left the page" % (_name(page), referrer))
+        if not any(r.get("referer") == referrer and page["m_arrive"] < r["m_arrive"] < left_at for r in chain_ends):
+            problems.append("%s: the release that ends its fetch chain (referrer %s) had not arrived when the walk left the page" % (
+                _name(page), referrer))
         stretches.setdefault(left_at, []).append(page)
     for left_at, group in stretches.items():
         expected = len(FONT_WEIGHTS) * len(group)
