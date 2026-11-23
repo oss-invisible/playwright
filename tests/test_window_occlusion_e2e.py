@@ -23,24 +23,33 @@ stacking (``XQueryTree``: the cover above the covered window) and the geometries
 proves nothing). With tracking enabled, X's ``FullyObscured`` arrived and a page that never turns ``hidden`` is red with a message that starts with "ENGINE".
 Without tracking, the same ``FullyObscured`` arrived and the page must stay ``visible``. The X record (the two window ids, the stacking and geometries read
 back, every visibility event with its time since the watch began, and whether ``FullyObscured`` arrived) is saved on every run, green or red, with the
-Windows record below. Windows: opening the second window is not enough. ``WinWindowOcclusionTracker`` marks a root window
+Windows record below. Windows: opening the second window is not enough, and neither is putting it above the first one. ``WinWindowOcclusionTracker`` marks a root window
 ``OCCLUDED`` only when the windows ABOVE it in the Z-order already cover its rectangle (``widget/windows/WinWindowOcclusionTracker.cpp``,
-``ProcessComputeNativeWindowOcclusionStatusCallback``: ``it->second = (mUnoccludedDesktopRegion == currUnoccludedDestkop) ? OCCLUDED : VISIBLE``); the second
-window lands above the first only when the system lets its process take the foreground (``nsWindow::Show``: ``::ShowWindow(mWnd, SW_SHOWNORMAL)``, an
-activation the system's foreground rules may refuse to a process the foreground one did not start); and a later move of another process's window is heard only
-once that process was seen with a visible window (``RegisterEventHookForProcess``). So on Windows the test puts the covering in place itself, in two
-``SetWindowPos`` calls that need no foreground right: first the second window becomes ``HWND_TOPMOST`` (the system keeps a topmost window above every
-non-topmost one, whoever has the foreground; a plain "insert after" from the test's process is a Z-order request the system may not keep), then the first window
-moves inside the second one's rectangle as the tracker reads it (a maximized window counts as its monitor's work area) with ``SWP_NOZORDER | SWP_NOACTIVATE``.
-That move, last, is the tracker's own signal (``EVENT_OBJECT_LOCATIONCHANGE`` of the first window's process). Right after, the test reads back ONCE what the
-tracker checks: the second window visible, not minimized, not cloaked, not layered-transparent, not a popup, above the first in the ``GW_HWNDPREV`` chain, and
-the first window inside it. Every red carries the two calls' results and ``GetLastError``, the Z-order from the top down to the first window (process, class,
-topmost), and the foreground window and its process, read once after the arrangement and again after the page has answered, so a covered window that something
-raised back is told from an arrangement the system refused. Before the topmost arrangement each half first does the plain one (the covered window
-inserted right after the cover, no topmost), waits for the page's answer it waits for anyway, and records, as evidence and never as a verdict, whether the
-system kept that order and whether the foreground window belongs to one of the two engines; ``FailureEvidence`` saves that record under
-``$RUNNER_TEMP/invpw-evidence/test_window_occlusion/`` on every run, green or red, and every message carries one line per half
-("order without topmost: kept / not kept, foreground: pid X (engine yes/no)").
+``ProcessComputeNativeWindowOcclusionStatusCallback``: ``it->second = (mUnoccludedDesktopRegion == currUnoccludedDestkop) ? OCCLUDED : VISIBLE``), and it
+computes that only when an event it hooks tells it to (``RegisterEventHooks``): a change of the foreground window, a move or resize, a minimize or restore, a
+state change, a cloak, and ``EVENT_OBJECT_LOCATIONCHANGE`` of the processes that had a visible window at the last calculation. A change of the Z-order is none of
+them, and neither is another process's window being shown (``ProcessEventHookCallback`` returns on ``EVENT_OBJECT_SHOW``). The foreground window is not special
+for the calculation: it is a source of events, nothing more. So a cover that is put above a window that keeps the foreground, with the covered window already
+where it is wanted, tells the tracker nothing, and the page stays ``visible`` for as long as the test waits; the same two windows are covered at once when the
+second session's window takes the foreground, because the change of foreground is an event.
+
+So on Windows the test builds the whole chain itself, with calls the system honours whoever has the foreground, and waits for what it reads back:
+
+1. Before the page is asked anything, the covered window becomes ``HWND_TOPMOST`` (the system keeps a topmost window above every non-topmost one: a window of
+   the same declared size that another session of the same desktop opened later cannot sit above it), it is moved by one pixel (a real
+   ``EVENT_OBJECT_LOCATIONCHANGE``, the tracker's own signal), and the test waits, with a deadline, until Windows reads back that no window above it covers it
+   and the page reads ``visible``. A red there says "the lab could not leave the covered window uncovered", with the Z-order.
+2. The second session opens the covering window. The covering window becomes ``HWND_TOPMOST`` (above the covered one: a window made topmost goes to the top of
+   the topmost windows) and the covered window moves inside its rectangle as the tracker reads it (a maximized window counts as its monitor's work area) with
+   ``SWP_NOZORDER | SWP_NOACTIVATE``. The test then waits, with a deadline, until Windows reads back what the tracker checks: the covering window visible, not
+   minimized, not cloaked, not layered-transparent, not a popup, above the covered one in the ``GW_HWNDPREV`` chain, and the covered one inside it. A red there
+   says "the lab could not cover the window", with that read-back; it is never the verdict about the page.
+3. Only then the page is waited on, and while it still reads ``visible`` the covered window is moved by one pixel again, every tenth look, so that the tracker
+   has been signalled AFTER the arrangement stood. A page that never turns ``hidden`` now is the engine's: the arrangement was read back as complete.
+
+Every message carries the calls' results and ``GetLastError``, the Z-order from the top down to the covered window (process, class, topmost), and the
+foreground window and its process, read once after the arrangement and again when the test judges; ``FailureEvidence`` saves them under
+``$RUNNER_TEMP/invpw-evidence/test_window_occlusion/`` on every run, green or red, with one line per half ("foreground: pid X (engine yes/no)").
 
 A page reads it from ``document.visibilityState`` and the ``visibilitychange`` event.
 """
@@ -79,6 +88,9 @@ COVERED_TITLE, COVER_TITLE = "occlusion-covered-window", "occlusion-covering-win
 
 #: How far inside the covering window's rectangle the covered one is put, in device pixels.
 INSET = 32
+
+#: Windows: while a wait for the tracker's answer goes on, the covered window is moved by one pixel on the first look and on every this-many-th one after it.
+SIGNAL_EVERY_LOOKS = 10
 
 
 def opens_the_covering_window(second):
@@ -238,13 +250,32 @@ class Win32:
             (cl, ct, cr, cb), (wl, wt, wr, wb))
         return (left, top, right - left, bottom - top)
 
-    def insert_under(self, covered, cover):
-        """The arrangement without topmost: ``covered`` inserted right after ``cover`` in the Z-order, inside its rectangle; activates nothing."""
-        return {"covered inserted after the cover": self.set_window_pos(covered, cover, *self.inside(cover), self.SWP_NOACTIVATE)}
+    def covering(self, hwnd):
+        """The windows above ``hwnd`` in the Z-order that the tracker counts as covering it by themselves: each can occlude (``why_it_cannot_cover``) and
+        contains ``hwnd``'s rectangle as the tracker reads it. A list of ``describe`` tuples, empty when nothing above covers it."""
+        inner, found = self.tracker_rect(hwnd), []
+        above = self.user32.GetWindow(hwnd, self.GW_HWNDPREV)
+        while above:
+            if not self.why_it_cannot_cover(above):
+                outer = self.tracker_rect(above)
+                if outer[0] <= inner[0] and outer[1] <= inner[1] and inner[2] <= outer[2] and inner[3] <= outer[3]:
+                    found.append(self.describe(above))
+            above = self.user32.GetWindow(above, self.GW_HWNDPREV)
+        return found
+
+    def make_topmost(self, hwnd):
+        """``HWND_TOPMOST``: the system keeps the window above every non-topmost one, whoever has the foreground; activates nothing."""
+        return self.set_window_pos(hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE)
+
+    def nudge(self, hwnd, step):
+        """Moves ``hwnd`` ``step`` pixels to the right (left when negative), its size and its place in the Z-order as they are: a real
+        ``EVENT_OBJECT_LOCATIONCHANGE``, the signal ``WinWindowOcclusionTracker`` recalculates on (a move to where the window already is sends none)."""
+        left, top, _, _ = self.rect(hwnd)
+        return self.set_window_pos(hwnd, None, left + step, top, 0, 0, self.SWP_NOSIZE | self.SWP_NOZORDER | self.SWP_NOACTIVATE)
 
     def arrange(self, covered, cover):
         """Makes ``cover`` topmost, then moves ``covered`` inside ``cover``'s rectangle and its work area; activates nothing. The calls' answers."""
-        calls = {"cover HWND_TOPMOST": self.set_window_pos(cover, self.HWND_TOPMOST, 0, 0, 0, 0, self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE)}
+        calls = {"cover HWND_TOPMOST": self.make_topmost(cover)}
         calls["covered moved inside"] = self.set_window_pos(covered, None, *self.inside(cover), self.SWP_NOZORDER | self.SWP_NOACTIVATE)
         return calls
 
@@ -298,50 +329,91 @@ class Win32:
 
 
 class CoveringOnWindows:
-    """Windows only: finds the two windows, arranges the covering (``arrange``), and reads it back as the tracker reads it (``read``)."""
+    """Windows only: finds the covered window, leaves it uncovered (``leave_uncovered``), finds the covering one (``find_the_cover``), arranges the covering
+    (``arrange``) and signals the tracker after it (``wait_for_hidden``); each step reads back from the system what the next one needs before the page is judged."""
 
     def __init__(self, covered) -> None:
         self.win = Win32()
-        found = {}
-        for title in (COVERED_TITLE, COVER_TITLE):
-            seen = wait_for_condition(covered, lambda title=title: self.win.window_titled(title), lambda hwnd: hwnd is not None,
-                                      "no single visible top-level window is titled %r" % title)
-            found[title] = seen.history[-1][1]
-        self.first, self.cover = found[COVERED_TITLE], found[COVER_TITLE]
-        wait_for_condition(covered, lambda: self.win.why_it_cannot_cover(self.cover), lambda why: why == "",
-                           "the covering window is not one the tracker counts as covering")
-        self.without_topmost = None
+        self.cover = None
+        self.looks = 0
+        self.signals = 0
+        self.uncovered = None
         self.calls = None
         self.after_arrangement = None
+        self.first = self.find(covered, COVERED_TITLE)
 
-    def record_without_topmost(self, answered):
-        """The arrangement without topmost, then ``answered()`` (the page's answer the half waits for), then the Z-order and the foreground read
-        back: EVIDENCE only, nothing asserted. Whether the system kept the order, and whether the foreground is one of the two engines."""
-        calls = self.win.insert_under(self.first, self.cover)
-        page = answered()
-        seen = self.read()
-        foreground = seen["foreground"]
-        pid = foreground[1] if foreground else None
-        engine = {self.win.pid(self.first): "the covered session's engine", self.win.pid(self.cover): "the covering session's engine"}.get(pid)
-        self.without_topmost = {"calls": calls, "page": page, "read back": seen,
-                                "line": "order without topmost: %s, foreground: pid %s %s (engine %s)" % (
-                                    "kept" if seen["cover above"] else "not kept", pid, self.win.process_name(pid) if pid else "",
-                                    "yes, %s" % engine if engine else "no")}
+    def find(self, covered, title):
+        seen = wait_for_condition(covered, lambda: self.win.window_titled(title), lambda hwnd: hwnd is not None,
+                                  "no single visible top-level window is titled %r" % title)
+        return seen.history[-1][1]
 
-    def arrange(self):
-        """The arrangement the precondition rests on: the cover topmost, then the covered window inside it, read back once right after."""
+    def signal(self):
+        """The covered window one pixel to the right, then one to the left, and so on: every call is a real move."""
+        self.win.nudge(self.first, 1 if self.signals % 2 == 0 else -1)
+        self.signals += 1
+
+    def wait(self, covered, sample, done, signalling):
+        """Until ``done(sample())`` (the deadline of ``wait_for_condition``), reading the page between two looks; with ``signalling``, the covered window is also
+        moved by one pixel on the first look and on every ``SIGNAL_EVERY_LOOKS``-th one after it. With what was seen on the way."""
+        looks = []
+
+        def pause():
+            if signalling and len(looks) % SIGNAL_EVERY_LOOKS == 0:
+                self.signal()
+            looks.append(None)
+            covered.wait_for_timeout(100)
+
+        return watch(sample, done, DEADLINE_S, pause)
+
+    def leave_uncovered(self, covered):
+        """Before anything covers the page: the covered window topmost and moved by one pixel, and a wait until Windows reads back that no window above it covers
+        it and the page reads ``visible`` (the caller asserts the page once more). A window of the same size that something else opened over it
+        (another session of this desktop, the load of the runner) is under it from here on."""
+        self.uncovered = {"calls": {"covered HWND_TOPMOST": self.win.make_topmost(self.first)}}
+        self.signal()
+        seen = self.wait(covered, lambda: (covered.evaluate(STATE), self.win.covering(self.first)), lambda now: now[0] == "visible" and not now[1], True)
+        self.uncovered["z-order"] = self.win.z_order_down_to(self.first)
+        if not seen.ok:
+            state, above = seen.history[-1][1]
+            what = ("the lab could not leave the covered window uncovered" if above else
+                    "ENGINE: Windows reads back that nothing above the covered window covers it, and the page reads %r" % (state,))
+            raise AssertionError("%s; seen: %s; %r" % (what, seen.render(), self.evidence()))
+
+    def find_the_cover(self, covered):
+        self.cover = self.find(covered, COVER_TITLE)
+        wait_for_condition(covered, lambda: self.win.why_it_cannot_cover(self.cover), lambda why: why == "",
+                           "the covering window is not one the tracker counts as covering")
+
+    def arrange(self, covered):
+        """The arrangement the precondition rests on: the cover topmost, the covered window inside it, and a wait until Windows reads back that the second
+        covers the first as the tracker reads them. Red: "the lab could not cover the window", never a verdict about the page."""
         self.calls = self.win.arrange(self.first, self.cover)
+        seen = self.wait(covered, lambda: self.read()["ok"], lambda ok: ok, False)
         self.after_arrangement = self.read()
-        assert self.after_arrangement["ok"], "the second window does not cover the first one as the tracker reads them, read once right after %r: %r; %s" % (
-            self.calls, self.after_arrangement, self.without_topmost["line"])
+        assert seen.ok, "the lab could not cover the window: the second window does not cover the first one as the tracker reads them; seen: %s; %r" % (
+            seen.render(), self.evidence())
+
+    def wait_for_hidden(self, covered):
+        """Until the covered page reads ``hidden``, moving the covered window by one pixel while it still does not: the tracker is signalled after the
+        arrangement (read back complete by ``arrange``), as it is when a user moves a window. With what was seen on the way."""
+        return self.wait(covered, lambda: covered.evaluate(STATE), lambda state: state == "hidden", True)
 
     def read(self):
         return self.win.coverage(self.first, self.cover)
 
+    def line(self, seen):
+        """One line: the foreground window of a read-back, whether it belongs to one of the two engines, and how many times the tracker was signalled."""
+        foreground = seen["foreground"]
+        pid = foreground[1] if foreground else None
+        engine = {self.win.pid(self.first): "the covered session's engine", self.win.pid(self.cover): "the covering session's engine"}.get(pid)
+        return "foreground: pid %s %s (engine %s), signals: %d" % (pid, self.win.process_name(pid) if pid else "", "yes, %s" % engine if engine else "no", self.signals)
+
     def evidence(self):
-        """Without topmost (calls, the page, the read-back, the summary line), the topmost calls, the read-back right after them, and a read-back
-        now: a covered window raised back after the arrangement shows here."""
-        return {"without topmost": self.without_topmost, "calls": self.calls, "after the arrangement": self.after_arrangement, "now": self.read()}
+        """The covered window left uncovered (the call, the Z-order), the topmost calls, the read-back right after them, a read-back now (a covered window
+        raised back after the arrangement shows here), and the line."""
+        now = self.read() if self.cover is not None else None
+        return {"uncovered": self.uncovered, "calls": self.calls, "after the arrangement": self.after_arrangement, "now": now,
+                "line": self.line(now) if now else "no covering window yet, signals: %d" % self.signals}
 
 
 class CoveringOnX:
@@ -418,29 +490,24 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
         covered = first.new_page()
         covered.goto("about:blank")
         covered.evaluate(NAME, COVERED_TITLE)
-        assert covered.evaluate(WATCH) == "visible", "the page was not visible before anything covered it"
         on_x = CoveringOnX(x) if x is not None else None
         covering = None
-
-        def answered():
-            """The page's answer this half waits for: ``hidden`` with tracking (the wait, not asserted here), two frames without."""
-            if tracking:
-                return {"hidden": watch_state(covered).render()}
-            return {"two frames": covered.evaluate(TWO_FRAMES), "state": covered.evaluate(STATE)}
-
         try:
+            if sys.platform == "win32":
+                covering = CoveringOnWindows(covered)
+                covering.leave_uncovered(covered)
+            assert covered.evaluate(WATCH) == "visible", "the page was not visible before anything covered it"
             if on_x:
                 on_x.watch_the_covered_window(covered)
             second.run(opens_the_covering_window)
-            if sys.platform == "win32":
-                covering = CoveringOnWindows(covered)
-                covering.record_without_topmost(answered)
-                covering.arrange()
+            if covering:
+                covering.find_the_cover(covered)
+                covering.arrange(covered)
             if on_x:
                 on_x.raise_the_cover_and_read_back(covered)
                 on_x.wait_until_x_says_fully_obscured(covered)
             if tracking:
-                seen = watch_state(covered)
+                seen = covering.wait_for_hidden(covered) if covering else watch_state(covered)
                 assert seen.ok, on_x.engine_message(seen) if on_x else (
                     "a window that another one covers never turned hidden with occlusion tracking enabled; seen: %s; windows: %r" % (
                         seen.render(), covering.evidence() if covering else None))
@@ -461,9 +528,9 @@ def watch_state(covered):
 
 
 def lines(record):
-    """Per half, the one line of the arrangement: X's on Linux, the one without topmost on Windows."""
+    """Per half, the one line of the arrangement: X's on Linux, the foreground and the signals on Windows."""
     with record.lock:
-        return ["%s: %s" % (r["half"], r.get("line") or (r.get("without topmost") or {}).get("line")) for r in record.records]
+        return ["%s: %s" % (r["half"], r.get("line")) for r in record.records]
 
 
 @contextlib.contextmanager
