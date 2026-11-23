@@ -23,12 +23,17 @@ import time
 from fakeweb import journey_site
 
 BLOCKED = ("image", "media")
-TIMEOUT_MS = 15000
+#: The guard against a HANG, not a measure of the speed of the machine: the deadline of every wait of the walk that has no time of its own
+#: (the default of the context for actions and navigations, `expect_navigation`, hover, click, the wait for the noise, `wait_for_load_state`).
+#: Such a wait exists only to find out that the browser has stopped; the walk's verdict never depends on how long a healthy browser takes.
+#: Run 45176061220 (gate, Windows, network oracle): the runner was 3 to 4 times slower for about 100 s, and from the click to `load` the walk took
+#: 15.7, 18.9 and 22.1 s in that launch (4.5 to 10.2 s on 480 pages in 6 runs), more than the 15 s this guard had: steps 2 and 3 of the
+#: second round ended with "Timeout 15000ms exceeded", and a deadline meant for a hang became a leaf of the comparison (`steps/NN/ok`
+#: and `error`). 120 s is far above anything a slow runner takes and far below the time the job has, so only a browser that has stopped reaches it.
+#: The waits that are part of the behaviour keep their own times: the back and forward keys (3000 ms, `_press`), `idle_timeout_ms` of networkidle, the pauses of the scroll.
+HANG_GUARD_MS = 120000
 #: What a page of the site says once its noise is done (journey_site.DET_JS; at once on a page without noise).
 NOISE_DONE = "window.__noiseDone === true"
-#: The deadline of the wait for it: a condition that must come (within a second of `load`, a few seconds in the lab that makes the
-#: last stage long), never a pause.
-NOISE_DONE_TIMEOUT_MS = 30000
 FIELDS = ["ok", "url", "title", "marker", "cookies", "history_length", "pages", "idle"]
 #: Seconds the walk waits for the requests a closed tab sends as it leaves: a safety net so that a request that never comes does not block it (the lab then sees it missing).
 LEAVING_FAILSAFE_S = 15.0
@@ -151,33 +156,88 @@ class Tracer:
         return taken
 
 
+class StageTimeout(Exception):
+    """A wait of the walk reached the hang guard. Its first line (the one the verdict compares, `first_line`) names the wait and the page and
+    the guard, and nothing that changes from run to run: two rounds that stop at the same place say the same words. The second line has
+    the last request the site saw and when (seconds from the start of the wait, rounded): for the report, never compared."""
+
+
+def is_playwright_timeout(exc):
+    """A timeout of the Playwright client: its own class, or an error whose message says `Timeout Nms exceeded` (the fork's guard forbids importing the class)."""
+    if type(exc).__name__ == "TimeoutError" and type(exc).__module__.startswith("playwright"):
+        return True
+    return re.search(r"\bTimeout \d+ms exceeded", str(exc)[:300]) is not None
+
+
+def last_request_seen(began):
+    """The last request the site logged, as `GET A/path, +2 s from the start of the wait`: the seconds from `began` (`time.time()` of the start of the wait), rounded; `none` before any."""
+    state = journey_site.STATE
+    if state is None:
+        return "none"
+    with state.lock:
+        last = state.events[-1] if state.events else None
+        t0 = state.t0
+    if last is None:
+        return "none"
+    return "%s %s%s, %+d s from the start of the wait" % (last["method"], last["origin"], last["path"], round(t0 + last["t"] - began))
+
+
 class Journey:
-    def __init__(self, context, page, a, o):
+    #: The deadline of every wait without a time of its own (HANG_GUARD_MS); a test that makes a hang cheap gives a smaller one.
+    hang_guard_ms = HANG_GUARD_MS
+
+    def __init__(self, context, page, a, o, hang_guard_ms=HANG_GUARD_MS):
         self.ctx, self.page, self.a, self.o = context, page, a, o
+        self.hang_guard_ms = hang_guard_ms
         self.extra = {}
 
     def norm(self, url):
         return (url or "").replace(self.a, "A").replace(self.o, "O")
 
     # helpers -----------------------------------------------------------------
+    def stage(self, name, fn, page=None):
+        """Runs `fn` (a wait of the walk) and, if the client times out, raises a StageTimeout that says which wait (`name`), on which page
+        (`page`, default the walk's page; normalized with `norm`) and the last request the site saw, in place of the client's "Timeout Nms exceeded".
+        Any other error, and the StageTimeout of a wait inside this one, goes through unchanged."""
+        began = time.time()
+        try:
+            return fn()
+        except Exception as exc:
+            explained = self.explain(exc, name, page, began)
+            if explained is exc:
+                raise
+            raise explained from exc
+
+    def explain(self, exc, name, page, began):
+        """`exc` itself, or the StageTimeout that replaces it when it is a timeout of the client (see `stage`)."""
+        if isinstance(exc, StageTimeout) or not is_playwright_timeout(exc):
+            return exc
+        try:
+            url = (page or self.page).url
+        except Exception:
+            url = None
+        return StageTimeout("%s did not finish in %g s (hang guard) on %s\nlast request the site saw: %s"
+                            % (name, self.hang_guard_ms / 1000, self.norm(url) or "a page that is gone", last_request_seen(began)))
+
     def leave(self, act, page=None):
         """The one point from which the walk leaves a page (`page`, default the walk's page): it waits until the page has declared its
         noise done (NOISE_DONE), then runs `act`, the click, the key, the back or forward, the close that leaves it."""
-        (page or self.page).wait_for_function(NOISE_DONE, timeout=NOISE_DONE_TIMEOUT_MS)
+        pg = page or self.page
+        self.stage("noise done", lambda: pg.wait_for_function(NOISE_DONE, timeout=self.hang_guard_ms), page=pg)
         return act()
 
-    def navigate(self, act, **expect):
-        """Leave the page with `act` (a click, a key) and wait for the navigation it starts (`expect`: of expect_navigation)."""
+    def navigate(self, act, what="click", **expect):
+        """Leave the page with `act` (a click, a key: `what` names it in a timeout) and wait for the navigation it starts (`expect`: of expect_navigation)."""
         def go():
-            with self.page.expect_navigation(**expect):
-                act()
-        self.leave(go)
+            with self.page.expect_navigation(**{"timeout": self.hang_guard_ms, **expect}):
+                self.stage(what, act)
+        self.leave(lambda: self.stage("navigation to load", go))
 
     def nav_click(self, selector, hover_first=False):
-        loc = self.page.locator(selector).first
+        loc = self.page.locator(selector).first      # hover and click wait for the context's default: the hang guard (`drive`)
         if hover_first:
-            loc.hover()
-        self.navigate(loc.click)
+            self.stage("hover", loc.hover)
+        self.navigate(loc.click, what="click")
 
     def expect_path(self, pattern):
         path = re.sub(r"^[A-Z]", "", self.norm(self.page.url))
@@ -206,7 +266,7 @@ class Journey:
             if required:
                 raise AssertionError("%s did not change the URL after %d presses" % (direction, presses))
             return False
-        p.wait_for_load_state("load")
+        self.stage("load state", lambda: p.wait_for_load_state("load", timeout=self.hang_guard_ms))
         return True
 
     def _press(self, direction):
@@ -290,7 +350,7 @@ class Journey:
         with self.ctx.expect_page() as info:
             self.page.click("#partner")
         tab = info.value
-        tab.wait_for_load_state("load")
+        self.stage("load state", lambda: tab.wait_for_load_state("load", timeout=self.hang_guard_ms), page=tab)
         tab.wait_for_selector("#marker")
         self.extra["pages_when_open"] = len(self.ctx.pages)
         if "Partner" not in tab.inner_text("#marker"):
@@ -339,7 +399,7 @@ class Journey:
         p.wait_for_selector("#msg")
         self.keep_check()
         self.type_in("#q", "quiet morning")
-        self.navigate(lambda: p.keyboard.press("Enter"))
+        self.navigate(lambda: p.keyboard.press("Enter"), what="key press")
         p.wait_for_selector("#qshow")
         self.extra["qshow"] = p.inner_text("#qshow")
         self.extra["results"] = p.locator("a.result").count()
@@ -358,11 +418,11 @@ class Journey:
         self.expect_path(r"^/signin")
         self.type_in("#user", journey_site.USER)
         self.type_in("#pass", "not-the-password")
-        self.navigate(lambda: p.keyboard.press("Enter"))
+        self.navigate(lambda: p.keyboard.press("Enter"), what="key press")
         p.wait_for_selector("#error")
         self.extra["error"] = p.inner_text("#error")
         self.type_in("#pass", journey_site.PASSWORD)
-        self.navigate(lambda: p.keyboard.press("Enter"), url=re.compile(r"/account"))
+        self.navigate(lambda: p.keyboard.press("Enter"), what="key press", url=re.compile(r"/account"))
         self.expect_path(r"^/account")
         self.extra["user"] = p.inner_text("#user")
         return p, None
@@ -452,11 +512,16 @@ def run_round(j, tracer, round_no, idle_timeout_ms, step_log=None):
             rec["m_step_start"], rec["t_step_start"] = round(m_before_set_step, 6), round(time.time(), 4)
         t0 = time.monotonic()
         pg, cleanup = j.page, None
+        began = time.time()
         try:
             pg, cleanup = getattr(j, method)()
             rec["ok"] = True
         except Exception as exc:
+            # a wait that has no stage of its own (a selector, a download, a tab) is named by the client's call: `Page.wait_for_selector`
+            exc = j.explain(exc, first_line(exc).split(": Timeout", 1)[0][:60], None, began)
             rec["error"] = first_line(exc)
+            if isinstance(exc, StageTimeout):
+                rec["error_detail"] = str(exc)
         if step_log is not None:
             rec["m_action_end"] = round(time.perf_counter(), 6)
         try:
@@ -500,21 +565,21 @@ def run_round(j, tracer, round_no, idle_timeout_ms, step_log=None):
     return out
 
 
-def drive(browser, origin_a, origin_o, rounds=1, idle_timeout_ms=15000, trace=False, client_log=None, step_log=None):
+def drive(browser, origin_a, origin_o, rounds=1, idle_timeout_ms=15000, trace=False, client_log=None, step_log=None, hang_guard_ms=HANG_GUARD_MS):
     """`rounds` walks, each in a fresh context and a fresh page. Returns the step records. `trace`: keep, per step, the request
     events the client reported and the hits the server saw (for the report; never compared). `client_log` and `step_log`, two lists
     (default None: nothing kept), are filled as the walk goes with what the client heard (`Tracer`) and with each step's record
-    (`run_round`): for a test that saves evidence when it fails."""
+    (`run_round`): for a test that saves evidence when it fails. `hang_guard_ms`: HANG_GUARD_MS; only a test of the guard gives another."""
     records = []
     for r in range(1, rounds + 1):
         context = browser.new_context()
         try:
-            context.set_default_timeout(TIMEOUT_MS)
-            context.set_default_navigation_timeout(TIMEOUT_MS)
+            context.set_default_timeout(hang_guard_ms)
+            context.set_default_navigation_timeout(hang_guard_ms)
             install_route(context)
             tracer = Tracer(context, events=trace, log=client_log)
             page = context.new_page()
-            records += run_round(Journey(context, page, origin_a, origin_o), tracer, r, idle_timeout_ms, step_log)
+            records += run_round(Journey(context, page, origin_a, origin_o, hang_guard_ms), tracer, r, idle_timeout_ms, step_log)
         finally:
             try:
                 context.close()

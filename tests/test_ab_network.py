@@ -393,7 +393,7 @@ def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests
         if arrivals:
             arrivals.pop(0)()
 
-    monkeypatch.setattr(profile_p4, "time", SimpleNamespace(monotonic=time.monotonic, sleep=sleep))
+    monkeypatch.setattr(profile_p4, "time", SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=sleep))
 
     class Tab:
         url = "http://journey-o.test:1/partner/8"

@@ -1923,8 +1923,8 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             else:
                 browser = p.firefox.connect(server.ws_endpoint)
                 context = browser.new_context()
-                context.set_default_timeout(profile_p4.TIMEOUT_MS)
-                context.set_default_navigation_timeout(profile_p4.TIMEOUT_MS)
+                context.set_default_timeout(profile_p4.HANG_GUARD_MS)
+                context.set_default_navigation_timeout(profile_p4.HANG_GUARD_MS)
                 profile_p4.install_route(context)
                 page = context.new_page()
                 glean = wait_for_glean_of_launch(profile_now, seed, launch_name)
