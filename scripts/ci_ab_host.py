@@ -1011,6 +1011,7 @@ def _read_lines(log: Path):
 # Windows: the processes with their command lines (the audit, event 4688) and the files (an ETW session on Kernel-File).
 
 AUDIT_GUID = "{0CCE922B-69AE-11D9-BED3-505054503030}"  # the subcategory "Process Creation"
+AUDIT_END_GUID = "{0CCE922C-69AE-11D9-BED3-505054503030}"  # the subcategory "Process Termination" (event 4689): when each process ended
 AUDIT_KEY = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit"
 AUDIT_VALUE = "ProcessCreationIncludeCmdLine_Enabled"
 FILE_PROVIDER, FILE_CREATE_KEYWORD = "Microsoft-Windows-Kernel-File", "0x80"  # KERNEL_FILE_KEYWORD_CREATE
@@ -1065,7 +1066,8 @@ def _number(text: str) -> int:
 
 def parse_audit_events(xml_text: str) -> list:
     """The process creations of what `wevtutil qe Security /f:xml` printed (event 4688, one `<Event>` after the other):
-    `[{"rid", "pid", "ppid", "image", "cmd"}]`, `ppid` being the creator's pid."""
+    `[{"rid", "pid", "ppid", "image", "parent_image", "cmd", "time"}]`, `ppid` being the creator's pid and `parent_image` the image the audit says that creator runs
+    ('' when the event does not carry it)."""
     body = re.sub(r"<\?xml[^>]*\?>", "", xml_text)
     root = ET.fromstring("<Events>%s</Events>" % body)
     out = []
@@ -1076,23 +1078,62 @@ def parse_audit_events(xml_text: str) -> list:
             continue
         when = next((e.get("SystemTime", "") for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "TimeCreated"), "")
         out.append({"rid": rid, "pid": _number(data["NewProcessId"]), "ppid": _number(data.get("ProcessId", "")),
-                    "image": data.get("NewProcessName", ""), "cmd": data.get("CommandLine", ""), "time": when})
+                    "image": data.get("NewProcessName", ""), "parent_image": data.get("ParentProcessName", ""), "cmd": data.get("CommandLine", ""), "time": when})
     return out
 
 
-def process_tree(events, roots) -> list:
-    """The events of `parse_audit_events` that are a root or come from a process of the tree, by the creator's pid each says, in their order."""
-    wanted, chosen, changed = set(roots), set(), True
-    floor = min((e.get("rid", 0) for e in events if e["pid"] in wanted), default=0)  # a creator's pid that Windows reused: what came before the root is not its tree
+def parse_audit_ends(xml_text: str) -> list:
+    """The process terminations of the same output (event 4689): `[{"rid", "pid", "time"}]`, in the order of the log. A 4688 has no end in it: this is where the
+    end of a process is read, so that the creator of a process can be told alive or gone at the moment the process was born."""
+    body = re.sub(r"<\?xml[^>]*\?>", "", xml_text)
+    root = ET.fromstring("<Events>%s</Events>" % body)
+    out = []
+    for ev in root:
+        if next((e.text for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "EventID"), "") != "4689":
+            continue
+        data = {d.get("Name"): (d.text or "") for d in ev.iter() if d.tag.rsplit("}", 1)[-1] == "Data"}
+        rid = next((int(e.text) for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "EventRecordID" and e.text), 0)
+        when = next((e.get("SystemTime", "") for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "TimeCreated"), "")
+        if "ProcessId" in data:
+            out.append({"rid": rid, "pid": _number(data["ProcessId"]), "time": when})
+    return out
+
+
+def process_tree(events, roots, ends=()) -> list:
+    """The events of `parse_audit_events` that are a root or were born from a process of the tree that was ALIVE when it was born, in their order.
+
+    Windows hands the pid of a process that ended to the next process it creates, so a pid is not a process: run 45221868374 (the idle launch of the 68) took into the
+    tree `svchost -s wlidsvc` (a service the service manager started, never ended: the tree "did not exit within 120 s", the A/A was broken), 7 `wevtutil` and 2 `wsl`
+    (the oracle's own tools), each by a pid that an earlier process of the tree had had. The tree is therefore walked in the order of the log (`rid`, monotone), the
+    births (4688) and the ends (`ends`, the 4689 of `parse_audit_ends`) together, with the set of the pids that are alive in it:
+      - a process joins when its creator is alive in the tree at its birth (the creator's birth before it, its end after it) and, when both events say it, the image the
+        audit gives for the creator is the image the creator was born with;
+      - a process that carries the pid of one alive in the tree and does not join is a stranger that took the pid of a process that is gone: that pid is no longer alive;
+      - the root joins by its own pid (its creator is the oracle); what came before it is not its tree (a creator's pid that Windows reused)."""
+    roots = set(roots)
+    floor = min((e.get("rid", 0) for e in events if e["pid"] in roots), default=0)
     events = [e for e in events if e.get("rid", 0) >= floor]
-    while changed:
-        changed = False
-        for i, e in enumerate(events):
-            if i not in chosen and (e["pid"] in wanted or e["ppid"] in wanted):
-                chosen.add(i)
-                wanted.add(e["pid"])
-                changed = True
-    return [events[i] for i in sorted(chosen)]
+    born = {e["pid"] for e in events if e["pid"] in roots}
+    alive = {pid: "" for pid in roots - born}  # a root with no birth in the log was born before the audit: alive from the start, its image unknown
+    waiting = set(born)
+    moments = sorted([(e.get("rid", 0), 0, i, e) for i, e in enumerate(events)] + [(x.get("rid", 0), 1, i, x) for i, x in enumerate(ends) if x.get("rid", 0) >= floor],
+                     key=lambda m: m[:3])
+    chosen = []
+    for _rid, is_end, _i, e in moments:
+        if is_end:
+            alive.pop(e["pid"], None)
+            continue
+        creator = alive.get(e["ppid"])
+        if e["pid"] in waiting:
+            waiting.discard(e["pid"])
+        elif e["ppid"] in alive and not (creator and e.get("parent_image") and _base(creator).lower() != _base(e["parent_image"]).lower()):
+            pass
+        else:
+            alive.pop(e["pid"], None)
+            continue
+        alive[e["pid"]] = e["image"]
+        chosen.append(e)
+    return chosen
 
 
 def windows_processes(tree, real: str) -> dict:
@@ -1194,6 +1235,8 @@ class WindowsTrace:
         self.session = False
         self.images: dict = {}
         self.exits_ok = False
+        self.ends_ok = False
+        self.before_end = None
 
     def _canary(self, which: str) -> str:
         """A file of the oracle's own, written and read now: the session must have a Create event of it."""
@@ -1206,6 +1249,12 @@ class WindowsTrace:
         self.before = {"setting": parse_audit_setting(_tool(["auditpol", "/get", "/subcategory:" + AUDIT_GUID, "/r"])),
                        "value": self._registry_value()}
         _tool(["auditpol", "/set", "/subcategory:" + AUDIT_GUID, "/success:enable"])
+        try:  # the end of each process (4689): without it the tree still tells a pid taken by a stranger by its birth, and the run says so, it is not red
+            end_setting = parse_audit_setting(_tool(["auditpol", "/get", "/subcategory:" + AUDIT_END_GUID, "/r"]))
+            _tool(["auditpol", "/set", "/subcategory:" + AUDIT_END_GUID, "/success:enable"])
+            self.before_end, self.ends_ok = end_setting, True
+        except TraceError:
+            self.ends_ok = False
         _tool(["reg", "add", AUDIT_KEY, "/v", AUDIT_VALUE, "/t", "REG_DWORD", "/d", "1", "/f"])
         newest = _tool(["wevtutil", "qe", "Security", "/c:1", "/rd:true", "/f:xml"])
         m = re.search(r"<EventRecordID>(\d+)</EventRecordID>", newest)
@@ -1233,10 +1282,10 @@ class WindowsTrace:
         return int(m.group(1), 16) if m else None
 
     def tree(self, roots) -> list:
-        xml = _tool(["wevtutil", "qe", "Security", "/q:*[System[(EventID=4688) and (EventRecordID>%d)]]" % self.first_record, "/f:xml"])
+        xml = _tool(["wevtutil", "qe", "Security", "/q:*[System[(EventID=4688 or EventID=4689) and (EventRecordID>%d)]]" % self.first_record, "/f:xml"])
         events = parse_audit_events(xml)
         self.images = {e["pid"]: _base(e["image"]).lower() for e in events}
-        return process_tree(events, roots)
+        return process_tree(events, roots, parse_audit_ends(xml))
 
     def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None) -> dict:
         """`{"tree": [4688 events], "files": {(pid, name)}, "outside": {process name: paths}, "exited": {...}, "events": n}`: what the TREE did from its
@@ -1299,6 +1348,9 @@ class WindowsTrace:
         flags = {"Success": ("enable", "disable"), "Failure": ("disable", "enable"), "Success and Failure": ("enable", "enable")}
         success, failure = flags.get(self.before["setting"], ("disable", "disable"))
         try:
+            if self.ends_ok:
+                end_success, end_failure = flags.get(self.before_end, ("disable", "disable"))
+                _tool(["auditpol", "/set", "/subcategory:" + AUDIT_END_GUID, "/success:" + end_success, "/failure:" + end_failure])
             _tool(["auditpol", "/set", "/subcategory:" + AUDIT_GUID, "/success:" + success, "/failure:" + failure])
             if self.before["value"] is None:
                 _tool(["reg", "delete", AUDIT_KEY, "/v", AUDIT_VALUE, "/f"])

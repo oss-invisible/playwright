@@ -3043,3 +3043,140 @@ def test_a_stock_firefox_with_no_parent_found_is_a_broken_control_that_says_so_a
     document = host.run_stock("windows-x86_64")
     problems = host.stock_control_problems(document)
     assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform provider" not in problems[0]
+
+
+# -
+# A pid is not a process (run 45221868374): Windows hands the pid of a process that ended to the next one it creates.
+
+def audit_with_parent(rid, pid, ppid, image, cmd, parent_image):
+    """A 4688 event that also carries the image the audit gives for the creator (`ParentProcessName`)."""
+    return audit(rid, pid, ppid, image, cmd).replace("</EventData>", '<Data Name="ParentProcessName">%s</Data></EventData>' % parent_image)
+
+
+def audit_end(rid, pid):
+    """A 4689 event: the process `pid` ended."""
+    return ('<Event %s><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4689</EventID><EventRecordID>%d</EventRecordID></System>'
+            '<EventData><Data Name="SubjectUserSid">S-1-5-18</Data><Data Name="Status">0x0</Data><Data Name="ProcessId">0x%x</Data>'
+            '<Data Name="ProcessName">%s</Data></EventData></Event>' % (NS, rid, pid, FIREFOX))
+
+
+def ev(rid, pid, ppid, image=FIREFOX, parent_image="", kind=""):
+    return {"rid": rid, "pid": pid, "ppid": ppid, "image": image, "parent_image": parent_image, "cmd": "", "time": "", "kind": kind}
+
+
+def test_the_audit_reads_the_end_of_a_process_and_the_image_of_its_creator():
+    xml = "\n".join([audit_with_parent(5, 102, 100, FIREFOX, "x", "C:\\lab\\ff\\FIREFOX.exe"), audit_end(6, 102), audit(7, 103, 100, FIREFOX, "y")])
+    events = host.parse_audit_events(xml)
+    assert [(e["pid"], e["parent_image"]) for e in events] == [(102, "C:\\lab\\ff\\FIREFOX.exe"), (103, "")], "the end is not a creation; a creation without the creator's image says ''"
+    assert host.parse_audit_ends(xml) == [{"rid": 6, "pid": 102, "time": ""}]
+    assert host.parse_audit_ends("") == []
+
+
+def test_a_child_born_while_its_creator_lives_stays_in_the_tree_though_the_pid_is_taken_later_by_a_stranger():
+    events = [ev(1, 100, 50), ev(2, 101, 100), ev(3, 102, 101), ev(5, 101, 900, "C:\\Windows\\notepad.exe"), ev(6, 103, 101, "C:\\Windows\\notepad.exe"), ev(7, 104, 100)]
+    ends = [{"rid": 4, "pid": 101}, {"rid": 8, "pid": 104}]
+    assert [e["pid"] for e in host.process_tree(events, {100}, ends)] == [100, 101, 102, 104], "101 and its child were born alive; the stranger of record 5 and its child (6) are not"
+    # without the ends the stranger is still seen: it carries the pid of a process of the tree and its creator is not in the tree, so the pid is no longer that process's
+    assert [e["pid"] for e in host.process_tree(events, {100})] == [100, 101, 102, 104]
+    assert [e["rid"] for e in host.process_tree(events, {100}, ends)] == [1, 2, 3, 7], "the births of the tree are the ones before the pid was taken"
+
+
+def test_a_process_born_from_the_pid_of_a_creator_that_is_gone_is_not_in_the_tree():
+    events = [ev(1, 100, 50), ev(2, 101, 100), ev(4, 105, 101, "C:\\Windows\\System32\\svchost.exe")]
+    assert [e["pid"] for e in host.process_tree(events, {100}, [{"rid": 3, "pid": 101}])] == [100, 101], "101 ended at record 3: record 4 is born from another process that has its pid"
+
+
+def test_the_creator_the_audit_names_must_be_the_image_the_creator_was_born_with():
+    events = [ev(1, 100, 50), ev(2, 101, 100, parent_image="c:\\LAB\\ff\\firefox.EXE"), ev(3, 102, 100, parent_image="C:\\Windows\\System32\\python.exe"), ev(4, 103, 100)]
+    assert [e["pid"] for e in host.process_tree(events, {100})] == [100, 101, 103], "the same file name under another spelling or no name stays; python.exe is not firefox.exe"
+    assert [e["pid"] for e in host.process_tree(events, {999})] == [], "a root that never appears has no tree"
+    # a root born before the audit (no event of its own) has no image to compare: its children join by its pid
+    assert [e["pid"] for e in host.process_tree([ev(4, 7, 100, parent_image="C:\\Windows\\System32\\python.exe")], {100})] == [7]
+
+
+def reconstruct_idle_launch_of_run_45221868374():
+    """The 4688 and 4689 events of the idle launch of run 45221868374, rebuilt from the rows of its lifecycle (kind, start or end, order): the footprint keeps no pid
+    and no creator, so these are the test's. The real firefox processes: the first `parent` is the root (its creator is the oracle's pid 50), the second parent is its
+    child, the tabs, the utility and the pingsender are the second parent's, the last socket is the pingsender's. What the run took into the tree besides them
+    (`svchost -s wlidsvc`, `wevtutil`, `wsl`, and the socket of 16:59:20, born before any pingsender and whose command line names another parent) is given a pid
+    Windows had already handed out: the pid of the process that ended last in the tree, when one had (a process taking the pid of one that is gone, its creator the
+    oracle), and before any process ended, a new pid whose creator is the root's pid and whose audit names python.exe as that creator.
+    Returns `(events, ends)`, each event with its `kind` and `legit`."""
+    import collections
+
+    rows = json.loads((Path(__file__).parent / "data" / "ab_host_pid_reuse" / "45221868374" / "idle-lifecycle.json").read_text(encoding="utf-8"))["lifecycle"]
+    tools = {"wevtutil.exe": "C:\\Windows\\System32\\wevtutil.exe", "svchost.exe": "C:\\Windows\\System32\\svchost.exe", "wsl.exe": "C:\\Windows\\System32\\wsl.exe"}
+    events, ends, running, dead, rid, fresh = [], [], {}, [], 0, iter(range(2000, 3000))
+    seen = collections.Counter()
+    for row in rows:
+        kind, rid = row["kind"], rid + 1
+        if row["event"] == "end":
+            pid = running[kind].pop(0)
+            ends.append({"rid": rid, "pid": pid})
+            dead.append(pid)
+            continue
+        legit = kind in ("parent", "tab/isForBrowser", "utility/sandboxingKind=0", "backgroundtask/pingsender") or (kind == "socket" and seen["backgroundtask/pingsender"] > 0)
+        if legit:
+            pid = [1000, 1001][seen["parent"]] if kind == "parent" else next(fresh)
+            creator = {"parent": [50, 1000][min(seen["parent"], 1)], "socket": (running.get("backgroundtask/pingsender") or [None])[0]}.get(kind, 1001)
+            events.append(dict(ev(rid, pid, creator, FIREFOX, FIREFOX, kind), legit=True))
+        else:
+            if dead:
+                pid, creator, said = dead.pop(), 50, ""
+            else:
+                pid, creator, said = next(fresh), 1000, "C:\\Windows\\System32\\python.exe"
+            events.append(dict(ev(rid, pid, creator, tools.get(kind, FIREFOX), said, kind), legit=False))
+        seen[kind] += 1
+        running.setdefault(kind, []).append(pid)
+    return events, ends
+
+
+def test_the_idle_launch_of_run_45221868374_has_only_the_processes_of_the_engine_in_its_tree():
+    events, ends = reconstruct_idle_launch_of_run_45221868374()
+    intruders = [e["kind"] for e in events if not e["legit"]]
+    assert sorted(intruders) == sorted(["svchost.exe"] * 2 + ["wevtutil.exe"] * 15 + ["wsl.exe"] * 2 + ["socket"]), "the rows of the run: what was not the engine's"
+    tree = host.process_tree(events, {1000}, ends)
+    assert [e["kind"] for e in tree if not e["legit"]] == [], "no service of the machine and no tool of the oracle is in the tree"
+    assert sorted(e["kind"] for e in tree) == sorted(["parent", "parent", "tab/isForBrowser", "tab/isForBrowser", "utility/sandboxingKind=0", "backgroundtask/pingsender", "socket"]), \
+        "every process of the engine is still in it"
+    # and a tree that holds none of them is a tree that can exit: every process of it ended in the run
+    assert {e["pid"] for e in tree} <= {x["pid"] for x in ends}
+
+
+def _name(path):
+    return re.split(r"[\\/]", path)[-1]
+
+
+def test_the_windows_trace_reads_the_ends_and_the_tree_leaves_the_stranger_that_took_a_pid_of_it(tmp_path, monkeypatch):
+    stranger = audit(30, 107, 5, "C:\\Windows\\System32\\svchost.exe", "svchost.exe -k netsvcs -p -s wlidsvc")
+    child = audit(31, 108, 107, "C:\\Windows\\System32\\wevtutil.exe", "wevtutil qe Security")
+    fake = FakeTools(tmp_path, TREE + [audit_end(20, 107), stranger, child], TREE_FILES)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+    trace.cleanup()
+    assert [(e["pid"], _name(e["image"])) for e in got["tree"]][-1] == (107, "pingsender.exe") and len(got["tree"]) == 6, "the svchost that has the pid of the pingsender is not the pingsender"
+    asked = [c for c in fake.calls if c[0] == "wevtutil" and "/c:1" not in c][0]
+    assert "EventID=4689" in asked[3] and trace.ends_ok is True
+    sets = [c for c in fake.calls if c[:2] == ["auditpol", "/set"]]
+    assert [c[2] for c in sets] == ["/subcategory:" + host.AUDIT_GUID, "/subcategory:" + host.AUDIT_END_GUID, "/subcategory:" + host.AUDIT_END_GUID, "/subcategory:" + host.AUDIT_GUID]
+    assert sets[1][-1] == "/success:enable" and sets[2][-2:] == ["/success:disable", "/failure:disable"], "the termination audit is turned on, and put back as it was"
+
+
+def test_a_machine_that_cannot_audit_the_ends_says_so_and_tells_the_strangers_by_their_birth(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE + [audit(30, 107, 5, "C:\\Windows\\System32\\svchost.exe", "svchost.exe -k x")], TREE_FILES)
+
+    def refusing(argv, timeout=300.0):
+        if argv[:2] == ["auditpol", "/set"] and argv[2] == "/subcategory:" + host.AUDIT_END_GUID:
+            raise host.TraceError("auditpol /set failed")
+        return fake(argv, timeout)
+
+    monkeypatch.setattr(host, "_tool", refusing)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+    trace.cleanup()
+    assert trace.ends_ok is False and got["problems"] == []
+    assert [e["pid"] for e in got["tree"]] == [100, 101, 102, 103, 104, 107], "107 is the pingsender: the svchost that took its pid has a creator that is not in the tree"
+    assert [c[2] for c in fake.calls if c[:2] == ["auditpol", "/set"]] == ["/subcategory:" + host.AUDIT_GUID] * 2

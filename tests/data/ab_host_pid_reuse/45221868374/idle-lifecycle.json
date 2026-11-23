@@ -1,0 +1,323 @@
+{
+ "launch": "idle",
+ "lifecycle": [
+  {
+   "event": "start",
+   "how": "",
+   "kind": "parent",
+   "time": "2026-11-23T16:58:12.9368975Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "parent",
+   "time": "2026-11-23T16:58:12.9447038Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:13.3147954Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "svchost.exe",
+   "time": "2026-11-23T16:58:13.7620819Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:13.7716028Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:13.8028781Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "svchost.exe",
+   "time": "2026-11-23T16:58:13.970863500+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "tab/isForBrowser",
+   "time": "2026-11-23T16:58:14.7079107Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:14.9940602Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "utility/sandboxingKind=0",
+   "time": "2026-11-23T16:58:15.7778669Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "tab/isForBrowser",
+   "time": "2026-11-23T16:58:15.9476388Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:16.2699895Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:16.2940466Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T16:58:18.7136711Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wsl.exe",
+   "time": "2026-11-23T16:59:10.2029323Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wsl.exe",
+   "time": "2026-11-23T16:59:12.221138500+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "svchost.exe",
+   "time": "2026-11-23T16:59:19.3828758Z"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "socket",
+   "time": "2026-11-23T16:59:20.0061534Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "socket",
+   "time": "2026-11-23T16:59:20.870868700+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wsl.exe",
+   "time": "2026-11-23T16:59:50.5782295Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 4294967295",
+   "kind": "wsl.exe",
+   "time": "2026-11-23T16:59:50.599354300+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "tab/isForBrowser",
+   "time": "2026-11-23T17:00:16.785320700+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:16.788835200+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:16.833776900+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "tab/isForBrowser",
+   "time": "2026-11-23T17:00:16.872780900+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:16.875828000+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:16.876346800+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:16.877080100+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "utility/sandboxingKind=0",
+   "time": "2026-11-23T17:00:17.005358500+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "backgroundtask/pingsender",
+   "time": "2026-11-23T17:00:17.0061094Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 1",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:17.019510200+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:17.020111700+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "parent",
+   "time": "2026-11-23T17:00:17.028312700+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "parent",
+   "time": "2026-11-23T17:00:17.061100700+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "socket",
+   "time": "2026-11-23T17:00:17.2400802Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "socket",
+   "time": "2026-11-23T17:00:17.750897400+00:00"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "backgroundtask/pingsender",
+   "time": "2026-11-23T17:00:17.760487100+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:31.4290003Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:31.524775100+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:36.4762838Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:00:36.572912700+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:07.2987869Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:07.398939500+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:11.3921796Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:11.490644500+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:30.9227343Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:31.023271300+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:41.2382275Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:01:41.340881700+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:02:03.6231004Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:02:03.728117900+00:00"
+  },
+  {
+   "event": "start",
+   "how": "",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:02:07.5330074Z"
+  },
+  {
+   "event": "end",
+   "how": "exited 0",
+   "kind": "wevtutil.exe",
+   "time": "2026-11-23T17:02:07.637980000+00:00"
+  }
+ ]
+}
