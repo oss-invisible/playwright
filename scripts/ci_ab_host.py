@@ -15,15 +15,15 @@ On Linux the same step runs and its footprint is compared like the rest.
 Three things are compared, over the whole trace:
 
   * the processes, by KIND, from the command lines of the launch: the parent, `-contentproc` with its type, `-sandboxingKind N` and
-    `-isForBrowser` / `-notForBrowser`, and the helpers (glxtest, pingsender, ...) by what they ran. Every kind and its COUNT must be identical,
-    with one exception: for the content processes of type `tab` only the presence of the kind counts, because how many are alive follows the idle
-    time (a spare process is prelaunched after a delay and closed after a grace period);
-  * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. ONE rule judges the host paths, in the A/A and in the
-    A/B, on Linux and on Windows, the system modules and the shortcut inventory included (`file_rule`): a path is red if and only if it is in ALL the measured launches (the warm-up and
-    the seeds) of one engine and in NO launch of the other (its idle launch included). Every other path that is not in the same share of the launches of both engines is LISTED, not judged: the log and the file
-    `not-judged-a-a.json` / `not-judged.json` of the artifact give, per path, in how many launches of how many each engine has it (measured and long) and the processes that touched it,
-    and mark `watch` the paths in at least half of the launches of one engine and in none of the other's. `ours` leaves the comparison as a class (OURS below: reading its own package is
-    not touching the host);
+    `-isForBrowser` / `-notForBrowser`, and the helpers (glxtest, pingsender, ...) by what they ran;
+  * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. ONE rule judges the host paths AND the kinds of process
+    (`proc.<kind>`), in the A/A and in the A/B, on Linux and on Windows, the system modules and the shortcut inventory included (`file_rule`): a path, or a kind, is red if and only if it
+    is in ALL the measured launches (the warm-up and the seeds) of one engine and in NO launch of the other (its idle launch included). A kind counts by its presence, never by how many
+    processes of it a launch has (the content processes of type `tab` followed the idle time, and so does the start of Mozilla's pingsender). Every other path or kind that is not in the same
+    share of the launches of both engines is LISTED, not judged: the log and the file `not-judged-a-a.json` / `not-judged.json` of the artifact give, per path and per kind, in how many launches
+    of how many each engine has it (measured and long) and the processes that touched the path or spawned the kind, and mark `watch` the ones in at least half of the launches of one engine and
+    in none of the other's. `ours` leaves the comparison as a class (OURS
+    below: reading its own package is not touching the host);
   * the network, per kind (Linux): every NETLINK socket the tree opens, by protocol (NETLINK_ROUTE, NETLINK_KOBJECT_UEVENT, ...), with the requests
     it sends on it (RTM_GETLINK, RTM_GETADDR, ...) and the multicast groups it binds to, and every connect or send towards a PUBLIC address, with
     the transport, the family, the address and the port. The SET per kind must be identical, no exception, like the host paths. A destination that
@@ -36,12 +36,12 @@ to blame (`by A: ... | B: ...`: who touched the path, who spawned the kind).
 
 Each engine run starts with a discarded WARM-UP launch (the first seed), an experiment control and not an excuse: its trace is kept in the footprint and the
 report lists what only the warm-up did (`WARMUP-ONLY`, per kind, per path and per net entry, with the process that did it), so that a first-launch-only behaviour (a
-helper spawned at the first shutdown of a cold machine) stays visible from run to run. The measured launches are compared as they are: a kind or a count that differs
-after the warm-up is red.
+helper spawned at the first shutdown of a cold machine) stays visible from run to run. The measured launches are compared as they are: a path or a kind that one engine has in all of them
+and the other in none is red.
 
 The exit pings (`firefox --backgroundtask pingsender`, through the session's route, never the separate `pingsender[.exe]`) leave only when Mozilla's `canUpload()` is
-true (TelemetrySend.sys.mjs:1083), which the core's declared terms of use make true from the start: in a measured launch their
-number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red. The paths only they touch are paths like any other (`file_rule`); the destinations only they reach are compared when they are
+true (TelemetrySend.sys.mjs:1083), which the core's declared terms of use make true from the start; whether a launch starts them, and how many, varies from a launch to the next (run
+45228081536: 3 in every launch of one run of the 68 and 3, 0, 2, 0, 3 in the other, the sockets they start in 3 launches and in none): their number, their types and what spawned them are listed, not judged (a pingsender kind is red by the rule of every kind). The paths only they touch are paths like any other (`file_rule`); the destinations only they reach are compared when they are
 there on both sides of a launch, and left out when they are there on one side only (a destination is `public, telemetry`: the telemetry host is the third party's, and
 whether the connection succeeded is not in the verdict). The IDLE launch of each engine run (a page, no pref changed, up to 120 s) is evidence: which pings leave in a long launch is not a rule until it is proven (the core declares
 the terms of use accepted, so `canUpload()` is true from the start and the notification of the data policy is never recorded; Linux started 1 pingsender in it, Windows 0).
@@ -51,7 +51,9 @@ ACCEPTED LOSSES (the rule of the host paths trades them for a verdict that does 
   * a path that one engine has in every measured launch and the other in only some of them is not red: always against sometimes is listed, never judged;
   * a reading tied to one seed is not judged: no path is compared seed by seed;
   * what happens only in the long launch (idle) is only listed: judging it would take two idle launches per engine;
-  * the cause of the pingsender that starts in one launch of eight is not known: its paths are listed like the others, there is no rule and no preference for it;
+  * the cause of the variable start of the pingsender is not known: how many of it a launch has, and what it spawns, are listed, and red only by the rule of every kind (in all the measured launches of one engine and in none of the other's); no type of the pings is held, no preference for it;
+  * how many processes of a kind a launch has is not compared (a candidate that spawns two gpu processes where the 68 spawns one is not seen): only that a kind is there in every launch of one
+    engine and in none of the other's;
   * a pid that Windows reuses may attribute to the engine the tools of the oracle itself, among the processes that touched a path.
 
 How the trace is taken:
@@ -90,6 +92,10 @@ there and removed after the run): the browser's processes read the link of every
 
 Declared differences (ci/ab-host-expected.json) are applied to the A/B only, never to the A/A, by kind, and one that does not show is red as stale. A declared `proc` difference covers the
 process kind and the file leaves whose only toucher on the published side is that kind (a leaf another process touched too is still a difference).
+
+Evidence of the tree (Windows): every launch (the warm-up, each seed, the idle launch and the stock control) saves the raw events of the audit that its tree was read from, the 4688 births
+and the 4689 ends, the excluded ones as well, in `<footprint>.audit/<launch>-<seed>.json` (`audit_listing`: record id, event, pid, creator's pid, image, `ParentProcessName`, time, command
+line, whether it is in the tree and why). It changes no verdict and is not a leaf of the footprint.
 """
 from __future__ import annotations
 
@@ -186,13 +192,11 @@ TAB_REASON = ("the number of content processes of type tab follows the idle time
 #: through the session's route, never as the separate `pingsender[.exe]`, which took its road from the host. Whether they leave at all is Mozilla's
 #: `canUpload()` (TelemetrySend.sys.mjs:1083: `options.usePingSender && !this._isOSShutdown && TelemetryReportingPolicy.canUpload()`), true once the data-policy
 #: notification was recorded (TelemetryReportingPolicy.sys.mjs:988 `_userNotified`, from `ensureUserIsNotified` at `sessionstore-windows-restored`, :1140-1175):
-#: a launch that stays short may or may not have got there, so it has 0 of them or all 3 (the first run sends new-profile, first-shutdown and event; the shutdown
-#: ping waits for the second session, TelemetrySession.sys.mjs:1011).
+#: a launch that stays short may or may not have got there (the first run sends new-profile, first-shutdown and event; the shutdown ping waits for the second session,
+#: TelemetrySession.sys.mjs:1011). Run 45228081536 (A/A of the 68, Windows): the pingsenders of the 68 were 3, 3, 3, 3, 3 in the seeds of one run and 3, 0, 2, 0, 3 in the other, and the
+#: sockets they start (`socket<-pingsender`) 0 to 3: the start of Mozilla's pingsender is not the engine's to hold, so HOW MANY of them a launch has is listed, not judged.
 PINGSENDER_KIND = "backgroundtask/pingsender"
 PINGSENDER_EXES = ("pingsender", "pingsender.exe")
-PING_TYPES = ("event", "first-shutdown", "new-profile")
-PINGSENDER_COUNTS = (0, 3)
-CAN_UPLOAD = "TelemetrySend.sys.mjs:1083"
 #: The pref the policy writes when the notification is recorded (TelemetryUtils.sys.mjs:80, TelemetryReportingPolicy.sys.mjs:1025): the profile's prefs.js says
 #: it, a file of the launch's own, so the precondition of the pings is observed without any channel into the engine.
 NOTIFIED_PREF = "datareporting.policy.dataSubmissionPolicyNotifiedTime"
@@ -492,22 +496,10 @@ def ping_records(procs: dict, labels: dict, parents: dict, windows: bool) -> lis
 
 
 def pingsender_problems(fp: dict) -> list:
-    """What is wrong with the exit pings of one launch (a short measured launch, or the idle one asking `strict`): the separate executable ran, a number of
-    pingsenders that is not 0 or 3, three that are not the three pings of a first run or not spawned by the parent."""
-    kinds, out = fp.get("kinds", {}), []
-    for exe in PINGSENDER_EXES:
-        if kinds.get(exe):
-            out.append("the separate %s ran (B266: the pings leave as `firefox --backgroundtask pingsender`, through the session's route)" % exe)
-    n = kinds.get(PINGSENDER_KIND, 0)
-    if n not in PINGSENDER_COUNTS:
-        out.append("%d pingsender processes, not 0 or 3 (they leave only when canUpload is true, %s)" % (n, CAN_UPLOAD))
-    if n == 3:
-        records = [r for r in fp.get("pingsenders", []) if r["form"] == "backgroundtask"]
-        if sorted(str(r["type"]) for r in records) != list(PING_TYPES):
-            out.append("the three pingsenders are not the pings of a first run %s: %s" % (list(PING_TYPES), sorted(str(r["type"]) for r in records)))
-        if sorted({r["parent"] for r in records}) != ["parent"]:
-            out.append("the pingsenders were not all spawned by the parent: %s" % sorted({r["parent"] for r in records}))
-    return out
+    """What is wrong with the exit pings of one launch: the separate executable ran. HOW MANY pingsenders a launch starts, of which type and spawned by whom, is not judged (it varies from
+    a launch to the next): it is listed with the other kinds (`file_rule`)."""
+    kinds = fp.get("kinds", {})
+    return ["the separate %s ran (B266: the pings leave as `firefox --backgroundtask pingsender`, through the session's route)" % exe for exe in PINGSENDER_EXES if kinds.get(exe)]
 
 
 def privileged_problems(fp: dict) -> list:
@@ -530,8 +522,8 @@ def pingsender_destinations(fp: dict) -> list:
 #: how many launches of how many each engine has them and the processes that touched them; the ones in at least half of the launches of one engine and in none of the other's are
 #: marked `watch`.
 NOT_JUDGED_FORMAT = "ab-host-not-judged/1"
-NOT_JUDGED_REASON = ("a path in all the measured launches of one engine and in no launch of the other is red; the other paths that differ are listed, not judged; `watch` is a path "
-                     "in at least half of the launches of one engine and in none of the other's")
+NOT_JUDGED_REASON = ("a path, or a kind of process, in all the measured launches of one engine and in no launch of the other is red; the other paths and kinds that differ are listed, "
+                     "not judged; `watch` is one in at least half of the launches of one engine and in none of the other's")
 LISTED_IN_LOG = 50
 
 
@@ -542,25 +534,26 @@ def launches_of(fp: dict) -> list:
     return out + [(name, False, fp[name]) for name in ("idle",) if fp.get(name)]
 
 
-def path_table(fps: list) -> dict:
-    """What the launches of ONE engine (the footprints of its runs) did to the host paths: `{"launches": {"measured": n, "long": n}, "paths": {path: {"measured": k,
-    "long": k}}, "by": {path: [kinds that touched it]}}`."""
-    launches, paths, by = {"measured": 0, "long": 0}, {}, {}
+def presence_table(fps: list, items_of, by_of) -> dict:
+    """What the launches of ONE engine (the footprints of its runs) have of a set of things: `{"launches": {"measured": n, "long": n}, "seen": {thing: {"measured": k, "long": k}},
+    "by": {thing: [who]}}`. `items_of(launch)` is the set of the things a launch has (host paths, kinds of process), `by_of(launch, thing)` who is to blame for it there."""
+    launches, seen, by = {"measured": 0, "long": 0}, {}, {}
     for fp in fps:
         for _name, measured, launch in launches_of(fp):
             layer = "measured" if measured else "long"
             launches[layer] += 1
-            for path in set(launch.get("files", [])):
-                paths.setdefault(path, {"measured": 0, "long": 0})[layer] += 1
-                by.setdefault(path, set()).update((launch.get("touched_by") or {}).get(path, []))
-    return {"launches": launches, "paths": paths, "by": {path: sorted(kinds) for path, kinds in by.items()}}
+            for thing in items_of(launch):
+                seen.setdefault(thing, {"measured": 0, "long": 0})[layer] += 1
+                by.setdefault(thing, set()).update(by_of(launch, thing))
+    return {"launches": launches, "seen": seen, "by": {thing: sorted(who) for thing, who in by.items()}}
 
 
-def file_rule(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
-    """`(red, not_judged)` of the host paths of two footprints, by the rule above. `red` is `{"A": [paths only A has, in all its measured launches], "B": [...]}`. `also_68`
-    are the other footprints of the engine of A in an A/B (the published engine measured twice): its launches are all of them the engine's."""
-    ta, tb = path_table([a, *also_68]), path_table([b])
-    red = {side: sorted(p for p, c in mine["paths"].items() if mine["launches"]["measured"] and c["measured"] == mine["launches"]["measured"] and p not in other["paths"])
+def presence_rule(ta: dict, tb: dict, key: str, by_key: str) -> tuple:
+    """`(red, entries)` of two `presence_table`s by the rule above, whatever the things are. `red` is `{"A": [things only A has, in all its measured launches], "B": [...]}`; the
+    entries are the other things that are not in the same share of the launches of both engines, `{key: thing, "watch", "A": {layer: [in n launches, of m]}, "B": ..., by_key: {"A": [who],
+    "B": [who]}}`, the ones to watch first."""
+    red = {side: sorted(p for p, c in mine["seen"].items()
+                        if mine["launches"]["measured"] and c["measured"] == mine["launches"]["measured"] and p not in other["seen"])
            for side, mine, other in (("A", ta, tb), ("B", tb, ta))}
     judged = set(red["A"]) | set(red["B"])
     every = {side: sum(t["launches"].values()) for side, t in (("A", ta), ("B", tb))}
@@ -569,18 +562,51 @@ def file_rule(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
         return all(seen["A"][layer] * tb["launches"][layer] == seen["B"][layer] * ta["launches"][layer] for layer in ("measured", "long"))
 
     entries = []
-    for path in sorted(set(ta["paths"]) | set(tb["paths"])):
-        if path in judged:
+    for thing in sorted(set(ta["seen"]) | set(tb["seen"])):
+        if thing in judged:
             continue
-        seen = {side: t["paths"].get(path, {"measured": 0, "long": 0}) for side, t in (("A", ta), ("B", tb))}
+        seen = {side: t["seen"].get(thing, {"measured": 0, "long": 0}) for side, t in (("A", ta), ("B", tb))}
         if same(seen):
-            continue  # in the same share of the launches of both engines (every one of them, for a path that is there always): nothing to list
+            continue  # in the same share of the launches of both engines (every one of them, for a thing that is there always): nothing to list
         watch = any(sum(seen[mine].values()) * 2 >= every[mine] and not sum(seen[other].values()) for mine, other in (("A", "B"), ("B", "A")))
-        entries.append({"path": path, "watch": watch,
+        entries.append({key: thing, "watch": watch,
                         **{side: {layer: [seen[side][layer], t["launches"][layer]] for layer in ("measured", "long")} for side, t in (("A", ta), ("B", tb))},
-                        "touched_by": {"A": ta["by"].get(path, []), "B": tb["by"].get(path, [])}})
-    entries.sort(key=lambda e: (not e["watch"], e["path"]))
-    return red, {"format": NOT_JUDGED_FORMAT, "mode": "a-a" if a_a else "a-b", "reason": NOT_JUDGED_REASON, "launches": {"A": ta["launches"], "B": tb["launches"]}, "paths": entries}
+                        by_key: {"A": ta["by"].get(thing, []), "B": tb["by"].get(thing, [])}})
+    entries.sort(key=lambda e: (not e["watch"], e[key]))
+    return red, entries
+
+
+def judged_kinds(launch: dict) -> set:
+    """The kinds of process of a launch that the rule looks at: every kind that ran, as a kind and not by how many of it there are (a kind of type tab is by its presence like
+    the rest). Not here: the separate `pingsender[.exe]`, which is red where it is (`pingsender_problems`, `idle_problems`), and the preloaded about:newtab (PRIVILEGED_REASON:
+    absent or present per launch, never more than one, never compared between the sides)."""
+    return {kind for kind, n in launch.get("kinds", {}).items() if n and kind not in PINGSENDER_EXES and kind != PRIVILEGED}
+
+
+def path_table(fps: list) -> dict:
+    """The `presence_table` of the host paths of the launches of ONE engine, `"paths"` being what is `"seen"`."""
+    table = presence_table(fps, lambda launch: set(launch.get("files", [])), lambda launch, path: (launch.get("touched_by") or {}).get(path, []))
+    return dict(table, paths=table["seen"])
+
+
+def kind_table(fps: list) -> dict:
+    """The `presence_table` of the kinds of process of the launches of ONE engine (who is to blame for a kind: the kinds that spawned it)."""
+    return presence_table(fps, judged_kinds, lambda launch, kind: (launch.get("spawned_by") or {}).get(kind, []))
+
+
+def file_rule(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
+    """`(red, not_judged)` of two footprints, by the rule above, over the host paths and over the KINDS of process (`proc.<kind>`, presence only: not how many of a kind a launch has).
+    `red` is `{"files": {"A": [paths only A has, in all its measured launches], "B": [...]}, "kinds": {"A": [...], "B": [...]}}`. `also_68` are the other footprints of the engine of A in
+    an A/B (the published engine measured twice): its launches are all of them the engine's. `not_judged` is the document of the file `not-judged[-a-a].json`: the paths and the kinds that
+    differ and are not red."""
+    fa, fb = [a, *also_68], [b]
+    ta, tb = path_table(fa), path_table(fb)
+    ka, kb = kind_table(fa), kind_table(fb)
+    red_files, paths = presence_rule(ta, tb, "path", "touched_by")
+    red_kinds, kinds = presence_rule(ka, kb, "kind", "spawned_by")
+    return ({"files": red_files, "kinds": red_kinds},
+            {"format": NOT_JUDGED_FORMAT, "mode": "a-a" if a_a else "a-b", "reason": NOT_JUDGED_REASON, "launches": {"A": ta["launches"], "B": tb["launches"]},
+             "paths": paths, "kinds": kinds})
 
 
 PRIVILEGED = "Privileged Cont"
@@ -1083,8 +1109,8 @@ def parse_audit_events(xml_text: str) -> list:
 
 
 def parse_audit_ends(xml_text: str) -> list:
-    """The process terminations of the same output (event 4689): `[{"rid", "pid", "time"}]`, in the order of the log. A 4688 has no end in it: this is where the
-    end of a process is read, so that the creator of a process can be told alive or gone at the moment the process was born."""
+    """The process terminations of the same output (event 4689): `[{"rid", "pid", "image", "time"}]`, in the order of the log. A 4688 has no end in it: this is where the
+    end of a process is read (the listing of the audit of a launch says when each process of the tree ended)."""
     body = re.sub(r"<\?xml[^>]*\?>", "", xml_text)
     root = ET.fromstring("<Events>%s</Events>" % body)
     out = []
@@ -1095,45 +1121,76 @@ def parse_audit_ends(xml_text: str) -> list:
         rid = next((int(e.text) for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "EventRecordID" and e.text), 0)
         when = next((e.get("SystemTime", "") for e in ev.iter() if e.tag.rsplit("}", 1)[-1] == "TimeCreated"), "")
         if "ProcessId" in data:
-            out.append({"rid": rid, "pid": _number(data["ProcessId"]), "time": when})
+            out.append({"rid": rid, "pid": _number(data["ProcessId"]), "image": data.get("ProcessName", ""), "time": when})
+    return out
+
+
+def walk_tree(events, roots, ends=()) -> list:
+    """Every event of the audit (the 4688 births of `parse_audit_events` and the 4689 ends of `parse_audit_ends`), in the order of the log (`rid`, monotone), each with what the
+    tree made of it: `[{"event": 4688 or 4689, "record": the event, "in_tree": bool, "why": text}]`. `process_tree` is its births that are in the tree, and the audit file of a launch
+    (`audit_listing`) is the whole of it, the excluded events included.
+
+    Windows hands the pid of a process that ended to the next process it creates, so a pid is not a process: run 45221868374 (the idle launch of the 68) took into the tree
+    `svchost -s wlidsvc` (a service the service manager started, never ended: the tree "did not exit within 120 s", the A/A was broken), 7 `wevtutil` and 2 `wsl` (the oracle's own
+    tools), each born with a pid that an earlier process of the tree had had. The rule is the least that tells them apart (run 45228081536: the pingsender, born by the parent when
+    the parent was already at its end, was left out of the tree by a rule on the end of the creator, and the A/A of the 68 was red on a process that is the engine's):
+      - a process joins when its creator's pid is one of the tree (the creator was born in it) and, when both events say it, the image the audit gives for the creator is the image
+        the creator was born with; the END of the creator (4689) does not exclude it: a child that is registered after the end of its creator is the creator's;
+      - a pid of the tree stops being the tree's only when the same pid is BORN again as a process that does not join: the next birth of a pid is the process that has it;
+      - the root joins by its own pid (its creator is the oracle); what came before it is not its tree (a creator's pid that Windows reused).
+    The 4689 are read all the same: they say, in the listing, when each process of the tree ended."""
+    roots = set(roots)
+    floor = min((e.get("rid", 0) for e in events if e["pid"] in roots), default=0)
+    born = {e["pid"] for e in events if e["pid"] in roots and e.get("rid", 0) >= floor}
+    known = {pid: "" for pid in roots - born}  # a root with no birth in the log was born before the audit: of the tree from the start, its image unknown
+    waiting = set(born)
+    moments = sorted([(e.get("rid", 0), 0, i, e) for i, e in enumerate(events)] + [(x.get("rid", 0), 1, i, x) for i, x in enumerate(ends)], key=lambda m: m[:3])
+    out = []
+    for rid, is_end, _i, e in moments:
+        if rid < floor:
+            out.append({"event": 4689 if is_end else 4688, "record": e, "in_tree": False, "why": "before the birth of the root: not its tree"})
+            continue
+        if is_end:
+            out.append({"event": 4689, "record": e, "in_tree": e["pid"] in known,
+                        "why": "the end of a process of the tree" if e["pid"] in known else "the end of a process that is not in the tree"})
+            continue
+        creator = known.get(e["ppid"])
+        if e["pid"] in waiting:
+            waiting.discard(e["pid"])
+            joined, why = True, "the root of the launch (its creator is the oracle)"
+        elif e["ppid"] not in known:
+            joined, why = False, "its creator (pid %d) is not a process of the tree: it is a stranger that has this pid" % e["ppid"]
+        elif creator and e.get("parent_image") and _base(creator).lower() != _base(e["parent_image"]).lower():
+            joined, why = False, "the creator the audit names (%s) is not the image pid %d was born with (%s)" % (_base(e["parent_image"]), e["ppid"], _base(creator))
+        else:
+            joined, why = True, "created by pid %d, a process of the tree" % e["ppid"]
+        if joined:
+            known[e["pid"]] = e["image"]
+        else:
+            known.pop(e["pid"], None)  # the pid is born again as a process that is not the tree's
+        out.append({"event": 4688, "record": e, "in_tree": joined, "why": why})
     return out
 
 
 def process_tree(events, roots, ends=()) -> list:
-    """The events of `parse_audit_events` that are a root or were born from a process of the tree that was ALIVE when it was born, in their order.
+    """The events of `parse_audit_events` that are a root or were born from a process of the tree, in their order (the rule is in `walk_tree`)."""
+    return [m["record"] for m in walk_tree(events, roots, ends) if m["event"] == 4688 and m["in_tree"]]
 
-    Windows hands the pid of a process that ended to the next process it creates, so a pid is not a process: run 45221868374 (the idle launch of the 68) took into the
-    tree `svchost -s wlidsvc` (a service the service manager started, never ended: the tree "did not exit within 120 s", the A/A was broken), 7 `wevtutil` and 2 `wsl`
-    (the oracle's own tools), each by a pid that an earlier process of the tree had had. The tree is therefore walked in the order of the log (`rid`, monotone), the
-    births (4688) and the ends (`ends`, the 4689 of `parse_audit_ends`) together, with the set of the pids that are alive in it:
-      - a process joins when its creator is alive in the tree at its birth (the creator's birth before it, its end after it) and, when both events say it, the image the
-        audit gives for the creator is the image the creator was born with;
-      - a process that carries the pid of one alive in the tree and does not join is a stranger that took the pid of a process that is gone: that pid is no longer alive;
-      - the root joins by its own pid (its creator is the oracle); what came before it is not its tree (a creator's pid that Windows reused)."""
-    roots = set(roots)
-    floor = min((e.get("rid", 0) for e in events if e["pid"] in roots), default=0)
-    events = [e for e in events if e.get("rid", 0) >= floor]
-    born = {e["pid"] for e in events if e["pid"] in roots}
-    alive = {pid: "" for pid in roots - born}  # a root with no birth in the log was born before the audit: alive from the start, its image unknown
-    waiting = set(born)
-    moments = sorted([(e.get("rid", 0), 0, i, e) for i, e in enumerate(events)] + [(x.get("rid", 0), 1, i, x) for i, x in enumerate(ends) if x.get("rid", 0) >= floor],
-                     key=lambda m: m[:3])
-    chosen = []
-    for _rid, is_end, _i, e in moments:
-        if is_end:
-            alive.pop(e["pid"], None)
-            continue
-        creator = alive.get(e["ppid"])
-        if e["pid"] in waiting:
-            waiting.discard(e["pid"])
-        elif e["ppid"] in alive and not (creator and e.get("parent_image") and _base(creator).lower() != _base(e["parent_image"]).lower()):
-            pass
-        else:
-            alive.pop(e["pid"], None)
-            continue
-        alive[e["pid"]] = e["image"]
-        chosen.append(e)
-    return chosen
+
+AUDIT_FORMAT = "ab-host-audit/1"
+
+
+def audit_listing(events, roots, ends, launch: str, seed: int) -> dict:
+    """The audit of one Windows launch as a document: every event the tree was read from, the excluded ones as well (`walk_tree`), each with its record id, event (4688 or 4689), pid,
+    creator's pid, image, the image the audit names for the creator (`ParentProcessName`), time, and whether it is in the tree and why. Evidence for the next time a process is or
+    is not in a tree: it changes no verdict and is never a leaf of the footprint."""
+    rows = []
+    for m in walk_tree(events, roots, ends):
+        r = m["record"]
+        rows.append({"rid": r.get("rid", 0), "event": m["event"], "pid": r["pid"], "ppid": r.get("ppid") if m["event"] == 4688 else None,
+                     "image": r.get("image", ""), "parent_image": r.get("parent_image", ""), "time": r.get("time", ""), "cmd": (r.get("cmd") or "")[:300],
+                     "in_tree": m["in_tree"], "why": m["why"]})
+    return {"format": AUDIT_FORMAT, "launch": launch, "seed": seed, "roots": sorted(roots), "in_tree": sum(1 for r in rows if r["in_tree"]), "events": rows}
 
 
 def windows_processes(tree, real: str) -> dict:
@@ -1237,6 +1294,7 @@ class WindowsTrace:
         self.exits_ok = False
         self.ends_ok = False
         self.before_end = None
+        self.audit_raw: tuple = ([], [])  # the births and the ends of the last read of the log (`audit_listing`)
 
     def _canary(self, which: str) -> str:
         """A file of the oracle's own, written and read now: the session must have a Create event of it."""
@@ -1285,7 +1343,9 @@ class WindowsTrace:
         xml = _tool(["wevtutil", "qe", "Security", "/q:*[System[(EventID=4688 or EventID=4689) and (EventRecordID>%d)]]" % self.first_record, "/f:xml"])
         events = parse_audit_events(xml)
         self.images = {e["pid"]: _base(e["image"]).lower() for e in events}
-        return process_tree(events, roots, parse_audit_ends(xml))
+        ends = parse_audit_ends(xml)
+        self.audit_raw = (events, ends)
+        return process_tree(events, roots, ends)
 
     def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None) -> dict:
         """`{"tree": [4688 events], "files": {(pid, name)}, "outside": {process name: paths}, "exited": {...}, "events": n}`: what the TREE did from its
@@ -1304,6 +1364,8 @@ class WindowsTrace:
                 except Exception:  # noqa: BLE001 - a process that is gone has no name
                     return "pid %d" % pid
         tree, exited = wait_exited(lambda: self.tree(roots), alive, sleep=sleep, now=now)
+        events, ends = self.audit_raw
+        audit = (events, ends, sorted(roots))
         end_canary = self._canary("end")
         _tool(["logman", "stop", self.name, "-ets"])
         self.session = False
@@ -1330,7 +1392,7 @@ class WindowsTrace:
         missing = sorted(tree_pids - {pid for pid, _n in seen})
         if missing:
             problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
-        return {"tree": tree, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
+        return {"tree": tree, "audit": audit, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
                 "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids], "exits_available": self.exits_ok,
                 "order": {k: v for k, v in order.items() if k[0] in tree_pids},
                 "dispositions": {k: sorted(v) for k, v in dispositions.items() if k[0] in tree_pids}}
@@ -1430,16 +1492,9 @@ def net_class(entry: str) -> str:
 
 
 def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
-    """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence) and
-    net.<kind>: <what> = 1 for every netlink socket, netlink request and public destination of a process of that kind (`network_events`). The host paths are not leaves
-    of a seed: they are judged over all the launches (`file_rule`)."""
+    """{leaf: value} of one seed: net.<kind>: <what> = 1 for every netlink socket, netlink request and public destination of a process of that kind (`network_events`). Neither the
+    host paths nor the kinds of process are leaves of a seed: both are judged over all the launches (`file_rule`)."""
     out = {}
-    for kind, n in seed_footprint.get("kinds", {}).items():
-        if kind == PRIVILEGED:
-            continue  # absent or present per launch (PRIVILEGED_REASON): `privileged_problems`
-        if kind == PINGSENDER_KIND or (kind.endswith("<-pingsender") and not with_pingsender):
-            continue  # 0 or 3 of them, with their form (`pingsender_problems`), and what they spawned: there when they are
-        out["proc." + kind] = 1 if is_tab(kind) and n else n
     for entry in seed_footprint.get("net") or []:
         if not entry.startswith(PINGSENDER_KIND + ": "):
             out["net." + net_class(entry)] = 1
@@ -1447,6 +1502,11 @@ def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
         for entry in pingsender_destinations(seed_footprint):
             out["net." + entry] = 1
     return out
+
+
+def _kind_value(kind: str, n: int):
+    """What a red kind of process shows in a seed: how many of it the seed has (1 for a kind of type tab: its presence)."""
+    return 1 if is_tab(kind) and n else n
 
 
 def category_of(leaf: str) -> str:
@@ -1593,17 +1653,19 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         both = bool(seeds_a[seed].get("kinds", {}).get(PINGSENDER_KIND)) and bool(seeds_b[seed].get("kinds", {}).get(PINGSENDER_KIND))
         la, lb = leaves_of(seeds_a[seed], both), leaves_of(seeds_b[seed], both)
+        ka, kb = judged_kinds(seeds_a[seed]), judged_kinds(seeds_b[seed])
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
             for message in fp.get("problems", []) + pingsender_problems(fp) + privileged_problems(fp):
                 problems.append("seed %s side %s: %s" % (seed, side, message))
         per = {c: 0 for c in CATEGORIES}
         for leaf in set(la) | set(lb):
             per[category_of(leaf)] = per.get(category_of(leaf), 0) + 1
+        per["proc"] = len(ka | kb)
         per["file"] = len(set(seeds_a[seed].get("files", [])) | set(seeds_b[seed].get("files", [])))
         counts[str(seed)] = per
-        for side, leaves, files in (("A", la, seeds_a[seed].get("files", [])), ("B", lb, seeds_b[seed].get("files", []))):
+        for side, leaves, kinds, files in (("A", la, ka, seeds_a[seed].get("files", [])), ("B", lb, kb, seeds_b[seed].get("files", []))):
             have = {c: sum(1 for k in leaves if category_of(k) == c) for c in floors}
-            have["file"] = len(files)
+            have["proc"], have["file"] = len(kinds), len(files)
             for c, floor in floors.items():
                 if have[c] < floor:
                     problems.append("seed %s side %s has %d %s leaves, fewer than the floor of %d: the run was not seen"
@@ -1616,12 +1678,14 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                                     "calls": {"A": _calls(seeds_a[seed], leaf), "B": _calls(seeds_b[seed], leaf)}})
     red, not_judged = file_rule(a, b, a_a, also_68 or ())
     for side, seeds in (("A", seeds_a), ("B", seeds_b)):
-        for path in red[side]:
-            leaf = "file." + path
-            for seed in sorted(seeds):
-                other = {"A": "B", "B": "A"}[side]
-                differences.append({"seed": seed, "category": "file", "leaf": leaf, "a": 1 if side == "A" else MISSING, "b": 1 if side == "B" else MISSING,
-                                    "by": {side: _by(seeds[seed], leaf), other: []}, "calls": {side: _calls(seeds[seed], leaf), other: []}})
+        other = {"A": "B", "B": "A"}[side]
+        for category, names in (("file", red["files"][side]), ("proc", red["kinds"][side])):
+            for name in names:
+                leaf = "%s.%s" % (category, name)
+                for seed in sorted(seeds):
+                    value = 1 if category == "file" else _kind_value(name, seeds[seed].get("kinds", {}).get(name, 0))
+                    differences.append({"seed": seed, "category": category, "leaf": leaf, "a": value if side == "A" else MISSING, "b": value if side == "B" else MISSING,
+                                        "by": {side: _by(seeds[seed], leaf), other: []}, "calls": {side: _calls(seeds[seed], leaf), other: []}})
     differences.sort(key=lambda d: (d["seed"], d["leaf"]))
     if os_name == "windows" and not a_a:
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
@@ -1688,15 +1752,18 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
     for d in report["differences"][:200]:
         print("DIFF seed %s %s: %s %s | %s %s%s" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160],
                                                     b_name, json.dumps(d["b"], sort_keys=True)[:160], _by_text(d)))
-    listed = (report.get("not_judged") or {}).get("paths", [])
-    if listed:
+    for key, label, prefix, name_key, by_key in (("paths", "paths", "", "path", "touched_by"), ("kinds", "kinds of process", "proc.", "kind", "spawned_by")):
+        listed = (report.get("not_judged") or {}).get(key, [])
+        if not listed:
+            continue
         watch = [e for e in listed if e["watch"]]
-        print("NOT JUDGED (listed in the artifact, not red): %d paths, %d to watch" % (len(listed), len(watch)))
+        print("NOT JUDGED (listed in the artifact, not red): %d %s, %d to watch" % (len(listed), label, len(watch)))
         for e in watch + [e for e in listed if not e["watch"]][:LISTED_IN_LOG]:
-            print("%s %s: %s %s | %s %s (by %s | %s)" % ("WATCH" if e["watch"] else "LISTED", e["path"], a_name, _launch_counts(e["A"]), b_name, _launch_counts(e["B"]),
-                                                       ", ".join(e["touched_by"]["A"]) or "-", ", ".join(e["touched_by"]["B"]) or "-"))
+            who = e[by_key]
+            print("%s %s%s: %s %s | %s %s (by %s | %s)" % ("WATCH" if e["watch"] else "LISTED", prefix, e[name_key], a_name, _launch_counts(e["A"]), b_name, _launch_counts(e["B"]),
+                                                          ", ".join(who["A"]) or "-", ", ".join(who["B"]) or "-"))
         if len(listed) - len(watch) > LISTED_IN_LOG:
-            print("LISTED: %d more paths in the file of the not judged list" % (len(listed) - len(watch) - LISTED_IN_LOG))
+            print("LISTED: %d more %s in the file of the not judged list" % (len(listed) - len(watch) - LISTED_IN_LOG, label))
     for side, name in (("A", a_name), ("B", b_name)):
         warm = (report.get("warmup") or {}).get(side)
         if warm:
@@ -1884,7 +1951,21 @@ def save_datareporting(profile, folder, launch: str, seed: int) -> None:
         print("the list of datareporting could not be saved (seed %d, launch %s): %s" % (seed, launch, e))
 
 
-def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, crash_with: int | None = None, datareporting_dir=None) -> dict:
+def save_audit(folder, launch: str, seed: int, audit) -> None:
+    """Saves the raw events the tree of a Windows launch was read from as `<folder>/<launch>-<seed>.json` (`audit_listing`: the 4688 and 4689 of the launch, the excluded ones as well,
+    each with the reason): evidence for the next time a process is or is not in a tree, it changes no verdict and is never a leaf of the footprint. No folder, no file; a write that
+    fails is said on the output."""
+    if not folder or not audit:
+        return
+    events, ends, roots = audit
+    try:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        write_json(Path(folder) / ("%s-%d.json" % (launch, seed)), audit_listing(events, roots, ends, launch, seed))
+    except (OSError, ValueError, TypeError) as e:
+        print("the audit of the tree could not be saved (seed %d, launch %s): %s" % (seed, launch, e))
+
+
+def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, crash_with: int | None = None, datareporting_dir=None, audit_dir=None) -> dict:
     """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
 
     `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey and no pref changed; the launch waits until the notification of the data
@@ -1897,7 +1978,8 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     A launch with a page waits for Glean to have initialised right after its first page is opened (`wait_for_glean_of_launch`: Glean is born once a window is open, and a session
     that closes before it has initialised makes it start inside the shutdown, where the parent can end with -11), so that the work of the launch is always between the condition and the
     close; a condition that is not met is a problem of the launch (the verdict is red) and the launch goes on. Just before the close the list of `<profile>/datareporting/` is saved in
-    `datareporting_dir` (`save_datareporting`: evidence for the next time, never part of the footprint).
+    `datareporting_dir` (`save_datareporting`: evidence for the next time, never part of the footprint). On Windows the raw events of the audit the tree was read from, the
+    excluded ones included, are saved in `audit_dir` (`save_audit`), also evidence.
 
     `crash_with` is the recorder's own test (`crash-probe`): the signal sent to the parent of the browser once it is up, to show that a launch that dies is red and keeps its evidence."""
     from playwright.sync_api import sync_playwright
@@ -2007,7 +2089,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         exited = _wait_for_tree_exit(pgid)
         if exited is not None and not exited:
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
-        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close)
+        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close, lambda audit: save_audit(audit_dir, launch_name, seed, audit))
         if idle:
             result["idle"] = {"notified": notified, "shortcut_changes": diff_snapshots(shortcuts_before, snapshot_places(places)) if places else None}
         watched, watcher = watcher.stop(), None
@@ -2188,11 +2270,14 @@ def _wait_for_tree_exit(pgid):
     return not _wait_for_exit(pgid, EXIT_LIMIT_S)
 
 
-def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool, close: dict | None = None) -> dict:
+def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool, close: dict | None = None, keep_audit=None) -> dict:
+    """The footprint of one launch. On Windows `keep_audit(audit)` is given the raw events of the audit the tree was read from (`save_audit`), before they are read into the footprint."""
     real = os.path.realpath(binary)
     ctx = _context(binary, windows, seed_work)
     if windows:
         got = trace.finish({root_pid})
+        if keep_audit is not None:
+            keep_audit(got.get("audit"))
         procs = windows_processes(got["tree"], real)
         pairs = list(got["files"])
         labels = {pid: p["label"] for pid, p in procs.items()}
@@ -2259,11 +2344,11 @@ def keep_crash(fp: dict, launch: str, crash_dir) -> None:
     sys.stdout.flush()
 
 
-def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, datareporting_dir=None) -> dict:
+def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, datareporting_dir=None, audit_dir=None) -> dict:
     """The footprint document of one engine. A discarded WARM-UP launch first, of the first seed, then every seed's journey, one browser at a time.
 
     Every launch (the warm-up, each seed and the idle one) that does not end with 0 is a problem of the run, and what it left is kept in `crash_dir` (`keep_crash`). The list of the
-    `datareporting` folder of each launch with a page is saved in `datareporting_dir` (`save_datareporting`).
+    `datareporting` folder of each launch with a page is saved in `datareporting_dir` (`save_datareporting`), and on Windows the raw events of the audit of each launch in `audit_dir` (`save_audit`).
 
     The warm-up is a control of the experiment and not an excuse: what a machine does the first time it runs an engine (its files scanned, its caches
     cold, a first-run behaviour of the engine) is in a launch that is not compared, whose trace is kept in the document (`warmup`) so that what it
@@ -2272,14 +2357,14 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, d
     work = Path(tempfile.mkdtemp(prefix="ab-host-"))
     problems, out_seeds = [], []
     try:
-        warm = run_seed(binary, seeds[0], work, name="warmup", datareporting_dir=datareporting_dir)
+        warm = run_seed(binary, seeds[0], work, name="warmup", datareporting_dir=datareporting_dir, audit_dir=audit_dir)
         keep_crash(warm, "warmup", crash_dir)
         problems += ["warm-up: %s" % p for p in warm.get("problems", [])]
         problems += ["warm-up: seed %d: step %d (%s) failed: %s" % (seeds[0], st["n"], st["name"], st.get("error")) for st in warm["steps"] if not st["ok"]]
         print("warm-up (seed %d, discarded): %s; %d host paths" % (seeds[0], json.dumps(warm["kinds"], sort_keys=True), len(warm["files"])))
         sys.stdout.flush()
         for seed in seeds:
-            fp = run_seed(binary, seed, work, datareporting_dir=datareporting_dir)
+            fp = run_seed(binary, seed, work, datareporting_dir=datareporting_dir, audit_dir=audit_dir)
             keep_crash(fp, "seed%d" % seed, crash_dir)
             out_seeds.append(fp)
             for step in fp["steps"]:
@@ -2288,7 +2373,7 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, d
             print("seed %d: %s; %d host paths, %d net entries, %s" % (seed, json.dumps(fp["kinds"], sort_keys=True), len(fp["files"]),
                                                                       len(fp.get("net") or []), json.dumps(fp.get("ours", {}), sort_keys=True)))
             sys.stdout.flush()
-        idle = run_seed(binary, seeds[0], work, name="idle", idle=True, datareporting_dir=datareporting_dir)
+        idle = run_seed(binary, seeds[0], work, name="idle", idle=True, datareporting_dir=datareporting_dir, audit_dir=audit_dir)
         keep_crash(idle, "idle", crash_dir)
         problems += ["idle: %s" % p for p in idle.get("problems", [])]
         print("idle (seed %d): %s; notification %s" % (seeds[0], json.dumps(idle["kinds"], sort_keys=True), json.dumps((idle.get("idle") or {}).get("notified"))))
@@ -2335,7 +2420,7 @@ def stock_browser_parent(root_pid: int | None = None) -> int | None:
     return min(found)[1] if found else None
 
 
-def run_stock(leg: str) -> dict:
+def run_stock(leg: str, audit_dir=None) -> dict:
     """The negative control of the geolocation step, Windows only: Playwright's own Firefox (`p.firefox.launch()`, as the fake web's stock control), with
     no declared position, the same step, the same trace. It must start the Windows location utility process (`stock_control_problems`). The tree is the
     one of this process (the driver and the browser it launches): only the kinds and the modules of the run are read."""
@@ -2386,7 +2471,7 @@ def run_stock(leg: str) -> dict:
                 return document({"seed": 0, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False}, "started": False,
                                  "problems": [STOCK_NO_PARENT % exe]})
             stock_phase("seed result")
-            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, parent, True)
+            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, parent, True, None, lambda audit: save_audit(audit_dir, "stock", 0, audit))
             result["started"] = True
             return document(result)
         except TraceError as e:
@@ -2676,7 +2761,7 @@ def main(argv=None) -> int:
         if not _windows():
             print("the stock control is for Windows: Linux has no Windows location provider to reach")
             return 3
-        write_json(args.out, run_stock(args.leg))
+        write_json(args.out, run_stock(args.leg, args.out.parent / (args.out.stem + ".audit")))
         return 0
     if args.cmd == "crash-probe":
         if not sys.platform.startswith("linux"):
@@ -2692,7 +2777,8 @@ def main(argv=None) -> int:
         if args.crash_with:
             document = run_crash_probe(args.binary, args.leg, seeds[0], args.label, crash_dir, args.crash_with)
         else:
-            document = run_engine(args.binary, args.leg, seeds, args.label, crash_dir, args.out.parent / (args.out.stem + ".datareporting"))
+            document = run_engine(args.binary, args.leg, seeds, args.label, crash_dir, args.out.parent / (args.out.stem + ".datareporting"),
+                                  args.out.parent / (args.out.stem + ".audit"))  # footprint-68.json -> footprint-68.audit/<launch>-<seed>.json
         write_json(args.out, document)
         return 0
     if args.candidate and not args.candidate_seal:

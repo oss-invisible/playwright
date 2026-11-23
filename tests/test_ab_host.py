@@ -117,12 +117,19 @@ def test_a_path_of_ours_on_one_side_only_is_green_because_ours_is_not_compared()
     assert report["ours"]["package"] == "reading its own package is not touching the host"
 
 
-def test_a_kind_with_another_count_is_red_and_names_the_kind_and_both_sides():
-    b = footprint(kinds=dict(KINDS, gpu=2))
+def test_how_many_processes_of_a_kind_a_launch_has_is_not_judged_only_whether_a_kind_is_there():
+    """The kinds of process follow the rule of the paths (`file_rule`): a kind is red only when it is in all the measured launches of one engine and in none of the other's."""
+    report = judge(footprint(), footprint(kinds=dict(KINDS, gpu=2)), a_a=True)
+    assert report["verdict"] == "green" and report["differences"] == [], "gpu is in every launch of both: the count is not compared"
+    assert report["not_judged"]["kinds"] == []
+
+
+def test_a_kind_that_one_engine_has_in_every_measured_launch_and_the_other_in_none_is_red_and_names_the_kind_and_both_sides():
+    b = footprint(kinds={k: n for k, n in KINDS.items() if k != "gpu"})
     report = judge(footprint(), b, a_a=True)
     assert report["verdict"] == "red"
-    assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [(11, "proc.gpu", 1, 2), (12, "proc.gpu", 1, 2)]
-    assert any("seed 12 proc.gpu: A 1 | B 2" in p for p in report["problems"])
+    assert [(d["seed"], d["leaf"], d["a"], d["b"]) for d in report["differences"]] == [(11, "proc.gpu", 1, host.MISSING), (12, "proc.gpu", 1, host.MISSING)]
+    assert any("seed 12 proc.gpu: A 1 | B \"<missing>\"" in p for p in report["problems"])
 
 
 def test_a_kind_that_exists_on_one_side_only_is_red():
@@ -131,9 +138,42 @@ def test_a_kind_that_exists_on_one_side_only_is_red():
     assert sorted({(d["leaf"], d["a"], d["b"]) for d in report["differences"]}) == [("proc.rdd", host.MISSING, 1)]
 
 
-def test_a_helper_that_is_spawned_one_more_time_is_red():
-    report = judge(footprint(), footprint(kinds=dict(KINDS, **{"pingsender.exe": 1})), a_a=True)
-    assert {d["leaf"] for d in report["differences"]} == {"proc.pingsender.exe"}
+def test_a_helper_that_one_engine_spawns_in_every_launch_and_the_other_in_none_is_red():
+    report = judge(footprint(), footprint(kinds=dict(KINDS, **{"lsb_release": 1})), a_a=True)
+    assert {d["leaf"] for d in report["differences"]} == {"proc.lsb_release"}
+
+
+def six_launches(engine, extra=None, kinds=None):
+    """A footprint of six measured launches (the warm-up and five seeds), launch `i` having the kinds `extra[i]` besides KINDS: the shape of a run of the oracle."""
+    extra = extra or {}
+    fp = footprint(engine, kinds=kinds)
+    fp["seeds"] = [seed_footprint(s, dict(KINDS, **extra.get(i + 1, {}))) for i, s in enumerate(range(5))]
+    return with_warmup(fp, kinds=dict(KINDS, **extra.get(0, {})), seed=0)
+
+
+def test_the_separate_pingsender_is_red_in_one_launch_of_six_where_the_rule_of_the_kinds_would_only_list_it():
+    """`pingsender[.exe]` is not a kind of the rule (`judged_kinds`): it is held in every launch (`pingsender_problems`), as before."""
+    for exe in host.PINGSENDER_EXES:
+        a, b = six_launches("A"), six_launches("B", {3: {exe: 1}})
+        report = host.judge(a, b, a_a=True, floors=SMALL)
+        assert report["verdict"] == "red" and any("the separate %s ran (B266" % exe in p for p in report["problems"])
+        assert report["differences"] == [] and all(e["kind"] != exe for e in report["not_judged"]["kinds"])
+
+
+def test_a_kind_in_six_launches_of_six_of_the_candidate_and_in_none_of_the_68_is_red():
+    c = six_launches("candidate", {i: {"rdd": 1} for i in range(6)})
+    report = host.judge(six_launches("A"), c, a_a=False, expected=[], also_68=[six_launches("A again")], floors=SMALL)
+    assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["proc.rdd"] * 5
+    assert {(d["a"], d["b"]) for d in report["differences"]} == {(host.MISSING, 1)} and report["not_judged"]["kinds"] == []
+
+
+def test_a_kind_in_some_launches_of_one_engine_and_in_none_of_the_other_is_listed_not_red():
+    c = six_launches("candidate", {0: {"rdd": 1}, 2: {"rdd": 1}, 5: {"rdd": 2}})
+    report = host.judge(six_launches("A"), c, a_a=False, expected=[], also_68=[six_launches("A again")], floors=SMALL)
+    assert report["verdict"] == "green" and report["differences"] == [], report["problems"]
+    (entry,) = report["not_judged"]["kinds"]
+    assert entry["kind"] == "rdd" and entry["A"]["measured"] == [0, 12] and entry["B"]["measured"] == [3, 6] and entry["watch"] is True, "in half of the launches of one engine and in none of the other's"
+    assert entry["spawned_by"] == {"A": [], "B": []}
 
 
 def test_the_count_of_the_tab_kind_is_not_compared_and_its_presence_is():
@@ -151,6 +191,8 @@ def test_the_content_processes_that_name_themselves_after_a_remote_type_are_of_t
     a, b = footprint(kinds=dict(KINDS, **names)), footprint(kinds=dict(KINDS, **dict(names, **{"Web Content": 5})))
     assert judge(a, b, a_a=True)["verdict"] == "green"
     del b["seeds"][0]["kinds"]["WebExtensions"]
+    assert judge(a, b, a_a=True)["verdict"] == "green", "gone from one launch of B: not in all the launches of A and none of B's"
+    del b["seeds"][1]["kinds"]["WebExtensions"]
     assert {d["leaf"] for d in judge(a, b, a_a=True)["differences"]} == {"proc.WebExtensions"}
     assert [host.is_tab(k) for k in ("tab", "tab/isForBrowser", "Web Content", "gpu", "utility/sandboxingKind=1", "fork<-forkserver")] == [
         True, True, True, False, False, False]
@@ -211,10 +253,11 @@ def test_the_declared_gfxtest_difference_passes_in_an_a_b():
 
 def test_a_difference_next_to_the_declared_one_is_still_red():
     c = a_candidate_without_gfxtest()
-    c["seeds"][0]["kinds"]["utility/sandboxingKind=1"] = 1
+    for seed in c["seeds"]:
+        seed["kinds"]["utility/sandboxingKind=1"] = 1
     report = judge(footprint(), c, expected=expected())
     assert report["verdict"] == "red"
-    assert [d["leaf"] for d in report["differences"]] == ["proc.utility/sandboxingKind=1"]
+    assert [d["leaf"] for d in report["differences"]] == ["proc.utility/sandboxingKind=1"] * len(SEEDS)
 
 
 def test_the_declared_difference_the_other_way_round_is_red():
@@ -458,7 +501,7 @@ def test_a_closed_linux_run_makes_a_footprint_of_its_kinds_and_its_host_paths(tm
     assert fp["kinds"] == {"glxtest": 1, "lsb_release": 1, "parent": 1, "tab/isForBrowser": 1, "utility/sandboxingKind=1": 1}
     assert "/etc/hosts" not in fp["files"] and "/etc/localtime" in fp["files"] and "/proc/N/status" in fp["files"] and "/e/firefox/libxul.so" not in fp["files"]
     assert fp["ours"] == {"package": 2, "profile": 1} and fp["trace"]["source"] == "strace" and fp["problems"] == []
-    assert host.leaves_of(fp)["proc.tab/isForBrowser"] == 1 and not any(leaf.startswith("file.") for leaf in host.leaves_of(fp)), "the host paths are judged over all the launches"
+    assert "tab/isForBrowser" in host.judged_kinds(fp) and not any(leaf.startswith(("file.", "proc.")) for leaf in host.leaves_of(fp)), "the host paths and the kinds are judged over all the launches"
 
 
 def test_the_strace_stand_in_prints_the_paths_of_the_descriptors_only_when_asked(monkeypatch):
@@ -747,7 +790,7 @@ def with_warmup(fp, kinds=None, files=None, touched_by=None, spawned_by=None, se
 def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_then_its_measured_ones_and_the_idle_launch_last(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None, audit_dir=None):
         calls.append((seed, name, idle))
         return seed_footprint(seed)
 
@@ -759,7 +802,7 @@ def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_then_its
 
 
 def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(monkeypatch):
-    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None, audit_dir=None):
         fp = seed_footprint(seed)
         if name == "warmup":
             fp["problems"] = ["the file trace did not see the end canary file of the oracle"]
@@ -820,20 +863,37 @@ def test_the_report_lists_what_is_only_in_the_warm_up_and_says_when_both_engines
     assert "WARMUP-ONLY firefox-68 again seed 11 proc.backgroundtask/pingsender" in out
 
 
-def test_the_pingsenders_of_a_short_launch_are_none_or_the_three_of_a_first_run_and_nothing_else():
+def test_how_many_pingsenders_a_launch_has_is_not_judged_it_is_listed():
+    """Run 45228081536 (A/A of the 68, Windows): 2 pingsenders in seed 4 of one side was red ("not 0 or 3"), and the sockets they start, 3 in seed 63 of A and none of B, were a difference of
+    counts. Mozilla's start of the pingsender varies from a launch to the next: any number of them, in any of the launches, is green, in the list of what is not judged."""
+    ping = host.PINGSENDER_KIND
+    a = six_launches("A", {i: {ping: 3} for i in range(6)})
+    for n, where in ((0, {}), (1, {1: {ping: 1}}), (2, {1: {ping: 2}, 4: {ping: 2}}), (4, {0: {ping: 4}, 5: {ping: 4}})):
+        report = host.judge(a, six_launches("B", where), a_a=True, floors=SMALL)
+        assert report["verdict"] == ("red" if n == 0 else "green"), (n, report["problems"][:2])
+        if n:
+            (entry,) = report["not_judged"]["kinds"]
+            assert entry["kind"] == ping and entry["A"]["measured"] == [6, 6] and entry["B"]["measured"][1] == 6 and 0 < entry["B"]["measured"][0] < 6, n
     pings = with_pingsenders(footprint(), 3)
-    assert judge(pings, footprint("again"), a_a=True)["verdict"] == "green", "3 on one side and 0 on the other is the approved tolerance"
     assert judge(with_pingsenders(footprint(), 3), with_pingsenders(footprint("again"), 3), a_a=True)["verdict"] == "green"
-    for n in (1, 2, 4):
-        report = judge(with_pingsenders(footprint(), n), footprint("again"), a_a=True)
-        assert report["verdict"] == "red" and any("%d pingsender processes, not 0 or 3" % n in p and "TelemetrySend.sys.mjs:1083" in p for p in report["problems"]), n
+    report = judge(pings, footprint("again"), a_a=True)
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc." + ping}, "in every launch of one engine and in none of the other's: the rule of every kind"
 
 
-def test_three_pingsenders_that_are_not_the_pings_of_a_first_run_or_not_spawned_by_the_parent_are_red():
+def test_a_pingsender_kind_in_six_launches_of_six_of_one_engine_and_in_none_of_the_other_is_red_and_one_in_some_launches_is_listed():
+    ping, child = host.PINGSENDER_KIND, "socket<-pingsender"
+    both = {i: {ping: 3, child: 3} for i in range(6)}
+    report = host.judge(six_launches("A", both), six_launches("B"), a_a=True, floors=SMALL)
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc." + ping, "proc." + child}
+    some = host.judge(six_launches("A", both), six_launches("B", {0: {child: 1}, 3: {ping: 2, child: 2}}), a_a=True, floors=SMALL)
+    assert some["verdict"] == "green" and {e["kind"] for e in some["not_judged"]["kinds"]} == {ping, child}
+
+
+def test_the_types_and_the_parents_of_the_pingsenders_are_not_judged_only_the_separate_executable_is():
     wrong = with_pingsenders(footprint(), 3, types=("event", "event", "new-profile"))
-    assert any("not the pings of a first run" in p for p in judge(wrong, footprint("again"), a_a=True)["problems"])
     orphan = with_pingsenders(footprint(), 3, parent="gpu")
-    assert any("not all spawned by the parent" in p for p in judge(orphan, footprint("again"), a_a=True)["problems"])
+    for fp in (wrong, orphan):
+        assert judge(fp, with_pingsenders(footprint("again"), 3), a_a=True)["problems"] == []
 
 
 def test_the_separate_pingsender_executable_is_red_whatever_the_count():
@@ -855,7 +915,7 @@ def test_what_only_the_pingsender_touches_is_a_path_like_any_other_and_its_desti
         return fp
 
     one_side = judge(with_surface(footprint(), 3), footprint("again"), a_a=True)
-    assert {d["leaf"] for d in one_side["differences"]} == {"file." + imagehlp}, "its paths are paths like any other: in every launch of one side and in none of the other"
+    assert {d["leaf"] for d in one_side["differences"]} == {"file." + imagehlp, "proc." + host.PINGSENDER_KIND}, "its paths and its kind are like any other: in every launch of one side and in none of the other"
     assert not any(d["category"] == "net" for d in one_side["differences"]), "its destinations on one side only are left out"
     same = judge(with_surface(footprint(), 3), with_surface(footprint("again"), 3), a_a=True)
     assert same["verdict"] == "green", same["problems"]
@@ -1771,15 +1831,17 @@ def test_what_a_pingsender_spawns_is_named_after_it_and_comes_and_goes_with_the_
     got = host.derive_labels(labels, parents)
     assert got == {1: "parent", 2: "socket", 3: host.PINGSENDER_KIND, 4: "socket<-pingsender", 5: host.PINGSENDER_KIND, 6: "socket<-pingsender", 7: "tab/isForBrowser"}
     kinds = {"parent": 1, "socket": 1, "socket<-pingsender": 2, host.PINGSENDER_KIND: 2, "gpu": 1, "glxtest": 1, "tab/isForBrowser": 2}
-    # the pingsenders (and so what they spawn) on one side only: left out; the parent's own socket is compared
+    # the pingsenders (and so what they spawn) in every launch of one side and none of the other: red like any kind; the parent's own socket is a kind of its own
     a = with_pingsenders(footprint(kinds=kinds), 3)
-    assert judge(a, footprint("again", kinds={k: n for k, n in kinds.items() if "pingsender" not in k}), a_a=True)["verdict"] == "green"
-    # on both sides the spawned processes are compared
+    report = judge(a, footprint("again", kinds={k: n for k, n in kinds.items() if "pingsender" not in k}), a_a=True)
+    assert {d["leaf"] for d in report["differences"]} == {"proc." + host.PINGSENDER_KIND, "proc.socket<-pingsender"}
+    # on both sides, what they spawn is listed by the launches that have it, and its count is not compared
     b = with_pingsenders(footprint("again", kinds=dict(kinds, **{"socket<-pingsender": 3})), 3)
     report = judge(a, b, a_a=True)
-    assert report["verdict"] == "red" and {(d["leaf"], d["a"], d["b"]) for d in report["differences"]} == {("proc.socket<-pingsender", 2, 3)}
-    lost = footprint("again", kinds={k: n for k, n in kinds.items() if k != "socket"})
-    assert {d["leaf"] for d in judge(with_pingsenders(footprint(kinds=kinds), 0), lost, a_a=True)["differences"]} == {"proc.socket"}, "the parent's own socket still counts"
+    assert report["verdict"] == "green" and report["differences"] == [] and report["not_judged"]["kinds"] == []
+    plain = {k: n for k, n in kinds.items() if "pingsender" not in k}
+    lost = footprint("again", kinds={k: n for k, n in plain.items() if k != "socket"})
+    assert {d["leaf"] for d in judge(footprint(kinds=plain), lost, a_a=True)["differences"]} == {"proc.socket"}, "the parent's own socket still counts"
 
 
 def test_a_creator_pid_that_windows_reused_before_the_launch_is_not_in_its_tree():
@@ -2198,7 +2260,7 @@ def test_a_fake_launch_that_died_with_minus_11_is_a_red_line_with_the_evidence_a
 def test_a_launch_that_did_not_end_with_0_is_in_the_verdict_of_the_run_named_by_side_seed_and_launch_whatever_launch_it_was(monkeypatch, tmp_path):
     bad = crash.exit_problem(-11, False, seed=12, launch="measured")
 
-    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None, audit_dir=None):
         fp = seed_footprint(seed)
         if name is None and seed == 12:
             fp["problems"] = [bad]
@@ -2483,13 +2545,16 @@ def test_a_path_only_the_gfxtest_touched_in_a_seed_where_both_sides_have_it_is_a
     assert report["stale"] == ["gfxtest-69"]
 
 
-def test_the_entry_covers_only_the_seeds_where_the_process_is_gone_and_the_path_of_another_seed_is_red():
+def test_a_candidate_that_still_spawns_the_gfxtest_in_one_seed_does_not_show_the_declared_difference_and_lists_the_paths():
+    """The kind is judged over all the launches (`file_rule`), not seed by seed: a candidate that has the gfxtest in one seed is not the 69 that no longer spawns it, the entry is stale
+    and red, and the paths only the gfxtest touched stay differences like any path only one engine has (no process of the candidate touches them)."""
     a = with_files(footprint(), GFX_PCI, GFX_ONLY)
     c = footprint("candidate", kinds={k: n for k, n in KINDS.items() if k != "gfxtest"})
     c["seeds"][1]["kinds"] = dict(KINDS)
     report = judge(a, c, expected=expected())
-    assert report["verdict"] == "red" and {(d["seed"], d["leaf"]) for d in report["differences"]} == {(SEEDS[1], "file./sys/bus/pci"), (SEEDS[1], "file./sys/bus/pci/")}
-    assert {d["seed"] for d in report["declared"]} == {SEEDS[0]}
+    assert report["verdict"] == "red" and report["stale"] == ["gfxtest-69"] and report["declared"] == []
+    assert {d["leaf"] for d in report["differences"]} == {"file." + p for p in GFX_PCI}, "no proc.gfxtest: the kind is in a launch of the candidate"
+    assert {e["kind"] for e in report["not_judged"]["kinds"]} == {"gfxtest"}
 
 
 def test_the_declared_list_may_only_shrink_and_stays_applied_by_kind():
@@ -2855,19 +2920,21 @@ def test_the_list_of_datareporting_is_relative_sorted_with_sizes_and_a_read_erro
 def test_an_engine_run_hands_the_datareporting_folder_to_every_launch_and_the_run_command_puts_it_next_to_the_footprint(tmp_path, monkeypatch):
     got = []
 
-    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
-        got.append((name, datareporting_dir))
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None, audit_dir=None):
+        got.append((name, datareporting_dir, audit_dir))
         return seed_footprint(seed)
 
     monkeypatch.setattr(host, "run_seed", fake_run_seed)
     monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
-    host.run_engine("ff", "linux-x86_64", [11], "firefox-68", None, tmp_path / "dr")
-    assert got == [("warmup", tmp_path / "dr"), (None, tmp_path / "dr"), ("idle", tmp_path / "dr")]
+    host.run_engine("ff", "linux-x86_64", [11], "firefox-68", None, tmp_path / "dr", tmp_path / "audit")
+    assert got == [("warmup", tmp_path / "dr", tmp_path / "audit"), (None, tmp_path / "dr", tmp_path / "audit"), ("idle", tmp_path / "dr", tmp_path / "audit")]
     seen = {}
-    monkeypatch.setattr(host, "run_engine", lambda binary, leg, seeds, label, crash_dir=None, datareporting_dir=None: seen.update(crash=crash_dir, dr=datareporting_dir) or {"format": host.FORMAT, "problems": []})
+    monkeypatch.setattr(host, "run_engine", lambda binary, leg, seeds, label, crash_dir=None, datareporting_dir=None, audit_dir=None:
+                        seen.update(crash=crash_dir, dr=datareporting_dir, audit=audit_dir) or {"format": host.FORMAT, "problems": []})
     (tmp_path / "o").mkdir()
     host.main(["run", "ff", "--leg", "linux-x86_64", "--out", str(tmp_path / "o" / "footprint-68.json"), "--seeds", "11"])
     assert seen["dr"] == tmp_path / "o" / "footprint-68.datareporting" and seen["crash"] == tmp_path / "o" / "footprint-68.crash"
+    assert seen["audit"] == tmp_path / "o" / "footprint-68.audit", "the raw events of the audit of every launch go in the folder that is the artifact, next to the datareporting lists"
 
 
 # -
@@ -3068,7 +3135,7 @@ def test_the_audit_reads_the_end_of_a_process_and_the_image_of_its_creator():
     xml = "\n".join([audit_with_parent(5, 102, 100, FIREFOX, "x", "C:\\lab\\ff\\FIREFOX.exe"), audit_end(6, 102), audit(7, 103, 100, FIREFOX, "y")])
     events = host.parse_audit_events(xml)
     assert [(e["pid"], e["parent_image"]) for e in events] == [(102, "C:\\lab\\ff\\FIREFOX.exe"), (103, "")], "the end is not a creation; a creation without the creator's image says ''"
-    assert host.parse_audit_ends(xml) == [{"rid": 6, "pid": 102, "time": ""}]
+    assert host.parse_audit_ends(xml) == [{"rid": 6, "pid": 102, "image": FIREFOX, "time": ""}]
     assert host.parse_audit_ends("") == []
 
 
@@ -3081,9 +3148,23 @@ def test_a_child_born_while_its_creator_lives_stays_in_the_tree_though_the_pid_i
     assert [e["rid"] for e in host.process_tree(events, {100}, ends)] == [1, 2, 3, 7], "the births of the tree are the ones before the pid was taken"
 
 
-def test_a_process_born_from_the_pid_of_a_creator_that_is_gone_is_not_in_the_tree():
-    events = [ev(1, 100, 50), ev(2, 101, 100), ev(4, 105, 101, "C:\\Windows\\System32\\svchost.exe")]
-    assert [e["pid"] for e in host.process_tree(events, {100}, [{"rid": 3, "pid": 101}])] == [100, 101], "101 ended at record 3: record 4 is born from another process that has its pid"
+def test_a_child_registered_after_the_end_of_its_creator_is_in_the_tree_while_the_pid_has_not_been_born_again():
+    """Run 45228081536: the pingsender of the parent is registered (4688) after the end (4689) of the parent: the creator's end is not a reason to leave it out. Red on e3572f28, where
+    the pid of a creator that had ended was no longer the tree's."""
+    events = [ev(1, 100, 50), ev(2, 101, 100), ev(4, 105, 101, "C:\\lab\\ff\\pingsender.exe")]
+    ends = [{"rid": 3, "pid": 101}]
+    assert [e["pid"] for e in host.process_tree(events, {100}, ends)] == [100, 101, 105]
+    assert [e["pid"] for e in host.process_tree(events, {100})] == [100, 101, 105], "the ends are read, they do not decide"
+
+
+def test_a_child_of_a_pid_that_was_born_again_as_a_stranger_is_not_in_the_tree_the_ends_or_not():
+    """Run 45221868374: `svchost -s wlidsvc`, `wevtutil` and `wsl` took pids that processes of the tree had had. The pid of the tree stops being the tree's only when the same pid is
+    BORN again as a process that does not join; what is born from that pid after it is the stranger's."""
+    events = [ev(1, 100, 50), ev(2, 101, 100), ev(4, 101, 900, "C:\\Windows\\System32\\svchost.exe"), ev(5, 105, 101, "C:\\Windows\\System32\\wevtutil.exe"), ev(6, 106, 100)]
+    for ends in ([], [{"rid": 3, "pid": 101}]):
+        assert [e["pid"] for e in host.process_tree(events, {100}, ends)] == [100, 101, 106], ends
+    again = [ev(1, 100, 50), ev(2, 101, 100), ev(4, 101, 100), ev(5, 105, 101)]
+    assert [e["pid"] for e in host.process_tree(again, {100})] == [100, 101, 101, 105], "the same pid born again from the tree is the tree's again"
 
 
 def test_the_creator_the_audit_names_must_be_the_image_the_creator_was_born_with():
@@ -3145,6 +3226,74 @@ def test_the_idle_launch_of_run_45221868374_has_only_the_processes_of_the_engine
 
 def _name(path):
     return re.split(r"[\\/]", path)[-1]
+
+
+# -
+# The raw events of the audit of every Windows launch are saved next to the footprint (run 45228081536: a process that was or was not in the tree could not be told from the artifact).
+
+def a_launch_with_a_stranger_and_an_end(tmp_path, monkeypatch):
+    stranger = audit_with_parent(30, 107, 5, "C:\\Windows\\System32\\svchost.exe", "svchost.exe -k netsvcs -p -s wlidsvc", "C:\\Windows\\System32\\services.exe")
+    fake = FakeTools(tmp_path, TREE + [audit_end(20, 107), stranger], TREE_FILES)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+    trace.cleanup()
+    return got
+
+
+def test_the_audit_of_a_launch_lists_every_event_it_read_the_excluded_ones_with_the_reason(tmp_path, monkeypatch):
+    got = a_launch_with_a_stranger_and_an_end(tmp_path, monkeypatch)
+    events, ends, roots = got["audit"]
+    listing = host.audit_listing(events, roots, ends, "measured", 4)
+    assert listing["format"] == host.AUDIT_FORMAT and (listing["launch"], listing["seed"], listing["roots"]) == ("measured", 4, [100])
+    rows = listing["events"]
+    assert [r["rid"] for r in rows] == sorted(r["rid"] for r in rows) and len(rows) == len(TREE) + 2, "every 4688 and 4689 the log gave, in the order of the log"
+    by_rid = {r["rid"]: r for r in rows}
+    assert (by_rid[10]["event"], by_rid[10]["pid"], by_rid[10]["ppid"], by_rid[10]["in_tree"]) == (4688, 100, 1, True) and "root" in by_rid[10]["why"]
+    assert by_rid[12]["image"] == FIREFOX and by_rid[12]["in_tree"] and by_rid[12]["time"] == "" and by_rid[12]["cmd"].endswith("tab")
+    assert (by_rid[15]["pid"], by_rid[15]["in_tree"]) == (105, False) and "creator (pid 999) is not a process of the tree" in by_rid[15]["why"]
+    assert (by_rid[20]["event"], by_rid[20]["pid"], by_rid[20]["ppid"], by_rid[20]["in_tree"]) == (4689, 107, None, True)
+    assert by_rid[20]["image"] == FIREFOX
+    stranger = by_rid[30]
+    assert (stranger["pid"], stranger["in_tree"], stranger["parent_image"]) == (107, False, "C:\\Windows\\System32\\services.exe") and "stranger" in stranger["why"]
+    assert listing["in_tree"] == sum(1 for r in rows if r["in_tree"])
+
+
+def test_a_creator_the_audit_names_with_another_image_is_said_in_the_reason():
+    events = [ev(1, 100, 50, FIREFOX), ev(2, 101, 100, "C:\\Windows\\System32\\wevtutil.exe", parent_image="C:\\Windows\\System32\\python.exe")]
+    (root, other) = host.walk_tree(events, {100})
+    assert other["in_tree"] is False and "python.exe" in other["why"] and "firefox.exe" in other["why"]
+
+
+def test_the_audit_of_a_launch_is_saved_as_launch_dash_seed_json_and_a_write_that_fails_is_said_not_raised(tmp_path, monkeypatch, capsys):
+    got = a_launch_with_a_stranger_and_an_end(tmp_path, monkeypatch)
+    folder = tmp_path / "footprint-68.audit"
+    host.save_audit(folder, "measured", 4, got["audit"])
+    host.save_audit(folder, "idle", 0, got["audit"])
+    assert sorted(p.name for p in folder.iterdir()) == ["idle-0.json", "measured-4.json"]
+    saved = json.loads((folder / "measured-4.json").read_text(encoding="utf-8"))
+    assert saved["format"] == host.AUDIT_FORMAT and saved["events"][0]["rid"] == 10 and any(not r["in_tree"] for r in saved["events"])
+    host.save_audit(None, "measured", 4, got["audit"])  # no folder: nothing happens
+    host.save_audit(folder, "measured", 4, None)  # nothing read: nothing happens
+    blocked = tmp_path / "file"
+    blocked.write_text("x", encoding="utf-8")
+    host.save_audit(blocked / "audit", "measured", 5, got["audit"])
+    assert "the audit of the tree could not be saved (seed 5, launch measured)" in capsys.readouterr().out
+
+
+def test_the_audit_goes_to_the_save_and_never_into_the_footprint_the_judge_reads(tmp_path, monkeypatch):
+    got = a_launch_with_a_stranger_and_an_end(tmp_path, monkeypatch)
+
+    class Done:
+        def finish(self, roots):
+            return got
+
+    kept = []
+    monkeypatch.setattr(host, "_context", lambda binary, windows, work: host.Context("win32", app=["D:\\lab\\ff"], temp=["D:\\lab\\tmp"], devices=DEVICES))
+    fp = host._seed_result(FIREFOX, 4, tmp_path, [], tmp_path / "none.log", Done(), 100, True, None, kept.append)
+    assert kept == [got["audit"]] and "audit" not in fp and "events" not in fp and "rid" not in json.dumps(fp)
+    assert host.leaves_of(fp) == {}
 
 
 def test_the_windows_trace_reads_the_ends_and_the_tree_leaves_the_stranger_that_took_a_pid_of_it(tmp_path, monkeypatch):
