@@ -716,6 +716,10 @@ def test_the_windows_host_job_turns_on_the_location_service_of_the_runner_before
     assert "Set-Service -Name lfsvc -StartupType Manual" in step and "Start-Service -Name lfsvc" in step
     assert "throw" in step and "'Running'" in step, "a service that is not on is red with its reason"
     assert "New-Item -Path $key -Force" not in step, "-Force on an existing registry key would empty it"
+    # Windows' own answer, the question stock Firefox asks (run 45206303882: the keys said Allow and the provider was not started): read before and after, red unless Allowed
+    assert "AppCapability]::Create('location').CheckAccess()" in step and "powershell.exe" in step
+    assert step.index('"CheckAccess(location) before:') < step.index("Set-ItemProperty") < step.index('"CheckAccess(location) after:')
+    assert "if ($after -ne 'Allowed') { $bad +=" in step and step.index("if ($after -ne 'Allowed')") < step.index("if ($bad) { throw")
     first_launch = body.index("      - name: Run the host oracle's A/A\n")
     assert body.index(name) < first_launch, "the laboratory is set before the first launch"
 

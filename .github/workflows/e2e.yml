@@ -796,6 +796,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Windows' own answer for the user of the job: the question stock Firefox asks before it starts the Windows provider (AppCapability "location"
+          # CheckAccess, dom/geolocation/GeolocationSystemWin.cpp). Read, not presumed: printed before and after, and red unless it is Allowed after
+          # (run 45206303882: on windows-2025 the keys said Allow and stock Firefox did not start the provider). WinRT is read through Windows PowerShell.
+          $access = {
+            $answer = & powershell.exe -NoProfile -Command "`$null = [Windows.Security.Authorization.AppCapabilityAccess.AppCapability,Windows.Security.Authorization.AppCapabilityAccess,ContentType=WindowsRuntime]; [string][Windows.Security.Authorization.AppCapabilityAccess.AppCapability]::Create('location').CheckAccess()" 2>&1
+            ($answer | Out-String).Trim()
+          }
+          "CheckAccess(location) before: $(& $access)"
           $machine = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
           $user = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
           foreach ($key in @($machine, $user, "$user\NonPackaged")) {
@@ -814,6 +822,9 @@ jobs:
             "$key = $value"
           }
           "lfsvc: $($service.Status), $($service.StartType)"
+          $after = & $access
+          "CheckAccess(location) after: $after"
+          if ($after -ne 'Allowed') { $bad += "Windows answers CheckAccess(location) = $after, not Allowed" }
           if ($bad) { throw ("the location service of the runner is not on: " + ($bad -join '; ')) }
       - name: The security state (a fixed directory of the repository)
         shell: bash
