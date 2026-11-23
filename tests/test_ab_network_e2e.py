@@ -18,6 +18,7 @@ events, and the idle windows end at an event (see IDLE in scripts/ci_ab_network.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -37,20 +38,23 @@ from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 #: 500 says "the run saw something on every road" and nothing more: it is raised to a fraction of the measured count once the A/A has measured it.
 FLOOR = {"linux": 500, "win32": 500}
 
-#: The hang guard of the test, sized from what it will run. It is a safety net and never a verdict: the pull request's default timeout of 420 s (`--timeout 420 --timeout-method thread`
-#: of run_e2e.py) killed the xdist worker of the A/A on 5 seeds, on Linux and on Windows (run 44963364060), because the run takes minutes per seed.
-#: Measured (runs 44946411675 and 44960767715, A/A of one seed, two engine runs): 4:00 on Linux and 4:50 on Windows, so 120 s and 145 s per engine run for the first seed, which also
-#: has the two idle launches. The budget allows 220 s for the first seed of an engine run (145 s measured on Windows), 120 s for each next one, and 120 s to start, so that the guard plus the 10 minutes of the job's own steps fit its 40 minutes: 5 seeds
-#: in an A/A are 30 minutes at most, expected about 18 on Linux and 22 on Windows (the exit-ping launch adds 1 to 2.3 minutes per engine run); with a candidate (three engine runs on every seed) 44 minutes at most.
-SETUP_S, FIRST_SEED_S, NEXT_SEED_S = 120, 220, 120
-#: The launch that counts the exit pings (a page, the wait for Glean, one navigation, the close and the tree's exit), on the first seed only: 140 s at most per engine run, the
-#: bound of the launch as it was before it had a page; to be recomputed from the launches measured with the page.
-EXIT_PINGS_S = 140
+#: The hang guard of the test, sized from what it will run: the slowest launches MEASURED, plus a declared margin of 25%. It is a guard against a launch that hangs, never a
+#: verdict and never a threshold of the product (the pull request's default of 420 s killed the xdist worker of a 5-seed A/A: run 44963364060).
+#: Measured per engine run, 5 seeds: run 45121964904 (the gate of the series, Windows, the slowest runner seen: main launches of 139-170 s, idle c1 10 s) and run 45153612447
+#: (pull request #578, every launch with a page and the wait for Glean: main launches of 123-135 s on Windows and 110-118 s on Linux, idle c2 4-5 s, exit pings 6 s, and 15 s
+#: of the test before the first launch and after the last). An engine run is the idle launches of the first seed and one main launch per seed: 650-659 s on Windows and 590 s
+#: on Linux in 45153612447, 925-941 s in 45121964904.
+MEASURED_SETUP_S = 15
+#: idle c1 (10 s, 45121964904) + idle c2 (5 s, 45153612447) + the exit pings (6 s, 45153612447)
+MEASURED_IDLE_S = 21
+#: the slowest main launch (45121964904, Windows)
+MEASURED_MAIN_S = 170
+MARGIN = 1.25
 
 
 def budget_s(seeds: int, engine_runs: int) -> int:
-    """Seconds the test may take for ``seeds`` seeds in ``engine_runs`` runs of an engine (the A/A is two, with a candidate three)."""
-    return SETUP_S + engine_runs * (FIRST_SEED_S + EXIT_PINGS_S + (seeds - 1) * NEXT_SEED_S)
+    """Seconds the test may take for ``seeds`` seeds in ``engine_runs`` runs of an engine (the A/A is two, with a candidate three): the measured time of that run plus ``MARGIN``."""
+    return math.ceil(MARGIN * (MEASURED_SETUP_S + engine_runs * (MEASURED_IDLE_S + seeds * MEASURED_MAIN_S)))
 
 
 def plan() -> tuple:

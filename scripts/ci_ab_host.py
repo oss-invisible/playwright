@@ -1741,17 +1741,33 @@ def start_geo_lab():
     return "http://127.0.0.1:%d" % server.server_address[1], stop
 
 
+def stock_phase(name: str, now=None) -> None:
+    """`stock phase <name> at <iso, UTC>` on the output, flushed: the stock control once stood still for more than 26 minutes (run 45153612447, PR #578, Windows) and nothing said in
+    which call; the last phase line is where it stood. The output of the stock process is the one of the oracle (`run_stock_subprocess` does not capture it)."""
+    at = now or datetime.datetime.now(datetime.timezone.utc)
+    print("stock phase %s at %s" % (name, at.isoformat(timespec="seconds")))
+    sys.stdout.flush()
+
+
 def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dict:
     """The step after the journey: a context (with the declared position, or none for the stock control), the permission granted to the lab page,
-    the page opened, `getCurrentPosition` called and awaited. Returns the step as the journey's are recorded, with `geo` (what the page was answered)."""
+    the page opened, `getCurrentPosition` called and awaited. Returns the step as the journey's are recorded, with `geo` (what the page was answered).
+    The stock control (no declared position) says each call on the output before it makes it (`stock_phase`), and the answer after it."""
     step = {"n": n, "name": GEO_STEP}
     context = None
+    say = stock_phase if declared is None else (lambda name: None)
     try:
+        say("new_context")
         context = browser.new_context(geolocation=dict(declared)) if declared else browser.new_context()
+        say("grant_permissions")
         context.grant_permissions(["geolocation"], origin=origin)
+        say("new_page")
         page = context.new_page()
+        say("goto")
         page.goto(origin + GEO_PATH)
+        say("evaluate begin")
         step["geo"] = page.evaluate(GEO_READ)
+        say("evaluate end: %s" % json.dumps(step["geo"], sort_keys=True))
         step["ok"] = True
     except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
         step.update(ok=False, error=str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc))
@@ -1875,6 +1891,8 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
 
     started_at = time.time()
     already = crash.existing_crash_files(crash_dirs())  # the reports of earlier crashes are not this launch's
+    print(crash.launch_line(seed, launch_name, HOST_LABEL))  # which launch is alive, and since when, for the test that runs this oracle when it does not end in time
+    sys.stdout.flush()
 
     try:
         server = launch_server(headless=True, binary_path=exe, seed=seed, locale="en-US", timezone="Europe/Rome",
@@ -2229,6 +2247,9 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, d
             "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
 
 
+#: The label of the launch line of the stock control, and of the launches of the oracle (`crash.launch_line`).
+STOCK_LABEL = "stock control"
+HOST_LABEL = "ab-host"
 STOCK_NOT_INSTALLED = "the stock Firefox of Playwright is not installed: %s does not exist (the job must run `python -m playwright install firefox`)"
 
 
@@ -2251,6 +2272,8 @@ def run_stock(leg: str) -> dict:
     one of this process (the driver and the browser it launches): only the kinds and the modules of the run are read."""
     from playwright.sync_api import sync_playwright
 
+    print(crash.launch_line(0, "stock", STOCK_LABEL))  # the line `crash.last_launch` reads when the run does not end in time
+    sys.stdout.flush()
     work = Path(tempfile.mkdtemp(prefix="ab-host-stock-"))
     trace = WindowsTrace(work)
     stop_geo = None
@@ -2265,16 +2288,19 @@ def run_stock(leg: str) -> dict:
         return document({"seed": 0, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False}, "started": False, "problems": [reason]})
 
     try:
+        stock_phase("trace start")
         try:
             trace.start()
         except TraceError as e:
             return not_started("the trace of a Windows run could not be started (it needs an administrator): %s" % e)
+        stock_phase("geolocation lab")
         geo_origin, stop_geo = start_geo_lab()
         try:
             with sync_playwright() as p:
                 exe = p.firefox.executable_path
                 if not Path(exe).exists():
                     return not_started(STOCK_NOT_INSTALLED % exe)
+                stock_phase("launch")
                 try:
                     browser = p.firefox.launch(headless=True)
                 except Exception as exc:  # noqa: BLE001 - the reason is the verdict's
@@ -2282,7 +2308,9 @@ def run_stock(leg: str) -> dict:
                 try:
                     steps.append(geolocation_step(browser, geo_origin, None, len(JOURNEY) + 1))
                 finally:
+                    stock_phase("browser close")
                     browser.close()
+            stock_phase("seed result")
             result = _seed_result(exe, 0, work, steps, work / "none.log", trace, os.getpid(), True)
             result["started"] = True
             return document(result)
@@ -2395,18 +2423,55 @@ def crash_probe(binary: str, leg: str, out: Path, seed: int, run=None) -> int:
     return 1 if exit_lines else 0
 
 
-def run_stock_subprocess(leg: str, out: Path) -> int:
-    """`stock` in a process of its own (its tree is the one of that process), with a temp root of its own."""
+#: The whole life of the stock control, from the launch of its process to its end: a Firefox that starts, answers one `getCurrentPosition` and closes takes seconds. Never again 26 silent
+#: minutes (run 45153612447, PR #578, Windows: the A/A was green and the stock control stood still until the guard of the test killed the python child alone). A control that does not end in
+#: this time is a BROKEN control that says in which phase it stood (`last_stock_phase`).
+STOCK_LIMIT_S = 120
+
+STOCK_PHASE = re.compile(r"^stock phase (?P<phase>.*?) at (?P<at>\S+)\s*$", re.M)
+
+
+def last_stock_phase(text: str, now=None) -> tuple:
+    """`(phase, seconds since it began)` of the last `stock phase` line of `text`; `(None, None)` when there is none (`seconds` None when its time does not read)."""
+    found = None
+    for found in STOCK_PHASE.finditer(text or ""):
+        pass
+    if found is None:
+        return None, None
+    try:
+        began = datetime.datetime.fromisoformat(found.group("at"))
+        return found.group("phase"), (now or datetime.datetime.now(datetime.timezone.utc)) - began
+    except (ValueError, TypeError):
+        return found.group("phase"), None
+
+
+def run_stock_subprocess(leg: str, out: Path, limit_s: float = STOCK_LIMIT_S, command=None) -> int:
+    """`stock` in a process of its own (its tree is the one of that process), with a temp root of its own, run by `crash.run_tree` (its output in files under `<out>.tree`, the whole
+    tree killed at `limit_s`) and then printed on the output of the oracle, so that the phases it said are in the log.
+
+    A process that does not end in `limit_s` leaves no footprint: this writes the document of a control that never ran to its end (`started` False, the reason in its problems: the
+    last phase it said and since when), so that the verdict names that and not the platform provider. Returns the exit code (0 for that document: the reason is in it)."""
     env = dict(os.environ)
     for name in ("MOZ_LOG", "MOZ_LOG_FILE"):
         env.pop(name, None)
-    cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "stock", "--leg", leg, "--out", str(out)]
-    try:
-        with tempfile.TemporaryDirectory(prefix="ab-host-tmp-") as temp:
-            env.update(TMPDIR=temp, TEMP=temp, TMP=temp)
-            return subprocess.run(cmd, env=env, timeout=RUN_TIMEOUT_S).returncode
-    except subprocess.TimeoutExpired:
-        return 124
+    cmd = command or [sys.executable, "-u", str(Path(__file__).resolve()), "stock", "--leg", leg, "--out", str(out)]
+    with tempfile.TemporaryDirectory(prefix="ab-host-tmp-") as temp:
+        env.update(TMPDIR=temp, TEMP=temp, TMP=temp)
+        done = crash.run_tree(cmd, Path(out).with_suffix(".tree"), limit_s, env=env)
+    sys.stdout.write(done.stdout)
+    sys.stdout.flush()
+    sys.stderr.write(done.stderr)
+    sys.stderr.flush()
+    if not done.timed_out:
+        return done.returncode
+    phase, since = last_stock_phase(done.stdout)
+    where = "no phase had been said" if phase is None else "the last phase was `%s`, begun %s before the end" % (phase, "%d s" % since.total_seconds() if since is not None else "an unknown time")
+    reason = "the stock control did not end within %g s (never again 26 silent minutes, run 45153612447): %s; its tree was killed" % (limit_s, where)
+    print("stock control: " + reason)
+    sys.stdout.flush()
+    write_json(out, {"format": FORMAT, "engine": "stock", "leg": leg, "platform": sys.platform,
+                     "stock": {"seed": 0, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False}, "started": False, "problems": [reason]}})
+    return 0
 
 
 def run_stock_control(leg: str, out: Path) -> dict | None:

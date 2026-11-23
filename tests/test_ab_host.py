@@ -2868,3 +2868,105 @@ def test_an_engine_run_hands_the_datareporting_folder_to_every_launch_and_the_ru
     (tmp_path / "o").mkdir()
     host.main(["run", "ff", "--leg", "linux-x86_64", "--out", str(tmp_path / "o" / "footprint-68.json"), "--seeds", "11"])
     assert seen["dr"] == tmp_path / "o" / "footprint-68.datareporting" and seen["crash"] == tmp_path / "o" / "footprint-68.crash"
+
+
+# -
+# A stock control that stands still says where (run 45153612447, PR #578, Windows: more than 26 minutes with no word), and the test that runs the oracle kills its whole tree.
+
+def test_the_host_test_runs_the_oracle_through_run_tree_and_not_through_a_pipe_a_grandchild_holds():
+    source = (Path(__file__).resolve().parent / "test_ab_host_e2e.py").read_text(encoding="utf-8")
+    assert "crash.run_tree(" in source and "timeout_message(" in source and "done.timed_out" in source
+    assert "subprocess.run(" not in source and "capture_output" not in source, "the child alone is killed at the timeout and communicate() waits for the grandchild that holds the pipe"
+    assert "TIMEOUT_S = 35 * 60" in source
+
+
+def test_the_launches_and_the_stock_control_write_the_launch_line_the_test_reads_back_when_the_run_does_not_end(capsys, monkeypatch):
+    assert "crash.launch_line(seed, launch_name, HOST_LABEL)" in inspect.getsource(host.run_seed)
+    line = host.crash.launch_line(11, "measured", host.HOST_LABEL)
+    assert host.crash.last_launch("x\n" + line + "\n")["launch"] == "measured"
+    assert "crash.launch_line(0, \"stock\", STOCK_LABEL)" in inspect.getsource(host.run_stock)
+
+
+def phases(text):
+    return [m.group(1) for m in re.finditer(r"^stock phase (.*?) at \d{4}-\d\d-\d\dT[\d:]+\+00:00$", text, re.M)]
+
+
+def test_the_stock_step_says_each_call_before_it_makes_it_in_order_and_the_answer_after_it_and_a_declared_step_says_nothing(capsys):
+    host.geolocation_step(FakeBrowser(), "http://127.0.0.1:9", None, 5)
+    assert phases(capsys.readouterr().out) == ["new_context", "grant_permissions", "new_page", "goto", "evaluate begin", 'evaluate end: {"answer": "error", "code": 2}']
+    host.geolocation_step(FakeBrowser(), "http://127.0.0.1:9", host.GEO_DECLARED, 5)
+    assert "stock phase" not in capsys.readouterr().out
+
+
+def test_a_stock_step_that_stands_still_leaves_the_last_phase_as_the_place_it_stood(capsys):
+    class Stuck(FakePage):
+        def evaluate(self, script):
+            self.calls.append(("evaluate", script))
+            raise RuntimeError("stuck")
+
+    class B(FakeBrowser):
+        def new_context(self, **options):
+            context = FakeContext(self.calls, options)
+            context.new_page = lambda: Stuck(self.calls)
+            return context
+
+    host.geolocation_step(B(), "http://127.0.0.1:9", None, 5)
+    assert phases(capsys.readouterr().out) == ["new_context", "grant_permissions", "new_page", "goto", "evaluate begin"]
+
+
+def test_run_stock_says_its_phases_from_the_trace_to_the_result_and_the_subprocess_prints_them_on_the_log(tmp_path, monkeypatch, capsys):
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    class Browser(FakeBrowser):
+        def close(self):
+            self.calls.append(("browser-close",))
+
+    fake_playwright(monkeypatch, exe, launch=Browser)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    monkeypatch.setattr(host, "_seed_result", lambda *a, **k: {"seed": 0, "steps": [], "kinds": {}, "files": []})
+    document = host.run_stock("windows-x86_64")
+    out = capsys.readouterr().out
+    assert document["stock"]["started"] is True
+    assert out.splitlines()[0].startswith("=== launch stock seed 0 of stock control began at ")
+    assert phases(out) == ["trace start", "geolocation lab", "launch", "new_context", "grant_permissions", "new_page", "goto", "evaluate begin",
+                           'evaluate end: {"answer": "error", "code": 2}', "browser close", "seed result"]
+    source = inspect.getsource(host.run_stock_subprocess)
+    assert "crash.run_tree(" in source and "sys.stdout.write(done.stdout)" in source, "its output is run_tree's files, printed on the output of the oracle: the phases are in the log"
+
+
+def test_a_stock_process_that_stands_still_is_a_broken_control_that_names_its_last_phase_within_the_limit_and_the_log_keeps_what_it_said(tmp_path, capsys, monkeypatch):
+    import time
+
+    script = ("import sys, time, datetime\n"
+              "print('stock phase launch at', datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), flush=True)\n"
+              "print('stock phase evaluate begin at', datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), flush=True)\n"
+              "time.sleep(60)\n")
+    out = tmp_path / "footprint-stock.json"
+    began = time.monotonic()
+    rc = host.run_stock_subprocess("windows-x86_64", out, limit_s=2, command=[sys.executable, "-u", "-c", script])
+    assert time.monotonic() - began < 20 and rc == 0
+    document = host.read_json(out)
+    problems = host.stock_control_problems(document)
+    assert len(problems) == 1 and "did not end within 2 s" in problems[0] and "`evaluate begin`" in problems[0] and "tree was killed" in problems[0]
+    assert "does not reach the platform provider" not in problems[0] and document["stock"]["started"] is False
+    printed = capsys.readouterr().out
+    assert "stock phase evaluate begin at" in printed, "the log keeps the phases"
+    # and the control reports it: the verdict is the broken control that says where it stood
+    monkey_out = tmp_path / "o"
+    monkey_out.mkdir()
+    real = host.run_stock_subprocess
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: real(leg, path, limit_s=2, command=[sys.executable, "-u", "-c", script]))
+    assert host.run_stock_control("windows-x86_64", monkey_out) is None
+    printed = capsys.readouterr().out
+    assert "FAIL stock control: the stock control did not end within 2 s" in printed and "BROKEN CONTROL: the stock control did not run to the end" in printed
+
+
+def test_the_stock_limit_is_short_and_declared_and_a_process_that_ends_returns_its_code_and_its_output(tmp_path, capsys):
+    assert host.STOCK_LIMIT_S == 120 and host.STOCK_LIMIT_S < host.RUN_TIMEOUT_S
+    assert host.last_stock_phase("stock phase a at 2026-11-23T10:00:00+00:00\nstock phase b c at 2026-11-23T10:00:05+00:00\n",
+                                 now=host.datetime.datetime(2026, 11, 23, 10, 0, 9, tzinfo=host.datetime.timezone.utc)) == ("b c", host.datetime.timedelta(seconds=4))
+    assert host.last_stock_phase("nothing") == (None, None)
+    rc = host.run_stock_subprocess("windows-x86_64", tmp_path / "f.json", limit_s=30, command=[sys.executable, "-c", "print('hello'); raise SystemExit(3)"])
+    assert rc == 3 and "hello" in capsys.readouterr().out and not (tmp_path / "f.json").exists()
