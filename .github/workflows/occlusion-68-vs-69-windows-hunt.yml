@@ -1,0 +1,355 @@
+# -----------------------------------------------------------------------------
+# occlusion-68-vs-69-windows-hunt.yml - TEMPORARY. Deleted, with its branch, when the question is answered.
+#
+# The question. Does
+#   tests/test_window_occlusion_e2e.py::test_a_covered_window_stays_visible_unless_occlusion_tracking_is_enabled
+# fail more often on the engine of firefox-69 than on the engine of firefox-68, on Windows, under the normal load of its row? It is NOT a gate: it is never merged
+# to main, and a green hunt proves nothing about a release; a red rep is evidence to read. It is the Windows twin of occlusion-68-vs-69-hunt.yml (Linux).
+#
+# What it runs. Two Windows jobs (the matrix has 2 entries and runs both at once), each on its own engine:
+#   - "engine 69" (label A): the engine BUILT BY run 45077433049 of oss-invisible/firefox_antidetect_patch (the asset `asset-win-x86_64`), unpacked and sealed
+#     the way the series' gate does on Windows (Download asset, Extract + locate firefox binary with the zip branch, The core under test at the commit below with
+#     its assertion, Seal of the binary under test), then the security state and the GeoIP database;
+#   - "engine 68" (label B): the PUBLISHED engine and core, set up exactly as the Windows job of e2e.yml (`python -m invisible_playwright fetch`).
+# In both jobs the hunt step runs, on the runner's desktop (there is no virtual display on Windows; the test arranges its two windows there itself):
+#   - in the BACKGROUND, the files of the row `wrapper.e2e.suite.windows.4` (the row the test belongs to) with the occlusion node deselected, 3 browsers at once
+#     (the options of command() in invisible_core.testing.e2e), one run after the other until the foreground ends: the load of its row. Its result decides nothing;
+#   - in the FOREGROUND, the occlusion node alone, 40 times in a row, each rep its own pytest, with its own stdout and junit.
+#
+# How to read it (the summary of each job, and the artifact `occlusion-hunt-win-<A|B>-<run id>`):
+#   - one line per rep: pass or fail, and for every red rep the line of its assertion (`ENGINE: ...`, `arrangement: ...`, `control: ...` or the text of the
+#     assertion, first 600 characters), with the `occlusion arrangement:` line the test writes to stderr;
+#   - the totals give the reps run and the reds, and the background loop's iterations.
+# A job is red when any rep failed or fewer than 40 ran.
+#
+# Triggered ONLY by a push to `hunt/occlusion-68-vs-69-windows`: no schedule, no dispatch, no pull request. A newer push replaces the run it supersedes.
+# -----------------------------------------------------------------------------
+name: occlusion 68 vs 69 windows hunt
+
+on:
+  push:
+    branches: [hunt/occlusion-68-vs-69-windows]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: occlusion-68-vs-69-windows-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+# Engine and GeoIP downloads go through the release API with this token (as every workflow that runs tests).
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+  # The engine of firefox-69 under test (job A): the run of the series that built it, the core that run was gated with, and the seal tag.
+  HUNT_BUILD_RUN_ID: "45077433049"
+  HUNT_CORE_REF: 0fb09bbd2e9924b0166b712a7d9b5d1266806d7d
+  HUNT_SEAL_TAG: firefox-69-candidate
+
+jobs:
+  hunt:
+    name: engine ${{ matrix.engine }} (windows)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder), as the job of e2e.yml has them.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - engine: "69"
+            label: A
+          - engine: "68"
+            label: B
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      # RED AT ONCE (job A) while the build run, the core ref or the seal tag is empty or malformed: nothing is installed or run on an engine nobody named.
+      - name: The build to hunt on (run id, core ref, seal tag)
+        if: matrix.engine == '69'
+        run: |
+          set -e
+          run_id="$(printf '%s' "$HUNT_BUILD_RUN_ID" | tr -d '[:space:]')"
+          case "$run_id" in ''|*[!0-9]*) echo "::error::HUNT_BUILD_RUN_ID holds '$run_id', not the id of a run of the series"; exit 1;; esac
+          core_ref="$(printf '%s' "$HUNT_CORE_REF" | tr -d '[:space:]')"
+          case "$core_ref" in ''|*[!0-9a-f]*) echo "::error::HUNT_CORE_REF holds '$core_ref', not a 40-digit commit id"; exit 1;; esac
+          if [ "${#core_ref}" -ne 40 ]; then echo "::error::HUNT_CORE_REF holds '$core_ref', not a 40-digit commit id"; exit 1; fi
+          seal_tag="$(printf '%s' "$HUNT_SEAL_TAG" | tr -d '[:space:]')"
+          case "$seal_tag" in firefox-[0-9]*) ;; *) echo "::error::HUNT_SEAL_TAG holds '$seal_tag', not firefox-N or firefox-N-candidate"; exit 1;; esac
+          echo "engine of run $run_id, core at $core_ref, seal tag $seal_tag"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
+      # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+
+      # ---- Job B: the published engine, as the Windows job of e2e.yml has it.
+      - name: Fetch the published firefox binary
+        if: matrix.engine == '68'
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+
+      # ---- Job A: the engine of the series' build. The steps that follow are the ones of the series' gate (gate.yml of oss-invisible/firefox_antidetect_patch),
+      # on its Windows leg (win-x86_64). The series repository is public: the token of this repository reads its artifacts.
+      - name: Download asset (the build of the series)
+        if: matrix.engine == '69'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: asset-win-x86_64
+          path: art
+          repository: oss-invisible/firefox_antidetect_patch
+          run-id: ${{ env.HUNT_BUILD_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Extract + locate firefox binary
+        if: matrix.engine == '69'
+        run: |
+          set -e
+          mkdir -p ff
+          set -- art/firefox-*-stealth-win-x86_64.*
+          [ "$#" -eq 1 ] && [ -e "$1" ] || { echo "ERROR: expected one firefox-*-stealth-win-x86_64 archive in art/, found: $*"; exit 1; }
+          A="$1"
+          sha256sum "$A"
+          python -c "import zipfile; zipfile.ZipFile('$A').extractall('ff')"
+          EXE="ff/firefox.exe"
+          [ -e "$EXE" ] || { echo "ERROR: firefox binary not found at $EXE"; exit 1; }
+          chmod +x "$EXE" 2>/dev/null || true
+          echo "FF_EXE=$PWD/$EXE" >> "$GITHUB_ENV"
+      - name: The core under test (core_ref, from git) and the wrapper with its dev extra
+        if: matrix.engine == '69'
+        env:
+          CORE_REF: ${{ env.HUNT_CORE_REF }}
+        run: |
+          export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
+          CORE_GIT="git+https://github.com/oss-invisible/core@$CORE_REF"
+          python -m pip install --quiet "$CORE_GIT"
+          python -m pip install --quiet ".[dev]"
+          python -m pip install --quiet --force-reinstall "$CORE_GIT"
+          python - <<'PY'
+          import json, os, re, subprocess, sys
+          from importlib.metadata import distribution, version
+          ref = os.environ["CORE_REF"]
+          if re.fullmatch(r"[0-9a-f]{40}", ref):
+              want = ref
+          else:
+              rows = [line.split() for line in subprocess.run(
+                  ["git", "ls-remote", "https://github.com/oss-invisible/core", ref, ref + "^{}"],
+                  capture_output=True, text=True, check=True).stdout.splitlines() if line.strip()]
+              peeled = [s for s, r in rows if r.endswith("^{}")]
+              want = (peeled or [s for s, _ in rows] or [""])[0]
+          import invisible_playwright  # noqa: F401
+          raw = distribution("invisible-core").read_text("direct_url.json")
+          got = (json.loads(raw).get("vcs_info") or {}).get("commit_id") if raw else None
+          print("core under test: %s from %s" % (version("invisible-core"), got or "the index"))
+          if not want or got != want:
+              sys.exit("THE CORE UNDER TEST IS NOT core_ref: installed %s from %s, core_ref %r is %s"
+                       % (version("invisible-core"), got or "the index", ref, want or "not a ref of invisible_core"))
+          PY
+      # The seal of the binary: INVISIBLE_SEAL_FILE makes the wrapper accept it ("substituted seal in effect"), and the switches keep the core at core_ref. FF, the
+      # binary of the run, is the one the gate calls FF_EXE; every later step of the job reads these.
+      - name: Seal of the binary under test
+        if: matrix.engine == '69'
+        env:
+          SEAL_TAG: ${{ env.HUNT_SEAL_TAG }}
+        run: |
+          export INVISIBLE_CORE_AUTOFIX=off INVISIBLE_CORE_PIN=allow
+          python -m invisible_core seal --binary "$FF_EXE" --tag "$SEAL_TAG" -o gate.seal.json
+          {
+            echo "INVISIBLE_CORE_AUTOFIX=off"
+            echo "INVISIBLE_CORE_PIN=allow"
+            echo "INVISIBLE_SEAL_FILE=$PWD/gate.seal.json"
+            echo "FF=$FF_EXE"
+            echo "INVPW_BINARY_PATH=$FF_EXE"
+            echo "STEALTHFOX_E2E_BINARY=$FF_EXE"
+          } >> "$GITHUB_ENV"
+
+      # The GeoIP database made by the repository, as in e2e.yml (no download, the same bytes every run).
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      # The files of the load are the row of part 4 of the Windows e2e, as the job of e2e.yml reads it.
+      - name: The files of the row wrapper.e2e.suite.windows.4
+        run: python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.windows.4" --os windows > "$RUNNER_TEMP/e2e_args.txt"
+      - name: The covered-window test, 40 times, under the load of its row
+        env:
+          PYTHONUNBUFFERED: "1"
+          HUNT_ENGINE: ${{ matrix.engine }}
+          HUNT_REPS: "40"
+          # No new rep starts after this many seconds of the step, so that the artifact is uploaded before the job's ceiling (fewer than 40 reps is red).
+          HUNT_BUDGET_S: "5400"
+          HUNT_NODE: "tests/test_window_occlusion_e2e.py::test_a_covered_window_stays_visible_unless_occlusion_tracking_is_enabled"
+        run: |
+          # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before the verdict into a red step.
+          set -euo pipefail
+          finished=0
+          hunt="$RUNNER_TEMP/occlusion-hunt"
+          reps="$hunt/reps"
+          bg="$hunt/bg"
+          mkdir -p "$reps" "$bg"
+          bg_pid=""
+          # Every Firefox and the background run, whole trees. Safe to call twice.
+          cleanup() {
+            touch "$bg/stop" || true
+            powershell -NoProfile -ExecutionPolicy Bypass -File "$hunt/kill_bg.ps1" > "$hunt/kill-bg.txt" 2>&1 || true
+            if [ -n "$bg_pid" ]; then
+              for _ in $(seq 1 30); do kill -0 "$bg_pid" 2>/dev/null || break; sleep 2; done
+              kill -9 "$bg_pid" 2>/dev/null || true
+              wait "$bg_pid" 2>/dev/null || true
+              bg_pid=""
+            fi
+            powershell -NoProfile -ExecutionPolicy Bypass -File "$hunt/kill_firefox.ps1" > "$hunt/kill-firefox.txt" 2>&1 || true
+          }
+          trap 'cleanup; if [ "$finished" != 1 ]; then echo "::error::the hunt step stopped before its verdict"; exit 1; fi' EXIT
+          if [ -z "${FF:-}" ] || [ ! -e "$FF" ]; then echo "::error::no engine binary (FF='${FF:-}')"; exit 1; fi
+          # The binary in both variables. Job B has no INVISIBLE_CORE_PIN, as run_e2e strips it (one e2e asserts the pin repair it disables). Job A keeps it
+          # where the series' hunt kept it for its single pytest runs (the core of the seal is not the one the wrapper pins, and the pin would repair it); the
+          # background run strips it, as run_e2e does.
+          if [ "$HUNT_ENGINE" = "68" ]; then unset INVISIBLE_CORE_PIN; fi
+          export INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF"
+          echo "engine $HUNT_ENGINE, binary $FF, pin: ${INVISIBLE_CORE_PIN:-unset}"
+          echo "the load: $(wc -l < "$RUNNER_TEMP/e2e_args.txt") files of the row; the node: $HUNT_NODE"
+          mapfile -t ARGS < <(tr -d '\r' < "$RUNNER_TEMP/e2e_args.txt")
+          cat > "$hunt/kill_bg.ps1" <<'PS'
+          # The background pytest of the loop (its command line carries junit_suite_name=occlusion_hunt_bg) and its whole tree, workers included.
+          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*junit_suite_name=occlusion_hunt_bg*' } |
+            ForEach-Object { & taskkill /F /T /PID $_.ProcessId }
+          exit 0
+          PS
+          cat > "$hunt/kill_firefox.ps1" <<'PS'
+          Get-Process firefox -ErrorAction SilentlyContinue | ForEach-Object { & taskkill /F /T /PID $_.Id }
+          Start-Sleep -Seconds 3
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          "firefox left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+          exit 0
+          PS
+          # THE BACKGROUND LOOP: the files of the row with 3 browsers (the options of command() in invisible_core.testing.e2e, the node deselected), one run
+          # after the other until the stop file exists. Its result decides nothing: one line per iteration in bg.tsv (iteration, pytest exit, seconds, last line).
+          # A function of this shell, run in a subshell, so that it sees ARGS; nothing in it may stop the loop.
+          bg_loop() {
+            set +e +o pipefail
+            local n=0 t0 code last
+            while [ ! -e "$bg/stop" ]; do
+              n=$((n + 1))
+              t0=$SECONDS
+              INVPW_TEST_WATCHDOG_FILE="$bg/watchdog.log" env -u INVISIBLE_CORE_PIN -u PYTEST_ADDOPTS python -u -m pytest "${ARGS[@]}" --deselect "$HUNT_NODE" \
+                -m "e2e and not wall_clock" -o addopts= -p no:rerunfailures -o junit_family=xunit2 -o junit_suite_name=occlusion_hunt_bg \
+                --junitxml="$bg/it-$n.xml" --timeout 420 --timeout-method thread -o faulthandler_timeout=399 -p no:cacheprovider -v --tb=short \
+                -n 3 --dist loadfile --max-worker-restart 0 > "$bg/it-$n.log" 2>&1
+              code=$?
+              last=$(tr -d '\r' < "$bg/it-$n.log" | grep -v '^$' | tail -n 1 | cut -c1-200)
+              if [ -e "$bg/stop" ]; then last="cut at the end of the hunt: $last"; fi
+              printf '%s\t%s\t%s\t%s\n' "$n" "$code" "$((SECONDS - t0))" "$last" >> "$bg/bg.tsv"
+            done
+          }
+          bg_loop > "$bg/loop.log" 2>&1 &
+          bg_pid=$!
+          echo "background loop started (pid $bg_pid)"
+          # The load is up before the first rep: the first browsers of the loop have started.
+          sleep 45
+          # THE FOREGROUND: only the occlusion node, one pytest after the other, each rep with its own stdout and junit. A rep that fails does not stop the step.
+          # GEOIP_USED_OUT is left out, as the loops of the series' hunt left it out: the reps write nothing in the leg's record.
+          for i in $(seq 1 "$HUNT_REPS"); do
+            if [ "$SECONDS" -gt "$HUNT_BUDGET_S" ]; then echo "::warning::the budget of the step is spent: rep $i and the following did not run"; break; fi
+            r=$(printf '%02d' "$i")
+            code=0
+            INVPW_TEST_WATCHDOG_FILE="$hunt/watchdog-fg.log" env -u GEOIP_USED_OUT -u PYTEST_ADDOPTS python -u -m pytest "$HUNT_NODE" -m e2e -n 0 -o addopts='' \
+              -p no:cacheprovider -p no:rerunfailures -s -o junit_family=xunit2 --timeout 300 --timeout-method thread \
+              --junitxml="$reps/rep-$r.xml" > "$reps/rep-$r.log" 2>&1 || code=$?
+            echo "$code" > "$reps/rep-$r.exit"
+            echo "rep $i of $HUNT_REPS: pytest exit $code; $(tr -d '\r' < "$reps/rep-$r.log" | grep -m1 -o 'occlusion arrangement: .*' | cut -c1-300 || true)"
+          done
+          # The foreground has ended: the loop stops (its run in progress is killed with its tree), then every Firefox is killed and counted.
+          cleanup
+          cat "$hunt/kill-firefox.txt" || true
+          cat > "$hunt/summary.py" <<'PY'
+          import glob, os, re, sys, xml.etree.ElementTree as ET
+          hunt, want, engine = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          reps = os.path.join(hunt, "reps")
+          KEY = re.compile(r"(ENGINE:|arrangement:|control:|the product's covered page).*")
+          lines, reds, ran, engine_reds = [], 0, 0, 0
+          for exit_file in sorted(glob.glob(os.path.join(reps, "rep-*.exit"))):
+              r = os.path.basename(exit_file)[len("rep-"):-len(".exit")]
+              ran += 1
+              code = open(exit_file).read().strip()
+              log = open(os.path.join(reps, "rep-%s.log" % r), encoding="utf-8", errors="replace").read()
+              counts, message = None, ""
+              try:
+                  root = ET.parse(os.path.join(reps, "rep-%s.xml" % r)).getroot()
+                  suite = root if root.tag == "testsuite" else root.find("testsuite")
+                  counts = tuple(int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped"))
+                  for case in root.iter("testcase"):
+                      for kind in ("failure", "error"):
+                          bad = case.find(kind)
+                          if bad is not None:
+                              message = ((bad.get("message") or "") + "\n" + (bad.text or "")).strip()
+                              break
+              except Exception:
+                  pass
+              passed = code == "0" and counts == (1, 0, 0, 0)
+              arrangement = re.findall(r"occlusion arrangement: (.*)", log)
+              arrangement = ("occlusion arrangement: " + arrangement[-1][:400]) if arrangement else "no occlusion arrangement line"
+              if passed:
+                  lines.append("rep %s: pass | %s" % (r, arrangement))
+                  continue
+              reds += 1
+              hit = None
+              for line in message.splitlines():
+                  hit = KEY.search(line)
+                  if hit:
+                      break
+              first = hit.group(0) if hit else (next((l for l in message.splitlines() if l.strip()), "") or "no message in the junit (pytest exit %s)" % code)
+              if first.startswith("ENGINE:"):
+                  engine_reds += 1
+              lines.append("rep %s: FAIL (pytest exit %s, junit tests/failures/errors/skipped %s)\n    %s\n    %s" % (r, code, counts, first[:600], arrangement))
+          bg = []
+          tsv = os.path.join(hunt, "bg", "bg.tsv")
+          if os.path.exists(tsv):
+              rows = [l.rstrip("\n").split("\t") for l in open(tsv, encoding="utf-8", errors="replace")]
+              rows = [x for x in rows if len(x) > 3]
+              whole = [x for x in rows if not x[3].startswith("cut at the end")]
+              bg.append("background loop (decides nothing): %d iterations ended, %d cut at the end, %d with pytest exit 0" % (
+                  len(whole), len(rows) - len(whole), sum(1 for x in whole if x[1] == "0")))
+              bg.extend("  it %s: pytest exit %s, %s s, %s" % tuple(x[:4]) for x in rows)
+          else:
+              bg.append("background loop: no iteration ended")
+          red = reds > 0 or ran < want
+          out = ["## occlusion hunt, engine %s, per rep" % engine, ""] + ["- " + l for l in lines] + ["", "## totals", "",
+                 "- reps run: %d (wanted %d)" % (ran, want), "- reds: %d" % reds, "- reds that start with ENGINE: %d" % engine_reds, "", "## load", ""] + [
+                 "    " + b for b in bg] + ["", "verdict: %s" % ("RED" if red else "green")]
+          text = "\n".join(out) + "\n"
+          open(os.path.join(hunt, "summary.md"), "w", encoding="utf-8", newline="\n").write(text)
+          sys.stdout.write(text)
+          sys.exit(1 if red else 0)
+          PY
+          verdict=0
+          python "$hunt/summary.py" "$hunt" "$HUNT_REPS" "$HUNT_ENGINE" > "$hunt/summary.txt" || verdict=$?
+          cat "$hunt/summary.txt"
+          cat "$hunt/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          finished=1
+          if [ "$verdict" != 0 ]; then echo "::error::the hunt is red: a rep failed or fewer than $HUNT_REPS reps ran"; exit 1; fi
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload the reps, the junit, the background logs and the summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: occlusion-hunt-win-${{ matrix.label }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/occlusion-hunt
+            ${{ runner.temp }}/invpw-evidence
+          if-no-files-found: warn
+          retention-days: 14
