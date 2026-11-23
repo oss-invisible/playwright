@@ -2250,6 +2250,7 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, d
 #: The label of the launch line of the stock control, and of the launches of the oracle (`crash.launch_line`).
 STOCK_LABEL = "stock control"
 HOST_LABEL = "ab-host"
+STOCK_NO_PARENT = "the parent process of the stock Firefox of Playwright was not found among the descendants of the oracle (no firefox.exe without -contentproc after the launch of %s): the trace has no root"
 STOCK_NOT_INSTALLED = "the stock Firefox of Playwright is not installed: %s does not exist (the job must run `python -m playwright install firefox`)"
 
 
@@ -2264,6 +2265,22 @@ def stock_evidence(seed: dict) -> list:
     lines.append("stock evidence: location modules loaded: %s" % (", ".join(_base(f) for f in wanted) or "none"))
     lines.append("stock evidence: other modules loaded (%d): %s" % (len(others), ", ".join(others[:150])))
     return lines
+
+
+def stock_browser_parent(root_pid: int | None = None) -> int | None:
+    """The pid of the parent process of the Firefox that Playwright launched: among the descendants of this process (`root_pid`, default this process), the oldest `firefox.exe` whose
+    command line has no `-contentproc`. None when there is none. It is the ROOT of the trace of the stock control, as the parent of the engine is the root of an engine's (run
+    45162128126: with this process as the root `WindowsTrace.finish` waited the whole `EXIT_LIMIT_S` for a tree that cannot exit, and the 120 s of the control ended it)."""
+    import psutil
+
+    found = []
+    for child in psutil.Process(os.getpid() if root_pid is None else root_pid).children(recursive=True):
+        try:
+            if child.name().lower() == "firefox.exe" and "-contentproc" not in [str(a) for a in child.cmdline()]:
+                found.append((child.create_time(), child.pid))
+        except Exception:  # noqa: BLE001 - a process that is already gone
+            continue
+    return min(found)[1] if found else None
 
 
 def run_stock(leg: str) -> dict:
@@ -2305,13 +2322,19 @@ def run_stock(leg: str) -> dict:
                     browser = p.firefox.launch(headless=True)
                 except Exception as exc:  # noqa: BLE001 - the reason is the verdict's
                     return not_started("the stock Firefox of Playwright did not start: %s" % (str(exc).strip().splitlines() or [repr(exc)])[0][:300])
+                parent = stock_browser_parent()
+                stock_phase("browser parent %s" % parent)
                 try:
                     steps.append(geolocation_step(browser, geo_origin, None, len(JOURNEY) + 1))
                 finally:
                     stock_phase("browser close")
                     browser.close()
+            if parent is None:
+                # never this process as the root in silence: its tree does not exit and the trace would wait for it
+                return document({"seed": 0, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False}, "started": False,
+                                 "problems": [STOCK_NO_PARENT % exe]})
             stock_phase("seed result")
-            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, os.getpid(), True)
+            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, parent, True)
             result["started"] = True
             return document(result)
         except TraceError as e:

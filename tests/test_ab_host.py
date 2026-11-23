@@ -2887,6 +2887,37 @@ def test_the_launches_and_the_stock_control_write_the_launch_line_the_test_reads
     assert "crash.launch_line(0, \"stock\", STOCK_LABEL)" in inspect.getsource(host.run_stock)
 
 
+class FakeProc:
+    def __init__(self, pid, name, cmdline, created):
+        self.pid, self._name, self._cmd, self._created = pid, name, cmdline, created
+
+    def name(self):
+        return self._name
+
+    def cmdline(self):
+        return self._cmd
+
+    def create_time(self):
+        return self._created
+
+
+def fake_psutil(monkeypatch, children):
+    """A `psutil` whose process (the oracle) has these descendants."""
+    import types
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=False):
+            assert recursive, "the browser's parent is a grandchild of the oracle (the driver's child)"
+            return list(children)
+
+    module = types.ModuleType("psutil")
+    module.Process = Process
+    monkeypatch.setitem(sys.modules, "psutil", module)
+
+
 def phases(text):
     return [m.group(1) for m in re.finditer(r"^stock phase (.*?) at \d{4}-\d\d-\d\dT[\d:]+\+00:00$", text, re.M)]
 
@@ -2925,12 +2956,13 @@ def test_run_stock_says_its_phases_from_the_trace_to_the_result_and_the_subproce
     fake_playwright(monkeypatch, exe, launch=Browser)
     monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
     monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    fake_psutil(monkeypatch, [FakeProc(4001, "firefox.exe", ["firefox.exe", "-no-remote"], 5.0)])
     monkeypatch.setattr(host, "_seed_result", lambda *a, **k: {"seed": 0, "steps": [], "kinds": {}, "files": []})
     document = host.run_stock("windows-x86_64")
     out = capsys.readouterr().out
     assert document["stock"]["started"] is True
     assert out.splitlines()[0].startswith("=== launch stock seed 0 of stock control began at ")
-    assert phases(out) == ["trace start", "geolocation lab", "launch", "new_context", "grant_permissions", "new_page", "goto", "evaluate begin",
+    assert phases(out) == ["trace start", "geolocation lab", "launch", "browser parent 4001", "new_context", "grant_permissions", "new_page", "goto", "evaluate begin",
                            'evaluate end: {"answer": "error", "code": 2}', "browser close", "seed result"]
     source = inspect.getsource(host.run_stock_subprocess)
     assert "crash.run_tree(" in source and "sys.stdout.write(done.stdout)" in source, "its output is run_tree's files, printed on the output of the oracle: the phases are in the log"
@@ -2970,3 +3002,44 @@ def test_the_stock_limit_is_short_and_declared_and_a_process_that_ends_returns_i
     assert host.last_stock_phase("nothing") == (None, None)
     rc = host.run_stock_subprocess("windows-x86_64", tmp_path / "f.json", limit_s=30, command=[sys.executable, "-c", "print('hello'); raise SystemExit(3)"])
     assert rc == 3 and "hello" in capsys.readouterr().out and not (tmp_path / "f.json").exists()
+
+
+def test_the_root_of_the_stock_trace_is_the_parent_of_the_firefox_playwright_launched_and_never_the_oracle(tmp_path, monkeypatch, capsys):
+    """Run 45162128126: the oracle's own pid was the root, its tree cannot exit, and the trace waited all of EXIT_LIMIT_S (116 s in `seed result`) until the 120 s of the control ended it."""
+    children = [FakeProc(3001, "node.exe", ["node.exe", "driver"], 1.0), FakeProc(4101, "firefox.exe", ["firefox.exe", "-contentproc", "-isForBrowser", "tab"], 4.0),
+                FakeProc(4001, "Firefox.exe", ["firefox.exe", "-no-remote", "-profile", "x"], 3.0), FakeProc(4009, "firefox.exe", ["firefox.exe", "-no-remote"], 9.0)]
+    fake_psutil(monkeypatch, children)
+    assert host.stock_browser_parent() == 4001, "the oldest firefox.exe without -contentproc"
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    class Browser(FakeBrowser):
+        def close(self):
+            pass
+
+    fake_playwright(monkeypatch, exe, launch=Browser)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    roots = []
+    monkeypatch.setattr(host, "_seed_result", lambda *a, **k: roots.append(a[6]) or {"seed": 0, "steps": [], "kinds": {}, "files": []})
+    host.run_stock("windows-x86_64")
+    assert roots == [4001] and roots != [os.getpid()]
+    assert "stock phase browser parent 4001 at" in capsys.readouterr().out
+
+
+def test_a_stock_firefox_with_no_parent_found_is_a_broken_control_that_says_so_and_never_traces_the_oracle(tmp_path, monkeypatch, capsys):
+    fake_psutil(monkeypatch, [FakeProc(4101, "firefox.exe", ["firefox.exe", "-contentproc", "tab"], 4.0), FakeProc(3001, "node.exe", ["node.exe"], 1.0)])
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    class Browser(FakeBrowser):
+        def close(self):
+            self.calls.append(("browser-close",))
+
+    fake_playwright(monkeypatch, exe, launch=Browser)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    monkeypatch.setattr(host, "_seed_result", lambda *a, **k: pytest.fail("the trace must not be read with this process as its root"))
+    document = host.run_stock("windows-x86_64")
+    problems = host.stock_control_problems(document)
+    assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform provider" not in problems[0]
