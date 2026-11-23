@@ -12,6 +12,7 @@ import socket
 import ssl
 import struct
 import threading
+import time
 
 import pytest
 
@@ -343,3 +344,61 @@ def test_h3_settings_are_named_and_a_reserved_identifier_is_grease():
     assert wc.h3_settings(None) is None
     assert wc.h3_settings({1: 65536, 7: 20, 0x21 + 0x1F * 3: 0, 0x33: 1}) == [["QPACK_MAX_TABLE_CAPACITY", 65536], ["QPACK_BLOCKED_STREAMS", 20], ["GREASE", 0],
                                                                               ["H3_DATAGRAM", 1]]
+
+
+# ------------------------------------------------------------------------------------------------------- when an answer is written in full
+def _held_responder(release: threading.Event):
+    """The default site, except that the answer to ``/wire.css`` is not given until ``release`` is set: the request has arrived and its answer is not written."""
+    def responder(request):
+        if request["target"].split("?")[0] == "/wire.css":
+            release.wait(60)
+        return wc.default_responder(request)
+    return responder
+
+
+def _http1_get(server, target: bytes) -> bytes:
+    with socket.create_connection((server.address, server.port), timeout=60) as raw:
+        with _client_context(["http/1.1"]).wrap_socket(raw, server_hostname="wire.test") as tls:
+            tls.sendall(b"GET " + target + b" HTTP/1.1\r\nHost: wire.test\r\n\r\n")
+            tls.settimeout(60)
+            reply = b""
+            while b"p{color" not in reply:
+                chunk = tls.recv(4096)
+                assert chunk, "the connection closed before the answer: %r" % reply
+                reply += chunk
+    return reply
+
+
+def _arrived(server, kind: str):
+    connections = server.snapshot()["connections"]
+    return [r for c in connections for r in (c.get("http1") if kind == "http1" else c.get("h2", {}).get("requests")) or []]
+
+
+@pytest.mark.parametrize("kind", ["http1", "h2"])
+def test_a_request_is_answered_in_full_only_when_the_last_byte_of_its_answer_has_been_written_to_the_socket(kind):
+    """The visits of the oracle's walks are left only once the lab has SERVED the favicon in full (scripts/ci_ab_network.py ``settle_visit``): a server that says "answered" when the request arrives
+    (before the answer is written) or never says it is red here. The path is read without its query."""
+    from _waits import wait_until
+
+    release = threading.Event()
+    alpn = ("http/1.1",) if kind == "http1" else ("h2", "http/1.1")
+    with wc.WireServer(alpn=alpn, dns_names=("wire.test",), responder=_held_responder(release)) as server:
+        replies = []
+        client = (lambda: _http1_get(server, b"/wire.css?x=1")) if kind == "http1" else (lambda: _h2_client_exchange(server))
+        thread = threading.Thread(target=lambda: replies.append(client()), daemon=True)
+        thread.start()
+        try:
+            assert wait_until(lambda: _arrived(server, kind), 30, lambda: time.sleep(0.01)), "the request never arrived"
+            assert server.answered_at("/wire.css") is None, "the request has arrived and its answer is not written"
+        finally:
+            release.set()
+        thread.join(60)
+        assert replies, "the client got no answer"
+        # the client can hold the whole answer a moment before the server has stamped it (the stamp follows the write): the oracle waits for it too
+        assert wait_until(lambda: server.answered_at("/wire.css") is not None, 30, lambda: time.sleep(0.01)), "the answer was never marked as written"
+        written = server.answered_at("/wire.css")
+        assert isinstance(written, float) and written >= 0
+        if kind == "http1":
+            (request,) = _arrived(server, kind)
+            assert request["t"] <= written == request["written_t"]
+        assert server.answered_at("/favicon.ico") is None, "a path nobody asked for is not answered"
