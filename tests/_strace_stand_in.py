@@ -47,7 +47,7 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
               timestamps: bool = False, fd_paths: bool = False, network: bool = False, exit_status: bool = False,
-              core_dir: Path | None = None, cores: bool = False) -> str:
+              cores: bool = False) -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -66,8 +66,7 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
     ``fd_paths`` adds ``-y`` (scripts/ci_ab_host.py reads the paths the tree touched, and knows a socket by its inode);
     ``network`` adds the network calls to ``syscalls`` (scripts/ci_ab_host.py reads the netlink sockets and the public destinations);
     ``cores`` lets the tree dump core (``ulimit -c unlimited``) and changes nothing else: the working directory stays the launcher's, so the paths the trace reads
-    are the same, and where the kernel writes the core is the job's ``kernel.core_pattern``; ``core_dir`` does that and moves the working directory to that folder, where a
-    plain ``core`` pattern writes (the bare launch of scripts/ci_ab_host.py)."""
+    are the same, and where the kernel writes the core is the job's ``kernel.core_pattern`` (scripts/ci_ab_host.py)."""
     if network:
         syscalls = syscalls + "," + _NET_SYSCALLS
     real = Path(os.path.realpath(binary))
@@ -76,7 +75,7 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
         if entry.name != real.name:
             (tree / entry.name).symlink_to(entry)
     script = tree / real.name
-    cores_script = ("ulimit -c unlimited\ncd %s\n" % core_dir) if core_dir else ("ulimit -c unlimited\n" if cores else "")
+    cores_script = "ulimit -c unlimited\n" if cores else ""
     script.write_text(
         "#!/bin/sh\n"
         "echo $$ > %s\n"

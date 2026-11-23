@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_network.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import ci_ab_network as oracle  # noqa: E402
+import ci_crash_evidence as crash  # noqa: E402
 from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 
 #: The fewest leaves a comparison holds, per system. A minimal but complete run of ONE seed (one request on each road, tests/test_ab_network.py) holds about 670; a real one holds several times that. A floor of
@@ -43,8 +43,8 @@ FLOOR = {"linux": 500, "win32": 500}
 #: has the two idle launches. The budget allows 220 s for the first seed of an engine run (145 s measured on Windows), 120 s for each next one, and 120 s to start, so that the guard plus the 10 minutes of the job's own steps fit its 40 minutes: 5 seeds
 #: in an A/A are 30 minutes at most, expected about 18 on Linux and 22 on Windows (the exit-ping launch adds 1 to 2.3 minutes per engine run); with a candidate (three engine runs on every seed) 44 minutes at most.
 SETUP_S, FIRST_SEED_S, NEXT_SEED_S = 120, 220, 120
-#: The idle launch that waits for the engine to record that it told the user about its data reporting policy (60 s timer of the infobar, or the first-run tab) and then closes
-#: to count the exit pings: 140 s at most per engine run (the wait has a limit of 120 s, then the launch and the shutdown), on the first seed only.
+#: The launch that counts the exit pings (a page, the wait for Glean, one navigation, the close and the tree's exit), on the first seed only: 140 s at most per engine run, the
+#: bound of the launch as it was before it had a page; to be recomputed from the launches measured with the page.
 EXIT_PINGS_S = 140
 
 
@@ -88,8 +88,11 @@ def test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_
         command += ["--candidate", firefox_binary, "--candidate-seal", seal]
     else:
         command += ["--a-a", "--published-binary", firefox_binary, "--seeds", ",".join(str(s) for s in oracle.default_seeds()[:plan()[0]])]
-    done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
+    # Output in files and the whole tree killed at the limit: `subprocess.run(capture_output=True, timeout=...)` killed the python child alone, the firefox grandchild held the pipe
+    # and pytest ended with its own timeout 120 s later and no word about the launch (run 45121964904, Windows, job.log 546-557).
+    done = crash.run_tree(command, out / "tree", TIMEOUT_S)
     (out / "oracle.log").write_text(done.stdout + "\n--- stderr\n" + done.stderr, encoding="utf-8")
+    assert not done.timed_out, done.timeout_message("the network oracle", TIMEOUT_S) + ":\n" + "\n".join(done.stdout.splitlines()[-30:]) + "\n" + done.stderr[-1500:]
     verdict = [line for line in done.stdout.splitlines() if line.startswith(("DIFF ", "FAIL ", "AB NETWORK", "ERROR "))]
     control = out / "diff-a-a.json"
     assert control.is_file(), "the A/A did not run to its end (exit %s):\n%s\n%s" % (done.returncode, "\n".join(verdict[:40]), done.stderr[-1500:])

@@ -12,7 +12,7 @@ evidence: run 45030727459 had a firefox-68 parent die with -11 (SIGSEGV) in a no
     minidump list. Whatever a collector does not find is SAID (`said`), never left silent.
   * `LaunchProbe`: the observer the page and network oracles use. They launch through the wrapper, which keeps the browser's process inside the core's `Connection`;
     the probe wraps `Connection.__init__` and `Connection.close` (it reads the code after the close the launch already makes, and a watcher thread of the same
-    crash folders the host oracle's bare launch reads), so nothing about the launch changes: same environment, same prefs, same durations, same launch count.
+    crash folders that the host oracle's launches read too), so nothing about the launch changes: same environment, same prefs, same durations, same launch count.
 
 Three more things the probe keeps, in EVERY launch and not only in a bad one:
   * what the browser wrote (`stderr/<launch>.txt` in the crash folder): the core reads the browser's stdout and stderr (one pipe) through `ProcessOutput`, one reader for the whole life of
@@ -155,7 +155,7 @@ def parent_exit_problems(lifecycle, root_code, **who) -> list:
 
 
 # -
-# What a crash leaves: the folders, the files, the cores (the bare launch's collectors of scripts/ci_ab_host.py live here and are reused by every launch).
+# What a crash leaves: the folders, the files, the cores (the collectors that scripts/ci_ab_host.py and the probe's launches share live here).
 
 def crash_report_dirs(profile_dir, windows: bool) -> list:
     """The folders a crash leaves its `.dmp` and `.extra` in: the profile's `minidumps` and the `Crash Reports/pending` of the user's application data."""
@@ -757,6 +757,184 @@ def mark(**label) -> None:
     """Names the launch the oracle is about to make (no probe installed: nothing happens)."""
     if PROBE is not None:
         PROBE.set_label(**label)
+
+
+#: The file Glean's database writes on its first write, in the profile of a launch (the folder `db` is born when the database is opened, the file at the first write).
+GLEAN_DB = Path("datareporting", "glean", "db", "data.safe.bin")
+#: A safety net, not a measurement: the file is there at about +8 s in normal sessions, stock and ours (run 43649596941).
+GLEAN_LIMIT_S = 60.0
+
+
+class GleanNotReady(Exception):
+    """Glean had not initialised (no database file in the profile) when the launch was to close."""
+
+
+def wait_for_glean(profile: Path | None, limit_s: float = GLEAN_LIMIT_S, period: float = 0.25, sleep=time.sleep, now=time.monotonic) -> float:
+    """The seconds waited until `GLEAN_DB` exists in `profile`, read again every `period` seconds; `GleanNotReady` when `limit_s` is over or the profile is not known.
+
+    Why: a session that closes before Glean has initialised normally makes Glean start inside the shutdown, where its `glean.init` thread can die with the panic "No database
+    found" and the parent exits with -11 (Mozilla's race, the same in the retail browser; the network A/A, Linux, run 45121964904). The oracles close only after this. It only
+    reads: nothing is written in the profile, and no preference of the browser changes."""
+    if profile is None:
+        raise GleanNotReady("Glean did not initialise in %g s: no %s in the profile of the launch: the profile of the launch is not known (the close would make it start inside the "
+                            "shutdown, where it can crash: run 45121964904)" % (limit_s, GLEAN_DB.as_posix()))
+    target = Path(profile) / GLEAN_DB
+    start = now()
+    while not target.is_file():
+        waited = now() - start
+        if waited >= limit_s:
+            raise GleanNotReady("Glean did not initialise in %g s: no %s in the profile %s (the close would make it start inside the shutdown, where it can crash: run 45121964904)"
+                                % (limit_s, GLEAN_DB.as_posix(), profile))
+        sleep(period)
+    return now() - start
+
+
+#: Where a profile keeps what Glean and the data reporting policy write; its listing before the close is kept with the evidence of the launch (`save_datareporting`).
+DATAREPORTING_DIR = "datareporting"
+
+
+def datareporting_listing(profile) -> list:
+    """The lines of the list of `<profile>/datareporting/`: `<path relative to it><TAB><size in bytes>` (a folder ends with `/` and has `-`), sorted. A line that starts with `# `
+    says what could not be read: the list never raises."""
+    if profile is None:
+        return ["# the profile of the launch is not known"]
+    root = Path(profile) / DATAREPORTING_DIR
+    if not root.is_dir():
+        return ["# %s is not a folder in the profile %s" % (DATAREPORTING_DIR, profile)]
+    rows, problems = [], []
+    for folder, names, files in os.walk(root, onerror=lambda e: problems.append("# cannot read %s: %s" % (getattr(e, "filename", "?"), e))):
+        base = Path(folder)
+        for name in names:
+            rows.append("%s/\t-" % (base / name).relative_to(root).as_posix())
+        for name in files:
+            path = base / name
+            try:
+                size = str(path.stat().st_size)
+            except OSError as exc:
+                size = "?"
+                problems.append("# cannot read the size of %s: %s" % (path.relative_to(root).as_posix(), exc))
+            rows.append("%s\t%s" % (path.relative_to(root).as_posix(), size))
+    return problems + sorted(rows)
+
+
+def save_datareporting(profile) -> str | None:
+    """Writes the list of `<profile>/datareporting/` of the launch the probe sees now, to `<crash dir>/datareporting/<NN>-<seed>-<launch>.tsv` (NN: the number of the launch, the
+    one of its file in `stderr/`), and returns the path as the evidence names it. None when no probe is installed or it has no folder. What it could not read is in the file; it
+    never raises. It is evidence for the next time a launch dies: it is not in the leaves that are compared."""
+    probe = PROBE
+    if probe is None or probe.crash_dir is None:
+        return None
+    try:
+        with probe._lock:
+            records = list(probe.records)
+        number = getattr(records[-1], "n", len(records)) if records else 0
+        name = "%02d-%s.tsv" % (number, _safe("-".join(str(v) for v in probe.label.values()) or "launch"))
+        folder = probe.crash_dir / DATAREPORTING_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        head = ["# launch %d: %s" % (number, ", ".join("%s %s" % kv for kv in probe.label.items()) or "not named"), "# path (relative to datareporting/)<TAB>size in bytes"]
+        (folder / name).write_text("\n".join(head + datareporting_listing(profile)) + "\n", encoding="utf-8", newline="\n")
+        return "%s/%s/%s" % (probe.crash_dir.name, DATAREPORTING_DIR, name)
+    except Exception:  # noqa: BLE001 - the evidence never breaks a launch
+        return None
+
+
+#: The line an oracle writes when it begins a launch (`launch_line`), and what reads it back (`last_launch`): the process that runs the oracle names, when the oracle does not end in
+#: time, the launch that was alive.
+LAUNCH_LINE = re.compile(r"^=== launch (?P<launch>\S+) seed (?P<seed>-?\d+) of (?P<label>.*?) began at (?P<at>\S+)\s*$", re.M)
+
+
+def launch_line(seed, launch: str, label: str, at=None) -> str:
+    """`=== launch <launch> seed <seed> of <label> began at <iso, UTC>`: what an oracle prints when `mark` names a launch."""
+    import datetime
+
+    at = at or datetime.datetime.now(datetime.timezone.utc)
+    return "=== launch %s seed %s of %s began at %s" % (launch, seed, label or "?", at.isoformat(timespec="seconds"))
+
+
+def last_launch(text: str, now=None) -> dict | None:
+    """The last launch line of `text` as {launch, seed, label, at, alive_s} (alive_s: seconds from `at` to `now`, None when `at` does not read), or None when there is none."""
+    import datetime
+
+    found = None
+    for found in LAUNCH_LINE.finditer(text or ""):
+        pass
+    if found is None:
+        return None
+    item = found.groupdict()
+    try:
+        began = datetime.datetime.fromisoformat(item["at"])
+        item["alive_s"] = ((now or datetime.datetime.now(datetime.timezone.utc)) - began).total_seconds()
+    except (ValueError, TypeError):
+        item["alive_s"] = None
+    return item
+
+
+def kill_tree(pid: int) -> None:
+    """Kills `pid` and everything that descends from it. With psutil the descendants are listed first (a parent that dies hides its children) and all are killed; without it
+    Windows has `taskkill /T /F` and Linux the process group (the child was started in its own session, `run_tree`)."""
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            root = psutil.Process(pid)
+            victims = root.children(recursive=True) + [root]
+        except psutil.NoSuchProcess:
+            victims = []
+        for victim in victims:
+            with contextlib.suppress(psutil.Error):
+                victim.kill()
+    elif sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+    if sys.platform != "win32":
+        import signal
+
+        with contextlib.suppress(OSError):
+            os.killpg(pid, signal.SIGKILL)            # the group of the child, which is its own (start_new_session)
+
+
+class TreeRun:
+    """What `run_tree` saw: the code (None when the time ran out), the text of stdout and stderr, how long it ran and the launch line the oracle wrote last."""
+
+    def __init__(self, returncode, stdout: str, stderr: str, seconds: float, timed_out: bool) -> None:
+        self.returncode, self.stdout, self.stderr, self.seconds, self.timed_out = returncode, stdout, stderr, seconds, timed_out
+        self.launch = last_launch(stdout)
+
+    def timeout_message(self, who: str, limit_s: float) -> str:
+        """The red of a run that did not end: the launch that was alive and for how long."""
+        if self.launch is None:
+            alive = "no launch had begun"
+        else:
+            alive = "the launch %s of seed %s (%s) was alive for %s s" % (self.launch["launch"], self.launch["seed"], self.launch["label"],
+                                                                         "%d" % self.launch["alive_s"] if self.launch["alive_s"] is not None else "?")
+        return "%s did not end within %d s: %s; its tree was killed" % (who, limit_s, alive)
+
+
+def run_tree(command, out_dir, timeout_s: float, env=None, cwd=None, poll: float = 0.2) -> TreeRun:
+    """Runs `command` with its output in FILES under `out_dir` (never a pipe), and at `timeout_s` kills the whole tree.
+
+    Why not `subprocess.run(capture_output=True, timeout=...)`: at the timeout it kills the child alone. The firefox that the child launched holds the write end of the pipe,
+    `communicate()` does not return until it exits, and the test went on to a pytest timeout 120 s later (run 45121964904, Windows, job.log 546-557). With files nothing waits
+    for a grandchild, and `kill_tree` ends them all."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path, err_path = out_dir / "run-tree.stdout", out_dir / "run-tree.stderr"
+    start = time.monotonic()
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        extra = {"start_new_session": True} if sys.platform != "win32" else {}
+        child = subprocess.Popen(list(command), stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=env, cwd=cwd, **extra)
+        timed_out = False
+        while child.poll() is None:
+            if time.monotonic() - start >= timeout_s:
+                timed_out = True
+                kill_tree(child.pid)
+                break
+            time.sleep(poll)
+        child.wait()
+    seconds = time.monotonic() - start
+    read = lambda path: path.read_bytes().decode("utf-8", "replace")  # noqa: E731
+    return TreeRun(None if timed_out else child.returncode, read(out_path), read(err_path), seconds, timed_out)
 
 
 def read_exits(path) -> dict | None:

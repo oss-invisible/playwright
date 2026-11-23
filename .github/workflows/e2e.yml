@@ -782,6 +782,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      # The geolocation control of the host oracle runs on Playwright's own Firefox (`run_stock`, `ci_ab_host.py stock`) on every run: the binary is not in the image (run
+      # 45121964904: `Executable doesn't exist at ms-playwright/firefox-1532/firefox/firefox.exe`, and the oracle blamed the platform provider). The same python as the tests.
+      - name: Playwright's own Firefox (the control of the geolocation step)
+        run: python -m playwright install firefox
       - name: The security state (a fixed directory of the repository)
         shell: bash
         run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
@@ -802,6 +806,30 @@ jobs:
           print(counts)
           sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
           PY
+      # What the Windows location provider needs, read only and printed when the control says the step does not reach it (the service, the consent of the location
+      # capability for the machine and for the user, its configuration): the runner's state, to be read next to the stock evidence of the oracle.
+      - name: The state of the Windows location service and of its consent (read only)
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "--- Get-Service lfsvc"
+          try { Get-Service lfsvc -ErrorAction Stop | Format-List * } catch { "lfsvc: not readable: $($_.Exception.Message)" }
+          foreach ($key in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+              'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration')) {
+            "--- $key"
+            if (-not (Test-Path -LiteralPath $key)) { "key absent: $key"; continue }
+            try { Get-ItemProperty -LiteralPath $key -ErrorAction Stop | Format-List * } catch { "not readable: $($_.Exception.Message)" }
+            foreach ($sub in @('NonPackaged')) {
+              $path = Join-Path $key $sub
+              if (Test-Path -LiteralPath $path) {
+                "--- $path"
+                try { Get-ItemProperty -LiteralPath $path -ErrorAction Stop | Format-List * } catch { "not readable: $($_.Exception.Message)" }
+              }
+            }
+          }
       - name: The leg ran with the pinned GeoIP database
         if: always()
         run: |

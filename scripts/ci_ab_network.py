@@ -98,12 +98,6 @@ H3_VISITS = 5
 #: The safety nets of a run, in seconds: a launch that does not come back, a run that does not end. Never a verdict.
 RUN_TIMEOUT_S = 40 * 60
 WAIT_S = 30
-#: The pref the engine writes when it has told the user about its data reporting policy: from then on the shutdown sends its pings (TelemetryReportingPolicy.sys.mjs
-#: ``_recordNotificationData``), by a background task of the engine that is a process of its own.
-NOTIFIED_PREF = "datareporting.policy.dataSubmissionPolicyNotifiedTime"
-#: How often the profile's prefs.js is read while the launch waits for it, and the safety net that ends a launch that never gets there (it is not a verdict: the transcript says
-#: ``recorded: false`` and the A/A must agree on it).
-PREF_POLL_S, PREF_LIMIT_S = 0.5, 120.0
 #: How many times a lab is made again when two of its servers share a port number.
 MAX_LAB_TRIES = 50
 #: Whose categories a transcript holds under each seed.
@@ -1416,13 +1410,16 @@ def run_main(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
         trap = start_trap()
         watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
         try:
-            crash.mark(seed=seed, launch="main")
-            with launch(binary, seed, lab, patch) as browser:
+            begin_launch(seed, "main")
+            session = launch(binary, seed, lab, patch)
+            with session as browser:
                 out["journey"] = guarded(lambda: walk_journey(browser, lab))
+                out.update(glean_ready(session, seed, "main"))     # the journey opened its own pages: Glean is born; the rest of the work follows, then the close
                 out["https"] = {"h2": guarded(lambda: walk_https(browser, lab, "h2", lab.h2, H2_NAME)),
                                 "h1": guarded(lambda: walk_https(browser, lab, "h1", lab.h1, H1_NAME))}
                 out["h3"] = guarded(lambda: walk_h3(browser, lab))
                 out["webrtc"] = guarded(lambda: walk_webrtc(browser, lab))
+                save_datareporting(session, seed, "main")
         finally:
             watcher.stop()
             if trap is not None:
@@ -1476,11 +1473,13 @@ def run_idle(binary: str, seed: int, condition: str, patch: Any) -> Dict[str, An
     rounds in a row leave what is not the sentinel unchanged."""
     out: Dict[str, Any] = {}
     with open_lab(attribute_in=("launch", "idle", "sentinel")) as lab:
-        crash.mark(seed=seed, launch="idle-" + condition)
-        with launch(binary, seed, lab, patch) as browser:
+        begin_launch(seed, "idle-" + condition)
+        session = launch(binary, seed, lab, patch)
+        with session as browser:
             out["launch"] = lab.norm.walk(launch_data(lab))      # who asks what while the browser starts: the STUN Binding at launch is the core's measurement, not the browser's
             lab.rec.set_phase("idle")
             page = browser.new_context(ignore_https_errors=True).new_page()
+            out.update(glean_ready(session, seed, "idle-" + condition))     # Glean is born when a window opens: from here to the close there is the work of the launch
             lab.rec.set_phase("sentinel.0")
             page.goto("http://%s:%d/s/0" % (PAGE_NAME, lab.site.port), wait_until="load", timeout=60000)
             rounds, converged, previous = 0, False, sentinel_signature(lab)
@@ -1494,26 +1493,11 @@ def run_idle(binary: str, seed: int, condition: str, patch: Any) -> Dict[str, An
                         converged = True
                         break
                     previous = now
+            save_datareporting(session, seed, "idle-" + condition)
         out.update(destinations=lab.norm.walk(sentinel_signature(lab)))
         if condition == "c2":
             out.update(rounds=rounds, converged=converged)
     return out
-
-
-def wait_for_pref(prefs_js: Path, name: str, limit_s: float = PREF_LIMIT_S, period: float = PREF_POLL_S, sleep: Callable[[float], Any] = time.sleep,
-                  now: Callable[[], float] = time.monotonic) -> bool:
-    """True when ``user_pref("<name>", ...)`` is in the profile's prefs.js, read again every ``period`` seconds until it is or ``limit_s`` is over. Changes nothing in the profile."""
-    needle = 'user_pref("%s"' % name
-    end = now() + limit_s
-    while True:
-        try:
-            if needle in prefs_js.read_text(encoding="utf-8", errors="replace"):
-                return True
-        except OSError:
-            pass
-        if now() >= end:
-            return False
-        sleep(period)
 
 
 def profile_of(token: Any, find: Optional[Callable[[Any], list]] = None) -> Optional[Path]:
@@ -1530,6 +1514,43 @@ def profile_of(token: Any, find: Optional[Callable[[Any], list]] = None) -> Opti
     return None
 
 
+#: The label of the run in progress (``run``): the line that names a launch says which engine run it belongs to.
+RUN_LABEL = ""
+
+
+def begin_launch(seed: int, launch_name: str) -> None:
+    """Names the launch about to be made for the probe (``crash.mark``) and writes the line that says which launch is alive, and since when: the test that runs this oracle reads the
+    last one of these lines when the oracle does not end in time, and names the launch it was waiting for (run 45121964904, Windows: a firefox that did not exit held the pipe)."""
+    crash.mark(seed=seed, launch=launch_name)
+    print(crash.launch_line(seed, launch_name, RUN_LABEL))
+    sys.stdout.flush()
+
+
+def glean_ready(session: Any, seed: int, launch_name: str) -> Dict[str, Any]:
+    """Waits (inside the ``with`` of the launch, after a page is open and before the work of the launch) until Glean has initialised, so the close that follows is the one of a
+    browser that has finished starting: a close before that makes Glean start inside the shutdown, where its ``glean.init`` thread can die with the panic "No database found"
+    and the parent exits with -11 (Mozilla's race, the same in the retail browser: run 45121964904, the engine 68, Linux, launch ``exit-pings``). Glean is born when a window opens,
+    so without a page the condition never comes. The condition is read from the host, the engine and its prefs are untouched (``crash.wait_for_glean``). ``{}`` when it is ready;
+    ``{"glean": {"error": ...}}`` when it is not, which ``transcript_errors`` sees and which is red: the launch goes on and is closed all the same (the exit of the ``with``), and what
+    it saw is kept."""
+    try:
+        waited = crash.wait_for_glean(profile_of(session._end_token))
+    except crash.GleanNotReady as exc:
+        return {"glean": {"error": "GleanNotReady: %s" % exc}}
+    print("glean ready after %.1f s (seed %d, launch %s)" % (waited, seed, launch_name))
+    sys.stdout.flush()
+    return {}
+
+
+def save_datareporting(session: Any, seed: int, launch_name: str) -> None:
+    """The last thing a launch does before its close: the list of ``<profile>/datareporting/`` goes to the evidence folder of the run (``crash.save_datareporting``), for the next time
+    a launch of the run dies. It changes nothing about the launch and nothing of what is compared, and a failure of it is not one of the launch."""
+    try:
+        crash.save_datareporting(profile_of(session._end_token))
+    except Exception:  # noqa: BLE001 - evidence, never a verdict
+        pass
+
+
 def outside_the_lab(lab: Lab, target: str) -> bool:
     """A CONNECT target that is neither the lab's own (loopback, the DoH, a server it runs, the egress endpoints) nor anything it serves: where an exit ping goes."""
     import _doh_servers as ds
@@ -1541,30 +1562,40 @@ def outside_the_lab(lab: Lab, target: str) -> bool:
     return not (ds.is_loopback(host) or known)
 
 
-def exit_pings_summary(targets: List[str], recorded: bool, norm: Normalizer, openers: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
-    """What the shutdown of an idle launch sent out of the lab: ``recorded`` (the pref was written, so the engine may send), and the CONNECTs towards names outside the lab, in the
-    form the proxy was asked them (a name, or an address), how many of each, and in the order they were first asked."""
-    return dict(connect_summary(targets, norm, openers), recorded=recorded)
+def exit_pings_summary(targets: List[str], norm: Normalizer, openers: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
+    """What the shutdown of a launch with a page sent out of the lab: the CONNECTs towards names outside the lab, in the form the proxy was asked them (a name, or an address), how
+    many of each, and in the order they were first asked."""
+    return connect_summary(targets, norm, openers)
 
 
 def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
-    """An idle launch behind the lab's proxy with no pref changed: it waits until the engine has written ``NOTIFIED_PREF`` to the profile (or ``PREF_LIMIT_S`` is over: then
-    ``recorded`` is false), closes, and records until the tree has exited, the pingsender of the shutdown included (``EndingPlaywright`` returns when the reaper has). What went
-    to the proxy towards a name outside the lab is the exit pings; the proxy refuses those CONNECTs itself (a SOCKS reply 4, host unreachable: nothing leaves the lab), and a
-    connection from the browser or from its pingsender that did not go to the proxy is in ``direct``, which is red on either side."""
+    """A launch behind the lab's proxy with no pref changed: it opens a context and a page, waits until Glean has initialised, navigates to the sentinel page of the idle launches
+    until its ``load``, closes, and records until the tree has exited, the pingsender of the shutdown included (``EndingPlaywright`` returns when the reaper has). What went to the proxy towards a name outside the lab is the exit pings; the proxy
+    refuses those CONNECTs itself (a SOCKS reply 4, host unreachable: nothing leaves the lab), and a connection from the browser or from its pingsender that did not go to the proxy
+    is in ``direct``, which is red on either side.
+
+    The navigation sits between the condition and the close on purpose: the condition says that the database has been written (its file exists), not that the init thread of Glean
+    has finished, and that thread can still be half-way when the file appears: that is the window of the race. The page's load is real work of the launch after the condition, and
+    the stage ``exit`` begins after it.
+
+    It measures the exit pings of the close of a normal session (one page, Glean initialised). It does not measure the shutdown of a session with no window or one closed in its
+    first seconds, where Glean is born inside the shutdown: that is the road of Mozilla's race (run 45121964904, the engine 68, Linux), and it is on the list for after the 69, with
+    the sessions closed in the first seconds."""
     from _leaks import Watcher
 
     with open_lab(attribute_in=("exit",)) as lab:
         trap = start_trap()
         watcher = Watcher(match=("firefox", Path(binary).stem.lower())).start()
-        recorded = False
         try:
-            crash.mark(seed=seed, launch="exit-pings")
+            begin_launch(seed, "exit-pings")
             session = launch(binary, seed, lab, patch)
             with session as browser:
                 lab.rec.set_phase("exit.wait")
-                profile = profile_of(session._end_token)
-                recorded = bool(profile) and wait_for_pref(profile / "prefs.js", NOTIFIED_PREF)
+                page = browser.new_context(ignore_https_errors=True).new_page()
+                glean = glean_ready(session, seed, "exit-pings")
+                lab.rec.set_phase("sentinel.0")        # not under ``exit``: what the navigation asks of the proxy is not an exit ping
+                page.goto("http://%s:%d/s/0" % (PAGE_NAME, lab.site.port), wait_until="load", timeout=60000)
+                save_datareporting(session, seed, "exit-pings")
                 lab.rec.set_phase("exit")
             lab.rec.set_phase("exit.end")
         finally:
@@ -1572,7 +1603,8 @@ def run_exit_pings(binary: str, seed: int, patch: Any) -> Dict[str, Any]:
             if trap is not None:
                 trap.__exit__(None, None, None)
         pings = [e for e in lab.rec.of("exit", "connect") if outside_the_lab(lab, e["target"])]
-        out = exit_pings_summary([e["target"] for e in pings], recorded, lab.norm, [e.get("opener") for e in pings])
+        out = exit_pings_summary([e["target"] for e in pings], lab.norm, [e.get("opener") for e in pings])
+        out.update(glean)
         out["direct"] = direct_report(lab, watcher, trap)
         return out
 
@@ -1603,6 +1635,8 @@ def run(binary: str, label: str, seeds: Tuple[int, ...], out: Path) -> int:
         _lab_egress.install(patch, work)
         transcript: Dict[str, Any] = {"format": FORMAT, "label": label, "platform": sys.platform, "seeds": {}}
         EVIDENCE.clear()
+        global RUN_LABEL
+        RUN_LABEL = label
         for index, seed in enumerate(seeds):
             print("=== %s: seed %d" % (label, seed))
             sys.stdout.flush()

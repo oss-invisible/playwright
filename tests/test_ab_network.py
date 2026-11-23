@@ -1174,30 +1174,6 @@ def _socks_connect_name(proxy_port: int, host: str, port: int):
 TELEMETRY = "incoming.telemetry.mozilla.org:443"
 
 
-def test_the_pref_wait_reads_the_profile_every_period_changes_nothing_and_ends_at_the_limit_with_not_recorded(tmp_path):
-    prefs = tmp_path / "prefs.js"
-    clock = {"t": 0.0}
-    polls = []
-
-    def sleep(period):
-        polls.append((clock["t"], period))
-        clock["t"] += period
-        if len(polls) == 3:       # the engine writes the pref on the third look
-            prefs.write_text('user_pref("browser.startup.homepage_override.mstone", "x");\nuser_pref("%s", 1700000000000);\n' % ab.NOTIFIED_PREF, encoding="utf-8")
-
-    assert ab.wait_for_pref(prefs, ab.NOTIFIED_PREF, limit_s=120.0, period=0.5, sleep=sleep, now=lambda: clock["t"]) is True
-    assert polls == [(0.0, 0.5), (0.5, 0.5), (1.0, 0.5)], "the file did not exist for two looks (no file is not an error), and it is read every half second"
-    before = prefs.read_bytes()
-    clock["t"] = 0.0
-    assert ab.wait_for_pref(prefs, ab.NOTIFIED_PREF, sleep=lambda p: None, now=lambda: clock["t"]) is True and prefs.read_bytes() == before, "reading changes nothing"
-    other = tmp_path / "other" / "prefs.js"
-    other.parent.mkdir()
-    other.write_text('user_pref("datareporting.policy.firstRunURL", "x");\n', encoding="utf-8")
-    ticks = iter(range(0, 1000, 30))
-    assert ab.wait_for_pref(other, ab.NOTIFIED_PREF, limit_s=120.0, sleep=lambda p: None, now=lambda: float(next(ticks))) is False, "a launch that never gets there ends at the limit: not recorded"
-    assert ab.PREF_LIMIT_S == 120.0 and ab.PREF_POLL_S == 0.5
-
-
 def test_the_profile_of_a_session_is_the_argument_of_its_parent_process_and_not_a_content_process():
     class Proc:
         def __init__(self, cmd):
@@ -1237,9 +1213,9 @@ def test_a_connect_target_is_outside_the_lab_when_it_is_neither_loopback_nor_a_s
         assert not ab.outside_the_lab(lab, "127.0.0.1:%d" % lab.h1.port)
 
 
-def _with_pings(t, targets, recorded=True, direct=None):
+def _with_pings(t, targets, direct=None):
     norm = ab.Normalizer({})
-    body = ab.exit_pings_summary(targets, recorded, norm)
+    body = ab.exit_pings_summary(targets, norm)
     body["direct"] = direct if direct is not None else {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}
     for seed in t["seeds"].values():
         seed["idle"]["exit_pings"] = copy.deepcopy(body)
@@ -1248,7 +1224,7 @@ def _with_pings(t, targets, recorded=True, direct=None):
 
 def test_the_exit_pings_are_the_connects_to_the_proxy_towards_the_telemetry_host_and_they_are_compared_strictly():
     three = [TELEMETRY] * 3
-    assert ab.exit_pings_summary(three, True, ab.Normalizer({})) == {"order": [TELEMETRY], "counts": {TELEMETRY: 3}, "recorded": True}
+    assert ab.exit_pings_summary(three, ab.Normalizer({})) == {"order": [TELEMETRY], "counts": {TELEMETRY: 3}}
     green = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), three))
     assert green["verdict"] == "green"
     # a different number
@@ -1257,11 +1233,11 @@ def test_the_exit_pings_are_the_connects_to_the_proxy_towards_the_telemetry_host
     # a different form: the address instead of the name
     form = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), ["162.159.207.1:443"] * 3))
     assert form["verdict"] == "red" and any("/idle/exit_pings/order/0" in d["path"] and d["b"] == "162.159.207.1:443" for d in form["differences"])
-    # recorded on one side only
-    one_sided = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), [], recorded=False))
-    assert one_sided["verdict"] == "red" and any(d["path"].endswith("/idle/exit_pings/recorded") and d["a"] is True and d["b"] is False for d in one_sided["differences"])
-    # not recorded on both: the A/A agrees and the shutdown sent nothing
-    both = compare(_with_pings(transcript("a"), [], recorded=False), _with_pings(transcript("b"), [], recorded=False))
+    # no ping on one side only
+    one_sided = compare(_with_pings(transcript("a"), three), _with_pings(transcript("b"), []))
+    assert one_sided["verdict"] == "red" and any(d["path"].endswith("/idle/exit_pings/counts/" + TELEMETRY) for d in one_sided["differences"])
+    # no ping on both: the A/A agrees
+    both = compare(_with_pings(transcript("a"), []), _with_pings(transcript("b"), []))
     assert both["verdict"] == "green"
     # a ping that did not go to the proxy is red on either side, and when both do it
     leak = {"witness_tcp": [], "witness_udp": [], "watcher": ["tcp firefox -> 162.159.207.1:443"], "doh_direct": [], "resolver_trap": [], "blind": []}
@@ -1270,7 +1246,7 @@ def test_the_exit_pings_are_the_connects_to_the_proxy_towards_the_telemetry_host
     assert compare(_with_pings(transcript("a"), three, direct=leak), _with_pings(transcript("b"), three, direct=leak))["verdict"] == "red"
 
 
-def test_the_exit_launch_waits_for_the_pref_then_closes_and_records_what_the_proxy_was_asked_until_the_tree_has_exited(tmp_path, monkeypatch):
+def test_the_exit_launch_opens_a_page_waits_for_glean_then_closes_and_records_what_the_proxy_was_asked_until_the_tree_has_exited(tmp_path, monkeypatch):
     import _leaks
 
     profile = tmp_path / "profile"
@@ -1291,6 +1267,26 @@ def test_the_exit_launch_waits_for_the_pref_then_closes_and_records_what_the_pro
         def stop(self):
             order.append("watcher stopped")
 
+    class Page:
+        def __init__(self, lab):
+            self.lab = lab
+
+        def goto(self, url, **kwargs):
+            order.append("goto %s in stage %s %s" % (url.rsplit("/", 2)[-2:], self.lab.rec.phase, sorted(kwargs.items())))
+            self.lab.rec.event("connect", target="198.51.100.77:80")      # what the navigation asks of the proxy: it is not an exit ping
+
+    class Browser:
+        def __init__(self, lab):
+            self.lab = lab
+
+        def new_context(self, **kwargs):
+            order.append("context %s" % sorted(kwargs.items()))
+            return self
+
+        def new_page(self):
+            order.append("page")
+            return Page(self.lab)
+
     class Session:
         _end_token = "token"
 
@@ -1299,8 +1295,7 @@ def test_the_exit_launch_waits_for_the_pref_then_closes_and_records_what_the_pro
 
         def __enter__(self):
             order.append("launched")
-            (profile / "prefs.js").write_text('user_pref("%s", 1);\n' % ab.NOTIFIED_PREF, encoding="utf-8")
-            return object()
+            return Browser(self.lab)
 
         def __exit__(self, *exc):
             order.append("closing in stage " + self.lab.rec.phase)
@@ -1315,32 +1310,32 @@ def test_the_exit_launch_waits_for_the_pref_then_closes_and_records_what_the_pro
     monkeypatch.setattr(ab, "start_trap", lambda: None)
     monkeypatch.setattr(ab, "profile_of", lambda token, find=None: profile)
     monkeypatch.setattr(ab, "launch", lambda binary, seed, lab, patch: Session(lab))
+    monkeypatch.setattr(ab.crash, "wait_for_glean", lambda p, *a, **k: order.append("glean waited") or 8.0)
+    monkeypatch.setattr(ab, "save_datareporting", lambda profile, seed, launch_name: order.append("datareporting listed"))
     out = ab.run_exit_pings("/ff/firefox", 11, object())
-    assert out["recorded"] is True and out["counts"] == {TELEMETRY: 3} and out["order"] == [TELEMETRY], "the DoH connection of the lab is not an exit ping"
-    assert out["direct"]["watcher"] == [] and out["direct"]["blind"] == []
-    assert order == ["launched", "closing in stage exit", "tree exited", "watcher stopped"]
-    # no pref ever: the launch ends at the limit and says so
-    (profile / "prefs.js").unlink()
-    monkeypatch.setattr(ab, "PREF_LIMIT_S", 0.0)
-    monkeypatch.setattr(ab, "wait_for_pref", lambda *a, **k: False)
+    assert out["counts"] == {TELEMETRY: 3} and out["order"] == [TELEMETRY], "the DoH connection of the lab is not an exit ping"
+    assert "recorded" not in out and out["direct"]["watcher"] == [] and out["direct"]["blind"] == []
+    assert order == ["launched", "context [('ignore_https_errors', True)]", "page", "glean waited", "goto ['s', '0'] in stage sentinel.0 [('timeout', 60000), ('wait_until', 'load')]",
+                     "datareporting listed", "closing in stage exit", "tree exited", "watcher stopped"], "page, Glean, a navigation to its load, then the close: the navigation is not an exit ping"
+    # Glean never initialised: red, and the launch closes all the same
+    order.clear()
+    monkeypatch.setattr(ab.crash, "wait_for_glean", lambda p, *a, **k: (_ for _ in ()).throw(ab.crash.GleanNotReady("Glean did not initialise in 60 s")))
+    late = ab.run_exit_pings("/ff/firefox", 11, object())
+    assert late["glean"]["error"].startswith("GleanNotReady: Glean did not initialise in 60 s") and "tree exited" in order
+    assert ab.transcript_errors({"11": {"idle": {"exit_pings": late}}}) == ["seeds/11/idle/exit_pings/glean/error"]
 
-    class Quiet(Session):
-        def __enter__(self):
-            return object()
 
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(ab, "launch", lambda binary, seed, lab, patch: Quiet(lab))
-    silent = ab.run_exit_pings("/ff/firefox", 11, object())
-    assert silent["recorded"] is False and silent["counts"] == {} and silent["order"] == []
+def test_no_wait_for_the_policy_pref_is_left_in_the_network_oracle():
+    assert not any(hasattr(ab, name) for name in ("wait_for_pref", "PREF_POLL_S", "PREF_LIMIT_S", "NOTIFIED_PREF")), "the exit launch waits for Glean and for nothing else"
+    text = (ROOT / "scripts" / "ci_ab_network.py").read_text(encoding="utf-8")
+    assert "recorded=" not in text and 'recorded"' not in text and "wait_for_pref" not in text
 
 
 def test_the_idle_category_of_the_first_seed_holds_the_exit_pings(monkeypatch):
     monkeypatch.setattr(ab, "run_idle", lambda binary, seed, condition, patch: {"destinations": {}})
-    monkeypatch.setattr(ab, "run_exit_pings", lambda binary, seed, patch: {"recorded": True})
+    monkeypatch.setattr(ab, "run_exit_pings", lambda binary, seed, patch: {"counts": {}})
     monkeypatch.setattr(ab, "run_main", lambda binary, seed, patch: {"journey": {}})
-    assert ab.walk_seed("ff", 11, True, object())["idle"] == {"c1": {"destinations": {}}, "c2": {"destinations": {}}, "exit_pings": {"recorded": True}}
+    assert ab.walk_seed("ff", 11, True, object())["idle"] == {"c1": {"destinations": {}}, "c2": {"destinations": {}}, "exit_pings": {"counts": {}}}
     assert "idle" not in ab.walk_seed("ff", 12, False, object())
 
 
@@ -1783,3 +1778,297 @@ def test_the_engine_run_is_given_a_folder_for_what_a_launch_that_died_leaves_bes
     monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, timeout: seen.append(env.get(crash.CRASH_DIR_ENV)) or Done())
     assert ab.run_engine("ff", None, "firefox-68-again", (0,), tmp_path / "out" / "transcript-68-again.json") == 0
     assert seen == [str(tmp_path / "out" / "transcript-68-again.crash")]
+
+
+# ----------------------------------------------------------------------------------------------------------------- Glean before the close
+def _glean_fakes(monkeypatch, tmp_path, waiter):
+    """`run_idle` with a fake lab, a fake launch and a fake `wait_for_glean`: what happened, in order, is the list returned."""
+    import contextlib
+
+    order = []
+    profile = tmp_path / "profile"
+
+    class Page:
+        def goto(self, *a, **k):
+            order.append("goto")
+
+        def evaluate(self, *a, **k):
+            return None
+
+    class Context:
+        def new_page(self):
+            order.append("new_page")
+            return Page()
+
+    class Browser:
+        def new_context(self, **k):
+            return Context()
+
+    class Session:
+        _end_token = "token"
+
+        def __enter__(self):
+            order.append("launched")
+            return Browser()
+
+        def __exit__(self, *exc):
+            order.append("closed")
+            return False
+
+    class Lab:
+        class rec:
+            phase = ""
+
+            @staticmethod
+            def set_phase(name):
+                order.append("phase " + name)
+
+        class norm:
+            @staticmethod
+            def walk(x):
+                return x
+
+        class site:
+            port = 1
+
+        h1 = h2 = None
+
+    @contextlib.contextmanager
+    def open_lab(**k):
+        yield Lab
+
+    monkeypatch.setattr(ab, "open_lab", open_lab)
+    monkeypatch.setattr(ab, "launch", lambda binary, seed, lab, patch: Session())
+    monkeypatch.setattr(ab, "launch_data", lambda lab: {})
+    monkeypatch.setattr(ab, "sentinel_signature", lambda lab: {"connects": [], "dns": [], "udp": []})
+    monkeypatch.setattr(ab, "profile_of", lambda token, find=None: order.append("profile of " + token) or profile)
+    monkeypatch.setattr(ab.crash, "wait_for_glean", lambda p, *a, **k: order.append("glean waited in %s" % p.name) or waiter(p))
+    monkeypatch.setattr(ab, "save_datareporting", lambda session, seed, launch_name: order.append("datareporting listed"))
+    return order
+
+
+@pytest.mark.parametrize("condition", ["c1", "c2"])
+def test_an_idle_launch_waits_for_glean_before_it_closes_and_prints_when_it_was_ready(tmp_path, monkeypatch, capsys, condition):
+    order = _glean_fakes(monkeypatch, tmp_path, lambda p: 8.25)
+    out = ab.run_idle("/ff/firefox", 11, condition, object())
+    assert order.index("new_page") < order.index("glean waited in profile") < order.index("goto"), "Glean is born when a window opens: the condition comes after the page and before the work"
+    assert order[-2:] == ["datareporting listed", "closed"] and order.count("closed") == 1, "the list of datareporting is the last thing before the close"
+    assert "profile of token" in order and order.index("profile of token") < order.index("glean waited in profile")
+    assert "glean ready after 8.2 s (seed 11, launch idle-%s)" % condition in capsys.readouterr().out
+    assert ab.transcript_errors({"11": out}) == [] and "glean" not in out
+
+
+def test_a_launch_whose_glean_never_initialised_is_a_red_error_of_the_transcript_and_the_browser_still_closes(tmp_path, monkeypatch):
+    def never(profile):
+        raise ab.crash.GleanNotReady("Glean did not initialise in 60 s: no data.safe.bin in the profile %s" % profile)
+
+    order = _glean_fakes(monkeypatch, tmp_path, never)
+    out = ab.run_idle("/ff/firefox", 11, "c1", object())
+    assert order[-1] == "closed" and order.count("closed") == 1 and "goto" in order, "the launch goes on and the close is the same: the exit of the `with`"
+    assert out["glean"]["error"].startswith("GleanNotReady: Glean did not initialise in 60 s"), out
+    assert "destinations" in out, "what the launch saw is kept: only the verdict is red"
+    assert ab.transcript_errors({"11": out}) == ["seeds/11/glean/error"]
+
+
+def test_a_launch_without_a_known_profile_is_red_the_same_way_for_glean(tmp_path, monkeypatch):
+    real = ab.crash.wait_for_glean
+    order = _glean_fakes(monkeypatch, tmp_path, lambda p: 0.0)
+    monkeypatch.setattr(ab, "profile_of", lambda token, find=None: None)
+    monkeypatch.setattr(ab.crash, "wait_for_glean", real)   # the real one: it knows what to say of a launch without a profile
+    out = ab.run_idle("/ff/firefox", 11, "c1", object())
+    assert "the profile of the launch is not known" in out["glean"]["error"] and order[-1] == "closed"
+
+
+def test_the_main_launch_waits_for_glean_after_the_journey_and_before_the_rest_of_its_work(tmp_path, monkeypatch):
+    import _leaks
+
+    order = _glean_fakes(monkeypatch, tmp_path, lambda p: 3.0)
+
+    class Watcher:
+        def __init__(self, match=()):
+            pass
+
+        def start(self):
+            return self
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(_leaks, "Watcher", Watcher)
+    monkeypatch.setattr(ab, "start_trap", lambda: None)
+    monkeypatch.setattr(ab, "direct_report", lambda lab, watcher, trap: {})
+    monkeypatch.setattr(ab, "wire_evidence", lambda lab: {})
+    for walker in ("walk_journey", "walk_h3", "walk_webrtc"):
+        monkeypatch.setattr(ab, walker, lambda *a, _w=walker, **k: order.append(_w) or {})
+    monkeypatch.setattr(ab, "walk_https", lambda *a, **k: order.append("walk_https") or {})
+    out = ab.run_main("/ff/firefox", 11, object())
+    assert order.index("walk_journey") < order.index("glean waited in profile") < order.index("walk_https") < order.index("walk_webrtc"), order
+    assert order[-2:] == ["datareporting listed", "closed"], order
+    assert "glean" not in out and "journey" in out
+
+
+# ----------------------------------------------------------------------------------------------------------------- the guard that kills the whole tree
+#: The oracle of the test: it writes the line of a launch, starts a grandchild that inherits its stdout and sleeps, and sleeps itself. The grandchild is the firefox that holds the pipe.
+_TREE_CHILD = '''
+import subprocess, sys, time
+sys.path.insert(0, sys.argv[2])
+import ci_crash_evidence as crash
+print(crash.launch_line(11, "exit-pings", "firefox-68-again"), flush=True)
+grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+open(sys.argv[1], "w").write(str(grandchild.pid))
+print("the grandchild is alive", flush=True)
+time.sleep(60)
+'''
+
+
+def _alive(pid):
+    import psutil
+
+    return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+
+
+def _wait_gone(pid, seconds=10.0):
+    end = time.monotonic() + seconds
+    while _alive(pid) and time.monotonic() < end:
+        time.sleep(0.1)
+    return not _alive(pid)
+
+
+def _kill_if_alive(pid):
+    import psutil
+
+    try:
+        psutil.Process(pid).kill()
+    except psutil.Error:
+        pass
+
+
+def _tree_command(tmp_path):
+    pidfile = tmp_path / "grandchild.pid"
+    return [sys.executable, "-u", "-c", _TREE_CHILD, str(pidfile), str(ROOT / "scripts")], pidfile
+
+
+def test_the_old_guard_leaves_the_grandchild_alive_and_on_windows_does_not_even_return_at_the_timeout(tmp_path):
+    """The defect, shown: `subprocess.run(capture_output=True, timeout=...)` kills the child alone. The grandchild lives; on Windows `run` then waits for the pipe it holds
+    (run 45121964904, Windows, job.log 546-557), here until we kill it."""
+    import subprocess
+    import threading
+
+    command, pidfile = _tree_command(tmp_path)
+    outcome = {}
+
+    def old():
+        try:
+            subprocess.run(command, capture_output=True, text=True, timeout=3)
+        except subprocess.TimeoutExpired:
+            outcome["timeout"] = True
+
+    thread = threading.Thread(target=old, daemon=True)
+    thread.start()
+    thread.join(3 + 5)
+    try:
+        assert pidfile.is_file(), "the child did not get to start its grandchild"
+        grandchild = int(pidfile.read_text())
+        assert _alive(grandchild), "the grandchild outlives the timeout of the old guard"
+        if sys.platform == "win32":
+            assert thread.is_alive(), "on Windows the old guard does not return: it waits for the pipe of the grandchild"
+    finally:
+        if pidfile.is_file():
+            _kill_if_alive(int(pidfile.read_text()))
+        thread.join(15)
+
+
+def test_the_tree_guard_returns_at_the_timeout_kills_the_grandchild_and_names_the_launch_that_was_alive(tmp_path):
+    import ci_crash_evidence as crash
+
+    command, pidfile = _tree_command(tmp_path)
+    began = time.monotonic()
+    try:
+        run = crash.run_tree(command, tmp_path / "out", timeout_s=3)
+        spent = time.monotonic() - began
+        assert run.timed_out and run.returncode is None
+        assert spent < 3 + 5, "it returned a few seconds after the timeout, not when the grandchild would have ended (%.1f s)" % spent
+        grandchild = int(pidfile.read_text())
+        assert _wait_gone(grandchild), "the grandchild is dead: the tree was killed, not the child alone"
+        assert "the grandchild is alive" in run.stdout, "the output is kept, from a file"
+        message = run.timeout_message("the network oracle", 3)
+        assert message.startswith("the network oracle did not end within 3 s: the launch exit-pings of seed 11 (firefox-68-again) was alive for ")
+        assert message.endswith(" s; its tree was killed")
+        assert 2 <= run.launch["alive_s"] < 3 + 5
+    finally:
+        if pidfile.is_file():
+            _kill_if_alive(int(pidfile.read_text()))
+
+
+def test_the_tree_guard_is_silent_when_the_run_ends_by_itself_and_keeps_stdout_stderr_and_the_code_apart(tmp_path):
+    import ci_crash_evidence as crash
+
+    run = crash.run_tree([sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(2)"], tmp_path / "out", timeout_s=30)
+    assert (run.returncode, run.timed_out, run.stdout.strip(), run.stderr.strip()) == (2, False, "out", "err")
+    assert run.launch is None and "no launch had begun" in run.timeout_message("the oracle", 30)
+
+
+def test_the_launch_line_is_read_back_and_the_last_one_wins():
+    import datetime
+
+    import ci_crash_evidence as crash
+
+    at = datetime.datetime(2026, 11, 22, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    text = "\n".join([crash.launch_line(11, "main", "firefox-68", at), "noise", crash.launch_line(12, "idle-c2", "firefox-68-again", at), "more noise"])
+    found = crash.last_launch(text, now=at + datetime.timedelta(seconds=95))
+    assert (found["launch"], found["seed"], found["label"], found["alive_s"]) == ("idle-c2", "12", "firefox-68-again", 95.0)
+    assert crash.last_launch("nothing here") is None
+
+
+def test_the_oracle_names_each_launch_with_the_line_the_guard_reads(tmp_path, monkeypatch, capsys):
+    import ci_crash_evidence as crash
+
+    monkeypatch.setattr(ab, "RUN_LABEL", "firefox-68-again")
+    ab.begin_launch(13, "exit-pings")
+    found = crash.last_launch(capsys.readouterr().out)
+    assert (found["launch"], found["seed"], found["label"]) == ("exit-pings", "13", "firefox-68-again")
+
+
+# ----------------------------------------------------------------------------------------------------------------- what the profile held in datareporting/ before the close
+def test_the_listing_of_datareporting_is_relative_sorted_and_with_sizes_and_is_written_where_the_stderr_of_the_launches_go(tmp_path, monkeypatch):
+    import ci_crash_evidence as crash
+
+    profile = tmp_path / "profile"
+    (profile / "datareporting" / "glean" / "db").mkdir(parents=True)
+    (profile / "datareporting" / "glean" / "db" / "data.safe.bin").write_bytes(b"x" * 37)
+    (profile / "datareporting" / "glean" / "pending_pings").mkdir()
+    (profile / "datareporting" / "state.json").write_text("{}", encoding="utf-8")
+    rows = crash.datareporting_listing(profile)
+    assert [r.split("\t") for r in rows if not r.startswith("#")] == [["glean/", "-"], ["glean/db/", "-"], ["glean/db/data.safe.bin", "37"], ["glean/pending_pings/", "-"], ["state.json", "2"]]
+    crash_dir = tmp_path / "t.crash"
+    probe = crash.LaunchProbe("/e/firefox", crash_dir)
+    monkeypatch.setattr(crash, "PROBE", probe)
+    probe.records.extend(["first", "second", "third"])      # the launch being made is the last record: the number of its stderr file
+    probe.set_label(seed=11, launch="idle-c1")
+    written = crash.save_datareporting(profile)
+    assert written == "t.crash/datareporting/03-11-idle-c1.tsv"
+    text = (crash_dir / "datareporting" / "03-11-idle-c1.tsv").read_text(encoding="utf-8")
+    assert "glean/db/data.safe.bin" in text and "37" in text
+
+
+def test_a_profile_that_cannot_be_read_is_said_in_the_file_and_never_raises(tmp_path, monkeypatch):
+    import ci_crash_evidence as crash
+
+    assert any("not known" in r for r in crash.datareporting_listing(None))
+    assert any("datareporting" in r and r.startswith("# ") for r in crash.datareporting_listing(tmp_path / "gone"))
+    monkeypatch.setattr(crash, "PROBE", None)
+    assert crash.save_datareporting(tmp_path) is None, "no probe, no folder: nothing is written"
+
+
+def test_the_oracle_lists_datareporting_of_the_profile_of_the_session_and_never_raises(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(ab, "profile_of", lambda token, find=None: tmp_path)
+    monkeypatch.setattr(ab.crash, "save_datareporting", lambda profile: seen.append(profile))
+
+    class Session:
+        _end_token = "token"
+
+    ab.save_datareporting(Session(), 11, "main")
+    assert seen == [tmp_path]
+    monkeypatch.setattr(ab.crash, "save_datareporting", lambda profile: 1 / 0)
+    ab.save_datareporting(Session(), 11, "main")           # a failure of the evidence is not a failure of the launch

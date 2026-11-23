@@ -20,7 +20,7 @@ Three things are compared, over the whole trace:
     time (a spare process is prelaunched after a delay and closed after a grace period);
   * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. ONE rule judges the host paths, in the A/A and in the
     A/B, on Linux and on Windows, the system modules and the shortcut inventory included (`file_rule`): a path is red if and only if it is in ALL the measured launches (the warm-up and
-    the seeds) of one engine and in NO launch of the other (its idle and bare launches included). Every other path that is not in the same share of the launches of both engines is LISTED, not judged: the log and the file
+    the seeds) of one engine and in NO launch of the other (its idle launch included). Every other path that is not in the same share of the launches of both engines is LISTED, not judged: the log and the file
     `not-judged-a-a.json` / `not-judged.json` of the artifact give, per path, in how many launches of how many each engine has it (measured and long) and the processes that touched it,
     and mark `watch` the paths in at least half of the launches of one engine and in none of the other's. `ours` leaves the comparison as a class (OURS below: reading its own package is
     not touching the host);
@@ -50,7 +50,7 @@ Only a separate `pingsender[.exe]` there is red. Behind a session proxy a direct
 ACCEPTED LOSSES (the rule of the host paths trades them for a verdict that does not follow the machine's timing; for the 69):
   * a path that one engine has in every measured launch and the other in only some of them is not red: always against sometimes is listed, never judged;
   * a reading tied to one seed is not judged: no path is compared seed by seed;
-  * what happens only in the long launches (idle, bare) is only listed: judging it would take two idle launches per engine;
+  * what happens only in the long launch (idle) is only listed: judging it would take two idle launches per engine;
   * the cause of the pingsender that starts in one launch of eight is not known: its paths are listed like the others, there is no rule and no preference for it;
   * a pid that Windows reuses may attribute to the engine the tools of the oracle itself, among the processes that touched a path.
 
@@ -67,13 +67,13 @@ How the trace is taken:
     are). Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
     see them is red, not empty.
 
-EVERY launch is also judged by how its parent ended (scripts/ci_crash_evidence.py): the warm-up, each measured seed, the idle and the bare launch alike. A root exit code other
+EVERY launch is also judged by how its parent ended (scripts/ci_crash_evidence.py): the warm-up, each measured seed and the idle launch alike. A root exit code other
 than 0, or one that was not seen, is a RED line that names the seed, the run side, the launch and the code; the verdict of a closed run is not "the trace is equal" alone. A launch
 that did not end with 0 keeps what it left in `<footprint>.crash/<launch>/`, next to the footprint (the artifact): the last 100 lines of the strace log and the fatal signal lines of
 the whole log (`--- SIGSEGV {si_addr=...} ---`: the trace records the fatal signals now, `tests/_strace_stand_in.py` RECORDED_SIGNALS, and the lines are dropped where the log is read, so they
 are never data of the comparison), the core run through `gdb -batch` (`thread apply all bt`, the MOZ_CRASH reason, `info sharedlibrary`) with the build ids, the crash reporter's `.extra` and
 the minidump names, and `said.txt` for every collector that found nothing. Cores are enabled in every launch (`ulimit -c unlimited` in the stand-in; the working directory is not touched, the
-job's `kernel.core_pattern` decides where the kernel writes them: INVPW_CORE_DIR), and a crash watcher reads the crash folders in every launch, as it did in the bare one. On Windows the `.extra`
+job's `kernel.core_pattern` decides where the kernel writes them: INVPW_CORE_DIR), and a crash watcher reads the crash folders in every launch. On Windows the `.extra`
 files and the minidump names are collected the same way. `crash-probe` is the recorder's own test (one launch, its parent sent SIGSEGV; red is the right answer, tests/test_ab_host_crash_linux_e2e.py).
 
     python ci_ab_host.py run <firefox> [--seal SEAL] --leg linux-x86_64 --out footprint.json [--seeds 11,12,13]
@@ -119,7 +119,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import ci_ab_oracle as oracle  # noqa: E402  (fetch_published, ENGINE_TAG)
 import ci_host_gate as gate  # noqa: E402  (SEEDS)
 import ci_crash_evidence as crash  # noqa: E402  (the exit code is red, and what a bad end left is saved)
-from ci_crash_evidence import CrashWatcher, core_info, crash_report_dirs, scan_crash_files  # noqa: E402,F401  (the bare launch's collectors, shared by every launch)
+from ci_crash_evidence import CrashWatcher, crash_report_dirs  # noqa: E402  (the collectors every launch shares)
 
 FORMAT = "ab-host/2"
 EXPECTED_FORMAT = "ab-host-expected/1"
@@ -523,19 +523,8 @@ def pingsender_destinations(fp: dict) -> list:
                    for e in fp.get("net") or [] if e.startswith(PINGSENDER_KIND + ": ")})
 
 
-def _bare_summary(bare: dict | None) -> dict | None:
-    """What the bare launch (never compared) says, for the report: how its parent ended, the crash reporter processes, the dump files, the cores."""
-    if not bare:
-        return None
-    crash = bare.get("crash") or {}
-    core = crash.get("core") or {}
-    return {"notified": (bare.get("notified") or {}).get("observed"), "parent_exits": crash.get("parent_exits"), "root_returncode": crash.get("root_returncode"),
-            "crash_processes": [(p["kind"], p["argv"]) for p in crash.get("crash_processes", [])], "dump_files": [f["name"] for f in crash.get("files", [])],
-            "cores": core.get("cores"), "core_pattern": core.get("core_pattern")}
-
-
 #: THE RULE OF THE HOST PATHS, one for the A/A and the A/B, Linux and Windows, over every host path (the system modules and the shortcut inventory included). A path is
-#: RED if and only if it is in ALL the measured launches (the warm-up and the seeds) of one engine and in NO launch of the other (its long idle and bare launches included). In
+#: RED if and only if it is in ALL the measured launches (the warm-up and the seeds) of one engine and in NO launch of the other (its long idle launch included). In
 #: the A/A that is a broken control, in the A/B a difference (the declared ones apply to it as they always did). Every other path that is not in all the launches of both engines is
 #: LISTED, not judged (`file_rule`, the file `not-judged[-a-a].json` of the artifact, the log): the paths that are not in the same share of the launches of both engines, with in
 #: how many launches of how many each engine has them and the processes that touched them; the ones in at least half of the launches of one engine and in none of the other's are
@@ -547,10 +536,10 @@ LISTED_IN_LOG = 50
 
 
 def launches_of(fp: dict) -> list:
-    """`[(name, measured, launch)]` of a footprint in the order of the run: the warm-up and the seeds (`measured`), then the idle and the bare launch (the long ones)."""
+    """`[(name, measured, launch)]` of a footprint in the order of the run: the warm-up and the seeds (`measured`), then the idle launch (the long one)."""
     out = [("warmup", True, fp["warmup"])] if fp.get("warmup") else []
     out += [("s%s" % s["seed"], True, s) for s in fp.get("seeds", [])]
-    return out + [(name, False, fp[name]) for name in ("idle", "bare") if fp.get(name)]
+    return out + [(name, False, fp[name]) for name in ("idle",) if fp.get(name)]
 
 
 def path_table(fps: list) -> dict:
@@ -1526,7 +1515,8 @@ def stock_control_problems(stock: dict) -> list:
     problems += ["stock control: step %s (%s) failed: %s" % (st.get("n"), st.get("name"), st.get("error")) for st in seed.get("steps", []) if not st.get("ok")]
     if not seed:
         problems.append("stock control: the run made no footprint")
-    elif not location_utility_kinds(seed.get("kinds", {})):
+    elif seed.get("started", True) and not location_utility_kinds(seed.get("kinds", {})):
+        # only a stock Firefox that RAN says anything about the provider: one that never started (not installed, did not launch) is a different broken control
         problems.append("stock control: stock Firefox did not start the Windows location utility process (-sandboxingKind %s) after getCurrentPosition with the "
                         "permission granted: the step does not reach the platform provider, so a candidate without that process proves nothing"
                         % LOCATION_UTILITY_KIND)
@@ -1625,7 +1615,6 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
             "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))}, "not_judged": not_judged,
-            "bare": {side: _bare_summary((fp.get("bare") or {}).get("bare")) for side, fp in (("A", a), ("B", b))},
             "shortcuts": {side: _shortcuts_summary(((fp.get("idle") or {}).get("idle") or {}).get("shortcut_changes")) for side, fp in (("A", a), ("B", b))},
             "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
 
@@ -1671,10 +1660,6 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
         if shortcuts:
             print("SHORTCUTS (the places of the shortcut code, before and after the idle launch; evidence) %s: %d new, %d changed, %d gone %s" % (
                 name, shortcuts["new"], shortcuts["changed"], shortcuts["gone"], json.dumps(shortcuts["files"])))
-    for side, name in (("A", a_name), ("B", b_name)):
-        bare = (report.get("bare") or {}).get(side)
-        if bare:
-            print("BARE (no client, no page; not compared) %s: %s" % (name, json.dumps(bare, sort_keys=True)))
     for side, name in (("A", a_name), ("B", b_name)):
         idle = (report.get("idle") or {}).get(side)
         if idle:
@@ -1779,11 +1764,60 @@ def geolocation_step(browser, origin: str, declared: dict | None, n: int) -> dic
     return step
 
 
-def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, bare: bool = False, crash_with: int | None = None) -> dict:
-    """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
+def wait_for_glean_of_launch(find_profile, seed: int, launch: str) -> str | None:
+    """The wait of a launch with a page for Glean (`crash.wait_for_glean`), made right after its first page is opened: Glean is born once a window is open, and a session that
+    closes before it has initialised makes it start inside the shutdown, where the parent can end with -11 (a race of Mozilla's, the same in the retail browser; run 45121964904).
+    The wait is on the file Glean writes, not on a time. Returns the problem of the launch when the condition is not met in the safety limit of `crash.GLEAN_LIMIT_S` (the
+    verdict is red; the launch goes on and closes as it always did), None when it is."""
+    try:
+        waited = crash.wait_for_glean(find_profile())
+    except crash.GleanNotReady as e:
+        print("glean NOT ready (seed %d, launch %s): %s" % (seed, launch, e))
+        sys.stdout.flush()
+        return str(e)
+    print("glean ready after %.1f s (seed %d, launch %s)" % (waited, seed, launch))
+    sys.stdout.flush()
+    return None
 
-    `bare` is the old idle launch, kept as a case of its own and never compared: no client and no page, as the run 44988820319 made it (a crash reporter ran in it, on
-    both systems). It records how the browser ended and what a crash leaves (`crash_evidence`), on Linux with core dumps on, and waits as the idle launch does.
+
+def datareporting_listing(profile) -> str:
+    """The text of `<profile>/datareporting/` as a table, `path<TAB>size` (relative, `/`, sorted): what Glean and the data policy left in the profile of a launch. A read error
+    is a line of the table (`# error`), never a reason to stop: it is evidence, and the launch does not depend on it."""
+    lines = ["path\tsize"]
+    if profile is None:
+        return "\n".join(lines + ["# error\tthe profile of the launch was not found"]) + "\n"
+    root = Path(profile) / "datareporting"
+    rows, errors = [], []
+
+    def on_error(e):
+        errors.append("# error\t%s\t%s" % (e.filename, e.strerror or e))
+
+    if not root.is_dir():
+        errors.append("# error\t%s\tno such folder" % root.as_posix())
+    for folder, _dirs, files in os.walk(root, onerror=on_error):
+        for name in files:
+            path = Path(folder) / name
+            try:
+                rows.append((path.relative_to(root).as_posix(), path.stat().st_size))
+            except OSError as e:
+                errors.append("# error\t%s\t%s" % (path.as_posix(), e.strerror or e))
+    return "\n".join(lines + ["%s\t%d" % row for row in sorted(rows)] + sorted(errors)) + "\n"
+
+
+def save_datareporting(profile, folder, launch: str, seed: int) -> None:
+    """Saves the listing of `<profile>/datareporting/` as `<folder>/<launch>-<seed>.tsv` (evidence for the next time: it changes no verdict and is never a leaf of the footprint).
+    No folder, no file; a write that fails is said on the output."""
+    if not folder:
+        return
+    try:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        (Path(folder) / ("%s-%d.tsv" % (launch, seed))).write_text(datareporting_listing(profile), encoding="utf-8", newline="")
+    except OSError as e:
+        print("the list of datareporting could not be saved (seed %d, launch %s): %s" % (seed, launch, e))
+
+
+def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, crash_with: int | None = None, datareporting_dir=None) -> dict:
+    """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
 
     `idle` is the launch in which the exit pings MUST leave (see `run_engine`): no journey and no pref changed; the launch waits until the notification of the data
     policy is recorded in its profile (the precondition of `canUpload`, seen in a file of the launch) and then closes; its footprint carries `idle` (what the wait saw).
@@ -1791,6 +1825,11 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     EVERY launch is judged by how its parent ended: a root exit code other than 0 is a problem of the launch (`crash.exit_problem`) and the launch keeps what it left
     (`result["crash"]`, `crash.collect`: the strace tail with the signal line, the core through gdb, the build ids, the `.extra` and the minidump names). The cores are
     enabled in every launch (`ulimit -c unlimited` in the stand-in, the working directory untouched) and a crash watcher reads the crash folders while any launch lives.
+
+    A launch with a page waits for Glean to have initialised right after its first page is opened (`wait_for_glean_of_launch`: Glean is born once a window is open, and a session
+    that closes before it has initialised makes it start inside the shutdown, where the parent can end with -11), so that the work of the launch is always between the condition and the
+    close; a condition that is not met is a problem of the launch (the verdict is red) and the launch goes on. Just before the close the list of `<profile>/datareporting/` is saved in
+    `datareporting_dir` (`save_datareporting`: evidence for the next time, never part of the footprint).
 
     `crash_with` is the recorder's own test (`crash-probe`): the signal sent to the parent of the browser once it is up, to show that a launch that dies is red and keeps its evidence."""
     from playwright.sync_api import sync_playwright
@@ -1800,6 +1839,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
 
     windows = sys.platform == "win32"
     seed_work = work / (name or "seed%d" % seed)
+    launch_name = name or "measured"  # `name` is a loop variable of the journey below
     seed_work.mkdir(parents=True)
     exe, log, pidfile, pgid = binary, seed_work / "strace.log", seed_work / "stand-in.pid", None
     trace = None
@@ -1816,7 +1856,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         from _strace_stand_in import _stand_in
 
         exe = _stand_in(binary, seed_work / "engine", log, pidfile, syscalls=STRACE_CALLS, fd_paths=True, network=True, exit_status=True,
-                        core_dir=seed_work if bare else None, cores=True)
+                        cores=True)
     origin_a, origin_o, stop_site = journey_site.start((0, 0))
     geo_origin, stop_geo = start_geo_lab()
     server, steps, root_pid = None, [], None
@@ -1825,8 +1865,12 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     shortcuts_before = snapshot_places(places) if places else None
     before = set(Path(tempfile.gettempdir()).glob("invisible_profile_*"))
 
+    def profile_now():
+        """The profile folder this launch made (None until it is there)."""
+        return (new_profiles(before) or [None])[0]
+
     def crash_dirs():
-        new = sorted(set(Path(tempfile.gettempdir()).glob("invisible_profile_*")) - before)
+        new = new_profiles(before)
         return crash_report_dirs(new[0] if new else None, windows)
 
     started_at = time.time()
@@ -1842,18 +1886,20 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
             pgid = _group_of(pidfile)
         watcher = CrashWatcher(crash_dirs, ignore=already)
         watcher.start()
-        with (contextlib.nullcontext() if (bare or crash_with is not None) else sync_playwright()) as p:
+        with (contextlib.nullcontext() if crash_with is not None else sync_playwright()) as p:
             if crash_with is not None:
                 crash_the_parent(root_pid, server.process, crash_with)  # the recorder's own test: the browser is up, its parent is sent a fatal signal
-            elif bare:
-                notified = wait_for_notification(profile_prefs_reader(before))  # nothing drives the bare browser: the launch the idle one was
             elif idle:
                 # Run 44988820319: with no client and no page the notification was never recorded in 120 s on either system (no window, so no
                 # `sessionstore-windows-restored` for the policy to start from) and the launch had a crash reporter: the idle launch has the page of a launch, and nothing else.
                 browser = p.firefox.connect(server.ws_endpoint)
                 context = browser.new_context()
                 context.new_page()
+                glean = wait_for_glean_of_launch(profile_now, seed, launch_name)
+                if glean:
+                    problems.append(glean)
                 notified = wait_for_notification(profile_prefs_reader(before))
+                save_datareporting(profile_now(), datareporting_dir, launch_name, seed)
                 context.close()
                 browser.close()
             else:
@@ -1863,6 +1909,9 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
                 context.set_default_navigation_timeout(profile_p4.TIMEOUT_MS)
                 profile_p4.install_route(context)
                 page = context.new_page()
+                glean = wait_for_glean_of_launch(profile_now, seed, launch_name)
+                if glean:
+                    problems.append(glean)
                 journey = profile_p4.Journey(context, page, origin_a, origin_o)
                 journey_site.STATE.begin_walk()
                 for n, (name, method) in enumerate(JOURNEY, 1):
@@ -1874,6 +1923,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
                     except Exception as exc:  # noqa: BLE001 - recorded, and a step that failed is a problem of the run
                         steps.append({"n": n, "name": name, "ok": False, "error": str(exc).strip().splitlines()[0][:300] if str(exc).strip() else repr(exc)})
                 steps.append(geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1))
+                save_datareporting(profile_now(), datareporting_dir, launch_name, seed)
                 context.close()
                 browser.close()
         # The close: the run ends with the exit of the browser, and the trace is read after it.
@@ -1891,10 +1941,8 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         if idle:
             result["idle"] = {"notified": notified, "shortcut_changes": diff_snapshots(shortcuts_before, snapshot_places(places)) if places else None}
         watched, watcher = watcher.stop(), None
-        if bare:
-            result["bare"] = {"notified": notified, "crash": crash_evidence(watched, result, core_info(seed_work, binary) if not windows else None)}
-        bad, left = end_of_launch(close["root_returncode"], windows, seed, name or "measured", result.get("lifecycle"), binary, log, watched,
-                                  seed_work if bare else None, started_at)
+        bad, left = end_of_launch(close["root_returncode"], windows, seed, launch_name, result.get("lifecycle"), binary, log, watched,
+                                  started_at)
         problems += bad
         result["exit_problems"] = bad
         if left:
@@ -1922,17 +1970,17 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     return result
 
 
-def end_of_launch(code, windows: bool, seed: int, launch: str, lifecycle, binary: str, log, watched: dict, bare_dir, started_at: float, folders=None, run=subprocess.run) -> tuple:
+def end_of_launch(code, windows: bool, seed: int, launch: str, lifecycle, binary: str, log, watched: dict, started_at: float, folders=None, run=subprocess.run) -> tuple:
     """How a launch ended, as the verdict reads it: `(problems, evidence)`. A root exit code other than 0 (or not seen) is a problem that names the seed, the launch and the
     code (`crash.exit_problem`), and so is a process of the kind parent that the lifecycle says did not exit 0 when the root said nothing of it (Windows: the core's spawn
     may be a launcher). A launch with a problem keeps what it left (`crash.collect`): the strace tail and the fatal signal lines, the cores through gdb with the build ids
-    (the folders of the job's core pattern, and the launch's own when it moved there: the bare one), the `.extra` and the minidump names the watcher read. A launch that
+    (the folders of the job's core pattern), the `.extra` and the minidump names the watcher read. A launch that
     ended with 0 has none and costs nothing."""
     bad = [x for x in [crash.exit_problem(code, windows, seed=seed, launch=launch)] + crash.parent_exit_problems(lifecycle, code, seed=seed, launch=launch) if x]
     if not bad:
         return [], None
     if folders is None:
-        folders = [] if windows else crash.core_dirs() + ([bare_dir] if bare_dir else [])
+        folders = [] if windows else crash.core_dirs()
     return bad, crash.collect(code, binary, strace_log=None if windows else log, watched=watched, windows=windows, core_folders=folders, since=started_at, run=run)
 
 
@@ -1960,20 +2008,6 @@ def crash_the_parent(root_pid: int, process, signum: int, limit_s: float = 60.0,
     while process.poll() is None and now() < end:
         sleep(0.1)
     return pid
-
-
-#: The crash evidence of the BARE launch (no client, no page: the launch of run 44988820319 that had a crash reporter): where a crash leaves its files.
-CRASH_PROCESS = re.compile(r"crashreporter|minidump-analyzer", re.I)
-
-
-def crash_evidence(watched: dict, fp: dict, core: dict | None = None) -> dict:
-    """What the bare launch says about how the browser ended: the exit code or signal of its parent processes (from the lifecycle), every crash reporter or
-    minidump analyzer process with its command line, the `.dmp` names and `.extra` contents the watcher read, and the core dump if there is one."""
-    lifecycle = fp.get("lifecycle")
-    exits = [e["how"] for e in lifecycle or [] if e["event"] == "end" and e["kind"] == "parent"]
-    procs = [{"kind": p["label"], "argv": p.get("cmd") or p.get("exec")} for p in fp.get("processes", []) if CRASH_PROCESS.search(p["label"])]
-    return {"parent_exits": exits if lifecycle is not None else None, "root_returncode": (fp.get("close") or {}).get("root_returncode"), "crash_processes": procs,
-            "files": watched.get("files", []), "scans": watched.get("scans"), "core": core}
 
 
 def shortcut_places(env=None) -> list:
@@ -2055,13 +2089,16 @@ def wait_for_notification(read, period=NOTIFY_PERIOD_S, limit_s=NOTIFY_LIMIT_S, 
         sleep(period)
 
 
+def new_profiles(before: set) -> list:
+    """The profile folders (`invisible_profile_*` of the temp root) that were not there before the launch, in order."""
+    return sorted(set(Path(tempfile.gettempdir()).glob("invisible_profile_*")) - before)
+
+
 def profile_prefs_reader(before: set):
     """`read()` for `wait_for_notification`: the prefs.js of the profile the launch made (the `invisible_profile_*` folder of the run's temp root that was not
     there before it)."""
-    root = Path(tempfile.gettempdir())
-
     def read():
-        for folder in sorted(set(root.glob("invisible_profile_*")) - before):
+        for folder in new_profiles(before):
             try:
                 return (folder / "prefs.js").read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -2152,10 +2189,11 @@ def keep_crash(fp: dict, launch: str, crash_dir) -> None:
     sys.stdout.flush()
 
 
-def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None) -> dict:
+def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, datareporting_dir=None) -> dict:
     """The footprint document of one engine. A discarded WARM-UP launch first, of the first seed, then every seed's journey, one browser at a time.
 
-    Every launch (the warm-up, each seed, the idle and the bare ones) that does not end with 0 is a problem of the run, and what it left is kept in `crash_dir` (`keep_crash`).
+    Every launch (the warm-up, each seed and the idle one) that does not end with 0 is a problem of the run, and what it left is kept in `crash_dir` (`keep_crash`). The list of the
+    `datareporting` folder of each launch with a page is saved in `datareporting_dir` (`save_datareporting`).
 
     The warm-up is a control of the experiment and not an excuse: what a machine does the first time it runs an engine (its files scanned, its caches
     cold, a first-run behaviour of the engine) is in a launch that is not compared, whose trace is kept in the document (`warmup`) so that what it
@@ -2164,14 +2202,14 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None) -
     work = Path(tempfile.mkdtemp(prefix="ab-host-"))
     problems, out_seeds = [], []
     try:
-        warm = run_seed(binary, seeds[0], work, name="warmup")
+        warm = run_seed(binary, seeds[0], work, name="warmup", datareporting_dir=datareporting_dir)
         keep_crash(warm, "warmup", crash_dir)
         problems += ["warm-up: %s" % p for p in warm.get("problems", [])]
         problems += ["warm-up: seed %d: step %d (%s) failed: %s" % (seeds[0], st["n"], st["name"], st.get("error")) for st in warm["steps"] if not st["ok"]]
         print("warm-up (seed %d, discarded): %s; %d host paths" % (seeds[0], json.dumps(warm["kinds"], sort_keys=True), len(warm["files"])))
         sys.stdout.flush()
         for seed in seeds:
-            fp = run_seed(binary, seed, work)
+            fp = run_seed(binary, seed, work, datareporting_dir=datareporting_dir)
             keep_crash(fp, "seed%d" % seed, crash_dir)
             out_seeds.append(fp)
             for step in fp["steps"]:
@@ -2180,21 +2218,31 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None) -
             print("seed %d: %s; %d host paths, %d net entries, %s" % (seed, json.dumps(fp["kinds"], sort_keys=True), len(fp["files"]),
                                                                       len(fp.get("net") or []), json.dumps(fp.get("ours", {}), sort_keys=True)))
             sys.stdout.flush()
-        idle = run_seed(binary, seeds[0], work, name="idle", idle=True)
+        idle = run_seed(binary, seeds[0], work, name="idle", idle=True, datareporting_dir=datareporting_dir)
         keep_crash(idle, "idle", crash_dir)
         problems += ["idle: %s" % p for p in idle.get("problems", [])]
         print("idle (seed %d): %s; notification %s" % (seeds[0], json.dumps(idle["kinds"], sort_keys=True), json.dumps((idle.get("idle") or {}).get("notified"))))
         sys.stdout.flush()
-        # The bare launch: the old idle launch (no client, no page), a case of its own that is never compared; what it records is evidence (`crash_evidence`).
-        bare = run_seed(binary, seeds[0], work, name="bare", bare=True)
-        keep_crash(bare, "bare", crash_dir)
-        problems += ["bare: %s" % p for p in bare.get("exit_problems", [])]  # the bare launch is never compared, but how its parent ended is red like any other's
-        print("bare (seed %d, not compared): %s; %s" % (seeds[0], json.dumps(bare["kinds"], sort_keys=True), json.dumps(_bare_summary(bare.get("bare")))))
-        sys.stdout.flush()
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "idle": idle, "bare": bare, "problems": problems,
+    return {"format": FORMAT, "engine": label, "leg": leg, "platform": sys.platform, "seeds": out_seeds, "warmup": warm, "idle": idle, "problems": problems,
             "binary": os.path.basename(os.path.dirname(os.path.realpath(binary)))}
+
+
+STOCK_NOT_INSTALLED = "the stock Firefox of Playwright is not installed: %s does not exist (the job must run `python -m playwright install firefox`)"
+
+
+def stock_evidence(seed: dict) -> list:
+    """What a stock Firefox that started but did not reach the location provider left, for the log: its processes by kind with their command, and the modules (the
+    DLLs of the host paths of the trace) the tree loaded, the location ones first. The document (`footprint-stock.json`) has all of it."""
+    lines = ["stock evidence: processes by kind: %s" % json.dumps(seed.get("kinds", {}), sort_keys=True)]
+    lines += ["stock evidence: process %s: %s" % (p.get("label"), p.get("cmd") or p.get("exec") or p.get("name")) for p in seed.get("processes", [])]
+    files = seed.get("files", [])
+    wanted = location_modules(files)
+    others = sorted({_base(f).lower() for f in files if f.lower().endswith(".dll")} - {_base(f).lower() for f in wanted})
+    lines.append("stock evidence: location modules loaded: %s" % (", ".join(_base(f) for f in wanted) or "none"))
+    lines.append("stock evidence: other modules loaded (%d): %s" % (len(others), ", ".join(others[:150])))
+    return lines
 
 
 def run_stock(leg: str) -> dict:
@@ -2211,22 +2259,33 @@ def run_stock(leg: str) -> dict:
     def document(result):
         return {"format": FORMAT, "engine": "stock", "leg": leg, "platform": sys.platform, "stock": result}
 
+    def not_started(reason):
+        """The control that never got a Firefox to run: `started` False, so the verdict names this reason and not the provider (run 45121964904: the binary of Playwright
+        was not installed in the job, and the oracle said that the step does not reach the provider on stock Firefox)."""
+        return document({"seed": 0, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False}, "started": False, "problems": [reason]})
+
     try:
         try:
             trace.start()
         except TraceError as e:
-            return document({"seed": 0, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False},
-                             "problems": ["the trace of a Windows run could not be started (it needs an administrator): %s" % e]})
+            return not_started("the trace of a Windows run could not be started (it needs an administrator): %s" % e)
         geo_origin, stop_geo = start_geo_lab()
         try:
             with sync_playwright() as p:
                 exe = p.firefox.executable_path
-                browser = p.firefox.launch(headless=True)
+                if not Path(exe).exists():
+                    return not_started(STOCK_NOT_INSTALLED % exe)
+                try:
+                    browser = p.firefox.launch(headless=True)
+                except Exception as exc:  # noqa: BLE001 - the reason is the verdict's
+                    return not_started("the stock Firefox of Playwright did not start: %s" % (str(exc).strip().splitlines() or [repr(exc)])[0][:300])
                 try:
                     steps.append(geolocation_step(browser, geo_origin, None, len(JOURNEY) + 1))
                 finally:
                     browser.close()
-            return document(_seed_result(exe, 0, work, steps, work / "none.log", trace, os.getpid(), True))
+            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, os.getpid(), True)
+            result["started"] = True
+            return document(result)
         except TraceError as e:
             return document({"seed": 0, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"exited": False},
                              "problems": ["the trace of the run could not be taken: %s" % e]})
@@ -2355,14 +2414,20 @@ def run_stock_control(leg: str, out: Path) -> dict | None:
     print("=== negative control of the geolocation step: Playwright's own Firefox")
     sys.stdout.flush()
     rc = run_stock_subprocess(leg, out / "footprint-stock.json")
-    broken = ["the run of the stock control ended with %s" % rc] if rc != 0 or not (out / "footprint-stock.json").exists() else []
+    broken = ["the run of the stock control ended with %s (its own output is above)" % rc] if rc != 0 or not (out / "footprint-stock.json").exists() else []
     stock = None
     if not broken:
         stock = read_json(out / "footprint-stock.json")
         broken = stock_control_problems(stock)
     if broken:
         print("\n".join("FAIL " + b for b in broken))
-        print("BROKEN CONTROL: the geolocation step does not reach the platform provider on stock Firefox; the A/B says nothing")
+        seed = (stock or {}).get("stock") or {}
+        if seed and seed.get("started", True) and not location_utility_kinds(seed.get("kinds", {})):
+            # the claim of the step is kept; the proof that goes with it is what the tree that did start left
+            print("\n".join(stock_evidence(seed)))
+            print("BROKEN CONTROL: the geolocation step does not reach the platform provider on stock Firefox; the A/B says nothing")
+        else:
+            print("BROKEN CONTROL: the stock control did not run to the end (the reason is above); the A/B says nothing")
         return None
     print("GEOLOCATION CONTROL: stock Firefox started %s; modules: %s" % (
         ", ".join(location_utility_kinds(stock["stock"]["kinds"])), ", ".join(location_modules(stock["stock"]["files"])) or "-"))
@@ -2406,12 +2471,14 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
         if control["verdict"] != "green":
             print("BROKEN CONTROL: the published engine differs from itself on this machine; the A/B says nothing")
             return 2
-        if not candidate:
-            return 0
+        # The control of the geolocation step is a control of the laboratory on Playwright's own Firefox and does not depend on a candidate: on Windows it runs after a
+        # green A/A on every run, a pull request included (run 45121964904, the gate of the series: it ran only with a candidate, and what it said there was never seen on a PR).
         if _windows():
             stock = run_stock_control(leg, out)
             if stock is None:
                 return 2
+        if not candidate:
+            return 0
         expected = load_expected(expected_file)
         report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False, also_68=[again])
         write_verdict(out / "diff.json", report, "not-judged.json")
@@ -2485,7 +2552,7 @@ def main(argv=None) -> int:
         if args.crash_with:
             document = run_crash_probe(args.binary, args.leg, seeds[0], args.label, crash_dir, args.crash_with)
         else:
-            document = run_engine(args.binary, args.leg, seeds, args.label, crash_dir)
+            document = run_engine(args.binary, args.leg, seeds, args.label, crash_dir, args.out.parent / (args.out.stem + ".datareporting"))
         write_json(args.out, document)
         return 0
     if args.candidate and not args.candidate_seal:
