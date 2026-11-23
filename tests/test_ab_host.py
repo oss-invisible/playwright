@@ -634,15 +634,59 @@ def test_the_audit_setting_is_read_from_the_csv_of_auditpol():
     assert host.parse_audit_setting(csv) == "Success" and host.parse_audit_setting("") == ""
 
 
+REAL_SESSION_LIST = """
+Data Collector Set                      Type                          Status
+-------------------------------------------------------------------------------
+Circular Kernel Context Logger          Trace                         Running
+EventLog-Application                    Trace                         Running
+EventLog-Security                       Trace                         Running
+EventLog-System                         Trace                         Running
+Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace Trace                     Running
+DiagLog                                 Trace                         Running
+abhost-4242-123456789                   Trace                         Running
+SgrmEtwSession                          Trace                         Stopped
+UBPM                                    Trace                         Running
+
+The command completed successfully.
+"""
+
+
+def logman_list(sessions):
+    """The output of `logman query -ets` for {name: status}: a header, a line of dashes, a row per session, the closing line."""
+    rows = "".join("%-39s %-29s %s\n" % (name, "Trace", status) for name, status in sessions.items())
+    return "\nData Collector Set                      Type                          Status\n" + "-" * 79 + "\n" + rows + "\nThe command completed successfully.\n"
+
+
 class FakeTools:
     """`_tool` of a Windows machine: the audit, the registry, the Security log, logman and tracerpt, with a record of what was asked."""
 
-    def __init__(self, work, tree, files, canaries=("start", "end")):
+    def __init__(self, work, tree, files, canaries=("start", "end"), still_listed=0, list_failures=0):
         self.work, self.tree, self.files, self.canaries, self.calls = work, tree, files, canaries, []
+        self.list_failures = list_failures  # the first reads of the list fail with 4200 (ERROR_WMI_GUID_NOT_FOUND)
+        self.sessions, self.still_listed, self.stopped = {}, still_listed, {}  # a stopped session is listed `still_listed` more times, then gone
 
     def __call__(self, argv, timeout=300.0):
         self.calls.append(list(argv))
         tool = argv[0]
+        if tool == "logman":
+            if argv[1] == "create":
+                self.sessions[argv[3]] = "Running"
+            elif argv[1] == "query" and argv[2:] == ["-ets"]:
+                if self.list_failures > 0:
+                    self.list_failures -= 1
+                    raise host.TraceError("logman query -ets failed with 0x80071068 (2147946600): The GUID passed was not recognized as valid by a WMI data provider.", 2147946600)
+                for name in [n for n, left in self.stopped.items() if left == 0]:
+                    self.sessions.pop(name, None)
+                    del self.stopped[name]
+                for name in self.stopped:
+                    self.stopped[name] -= 1
+                return logman_list(self.sessions)
+            elif argv[1] == "query":  # the query of one session resolves the GUIDs of its providers through WMI: run 45257629988
+                raise host.TraceError("logman query failed with 0x80071068", 2147946600)
+            elif argv[1] == "stop":
+                if argv[2] not in self.sessions or argv[2] in self.stopped:
+                    raise host.TraceError("logman stop failed with 0x80071069", 2147946601)  # 4201, ERROR_WMI_INSTANCE_NOT_FOUND
+                self.stopped[argv[2]] = self.still_listed
         if tool == "auditpol" and argv[1] == "/get":
             return "Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting\nM,System,Process Creation,{G},No Auditing,\n"
         if tool == "reg" and argv[1] == "query":
@@ -762,7 +806,8 @@ def test_the_session_is_recording_when_the_last_start_canary_is_in_the_trace_eve
     trace, fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start3", "end"))
     got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
     assert got["problems"] == []
-    assert sum(1 for c in fake.calls if c[:2] == ["logman", "query"]) == 3, "a round trip to the session before each canary"
+    stop = next(i for i, c in enumerate(fake.calls) if c[:2] == ["logman", "stop"])
+    assert sum(1 for c in fake.calls[:stop] if c == ["logman", "query", "-ets"]) == 3, "a round trip to the list of the sessions before each canary"
     trace, _fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start1", "start2", "end"))
     problems = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"]
     assert len(problems) == 1 and "last start canary" in problems[0]
@@ -3329,3 +3374,188 @@ def test_a_machine_that_cannot_audit_the_ends_says_so_and_tells_the_strangers_by
     assert trace.ends_ok is False and got["problems"] == []
     assert [e["pid"] for e in got["tree"]] == [100, 101, 102, 103, 104, 107], "107 is the pingsender: the svchost that took its pid has a creator that is not in the tree"
     assert [c[2] for c in fake.calls if c[:2] == ["auditpol", "/set"]] == ["/subcategory:" + host.AUDIT_GUID] * 2
+
+
+# -
+# The session of a Windows launch (run 45257629988, seed 6, side A: `logman query <name> -ets` failed with 0x80071068 after `logman create` had succeeded, the launch had no trace).
+
+def test_the_round_trip_before_the_canaries_is_the_list_of_the_sessions_and_never_the_query_of_one(tmp_path, monkeypatch):
+    trace, fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES)  # the fake fails `logman query <name>` with 2147946600, as the runner did
+    queries = [c for c in fake.calls if c[:2] == ["logman", "query"]]
+    assert queries == [["logman", "query", "-ets"]] * 3 and trace._start_canary
+    assert trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"] == []
+
+
+@pytest.mark.parametrize("listed", [{}, {"abhost-other": "Running"}, "stopped"])
+def test_a_session_that_is_not_in_the_list_or_not_running_is_an_error_that_says_what_was_read(tmp_path, monkeypatch, listed):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+
+    def lists(argv, timeout=300.0):
+        out = fake(argv, timeout)
+        if argv == ["logman", "query", "-ets"]:
+            return logman_list({trace.name: "Stopped"} if listed == "stopped" else listed)
+        return out
+
+    monkeypatch.setattr(host, "_tool", lists)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    with pytest.raises(host.TraceError, match="is not running in the list of `logman query -ets`") as err:
+        trace.start(sleep=clock.sleep, now=clock.now, limit=1.0)
+    assert clock.t >= 1.0, "read again every quarter of a second until the guard"
+    assert trace.name in str(err.value) and ("Stopped" in str(err.value) if listed == "stopped" else "nothing of it" in str(err.value))
+    assert ("abhost-other (Running)" in str(err.value)) == (listed == {"abhost-other": "Running"})
+
+
+class Clock:
+    """A clock that only the sleeps move: a wait for a condition is read without waiting."""
+
+    def __init__(self):
+        self.t, self.sleeps = 0.0, []
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+    def now(self):
+        return self.t
+
+
+def test_a_stopped_session_that_is_still_listed_is_waited_for_and_then_the_launch_goes_on(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, still_listed=2)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=clock.sleep, now=clock.now)
+    names = [c[:2] for c in fake.calls]
+    after_stop = [c for c in fake.calls[names.index(["logman", "stop"]):] if c == ["logman", "query", "-ets"]]
+    assert got["problems"] == [] and len(after_stop) == 3, "listed for two reads, gone at the third"
+    assert trace.name not in fake.sessions and trace.session is False
+    assert names.index(["logman", "stop"]) < max(i for i, c in enumerate(fake.calls) if c == ["logman", "query", "-ets"]) < names.index(["tracerpt", str(tmp_path / "files.etl")])
+
+
+def test_a_stopped_session_that_never_leaves_the_list_is_an_error_after_the_guard(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, still_listed=10 ** 9)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    with pytest.raises(host.TraceError, match="is still in the list of `logman query -ets` 2 s after `logman stop`"):
+        trace.finish({100}, alive=lambda pid: False, sleep=clock.sleep, now=clock.now, gone_limit=2.0)
+    assert clock.t >= 2.0 and trace.session is True, "the session is not taken for closed"
+    assert not any(c[:1] == ["tracerpt"] for c in fake.calls)
+
+
+def test_a_stop_that_fails_because_the_session_is_gone_is_not_an_error_when_the_list_says_so(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    fake.sessions.clear()  # the session ended by itself: `logman stop` says 4201
+    assert trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None, now=Clock().now)["exited"]["exited"] is True
+
+
+def test_a_stop_that_fails_while_the_session_is_still_listed_is_an_error(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+
+    def refusing(argv, timeout=300.0):
+        if argv[:2] == ["logman", "stop"]:
+            raise host.TraceError("logman stop failed with 0x80070005: Access is denied.", 5)
+        return fake(argv, timeout)
+
+    monkeypatch.setattr(host, "_tool", refusing)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    with pytest.raises(host.TraceError, match="Access is denied"):
+        trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+
+
+def test_the_cleanup_of_a_launch_also_waits_for_its_session_to_leave_the_list(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, still_listed=2)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    trace.cleanup(sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [0.25, 0.25] and trace.name not in fake.sessions and trace.session is False
+
+
+class Done:
+    def __init__(self, code, text):
+        self.returncode, self.stdout, self.stderr = code, "", text
+
+
+WMI_TEXT = "Error:\nThe GUID passed was not recognized as valid by a WMI data provider."
+
+
+def a_tool_that_fails_with(monkeypatch, code, text, *argv):
+    monkeypatch.setattr(host.subprocess, "run", lambda *a, **k: Done(code, text))
+    with pytest.raises(host.TraceError) as err:
+        host._tool(list(argv))
+    return err.value
+
+
+def test_a_failed_windows_tool_says_its_command_its_code_in_hex_and_the_text_of_windows(monkeypatch):
+    e = a_tool_that_fails_with(monkeypatch, 2147946600, WMI_TEXT, "logman", "query", "abhost-1-2", "-ets")
+    assert "logman query abhost-1-2 -ets" in str(e) and "0x80071068" in str(e) and "The GUID passed was not recognized as valid by a WMI data provider." in str(e)
+    assert e.code == 2147946600 and e.access_denied is False
+    line = host.trace_not_started(e)
+    assert line.startswith("the trace of a Windows run could not be started: logman query") and "needs an administrator" not in line
+
+
+@pytest.mark.parametrize("code", [5, 0x80070005, -2147024891])
+def test_access_denied_is_the_one_failure_that_says_the_trace_needs_an_administrator(monkeypatch, code):
+    e = a_tool_that_fails_with(monkeypatch, code, "Access is denied.", "auditpol", "/set", "/subcategory:{G}")
+    assert e.access_denied is True and "Access is denied." in str(e)
+    assert "(it needs an administrator): auditpol /set" in host.trace_not_started(e)
+
+
+def test_a_tool_that_could_not_run_has_no_code_and_does_not_blame_the_administrator(monkeypatch):
+    def missing(*a, **k):
+        raise FileNotFoundError("logman")
+
+    monkeypatch.setattr(host.subprocess, "run", missing)
+    with pytest.raises(host.TraceError) as err:
+        host._tool(["logman", "create"])
+    assert err.value.code is None and "needs an administrator" not in host.trace_not_started(err.value) and "logman create" in str(err.value)
+
+
+def test_the_list_of_the_sessions_is_read_from_the_output_of_logman_query_ets():
+    got = host.parse_sessions(REAL_SESSION_LIST)
+    assert got["abhost-4242-123456789"] == "Running" and got["SgrmEtwSession"] == "Stopped" and got["Circular Kernel Context Logger"] == "Running"
+    assert got["Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace"] == "Running", "a name as wide as its column leaves one space before the type"
+    assert len(got) == 9 and not any(k.startswith(("Data", "-", "The command")) for k in got)
+    assert host.parse_sessions("") == {} and host.parse_sessions("The command completed successfully.\n") == {}
+
+
+def test_a_read_of_the_list_that_fails_is_read_again_until_the_session_is_running(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, list_failures=2)  # run 45257629988: the read failed with 2147946600, the session was there
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start(sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [0.25, 0.25] and trace._start_canary
+    assert sum(1 for c in fake.calls if c == ["logman", "query", "-ets"]) == 5, "two failed reads, then the three of the canaries"
+    assert trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"] == []
+
+
+def test_a_read_of_the_list_that_always_fails_ends_at_the_guard_with_its_last_error(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, list_failures=10 ** 9)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    with pytest.raises(host.TraceError, match="could not be read in 3 s, the last error") as err:
+        trace.start(sleep=clock.sleep, now=clock.now, limit=3.0)
+    assert "0x80071068" in str(err.value) and "WMI data provider" in str(err.value) and err.value.code == 2147946600 and clock.t >= 3.0
+    assert "needs an administrator" not in host.trace_not_started(err.value)
+    assert not any(c[:1] == ["tracerpt"] for c in fake.calls) and trace.session is True, "the launch does not start; cleanup closes the session"
+
+
+def test_a_read_of_the_list_that_fails_after_stop_is_read_again_until_the_session_is_gone(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    fake.list_failures = 2
+    trace.cleanup(sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [0.25, 0.25] and trace.name not in fake.sessions and trace.session is False
+    trace2 = host.WindowsTrace(tmp_path)
+    trace2.start()
+    fake.list_failures = 10 ** 9
+    with pytest.raises(host.TraceError, match="could not be read in 1 s after `logman stop`, the last error: logman query -ets failed with 0x80071068"):
+        trace2._stop_session(clock.sleep, clock.now, 1.0)
+

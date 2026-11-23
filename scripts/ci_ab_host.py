@@ -66,7 +66,8 @@ How the trace is taken:
     line, switched on for the run and put back after it): the kernel writes one per process, so a short-lived child cannot be missed, which a
     poll of the job's pids can. The files come from an ETW session on Microsoft-Windows-Kernel-File (the Create events: every path a process
     opens, a library included) taken with `logman` and read with `tracerpt`, both part of Windows. It needs an administrator (the hosted runners
-    are). Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
+    are): a failure says so only when Windows answered "access denied" (0x80070005), any other failure says its command, its code and Windows' text.
+    The session of a launch is gone from the list of `logman query -ets` before the next launch may start. Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
     see them is red, not empty.
 
 EVERY launch is also judged by how its parent ended (scripts/ci_crash_evidence.py): the warm-up, each measured seed and the idle launch alike. A root exit code other
@@ -1044,8 +1045,43 @@ FILE_PROVIDER, FILE_CREATE_KEYWORD = "Microsoft-Windows-Kernel-File", "0x80"  # 
 PROCESS_PROVIDER, PROCESS_KEYWORD = "Microsoft-Windows-Kernel-Process", "0x10"  # WINEVENT_KEYWORD_PROCESS: starts and stops, with the exit code
 
 
+ACCESS_DENIED = (5, 0x80070005)  # ERROR_ACCESS_DENIED, as a Win32 code and as an HRESULT: the only failure that says "it needs an administrator"
+SESSION_GONE_LIMIT = 120.0  # the guard of the wait for a stopped session to leave the list of the sessions (a fence, not a pace: the wait is a condition read every 0.25 s)
+
+
 class TraceError(RuntimeError):
-    """The trace of a Windows run could not be taken (not an administrator, no audit, no session): said as such, never an empty trace."""
+    """The trace of a Windows run could not be taken (not an administrator, no audit, no session): said as such, never an empty trace. `code` is the exit
+    code of the Windows tool that failed (None when there was none)."""
+
+    def __init__(self, message, code=None) -> None:
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def access_denied(self) -> bool:
+        return self.code is not None and (self.code & 0xFFFFFFFF) in ACCESS_DENIED
+
+
+def trace_not_started(e: TraceError) -> str:
+    """The problem line of a trace that could not be started: what Windows said, and "it needs an administrator" only when Windows said access denied
+    (run 45257629988, seed 6: `logman query` failed with 0x80071068, ERROR_WMI_GUID_NOT_FOUND, and the line blamed the administrator)."""
+    return "the trace of a Windows run could not be started%s: %s" % (" (it needs an administrator)" if e.access_denied else "", e)
+
+
+def parse_sessions(text: str) -> dict:
+    """The sessions of `logman query -ets` as {name: status}: a header (Data Collector Set, Type, Status), a line of dashes, one row per session
+    (columns apart by two spaces or more; a name can hold single spaces), then "The command completed successfully."."""
+    sessions = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or set(line) == {"-"} or line.startswith("Data Collector Set") or line.startswith("The command completed"):
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) >= 2:
+            sessions[parts[0]] = parts[-1]
+    return sessions
 
 
 def split_command_line(text: str) -> list:
@@ -1271,10 +1307,10 @@ def _tool(argv, timeout: float = 300.0) -> str:
     try:
         done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise TraceError("%s: %s" % (argv[0], e))
+        raise TraceError("%s: %s" % (" ".join(str(a) for a in argv), e))
     if done.returncode != 0:
-        raise TraceError("%s %s failed with %d: %s" % (argv[0], argv[1] if len(argv) > 1 else "", done.returncode,
-                                                       (done.stdout + done.stderr).strip()[:300]))
+        code = done.returncode & 0xFFFFFFFF
+        raise TraceError("%s failed with 0x%08X (%d): %s" % (" ".join(str(a) for a in argv), code, code, (done.stdout + done.stderr).strip()[:500]), code)
     return done.stdout
 
 
@@ -1303,7 +1339,7 @@ class WindowsTrace:
         path.read_text(encoding="utf-8")
         return str(path)
 
-    def start(self) -> None:
+    def start(self, sleep=time.sleep, now=time.monotonic, limit=SESSION_GONE_LIMIT) -> None:
         self.before = {"setting": parse_audit_setting(_tool(["auditpol", "/get", "/subcategory:" + AUDIT_GUID, "/r"])),
                        "value": self._registry_value()}
         _tool(["auditpol", "/set", "/subcategory:" + AUDIT_GUID, "/success:enable"])
@@ -1326,10 +1362,63 @@ class WindowsTrace:
         except TraceError:
             self.exits_ok = False
         # The provider is enabled a moment after the session exists (the first canary of the first launch of run 44963364060 was not seen): the canaries are written
-        # with a round trip to the session between them, and it is the LAST one, written just before the launch, that must be in the trace.
+        # with a round trip to the session between them, and it is the LAST one, written just before the launch, that must be in the trace. The round trip is the
+        # LIST of the sessions, not the query of this one: `logman query <name>` resolves the GUIDs of its providers through WMI and failed with 0x80071068
+        # (ERROR_WMI_GUID_NOT_FOUND) in run 45257629988, seed 6, side A, after `logman create` had succeeded.
         for n in (1, 2, 3):
-            _tool(["logman", "query", self.name, "-ets"])
+            self._expect_running(sleep, now, limit)
             self._start_canary = self._canary("start%d" % n)
+
+    def _sessions(self) -> dict:
+        return parse_sessions(_tool(["logman", "query", "-ets"]))
+
+    def _wait_sessions(self, done, timed_out, sleep, now, limit) -> None:
+        """Reads the list of the sessions every 0.25 s until `done(sessions)` is true, or the guard `limit` runs out (then `timed_out(last list, last read error or None)` is the TraceError: the error when the last read failed, the list when it did not). A read that fails (4200 in run 45257629988, or any error) is read again: it is a read of a state, it changes nothing."""
+        deadline = now() + limit
+        sessions = error = None
+        while True:
+            try:
+                sessions, error = self._sessions(), None
+            except TraceError as e:
+                error = e
+            if error is None and done(sessions):
+                return
+            if now() >= deadline:
+                raise timed_out(sessions, error)
+            sleep(0.25)
+
+    def _expect_running(self, sleep=time.sleep, now=time.monotonic, limit=SESSION_GONE_LIMIT) -> None:
+        """The round trip to the session: it is in the list and it is running, or the launch does not start (the guard `limit` is the fence)."""
+        def timed_out(sessions, error):
+            if error is not None:
+                return TraceError("the list of the sessions (`logman query -ets`) could not be read in %g s, the last error: %s" % (limit, error), getattr(error, "code", None))
+            return TraceError("the session %s is not running in the list of `logman query -ets` (it says %s); the sessions read: %s" % (
+                self.name, repr(sessions[self.name]) if self.name in sessions else "nothing of it",
+                ", ".join("%s (%s)" % kv for kv in sorted(sessions.items())) or "none"))
+
+        self._wait_sessions(lambda sessions: sessions.get(self.name, "").lower() == "running", timed_out, sleep, now, limit)
+
+    def _stop_session(self, sleep=time.sleep, now=time.monotonic, limit=SESSION_GONE_LIMIT) -> None:
+        """Stops the session and returns when it is gone from the list of the sessions: the next launch starts with no session of this one. A `logman stop`
+        that fails because the session is no longer there (4201, ERROR_WMI_INSTANCE_NOT_FOUND) is not an error when the list confirms it is not; while the
+        list says it is still there, the error of `stop` is the error."""
+        failed = None
+        try:
+            _tool(["logman", "stop", self.name, "-ets"])
+        except TraceError as e:
+            failed = e
+
+        def gone(sessions):
+            if self.name in sessions and failed is not None:
+                raise failed
+            return self.name not in sessions
+
+        def timed_out(sessions, error):
+            if error is not None:
+                return TraceError("the list of the sessions (`logman query -ets`) could not be read in %g s after `logman stop`, the last error: %s" % (limit, error), getattr(error, "code", None))
+            return TraceError("the session %s is still in the list of `logman query -ets` %g s after `logman stop` (it says %s)" % (self.name, limit, repr(sessions[self.name])))
+
+        self._wait_sessions(gone, timed_out, sleep, now, limit)
 
     def _registry_value(self):
         try:
@@ -1347,7 +1436,7 @@ class WindowsTrace:
         self.audit_raw = (events, ends)
         return process_tree(events, roots, ends)
 
-    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None) -> dict:
+    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None, gone_limit=SESSION_GONE_LIMIT) -> dict:
         """`{"tree": [4688 events], "files": {(pid, name)}, "outside": {process name: paths}, "exited": {...}, "events": n}`: what the TREE did from its
         first process to its last (the ancestry by the creator's pid from the launched process). What a process outside the tree opened (a service, the
         antivirus, the oracle itself apart) is not the engine's: it is counted by process name and left out of the comparison."""
@@ -1367,7 +1456,7 @@ class WindowsTrace:
         events, ends = self.audit_raw
         audit = (events, ends, sorted(roots))
         end_canary = self._canary("end")
-        _tool(["logman", "stop", self.name, "-ets"])
+        self._stop_session(sleep, now, gone_limit)
         self.session = False
         summary = self.work / "files.txt"
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
@@ -1397,11 +1486,11 @@ class WindowsTrace:
                 "order": {k: v for k, v in order.items() if k[0] in tree_pids},
                 "dispositions": {k: sorted(v) for k, v in dispositions.items() if k[0] in tree_pids}}
 
-    def cleanup(self) -> None:
-        """Put the machine back: the session closed, the audit as it was."""
+    def cleanup(self, sleep=time.sleep, now=time.monotonic, gone_limit=SESSION_GONE_LIMIT) -> None:
+        """Put the machine back: the session closed and gone from the list, the audit as it was."""
         if self.session:
             try:
-                _tool(["logman", "stop", self.name, "-ets"])
+                self._stop_session(sleep, now, gone_limit)
             except TraceError:
                 pass
             self.session = False
@@ -2001,7 +2090,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         except TraceError as e:
             trace.cleanup()
             return {"seed": seed, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False},
-                    "problems": ["the trace of a Windows run could not be started (it needs an administrator): %s" % e]}
+                    "problems": [trace_not_started(e)]}
     else:
         from _strace_stand_in import _stand_in
 
@@ -2446,7 +2535,7 @@ def run_stock(leg: str, audit_dir=None) -> dict:
         try:
             trace.start()
         except TraceError as e:
-            return not_started("the trace of a Windows run could not be started (it needs an administrator): %s" % e)
+            return not_started(trace_not_started(e))
         stock_phase("geolocation lab")
         geo_origin, stop_geo = start_geo_lab()
         try:
