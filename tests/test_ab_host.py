@@ -241,9 +241,10 @@ def test_in_the_a_a_the_declared_list_is_not_applied():
 
 def test_the_declared_gfxtest_does_not_cover_a_path():
     c = a_candidate_without_gfxtest()
-    c["seeds"][0]["files"] = FILES + ["/usr/lib/x86_64-linux-gnu/libglx.so.0"]
+    for seed in c["seeds"]:
+        seed["files"] = FILES + ["/usr/lib/x86_64-linux-gnu/libglx.so.0"]
     report = judge(footprint(), c, expected=expected())
-    assert report["verdict"] == "red" and [d["leaf"] for d in report["differences"]] == ["file./usr/lib/x86_64-linux-gnu/libglx.so.0"]
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./usr/lib/x86_64-linux-gnu/libglx.so.0"}
 
 
 def test_the_cli_says_broken_control_for_an_a_a_difference(tmp_path, capsys):
@@ -457,7 +458,7 @@ def test_a_closed_linux_run_makes_a_footprint_of_its_kinds_and_its_host_paths(tm
     assert fp["kinds"] == {"glxtest": 1, "lsb_release": 1, "parent": 1, "tab/isForBrowser": 1, "utility/sandboxingKind=1": 1}
     assert "/etc/hosts" not in fp["files"] and "/etc/localtime" in fp["files"] and "/proc/N/status" in fp["files"] and "/e/firefox/libxul.so" not in fp["files"]
     assert fp["ours"] == {"package": 2, "profile": 1} and fp["trace"]["source"] == "strace" and fp["problems"] == []
-    assert host.leaves_of(fp)["proc.tab/isForBrowser"] == 1 and "file./etc/localtime" in host.leaves_of(fp)
+    assert host.leaves_of(fp)["proc.tab/isForBrowser"] == 1 and not any(leaf.startswith("file.") for leaf in host.leaves_of(fp)), "the host paths are judged over all the launches"
 
 
 def test_the_strace_stand_in_prints_the_paths_of_the_descriptors_only_when_asked(monkeypatch):
@@ -841,7 +842,7 @@ def test_the_separate_pingsender_executable_is_red_whatever_the_count():
         assert any("the separate %s ran (B266" % exe in p for p in judge(fp, footprint("again"), a_a=True)["problems"])
 
 
-def test_what_only_the_pingsender_touches_is_compared_when_it_is_on_both_sides_and_left_out_when_it_is_on_one_side_only():
+def test_what_only_the_pingsender_touches_is_a_path_like_any_other_and_its_destinations_are_compared_when_it_is_on_both_sides_and_left_out_when_it_is_on_one_side_only():
     imagehlp = "c:\\windows\\system32\\imagehlp.dll"
 
     def with_surface(fp, n, files=(imagehlp,), net=("backgroundtask/pingsender: connect tcp AF_INET 141.101.90.1:443",)):
@@ -854,7 +855,8 @@ def test_what_only_the_pingsender_touches_is_compared_when_it_is_on_both_sides_a
         return fp
 
     one_side = judge(with_surface(footprint(), 3), footprint("again"), a_a=True)
-    assert one_side["verdict"] == "green", "present on one side only: left out"
+    assert {d["leaf"] for d in one_side["differences"]} == {"file." + imagehlp}, "its paths are paths like any other: in every launch of one side and in none of the other"
+    assert not any(d["category"] == "net" for d in one_side["differences"]), "its destinations on one side only are left out"
     same = judge(with_surface(footprint(), 3), with_surface(footprint("again"), 3), a_a=True)
     assert same["verdict"] == "green", same["problems"]
     a = with_surface(footprint(), 3)
@@ -876,7 +878,7 @@ def test_a_pingsender_that_goes_to_the_telemetry_host_direct_is_the_products_beh
     for seed in b["seeds"]:
         seed["net"] = other
     assert judge(a, b, a_a=True)["verdict"] == "green", "the address and the family are the third party's: `public, telemetry`"
-    assert host.pingsender_surface(a["seeds"][0]) == ([], ["backgroundtask/pingsender: connect public, telemetry"])
+    assert host.pingsender_destinations(a["seeds"][0]) == ["backgroundtask/pingsender: connect public, telemetry"]
     idle = with_idle(footprint(), net=ping)
     assert judge(idle, with_idle(footprint("again")), a_a=True)["verdict"] == "green", "no rule about a pingsender that goes out direct in the host oracle"
     assert "session_proxy" not in inspect.getsource(host)
@@ -1317,7 +1319,7 @@ def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_
 
     def fake_judge(a, b, **kw):
         order.append(("judge", "a-a" if kw.get("a_a") else "a-b"))
-        return {"verdict": "green", "problems": []}
+        return {"verdict": "green", "problems": [], "not_judged": {}}
 
     monkeypatch.setattr(host, "run_subprocess", fake_run)
     monkeypatch.setattr(host, "run_stock_subprocess", fake_stock)
@@ -1539,12 +1541,17 @@ def test_the_pingsender_records_say_the_type_the_form_and_the_parent_of_each_pro
     assert host.ping_records(linux, {7: host.PINGSENDER_KIND}, {}, False) == [{"type": "first-shutdown", "form": "backgroundtask", "parent": "(oracle)"}]
 
 
-def test_the_pingsender_surface_of_the_two_warm_ups_is_compared_when_both_have_the_pingsender_and_left_out_when_one_has_it(capsys):
+def test_the_pingsender_destinations_of_the_two_warm_ups_are_compared_when_both_have_the_pingsender_and_left_out_when_one_has_it_and_its_paths_are_listed():
     kinds = dict(KINDS, **{host.PINGSENDER_KIND: 3})
+    ping = "backgroundtask/pingsender: connect tcp AF_INET 141.101.90.1:443"
     a = with_warmup(footprint(), kinds=kinds, files=FILES + ["/etc/machine-id"], touched_by={"/etc/machine-id": [host.PINGSENDER_KIND]})
     b = with_warmup(footprint("again"), kinds=kinds, files=FILES + ["/etc/resolv.conf"], touched_by={"/etc/resolv.conf": [host.PINGSENDER_KIND]})
+    a["warmup"]["net"] = [ping]
     report = judge(a, b, a_a=True)
-    assert report["verdict"] == "red" and any("warm-up: the pingsender paths differ: A only ['/etc/machine-id'] | B only ['/etc/resolv.conf']" in p for p in report["problems"])
+    assert report["verdict"] == "red" and any("warm-up: the pingsender destinations differ: A only ['backgroundtask/pingsender: connect public, telemetry'] | B only []" in p
+                                              for p in report["problems"])
+    paths = {e["path"]: e for e in report["not_judged"]["paths"]}
+    assert paths["/etc/machine-id"]["touched_by"]["A"] == [host.PINGSENDER_KIND] and paths["/etc/resolv.conf"]["touched_by"]["B"] == [host.PINGSENDER_KIND], "its paths are listed"
     assert judge(a, with_warmup(footprint("again")), a_a=True)["verdict"] == "green", "the pingsender is in one warm-up only"
 
 
@@ -1602,23 +1609,25 @@ def with_inventory(fp, paths=INV, present=True):
     return fp
 
 
-def test_the_shortcut_inventory_is_absent_or_complete_one_side_with_it_and_the_other_without_is_green():
+def test_the_shortcut_inventory_is_judged_like_every_other_path_one_side_with_it_and_the_other_without_is_red():
     report = judge(with_inventory(footprint(platform="win32")), footprint("again", platform="win32"), a_a=True)
-    assert report["verdict"] == "green", report["problems"]
-    assert judge(footprint("again", platform="win32"), with_inventory(footprint(platform="win32")), a_a=True)["verdict"] == "green"
+    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file." + p for p in INV}
+    back = judge(footprint("again", platform="win32"), with_inventory(footprint(platform="win32")), a_a=True)
+    assert {d["leaf"] for d in back["differences"]} == {"file." + p for p in INV}
     assert judge(with_inventory(footprint(platform="win32")), with_inventory(footprint("again", platform="win32")), a_a=True)["verdict"] == "green"
 
 
-def test_an_inventory_that_is_not_complete_on_both_sides_is_red_and_so_is_a_path_next_to_it():
+def test_an_inventory_that_is_not_complete_on_both_sides_is_red_and_so_is_a_path_next_to_it_in_every_launch():
     short = with_inventory(footprint("again", platform="win32"), INV[:3])
     report = judge(with_inventory(footprint(platform="win32")), short, a_a=True)
     assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file." + p for p in INV[3:]}
     extra = with_inventory(footprint(platform="win32"))
-    extra["seeds"][0]["files"] = extra["seeds"][0]["files"] + ["d:\\lab\\runner\\.ssh\\config"]
-    other = judge(extra, footprint("again", platform="win32"), a_a=True)
-    assert other["verdict"] == "red" and {d["leaf"] for d in other["differences"]} == {"file.d:\\lab\\runner\\.ssh\\config"}, "only the inventory's own paths are left out"
+    for seed in extra["seeds"]:
+        seed["files"] = seed["files"] + ["d:\\lab\\runner\\.ssh\\config"]
+    other = judge(extra, with_inventory(footprint("again", platform="win32")), a_a=True)
+    assert other["verdict"] == "red" and {d["leaf"] for d in other["differences"]} == {"file.d:\\lab\\runner\\.ssh\\config"}
     known = with_inventory(footprint(platform="win32"), INV + [FILES[0]])
-    assert judge(known, footprint("again", platform="win32"), a_a=True)["verdict"] == "green", "a path of the inventory window that the other side has too is not left out of its side"
+    assert {d["leaf"] for d in judge(known, footprint("again", platform="win32"), a_a=True)["differences"]} == {"file." + p for p in INV}, "FILES[0] is in both"
 
 
 def test_the_inventory_of_a_launch_is_what_the_parent_first_touched_from_the_first_to_the_last_open_of_the_places_it_walks():
@@ -1879,11 +1888,7 @@ def test_a_launch_that_left_nothing_says_so_and_the_report_carries_the_summary_l
 
 
 # -
-# The system modules of Windows: a set per path over the union of all the launches of a run.
-
-SYS_A = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "wevtapi.dll"
-SYS_B = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "imagehlp.dll"
-OUTSIDE = "c:" + chr(92) + "windows" + chr(92) + "systemapps" + chr(92) + "x" + chr(92) + "resources.pri"
+# Windows footprints with paths added to chosen launches (the host paths are judged over all the launches: tests/test_ab_host_aa_stable.py).
 
 
 def with_system(fp, per_launch):
@@ -1903,72 +1908,6 @@ def with_system(fp, per_launch):
 
 def win(engine="firefox-68", **kw):
     return footprint(engine, platform="win32", **kw)
-
-
-def test_a_system_module_in_a_launch_of_each_run_is_the_same_module_and_a_rare_one_is_printed_not_red(capsys):
-    a = with_system(win(), {11: [SYS_B]})
-    b = with_system(win("again"), {"warmup": [SYS_B], 12: [SYS_A]})
-    report = judge(a, b, a_a=True)
-    assert report["verdict"] == "green", report["problems"]
-    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": [SYS_A]} and report["system_modules"]["counts"]["measured"]["B"]["counted"] == 1 and report["system_modules"]["counts"]["measured"]["A"]["counted"] == 0
-    host.print_report(report, "firefox-68", "firefox-68 again")
-    assert "RARE system modules only firefox-68 again has in its measured launches: 1 counted (red above 5), 0 .mui excused with their library, 0 .cat excused, 0 orphan .mui" in capsys.readouterr().out
-    assert "no page reads them" in host.SYSTEM_REASON and "Windows loader" in host.SYSTEM_REASON
-
-
-def test_six_rare_system_modules_in_an_a_a_run_are_red_and_five_are_not():
-    many = ["c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "rare%d.dll" % i for i in range(6)]
-    assert judge(with_system(win(), {11: many}), win("again"), a_a=True)["verdict"] == "red"
-    report = judge(with_system(win(), {11: many}), win("again"), a_a=True)
-    assert any("the system modules only run A has in its measured launches are 6, more than 5: the class is growing" in p for p in report["problems"])
-    assert judge(with_system(win(), {11: many[:5]}), win("again"), a_a=True)["verdict"] == "green"
-    assert judge(win(), with_system(win("again"), {"warmup": many}), a_a=True)["verdict"] == "red", "either run, the warm-up included"
-
-
-def test_the_rare_modules_of_the_long_launches_are_counted_apart_with_a_cap_of_thirty():
-    many = ["c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "long%d.dll" % i for i in range(31)]
-    ok = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many[:30], "bare": []}), a_a=True)
-    assert ok["verdict"] == "green", ok["problems"]
-    assert [ok["system_modules"]["counts"][l][side]["counted"] for l in ("measured", "long") for side in "AB"] == [0, 0, 0, 30] and ok["system_modules"]["limits"] == {"measured": 5, "long": 30}
-    red = judge(with_system(win(), {"idle": []}), with_system(win("again"), {"idle": many, "bare": []}), a_a=True)
-    assert red["verdict"] == "red" and any("only run B has in its long launches are 31, more than 30" in p for p in red["problems"])
-    seven = many[:7]
-    measured = judge(with_system(win(), {"idle": []}), with_system(win("again"), {11: seven}), a_a=True)
-    assert measured["verdict"] == "red", "the measured launches keep the cap of 5"
-    in_both = judge(with_system(win(), {"idle": many}), with_system(win("again"), {11: many, "idle": []}), a_a=True)
-    assert in_both["verdict"] == "green" and in_both["system_modules"]["counts"]["long"]["B"]["counted"] == 0, "a module the other run has in any launch is not rare"
-
-
-def test_in_an_ab_a_system_module_only_the_candidate_opened_is_red_and_one_the_candidate_lacks_is_green():
-    published = with_system(win(), {11: [SYS_A]})
-    again = with_system(win("again"), {12: [SYS_B]})
-    candidate = with_system(win("candidate"), {11: [SYS_B]})
-    green = judge(published, candidate, expected=[], also_68=[again])
-    assert green["verdict"] == "green", green["problems"]
-    assert green["system_modules"]["lacking"] == [SYS_A] and green["system_modules"]["candidate_only"] == []
-    new = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "dnsapi.dll"
-    red = judge(published, with_system(win("candidate"), {11: [SYS_B, new]}), expected=[], also_68=[again])
-    assert red["verdict"] == "red" and [d["leaf"] for d in red["differences"]] == ["file." + new]
-    assert judge(win(), with_system(win("candidate"), {"warmup": [new]}), expected=[])["verdict"] == "red", "a module the candidate opened in a warm-up counts"
-    assert judge(with_system(win(), {"warmup": [new]}), with_system(win("candidate"), {11: [new]}), expected=[])["verdict"] == "green", "a 68 warm-up opened it too"
-    # the long launches are inside the class: a candidate's long-launch module is red only if no launch of the 68 loaded it
-    long_red = judge(published, with_system(win("candidate"), {"idle": [new]}), expected=[], also_68=[again])
-    assert long_red["verdict"] == "red" and [d["leaf"] for d in long_red["differences"]] == ["file." + new]
-    assert judge(with_system(win(), {"idle": [new]}), with_system(win("candidate"), {"idle": [new]}), expected=[])["verdict"] == "green", "a 68 long launch opened it"
-    assert judge(with_system(win(), {"warmup": [new]}), with_system(win("candidate"), {"bare": [new]}), expected=[])["verdict"] == "green", "any 68 launch counts"
-    assert judge(published, with_system(win("candidate"), {"bare": [new]}), expected=[], also_68=[with_system(win("again"), {"idle": [new]})])["verdict"] == "green", "the other 68 run too"
-
-
-def test_the_system_class_is_system32_syswow64_and_winsxs_and_everything_else_stays_strict_seed_by_seed():
-    for folder in ("syswow64", "winsxs"):
-        path = "c:" + chr(92) + "windows" + chr(92) + folder + chr(92) + "x.dll"
-        assert judge(with_system(win(), {11: [path]}), win("again"), a_a=True)["verdict"] == "green"
-    for other in (OUTSIDE, "c:" + chr(92) + "program files" + chr(92) + "vendor" + chr(92) + "hook.dll"):
-        report = judge(with_system(win(), {11: [other]}), win("again"), a_a=True)
-        assert report["verdict"] == "red" and {d["seed"] for d in report["differences"]} == {11}, other
-    lin = "/usr/lib/libx.so"
-    assert judge(with_system(footprint(), {11: [lin]}), footprint("again"), a_a=True)["system_modules"] is None
-    assert {d["seed"] for d in judge(with_system(footprint(), {11: [lin]}), footprint("again"), a_a=True)["differences"]} == {11}
 
 
 def test_the_ab_passes_the_other_run_of_the_68_to_the_judge(tmp_path, monkeypatch):
@@ -2003,80 +1942,6 @@ def test_the_preloaded_newtab_process_is_absent_or_present_per_launch_never_more
     report = judge(two, footprint("again"), a_a=True)
     assert report["verdict"] == "red" and any("2 Privileged Cont processes: the preloaded about:newtab is absent or present, never more than one" in p for p in report["problems"])
     assert "NewTabPagePreloading.sys.mjs:96" in host.PRIVILEGED_REASON and "firefox.js:1952" in host.PRIVILEGED_REASON and "idle time" in host.PRIVILEGED_REASON
-
-
-# -
-# What the cap does not count: a resource file whose library is seen, and a security catalog (both counted and printed, never silent).
-
-DIR32 = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92)
-CATDIR = DIR32 + "catroot" + chr(92) + "{f750e6c3-38ee-11d1-85e5-00c04fc295ee}" + chr(92)
-
-
-def dll(name):
-    return DIR32 + name + ".dll"
-
-
-def mui(name):
-    return DIR32 + "en-us" + chr(92) + name + ".dll.mui"
-
-
-def test_a_resource_file_is_counted_by_its_library_and_an_orphan_one_counts_itself():
-    assert host.mui_dll(mui("avrt")) == dll("avrt") and host.mui_dll(DIR32 + "fr-fr" + chr(92) + "x.dll.mui") == dll("x") and host.mui_dll(dll("x")) is None
-    assert host.mui_dll(DIR32 + "drivers" + chr(92) + "x.sys.mui") is None, "a folder that is not a language is not one"
-    seen = {dll("avrt")}
-    split = host.classify_rare([mui("avrt"), mui("orphan"), dll("wevtapi")], seen)
-    assert split == {"counted": [mui("orphan"), dll("wevtapi")], "mui": [mui("avrt")], "cat": [], "orphans": [mui("orphan")]}
-
-
-def test_a_catalog_under_catroot_is_not_counted_and_one_outside_catroot_is():
-    inside, outside = CATDIR + "package~1.cat", DIR32 + "package~1.cat"
-    assert host.is_catalog(inside) and not host.is_catalog(outside) and not host.is_catalog(CATDIR + "x.dll")
-    split = host.classify_rare([inside, outside], set())
-    assert split["cat"] == [inside] and split["counted"] == [outside]
-
-
-def test_in_an_a_a_the_resource_files_with_their_library_and_the_catalogs_do_not_count_toward_the_cap_and_are_printed(capsys):
-    muis = [mui("m%d" % i) for i in range(15)]
-    libs = [dll("m%d" % i) for i in range(15)]
-    cats = [CATDIR + "package%d~1.cat" % i for i in range(6)]
-    a = with_system(win(), {11: muis + libs + cats})
-    b = with_system(win("again"), {11: libs})
-    report = judge(a, b, a_a=True)
-    counts = report["system_modules"]["counts"]["measured"]["A"]
-    assert report["verdict"] == "green", report["problems"]
-    assert counts == {"counted": 0, "mui_excused": 15, "cat_excused": 6, "orphans": 0}
-    host.print_report(report, "firefox-68", "firefox-68 again")
-    assert "firefox-68 has in its measured launches: 0 counted (red above 5), 15 .mui excused with their library, 6 .cat excused, 0 orphan .mui" in capsys.readouterr().out
-
-
-def test_orphan_resource_files_and_libraries_keep_the_cap_and_six_rare_libraries_stay_red():
-    orphans = [mui("o%d" % i) for i in range(6)]
-    red = judge(with_system(win(), {11: orphans}), win("again"), a_a=True)
-    assert red["verdict"] == "red" and red["system_modules"]["counts"]["measured"]["A"]["orphans"] == 6
-    libs = [dll("r%d" % i) for i in range(6)]
-    assert judge(with_system(win(), {11: libs + [mui("r0")]}), win("again"), a_a=True)["verdict"] == "red"
-    five = judge(with_system(win(), {11: libs[:5] + [mui("r0"), CATDIR + "c.cat"]}), win("again"), a_a=True)
-    assert five["verdict"] == "green" and five["system_modules"]["counts"]["measured"]["A"]["counted"] == 5, "the cap is not raised"
-    assert host.RARE_LIMIT == 5 and host.RARE_LIMIT_LONG == 30
-
-
-def test_the_library_is_looked_for_in_the_run_that_has_the_resource_file_both_layers_included():
-    a = with_system(win(), {11: [mui("w")], "idle": [dll("w")]})
-    report = judge(with_system(a, {"bare": []}), with_system(win("again"), {"idle": []}), a_a=True)
-    assert report["system_modules"]["counts"]["measured"]["A"]["mui_excused"] == 1, "its library was opened by a long launch of the same run: seen in that run"
-
-
-def test_in_an_ab_the_excused_files_stay_listed_per_run_and_a_new_library_shows_through_itself():
-    published = with_system(win(), {11: [dll("old"), mui("old"), CATDIR + "old.cat"]})
-    new = "c:" + chr(92) + "windows" + chr(92) + "system32" + chr(92) + "newlib.dll"
-    candidate = with_system(win("candidate"), {11: [dll("old"), mui("old"), mui("newlib"), CATDIR + "new.cat", new]})
-    report = judge(published, candidate, expected=[])
-    assert [d["leaf"] for d in report["differences"]] == ["file." + new], "the new library is red; its resource file and the new catalog are not red on their own"
-    system = report["system_modules"]
-    assert system["excused_candidate_only"] == {"mui": [mui("newlib")], "cat": [CATDIR + "new.cat"]} and system["orphans"] == []
-    assert mui("old") in system["listed_mui_and_cat"]["68"] and CATDIR + "old.cat" in system["listed_mui_and_cat"]["68"] and mui("newlib") in system["listed_mui_and_cat"]["candidate"]
-    orphan = judge(published, with_system(win("candidate"), {11: [dll("old"), mui("lonely")]}), expected=[])
-    assert [d["leaf"] for d in orphan["differences"]] == ["file." + mui("lonely")] and orphan["system_modules"]["orphans"] == [mui("lonely")]
 
 
 # -
@@ -2690,18 +2555,16 @@ def test_the_13_wof_streams_of_run_45060573559_are_their_files_and_the_a_a_has_n
     assert all(host.wof_base(p) in a_warm for p in WIN_STREAMS), "each of the 13 is a file the run has"
     report = judge(a, b, a_a=True)
     assert report["problems"] == [] and report["verdict"] == "green" and report["differences"] == []
-    counts = report["system_modules"]["counts"]["measured"]
-    assert counts["A"] == {"counted": 0, "mui_excused": 13, "cat_excused": 4, "orphans": 0} and counts["B"]["counted"] == 0
-    assert report["system_modules"]["rare"]["measured"] == {"A": [], "B": []}, "none of the 13 is rare: the 6 libraries are in both runs, the 7 others are the excused files"
+    assert not any(e["path"].endswith(host.WOF_STREAM) for e in report["not_judged"]["paths"]), "none of the 13 is a path of its own"
 
 
-def test_the_same_13_streams_are_red_without_the_mapping_of_a_stream_to_its_file(tmp_path, monkeypatch):
+def test_the_same_13_streams_are_paths_of_their_own_listed_and_not_red_without_the_mapping_of_a_stream_to_its_file(tmp_path, monkeypatch):
     monkeypatch.setattr(host, "wof_base", lambda name: name)
     a, b, a_warm = real_win_runs(tmp_path)
     assert [p for p in a_warm if p.endswith(host.WOF_STREAM)] == sorted(WIN_STREAMS)
     report = judge(a, b, a_a=True)
-    assert report["verdict"] == "red" and report["system_modules"]["rare"]["measured"]["A"] == sorted(WIN_STREAMS), "the real 13"
-    assert len(report["problems"]) == 1 and "the system modules only run A has in its measured launches are 13, more than 5: the class is growing" in report["problems"][0]
+    assert report["verdict"] == "green", "the real 13 are in the warm-up of run A only: not in all its measured launches"
+    assert sorted(e["path"] for e in report["not_judged"]["paths"] if e["path"].endswith(host.WOF_STREAM)) == sorted(WIN_STREAMS)
 
 
 # -

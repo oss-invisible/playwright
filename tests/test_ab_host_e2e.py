@@ -4,7 +4,8 @@ candidate, against the candidate (e2e, Linux and Windows).
 scripts/ci_ab_host.py walks the first steps of the fake web's journey (no internet) with the stock Playwright client, closes the browser and waits for its tree to exit, and
 compares the TRACE of the run from the launch to the exit (not a photograph of one instant): the kinds of process (the parent, `-contentproc` with its type, `-sandboxingKind`
 and `-isForBrowser` / `-notForBrowser`, the helpers by what they ran) with their count, but for the kinds of type `tab` whose count follows the idle time (only their presence
-counts), and the set of host paths the tree touched, whatever is `ours` (its package, profile and temp dirs, the run's cache, its own shared memory) being left out as a class.
+counts), and the host paths the tree touched, whatever is `ours` (its package, profile and temp dirs, the run's cache, its own shared memory) being left out as a class. One rule judges
+the paths (`file_rule`): red if and only if a path is in all the measured launches of one engine and in no launch of the other; the rest is listed in not-judged-a-a.json and not-judged.json.
 Linux: strace of the whole tree. Windows: the process-creation audit (event 4688, with the command line) and an ETW file trace (Kernel-File), which need an administrator, as the
 hosted runners are. One browser at a time.
 
@@ -88,7 +89,7 @@ def test_the_engine_leaves_the_same_footprint_on_the_host_after_the_same_journey
                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
     (out / "ab-host.log").write_text(done.stdout + "\n--- stderr\n" + done.stderr, encoding="utf-8")
     verdict = [line for line in done.stdout.splitlines()
-               if line.startswith(("DIFF ", "FAIL ", "DECLARED ", "OURS ", "AB HOST", "BROKEN CONTROL", "seed ", "---"))]
+               if line.startswith(("DIFF ", "FAIL ", "DECLARED ", "OURS ", "AB HOST", "BROKEN CONTROL", "seed ", "---", "NOT JUDGED", "WATCH "))]
     control = json.loads((out / "diff-a-a.json").read_text(encoding="utf-8")) if (out / "diff-a-a.json").exists() else {}
     assert done.returncode != 2, "the control is broken: the engine differs from itself, what is compared is not stable (nothing is excused: a difference between two traces of one engine is a defect of the comparison)\n" + "\n".join(verdict[:80])
     assert done.returncode == 0, "the host footprint differs:\n" + "\n".join(verdict[:80]) + "\n" + done.stderr[-1500:]
@@ -96,6 +97,10 @@ def test_the_engine_leaves_the_same_footprint_on_the_host_after_the_same_journey
     names = sorted(p.name for p in out.glob("footprint-*.json"))
     assert names == (["footprint-68-again.json", "footprint-68.json", "footprint-candidate.json"] if candidate
                      else ["footprint-68-again.json", "footprint-68.json"])
+    listed = ["not-judged-a-a.json"] + (["not-judged.json"] if candidate else [])
+    for name in listed:
+        document = json.loads((out / name).read_text(encoding="utf-8"))
+        assert document["format"] == host.NOT_JUDGED_FORMAT and isinstance(document["paths"], list) and document["launches"]["A"]["measured"] >= 2, name
     if candidate:
         diff = json.loads((out / "diff.json").read_text(encoding="utf-8"))
         assert diff["verdict"] == "green" and diff["differences"] == [] and diff["problems"] == []

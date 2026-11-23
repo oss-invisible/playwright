@@ -18,8 +18,12 @@ Three things are compared, over the whole trace:
     `-isForBrowser` / `-notForBrowser`, and the helpers (glxtest, pingsender, ...) by what they ran. Every kind and its COUNT must be identical,
     with one exception: for the content processes of type `tab` only the presence of the kind counts, because how many are alive follows the idle
     time (a spare process is prelaunched after a delay and closed after a grace period);
-  * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. The SET of host
-    paths must be identical, no exception. `ours` leaves the comparison as a class (OURS below: reading its own package is not touching the host);
+  * the files: every path the tree touched (opened, stat'ed, accessed, read as a link, executed), classified `ours` or `host`. ONE rule judges the host paths, in the A/A and in the
+    A/B, on Linux and on Windows, the system modules and the shortcut inventory included (`file_rule`): a path is red if and only if it is in ALL the measured launches (the warm-up and
+    the seeds) of one engine and in NO launch of the other (its idle and bare launches included). Every other path that is not in the same share of the launches of both engines is LISTED, not judged: the log and the file
+    `not-judged-a-a.json` / `not-judged.json` of the artifact give, per path, in how many launches of how many each engine has it (measured and long) and the processes that touched it,
+    and mark `watch` the paths in at least half of the launches of one engine and in none of the other's. `ours` leaves the comparison as a class (OURS below: reading its own package is
+    not touching the host);
   * the network, per kind (Linux): every NETLINK socket the tree opens, by protocol (NETLINK_ROUTE, NETLINK_KOBJECT_UEVENT, ...), with the requests
     it sends on it (RTM_GETLINK, RTM_GETADDR, ...) and the multicast groups it binds to, and every connect or send towards a PUBLIC address, with
     the transport, the family, the address and the port. The SET per kind must be identical, no exception, like the host paths. A destination that
@@ -37,14 +41,18 @@ after the warm-up is red.
 
 The exit pings (`firefox --backgroundtask pingsender`, through the session's route, never the separate `pingsender[.exe]`) leave only when Mozilla's `canUpload()` is
 true (TelemetrySend.sys.mjs:1083), which the core's declared terms of use make true from the start: in a measured launch their
-number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red. The paths and the destinations only they touch are compared when they are
+number is 0 or 3 (the three pings of a first run, spawned by the parent), anything else is red. The paths only they touch are paths like any other (`file_rule`); the destinations only they reach are compared when they are
 there on both sides of a launch, and left out when they are there on one side only (a destination is `public, telemetry`: the telemetry host is the third party's, and
 whether the connection succeeded is not in the verdict). The IDLE launch of each engine run (a page, no pref changed, up to 120 s) is evidence: which pings leave in a long launch is not a rule until it is proven (the core declares
 the terms of use accepted, so `canUpload()` is true from the start and the notification of the data policy is never recorded; Linux started 1 pingsender in it, Windows 0).
 Only a separate `pingsender[.exe]` there is red. Behind a session proxy a direct pingsender is the network oracle's.
 
-On Windows the system modules (a path under the system folder) are compared as a SET over the union of the measured seeds of a side (`SYSTEM_REASON`): a module that is in a
-seed of each side is the same module; one that only one side has in any seed is still red.
+ACCEPTED LOSSES (the rule of the host paths trades them for a verdict that does not follow the machine's timing; for the 69):
+  * a path that one engine has in every measured launch and the other in only some of them is not red: always against sometimes is listed, never judged;
+  * a reading tied to one seed is not judged: no path is compared seed by seed;
+  * what happens only in the long launches (idle, bare) is only listed: judging it would take two idle launches per engine;
+  * the cause of the pingsender that starts in one launch of eight is not known: its paths are listed like the others, there is no rule and no preference for it;
+  * a pid that Windows reuses may attribute to the engine the tools of the oracle itself, among the processes that touched a path.
 
 How the trace is taken:
 
@@ -508,14 +516,11 @@ def privileged_problems(fp: dict) -> list:
     return ["%d %s processes: the preloaded about:newtab is absent or present, never more than one (%s)" % (n, PRIVILEGED, PRIVILEGED_REASON)] if n > 1 else []
 
 
-def pingsender_surface(fp: dict) -> tuple:
-    """`(paths only the pingsender kind touched, its destinations)` of a launch: a destination is `<kind>: connect public, telemetry` (or `send`), whatever the
-    address and the port: the telemetry host is the third party's."""
-    touched = fp.get("touched_by", {})
-    files = sorted(p for p in fp.get("files", []) if touched.get(p) and all(is_pingsender_part(k) for k in touched[p]))
-    nets = sorted({"%s: %s public, telemetry" % (PINGSENDER_KIND, e.split(": ", 1)[1].split(" ", 1)[0])
+def pingsender_destinations(fp: dict) -> list:
+    """The destinations of the pingsender kind in a launch: `<kind>: connect public, telemetry` (or `send`), whatever the address and the port: the telemetry host is the
+    third party's."""
+    return sorted({"%s: %s public, telemetry" % (PINGSENDER_KIND, e.split(": ", 1)[1].split(" ", 1)[0])
                    for e in fp.get("net") or [] if e.startswith(PINGSENDER_KIND + ": ")})
-    return files, nets
 
 
 def _bare_summary(bare: dict | None) -> dict | None:
@@ -529,119 +534,64 @@ def _bare_summary(bare: dict | None) -> dict | None:
             "cores": core.get("cores"), "core_pattern": core.get("core_pattern")}
 
 
-#: THE SYSTEM MODULES OF WINDOWS: the paths under System32, SysWOW64 and WinSxS (the security catalogs are under System32 catroot) that are not in the package. They are
-#: loaded by the Windows loader on behalf of system DLLs (a catalog lookup when a library is loaded, a library a system DLL loads lazily, the resource file of a module), and no
-#: page reads them: which of them a launch opens follows the system and its timing, not the engine. They are compared as a set per PATH over the union of the launches of a
-#: run (the measured seeds and the warm-up, and as a layer of its own the long idle and bare launches), never seed by seed:
-#:   * in the A/B, red only a module the CANDIDATE opened that NO launch of the 68 opened, in either run of the 68 (the published engine twice, warm-ups included); a module
-#:     the candidate lacks is not red (printed as `lacking`);
-#:   * in the A/A, a module of this class that only one run has is `rare`: printed with its count, and the control is red only if the rare ones of a run are more than RARE_LIMIT
-#:     paths in its measured launches, or RARE_LIMIT_LONG in its long ones (the class is growing and must be looked at).
-#: Everything outside these folders stays strict, and the shortcut inventory is its own rule (absent or complete).
-SYSTEM_FOLDERS = tuple("c:" + chr(92) + "windows" + chr(92) + name + chr(92) for name in ("system32", "syswow64", "winsxs"))
-SYSTEM_PREFIX = tuple("file." + f for f in SYSTEM_FOLDERS)
-RARE_LIMIT = 5
-SYSTEM_REASON = ("loaded by the Windows loader on behalf of system DLLs, and no page reads them: compared as a set per path over the union of all the launches of a run; in the "
-                 "A/B red only a module the candidate opened that no launch of the 68 opened; in the A/A the ones only one run has are rare, red above %d" % RARE_LIMIT)
+#: THE RULE OF THE HOST PATHS, one for the A/A and the A/B, Linux and Windows, over every host path (the system modules and the shortcut inventory included). A path is
+#: RED if and only if it is in ALL the measured launches (the warm-up and the seeds) of one engine and in NO launch of the other (its long idle and bare launches included). In
+#: the A/A that is a broken control, in the A/B a difference (the declared ones apply to it as they always did). Every other path that is not in all the launches of both engines is
+#: LISTED, not judged (`file_rule`, the file `not-judged[-a-a].json` of the artifact, the log): the paths that are not in the same share of the launches of both engines, with in
+#: how many launches of how many each engine has them and the processes that touched them; the ones in at least half of the launches of one engine and in none of the other's are
+#: marked `watch`.
+NOT_JUDGED_FORMAT = "ab-host-not-judged/1"
+NOT_JUDGED_REASON = ("a path in all the measured launches of one engine and in no launch of the other is red; the other paths that differ are listed, not judged; `watch` is a path "
+                     "in at least half of the launches of one engine and in none of the other's")
+LISTED_IN_LOG = 50
 
 
-LAYERS = {"measured": ("seeds", "warmup"), "long": ("idle", "bare")}
-RARE_LIMIT_LONG = 30
+def launches_of(fp: dict) -> list:
+    """`[(name, measured, launch)]` of a footprint in the order of the run: the warm-up and the seeds (`measured`), then the idle and the bare launch (the long ones)."""
+    out = [("warmup", True, fp["warmup"])] if fp.get("warmup") else []
+    out += [("s%s" % s["seed"], True, s) for s in fp.get("seeds", [])]
+    return out + [(name, False, fp[name]) for name in ("idle", "bare") if fp.get(name)]
 
 
-def _launches(fp: dict, layer: str) -> list:
-    out = []
-    for key in LAYERS[layer]:
-        got = fp.get(key)
-        out += got if key == "seeds" else [got or {}]
-    return out
+def path_table(fps: list) -> dict:
+    """What the launches of ONE engine (the footprints of its runs) did to the host paths: `{"launches": {"measured": n, "long": n}, "paths": {path: {"measured": k,
+    "long": k}}, "by": {path: [kinds that touched it]}}`."""
+    launches, paths, by = {"measured": 0, "long": 0}, {}, {}
+    for fp in fps:
+        for _name, measured, launch in launches_of(fp):
+            layer = "measured" if measured else "long"
+            launches[layer] += 1
+            for path in set(launch.get("files", [])):
+                paths.setdefault(path, {"measured": 0, "long": 0})[layer] += 1
+                by.setdefault(path, set()).update((launch.get("touched_by") or {}).get(path, []))
+    return {"launches": launches, "paths": paths, "by": {path: sorted(kinds) for path, kinds in by.items()}}
 
 
-def system_paths(fp: dict, layers=("measured", "long"), with_inventory: bool = True) -> set:
-    """The system modules (SYSTEM_FOLDERS) the launches of the given layers of a footprint opened. Two layers: `measured` (the seeds and the warm-up) and `long` (the idle
-    and the bare launch, 120 s, in which the parent runs Mozilla's idle tasks: the maintenance at 57 s, the shell code). Without `with_inventory` the ones a launch opened
-    as part of the shortcut inventory (its own rule: absent or complete, `INVENTORY_MARKER`) are left out."""
-    out = set()
-    for layer in layers:
-        for launch in _launches(fp, layer):
-            skip = set() if with_inventory else set(launch.get("inventory") or [])
-            out.update(p for p in launch.get("files", []) if p.startswith(SYSTEM_FOLDERS) and p not in skip)
-    return out
+def file_rule(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
+    """`(red, not_judged)` of the host paths of two footprints, by the rule above. `red` is `{"A": [paths only A has, in all its measured launches], "B": [...]}`. `also_68`
+    are the other footprints of the engine of A in an A/B (the published engine measured twice): its launches are all of them the engine's."""
+    ta, tb = path_table([a, *also_68]), path_table([b])
+    red = {side: sorted(p for p, c in mine["paths"].items() if mine["launches"]["measured"] and c["measured"] == mine["launches"]["measured"] and p not in other["paths"])
+           for side, mine, other in (("A", ta, tb), ("B", tb, ta))}
+    judged = set(red["A"]) | set(red["B"])
+    every = {side: sum(t["launches"].values()) for side, t in (("A", ta), ("B", tb))}
 
+    def same(seen: dict) -> bool:
+        return all(seen["A"][layer] * tb["launches"][layer] == seen["B"][layer] * ta["launches"][layer] for layer in ("measured", "long"))
 
-BS = chr(92)
-CATROOT = BS + "catroot" + BS
-
-
-def is_catalog(path: str) -> bool:
-    """A security catalog under `catroot`: Windows' signature verification reads it when a library is loaded, the engine does not choose it."""
-    return CATROOT in path and path.endswith(".cat")
-
-
-def mui_dll(path: str) -> str | None:
-    """The library a resource file belongs to (`...\\system32\\en-us\\x.dll.mui` is `...\\system32\\x.dll`), None for a path that is not one."""
-    if not path.endswith(".mui"):
-        return None
-    folder, _sep, name = path.rpartition(BS)
-    parent, _sep2, language = folder.rpartition(BS)
-    return parent + BS + name[:-4] if re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})*", language) and parent else None
-
-
-def classify_rare(paths, seen: set) -> dict:
-    """Splits the modules of a layer that only one run has: `counted` (what the cap counts: every module that is not excused, orphan resource files included), `mui` (a
-    resource file whose library is among the modules `seen` in that run: the library carries the count), `cat` (a security catalog under catroot) and `orphans` (the
-    resource files whose library was never seen: they are in `counted`)."""
-    out = {"counted": [], "mui": [], "cat": [], "orphans": []}
-    for path in sorted(paths):
-        dll = mui_dll(path)
-        if is_catalog(path):
-            out["cat"].append(path)
-        elif dll is not None and dll in seen:
-            out["mui"].append(path)
-        else:
-            out["counted"].append(path)
-            if dll is not None:
-                out["orphans"].append(path)
-    return out
-
-
-def system_class(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
-    """`(differences, problems, report)` of the system modules of two footprints: see SYSTEM_REASON. `also_68` are the other footprints of the 68 in an A/B.
-
-    A/A: a module only one run has is rare, counted in two layers with their own caps: the measured launches (RARE_LIMIT) and the long ones (RARE_LIMIT_LONG, what only a
-    long launch of the run opened). A module the other run has in ANY launch is not rare. The cap counts every rare module but two kinds that are not the engine's choice,
-    both listed and counted in the report, never silent (`classify_rare`): a resource file (`.mui`) whose library is among the modules seen in that run, since the library
-    carries the count, and a security catalog under `catroot`. An orphan `.mui` (its library never seen) counts. A/B: red only a module any launch of the candidate opened
-    that no launch of either 68 run opened, with the same two kinds left out of the red (a new library shows through the library itself); the ones each side opened are
-    listed per run."""
-    differences, problems = [], []
-    if a_a:
-        rare, excused = {"measured": {}, "long": {}}, {"measured": {}, "long": {}}
-        for side, x, y in (("A", a, b), ("B", b, a)):
-            other = system_paths(y, with_inventory=False)
-            seen = system_paths(x)
-            measured = system_paths(x, ("measured",), False)
-            for layer, paths in (("measured", measured - other), ("long", system_paths(x, ("long",), False) - measured - other)):
-                split = classify_rare(paths, seen)
-                rare[layer][side], excused[layer][side] = split["counted"], split
-        for layer, limit in (("measured", RARE_LIMIT), ("long", RARE_LIMIT_LONG)):
-            for side in ("A", "B"):
-                if len(rare[layer][side]) > limit:
-                    problems.append("the system modules only run %s has in its %s launches are %d, more than %d: the class is growing (%s)"
-                                    % (side, layer, len(rare[layer][side]), limit, rare[layer][side][:3]))
-        counts = {layer: {side: {"counted": len(excused[layer][side]["counted"]), "mui_excused": len(excused[layer][side]["mui"]),
-                                 "cat_excused": len(excused[layer][side]["cat"]), "orphans": len(excused[layer][side]["orphans"])}
-                          for side in ("A", "B")} for layer in rare}
-        return differences, problems, {"mode": "a-a", "rare": rare, "excused": excused, "counts": counts, "limits": {"measured": RARE_LIMIT, "long": RARE_LIMIT_LONG},
-                                       "reason": SYSTEM_REASON}
-    known = set(system_paths(a, with_inventory=False)).union(*[system_paths(x, with_inventory=False) for x in also_68])
-    mine = system_paths(b, with_inventory=False)
-    split = classify_rare(mine - known, system_paths(b))
-    for path in split["counted"]:
-        differences.append({"seed": "all", "category": "file", "leaf": "file." + path, "a": MISSING, "b": 1, "by": {"A": [], "B": []}, "calls": {"A": [], "B": []}})
-    listed = {"68": [p for p in sorted(known) if mui_dll(p) or is_catalog(p)], "candidate": [p for p in sorted(mine) if mui_dll(p) or is_catalog(p)]}
-    return differences, problems, {"mode": "a-b", "candidate_only": split["counted"], "excused_candidate_only": {"mui": split["mui"], "cat": split["cat"]}, "orphans": split["orphans"],
-                                   "listed_mui_and_cat": listed, "lacking": sorted(known - mine)[:50], "lacking_count": len(known - mine), "reason": SYSTEM_REASON}
+    entries = []
+    for path in sorted(set(ta["paths"]) | set(tb["paths"])):
+        if path in judged:
+            continue
+        seen = {side: t["paths"].get(path, {"measured": 0, "long": 0}) for side, t in (("A", ta), ("B", tb))}
+        if same(seen):
+            continue  # in the same share of the launches of both engines (every one of them, for a path that is there always): nothing to list
+        watch = any(sum(seen[mine].values()) * 2 >= every[mine] and not sum(seen[other].values()) for mine, other in (("A", "B"), ("B", "A")))
+        entries.append({"path": path, "watch": watch,
+                        **{side: {layer: [seen[side][layer], t["launches"][layer]] for layer in ("measured", "long")} for side, t in (("A", ta), ("B", tb))},
+                        "touched_by": {"A": ta["by"].get(path, []), "B": tb["by"].get(path, [])}})
+    entries.sort(key=lambda e: (not e["watch"], e["path"]))
+    return red, {"format": NOT_JUDGED_FORMAT, "mode": "a-a" if a_a else "a-b", "reason": NOT_JUDGED_REASON, "launches": {"A": ta["launches"], "B": tb["launches"]}, "paths": entries}
 
 
 PRIVILEGED = "Privileged Cont"
@@ -842,15 +792,10 @@ def derive_labels(labels: dict, parents: dict) -> dict:
     return out
 
 
-def is_pingsender_part(kind: str) -> bool:
-    """The pingsender kind and what it spawned: what is there when the pingsenders are."""
-    return kind == PINGSENDER_KIND or kind.endswith("<-pingsender")
-
-
 #: The shortcut inventory of Windows (a launch that ran it touches these): StartupOSIntegration.sys.mjs `onStartupIdle` (:165) -> `ensurePrivateBrowsingShortcutExists`
 #: (:238, `hasPinnableShortcut` :266 -> nsWindowsShellService.cpp `HasPinnableShortcut` :1672 -> `FindPinnableShortcut` :1625) and `CustomIconManager.ensureAppliedOrRevert` ->
 #: `enumerateInstallShortcuts` (CustomIconManager.sys.mjs:189 -> nsWindowsShellService.cpp `EnumerateInstallShortcutsImpl` :2960): Mozilla code at startup idle, which a short
-#: launch may or may not have reached before it closed. The marker is a path of the places it walks.
+#: launch may or may not have reached before it closed. The marker is a path of the places it walks. It is evidence (`inventory` of a launch): its paths are judged like any other (`file_rule`).
 INVENTORY_MARKER = re.compile(r"(\\start menu\\|\\users\\public\\desktop|\\quick launch\\|_shortcuts\.ini$|\\implicitappshortcuts)")
 
 
@@ -1444,9 +1389,9 @@ def net_class(entry: str) -> str:
 
 
 def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
-    """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence),
-    file.<path> = 1 for every HOST path the tree touched and net.<kind>: <what> = 1 for every netlink socket, netlink request and public
-    destination of a process of that kind (`network_events`)."""
+    """{leaf: value} of one seed: proc.<kind> = how many processes of that kind the run made (1 for a kind of type tab: its presence) and
+    net.<kind>: <what> = 1 for every netlink socket, netlink request and public destination of a process of that kind (`network_events`). The host paths are not leaves
+    of a seed: they are judged over all the launches (`file_rule`)."""
     out = {}
     for kind, n in seed_footprint.get("kinds", {}).items():
         if kind == PRIVILEGED:
@@ -1454,17 +1399,11 @@ def leaves_of(seed_footprint: dict, with_pingsender: bool = False) -> dict:
         if kind == PINGSENDER_KIND or (kind.endswith("<-pingsender") and not with_pingsender):
             continue  # 0 or 3 of them, with their form (`pingsender_problems`), and what they spawned: there when they are
         out["proc." + kind] = 1 if is_tab(kind) and n else n
-    # what only the pingsender kind touches or reaches is compared when it is on both sides of the launch (`with_pingsender`), left out when on one side only
-    surface_files, surface_nets = pingsender_surface(seed_footprint)
-    for path in seed_footprint.get("files", []):
-        if path in surface_files and not with_pingsender:
-            continue
-        out["file." + path] = 1
     for entry in seed_footprint.get("net") or []:
         if not entry.startswith(PINGSENDER_KIND + ": "):
             out["net." + net_class(entry)] = 1
     if with_pingsender:
-        for entry in surface_nets:
+        for entry in pingsender_destinations(seed_footprint):
             out["net." + entry] = 1
     return out
 
@@ -1612,52 +1551,45 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
     for seed in sorted(set(seeds_a) & set(seeds_b)):
         both = bool(seeds_a[seed].get("kinds", {}).get(PINGSENDER_KIND)) and bool(seeds_b[seed].get("kinds", {}).get(PINGSENDER_KIND))
         la, lb = leaves_of(seeds_a[seed], both), leaves_of(seeds_b[seed], both)
-        # The shortcut inventory (Windows) is there or it is not (`INVENTORY_MARKER`): when one side ran it and the other did not, the paths it walked that the other
-        # side does not have are left out; when both ran it, its paths are compared like any other, so it has to be complete.
-        inv_a, inv_b = set(seeds_a[seed].get("inventory") or []), set(seeds_b[seed].get("inventory") or [])
-        if inv_a and not inv_b:
-            for path in inv_a - set(seeds_b[seed].get("files", [])):
-                la.pop("file." + path, None)
-        elif inv_b and not inv_a:
-            for path in inv_b - set(seeds_a[seed].get("files", [])):
-                lb.pop("file." + path, None)
         for side, fp in (("A", seeds_a[seed]), ("B", seeds_b[seed])):
             for message in fp.get("problems", []) + pingsender_problems(fp) + privileged_problems(fp):
                 problems.append("seed %s side %s: %s" % (seed, side, message))
         per = {c: 0 for c in CATEGORIES}
         for leaf in set(la) | set(lb):
             per[category_of(leaf)] = per.get(category_of(leaf), 0) + 1
+        per["file"] = len(set(seeds_a[seed].get("files", [])) | set(seeds_b[seed].get("files", [])))
         counts[str(seed)] = per
-        for side, leaves in (("A", la), ("B", lb)):
+        for side, leaves, files in (("A", la, seeds_a[seed].get("files", [])), ("B", lb, seeds_b[seed].get("files", []))):
             have = {c: sum(1 for k in leaves if category_of(k) == c) for c in floors}
+            have["file"] = len(files)
             for c, floor in floors.items():
                 if have[c] < floor:
                     problems.append("seed %s side %s has %d %s leaves, fewer than the floor of %d: the run was not seen"
                                     % (seed, side, have[c], c, floor))
-        if os_name == "windows":
-            for leaves in (la, lb):
-                for k in [k for k in leaves if k.startswith(SYSTEM_PREFIX)]:
-                    del leaves[k]
         for leaf in sorted(set(la) | set(lb)):
             va, vb = la.get(leaf, MISSING), lb.get(leaf, MISSING)
             if va != vb:
                 differences.append({"seed": seed, "category": category_of(leaf), "leaf": leaf, "a": _clip(va), "b": _clip(vb),
                                     "by": {"A": _by(seeds_a[seed], leaf), "B": _by(seeds_b[seed], leaf)},
                                     "calls": {"A": _calls(seeds_a[seed], leaf), "B": _calls(seeds_b[seed], leaf)}})
-    system = None
-    if os_name == "windows":
-        more, found, system = system_class(a, b, a_a, also_68 or ())
-        differences += more
-        problems += found
+    red, not_judged = file_rule(a, b, a_a, also_68 or ())
+    for side, seeds in (("A", seeds_a), ("B", seeds_b)):
+        for path in red[side]:
+            leaf = "file." + path
+            for seed in sorted(seeds):
+                other = {"A": "B", "B": "A"}[side]
+                differences.append({"seed": seed, "category": "file", "leaf": leaf, "a": 1 if side == "A" else MISSING, "b": 1 if side == "B" else MISSING,
+                                    "by": {side: _by(seeds[seed], leaf), other: []}, "calls": {side: _calls(seeds[seed], leaf), other: []}})
+    differences.sort(key=lambda d: (d["seed"], d["leaf"]))
     if os_name == "windows" and not a_a:
         for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
             problems += geolocation_problems(fp, where)
     problems += idle_problems(a, b)
     wa, wb = a.get("warmup") or {}, b.get("warmup") or {}
     if wa.get("kinds", {}).get(PINGSENDER_KIND) and wb.get("kinds", {}).get(PINGSENDER_KIND):
-        for what, x, y in zip(("paths", "destinations"), pingsender_surface(wa), pingsender_surface(wb)):
-            if x != y:
-                problems.append("warm-up: the pingsender %s differ: A only %s | B only %s" % (what, sorted(set(x) - set(y))[:5], sorted(set(y) - set(x))[:5]))
+        x, y = pingsender_destinations(wa), pingsender_destinations(wb)
+        if x != y:
+            problems.append("warm-up: the pingsender destinations differ: A only %s | B only %s" % (sorted(set(x) - set(y))[:5], sorted(set(y) - set(x))[:5]))
     stale = []
     if not a_a:
         for entry in expected or []:
@@ -1692,10 +1624,21 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                 "net": sorted(set(warm["A"].get("net", [])) & set(warm["B"].get("net", [])))}
     return {"format": FORMAT, "mode": "a-a" if a_a else "a-b", "verdict": "red" if problems else "green", "problems": problems,
             "differences": differences, "declared": declared, "ours": OURS, "tab": {"reason": TAB_REASON, "counts": tab},
-            "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))}, "system_modules": system,
+            "outside_tree": outside, "warmup": dict(warm, both=both), "idle": {side: _idle_summary(fp.get("idle")) for side, fp in (("A", a), ("B", b))}, "not_judged": not_judged,
             "bare": {side: _bare_summary((fp.get("bare") or {}).get("bare")) for side, fp in (("A", a), ("B", b))},
             "shortcuts": {side: _shortcuts_summary(((fp.get("idle") or {}).get("idle") or {}).get("shortcut_changes")) for side, fp in (("A", a), ("B", b))},
             "stale": [e.get("id") for e in stale], "leaves": counts, "net": net}
+
+
+def _launch_counts(counts: dict) -> str:
+    """`5/6 measured, 0/2 long` of the entry of a path in the not judged list."""
+    return "%d/%d measured, %d/%d long" % (*counts["measured"], *counts["long"])
+
+
+def write_verdict(path: Path, report: dict, listed_name: str) -> None:
+    """The verdict at `path` and, next to it, the not judged list as `listed_name` (a file of its own: the verdict stays small)."""
+    write_json(path.with_name(listed_name), report["not_judged"])
+    write_json(path, {k: v for k, v in report.items() if k != "not_judged"})
 
 
 def print_report(report: dict, a_name: str, b_name: str) -> None:
@@ -1704,19 +1647,15 @@ def print_report(report: dict, a_name: str, b_name: str) -> None:
     for d in report["differences"][:200]:
         print("DIFF seed %s %s: %s %s | %s %s%s" % (d["seed"], d["leaf"], a_name, json.dumps(d["a"], sort_keys=True)[:160],
                                                     b_name, json.dumps(d["b"], sort_keys=True)[:160], _by_text(d)))
-    system = report.get("system_modules")
-    if system and system["mode"] == "a-a":
-        for side, name in (("A", a_name), ("B", b_name)):
-            for layer in ("measured", "long"):
-                c = system["counts"][layer][side]
-                print("RARE system modules only %s has in its %s launches: %d counted (red above %d), %d .mui excused with their library, %d .cat excused, %d orphan .mui%s" % (
-                    name, layer, c["counted"], system["limits"][layer], c["mui_excused"], c["cat_excused"], c["orphans"],
-                    (": " + json.dumps(system["rare"][layer][side][:20])) if system["rare"][layer][side] else ""))
-    elif system:
-        print("SYSTEM modules the 68 has and the candidate lacks (not red): %d; the candidate has alone: %d counted, %d .mui excused, %d .cat excused, %d orphan .mui; .mui and .cat "
-              "opened: 68 %d, candidate %d" % (system["lacking_count"], len(system["candidate_only"]), len(system["excused_candidate_only"]["mui"]),
-                                                len(system["excused_candidate_only"]["cat"]), len(system["orphans"]), len(system["listed_mui_and_cat"]["68"]),
-                                                len(system["listed_mui_and_cat"]["candidate"])))
+    listed = (report.get("not_judged") or {}).get("paths", [])
+    if listed:
+        watch = [e for e in listed if e["watch"]]
+        print("NOT JUDGED (listed in the artifact, not red): %d paths, %d to watch" % (len(listed), len(watch)))
+        for e in watch + [e for e in listed if not e["watch"]][:LISTED_IN_LOG]:
+            print("%s %s: %s %s | %s %s (by %s | %s)" % ("WATCH" if e["watch"] else "LISTED", e["path"], a_name, _launch_counts(e["A"]), b_name, _launch_counts(e["B"]),
+                                                       ", ".join(e["touched_by"]["A"]) or "-", ", ".join(e["touched_by"]["B"]) or "-"))
+        if len(listed) - len(watch) > LISTED_IN_LOG:
+            print("LISTED: %d more paths in the file of the not judged list" % (len(listed) - len(watch) - LISTED_IN_LOG))
     for side, name in (("A", a_name), ("B", b_name)):
         warm = (report.get("warmup") or {}).get(side)
         if warm:
@@ -2461,7 +2400,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
             return 2
         first, again = (read_json(out / runs[0][1]), read_json(out / runs[1][1]))
         control = judge(first, again, a_a=True)
-        write_json(out / "diff-a-a.json", control)
+        write_verdict(out / "diff-a-a.json", control, "not-judged-a-a.json")
         print("--- A/A: %s against itself" % engine_tag)
         print_report(control, engine_tag, engine_tag + " again")
         if control["verdict"] != "green":
@@ -2475,7 +2414,7 @@ def ab(candidate: str | None, candidate_seal: Path | None, leg: str, out: Path, 
                 return 2
         expected = load_expected(expected_file)
         report = judge(first, read_json(out / runs[2][1]), expected=expected, a_a=False, also_68=[again])
-        write_json(out / "diff.json", report)
+        write_verdict(out / "diff.json", report, "not-judged.json")
         print("--- A/B: %s against the candidate" % engine_tag)
         print_report(report, engine_tag, oracle.CANDIDATE)
         return 0 if report["verdict"] == "green" else 1
@@ -2521,7 +2460,7 @@ def main(argv=None) -> int:
         a, b = read_json(args.a), read_json(args.b)
         report = judge(a, b, expected=None if args.a_a else load_expected(args.expected), a_a=args.a_a)
         if args.out:
-            write_json(args.out, report)
+            write_verdict(args.out, report, args.out.stem + "-not-judged.json")
         print_report(report, a.get("engine", "A"), b.get("engine", "B"))
         if report["verdict"] == "green":
             return 0
