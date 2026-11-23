@@ -649,7 +649,7 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     linux, windows = _job(text, "e2e-network"), _job(text, "e2e-network-windows")
     assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
     for body in (linux, windows):
-        assert body.count(network) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 40" in body and "needs: core-on-index" in body
+        assert body.count(network) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 50" in body and "needs: core-on-index" in body
         assert "      - name: Run the network oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
     assert "xvfb-run -a" in linux
     shared_linux, shared_windows = _job(text, "e2e-linux"), _job(text, "e2e-windows")
@@ -666,10 +666,11 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     suite_entries = [t for r in rows if r["id"].startswith("wrapper.e2e.suite.") for t in r["tests"]]
     assert not [t for t in suite_entries if t.split("::")[0] in (network, host_file, page_file, "tests/test_ab_host_crash_linux_e2e.py")]
     assert network not in _job(text, "e2e-windows-control-a")
-    # the budget of the test itself fits the job: 5 seeds, two engine runs, with its own setup
+    # the budget of the test itself fits the job with room for a slow runner: 5 seeds, two engine runs, the worker's 120 s after it and the job's own steps (48 s before the
+    # test and 6 s after it in run 45153612447, Windows), in the 50 minutes of the job
     import test_ab_network_e2e as network_e2e
 
-    assert network_e2e.budget_s(5, 2) == 1800 and network_e2e.budget_s(5, 2) + 10 * 60 <= 40 * 60
+    assert network_e2e.budget_s(5, 2) == 2197 and network_e2e.budget_s(5, 2) + 120 + 60 + 10 * 60 <= 50 * 60
 
 
 def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_traces_with():
@@ -686,6 +687,37 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
 
     assert host_e2e.TIMEOUT_S + crash_e2e.TIMEOUT_S + 10 * 60 <= 65 * 60, "the A/A and the recorder's own test, one after the other, fit the Linux job"
     assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the Windows job"
+
+
+def test_the_host_e2e_expects_the_stock_footprint_on_windows_in_both_modes_and_never_on_linux():
+    """Run 45165805370: the stock control now runs after a green A/A on every Windows run, and the e2e that expected only the two runs of the published engine was red on a
+    control that had passed. The four cases, so that the gate (the candidate mode) does not find a fifth."""
+    import test_ab_host_e2e as host_e2e
+
+    a_a, a_b = ["footprint-68-again.json", "footprint-68.json"], ["footprint-68-again.json", "footprint-68.json", "footprint-candidate.json"]
+    assert host_e2e.expected_footprints(False, "linux") == a_a
+    assert host_e2e.expected_footprints(True, "linux") == a_b
+    assert host_e2e.expected_footprints(False, "win32") == sorted(a_a + ["footprint-stock.json"])
+    assert host_e2e.expected_footprints(True, "win32") == sorted(a_b + ["footprint-stock.json"])
+
+
+def test_the_windows_host_job_turns_on_the_location_service_of_the_runner_before_any_launch():
+    """Run 45153612447: the runner had `lfsvc` Disabled and the machine's location consent Deny, so the stock control of the geolocation step could not reach the platform
+    provider and waited 26 minutes. The laboratory is set before any launch (the published engine, the candidate and the stock then run on the same machine in the same state),
+    and a setting that does not hold is red."""
+    root = Path(__file__).resolve().parents[1]
+    body = _job((root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8"), "e2e-host-windows")
+    name = "      - name: Turn on the Windows location service of the runner (the laboratory of the geolocation step)\n"
+    assert body.count(name) == 1, "the job turns on the location service in a step of its own"
+    step = body[body.index(name):]
+    step = step[:step.index("\n      - ", 1)]
+    assert "shell: pwsh" in step and "$ErrorActionPreference = 'Stop'" in step
+    assert "ConsentStore\\location'" in step and "HKLM:" in step and "HKCU:" in step and '"$user\\NonPackaged"' in step and "-Value 'Allow'" in step
+    assert "Set-Service -Name lfsvc -StartupType Manual" in step and "Start-Service -Name lfsvc" in step
+    assert "throw" in step and "'Running'" in step, "a service that is not on is red with its reason"
+    assert "New-Item -Path $key -Force" not in step, "-Force on an existing registry key would empty it"
+    first_launch = body.index("      - name: Run the host oracle's A/A\n")
+    assert body.index(name) < first_launch, "the laboratory is set before the first launch"
 
 
 def test_the_linux_jobs_of_the_three_oracles_install_gdb_and_elfutils_and_point_the_kernel_s_core_pattern_at_a_folder_of_the_job():

@@ -747,19 +747,19 @@ def with_warmup(fp, kinds=None, files=None, touched_by=None, spawned_by=None, se
 def test_an_engine_run_makes_its_warm_up_launch_first_of_the_first_seed_then_its_measured_ones_and_the_idle_launch_last(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
         calls.append((seed, name, idle))
         return seed_footprint(seed)
 
     monkeypatch.setattr(host, "run_seed", fake_run_seed)
     monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
     doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68")
-    assert calls == [(11, "warmup", False), (11, None, False), (12, None, False), (11, "idle", True), (11, "bare", False)]
-    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["idle"]["seed"] == 11 and doc["bare"]["seed"] == 11 and doc["problems"] == []
+    assert calls == [(11, "warmup", False), (11, None, False), (12, None, False), (11, "idle", True)], "no bare launch"
+    assert doc["warmup"]["seed"] == 11 and [s["seed"] for s in doc["seeds"]] == [11, 12] and doc["idle"]["seed"] == 11 and "bare" not in doc and doc["problems"] == []
 
 
 def test_a_warm_up_that_failed_is_red_in_the_document_like_a_measured_launch(monkeypatch):
-    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
         fp = seed_footprint(seed)
         if name == "warmup":
             fp["problems"] = ["the file trace did not see the end canary file of the oracle"]
@@ -1282,7 +1282,7 @@ def test_the_journey_has_the_geolocation_step_after_its_own_steps_in_a_run():
     source = Path(host.__file__).read_text(encoding="utf-8")
     run_seed = source[source.index("def run_seed("):source.index("def _wait_for_tree_exit(")]
     assert run_seed.index("for n, (name, method) in enumerate(JOURNEY, 1)") < run_seed.index("geolocation_step(browser, geo_origin, GEO_DECLARED, len(JOURNEY) + 1)")
-    assert run_seed.index("geolocation_step(") < run_seed.rindex("browser.close()")
+    assert run_seed.index("geolocation_step(") < run_seed.rindex("context.close()")  # the close of the page launch
 
 
 def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
@@ -1297,7 +1297,7 @@ def test_the_lab_page_of_the_step_is_served_by_the_oracle_itself():
         stop()
 
 
-def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_verdict_and_a_broken_one_is_exit_2(tmp_path, monkeypatch):
+def test_a_windows_ab_runs_the_stock_control_after_the_a_a_and_before_the_verdict_and_a_broken_one_is_exit_2(tmp_path, monkeypatch):
     order = []
     pub = fake_engine(tmp_path / "fetch", "pub")
     cand = fake_engine(tmp_path / "checkout", "cand")
@@ -1332,7 +1332,121 @@ def test_a_windows_ab_runs_the_stock_control_after_the_candidate_and_before_the_
     assert order[-2:] == [("stock", "windows-x86_64"), ("judge", "a-b")]
     order.clear()
     assert host.ab(None, None, "windows-x86_64", tmp_path / "o3", "firefox-68", [11]) == 0
-    assert ("stock", "windows-x86_64") not in order, "the A/A has no candidate: no control of the geolocation step"
+    assert order == [("run", "firefox-68"), ("run", "firefox-68 again"), ("judge", "a-a"), ("stock", "windows-x86_64")], "no candidate: the control of the geolocation step runs all the same"
+
+
+def test_a_windows_run_with_no_candidate_runs_the_stock_control_after_a_green_a_a_and_a_broken_one_is_red(tmp_path, monkeypatch):
+    """Run 45121964904 (the gate of the series): the control of the geolocation step ran only with a candidate, so a pull request never ran it."""
+    pub = fake_engine(tmp_path / "fetch", "pub")
+    monkeypatch.setattr(host, "_windows", lambda: True)
+    monkeypatch.setattr(host.oracle, "fetch_published", lambda tag, work: (pub, "pub-seal"))
+    monkeypatch.setattr(host, "print_report", lambda *a, **k: None)
+    seen = []
+    monkeypatch.setattr(host, "run_subprocess", lambda exe, seal, leg, out, label, seeds: host.write_json(out, footprint(label, platform="win32")) or 0)
+    monkeypatch.setattr(host, "judge", lambda a, b, **kw: {"verdict": "green", "problems": [], "not_judged": {}})
+    monkeypatch.setattr(host, "run_stock_control", lambda leg, out: seen.append(leg) or {"stock": True})
+    assert host.ab(None, None, "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 0 and seen == ["windows-x86_64"]
+    monkeypatch.setattr(host, "run_stock_control", lambda leg, out: None)
+    assert host.ab(None, None, "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 2, "a broken control is red with no candidate too"
+    monkeypatch.setattr(host, "_windows", lambda: False)
+    seen.clear()
+    monkeypatch.setattr(host, "run_stock_control", lambda leg, out: seen.append(leg) or {"stock": True})
+    assert host.ab(None, None, "linux-x86_64", tmp_path / "o3", "firefox-68", [11]) == 0 and seen == [], "Linux has no Windows location provider: no control"
+
+
+def fake_playwright(monkeypatch, executable, launch=None):
+    """`playwright.sync_api.sync_playwright` whose Firefox has this executable path (and, if given, this launch)."""
+    import types
+    from contextlib import contextmanager
+
+    class Firefox:
+        executable_path = str(executable)
+
+        def launch(self, **kw):
+            return launch()
+
+    @contextmanager
+    def sync_playwright():
+        yield types.SimpleNamespace(firefox=Firefox())
+
+    module = types.ModuleType("playwright.sync_api")
+    module.sync_playwright = sync_playwright
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", module)
+
+
+class FakeTrace:
+    def __init__(self, work):
+        pass
+
+    def start(self):
+        pass
+
+    def cleanup(self):
+        pass
+
+
+def test_a_stock_firefox_that_is_not_installed_is_said_by_name_and_is_not_blamed_on_the_platform_provider(tmp_path, monkeypatch, capsys):
+    """Run 45121964904: `Executable doesn't exist at ...firefox-1532...firefox.exe` ended the stock run and the oracle printed that the step does not reach the provider."""
+    missing = tmp_path / "ms-playwright" / "firefox-1532" / "firefox" / "firefox.exe"
+    fake_playwright(monkeypatch, missing)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    document = host.run_stock("windows-x86_64")
+    text = "\n".join(host.stock_control_problems(document))
+    assert "is not installed" in text and str(missing) in text and "python -m playwright install firefox" in text
+    assert "does not reach the platform provider" not in text and "did not start the Windows location utility" not in text
+    # and the control says the same on the output
+    out = tmp_path / "o"
+    out.mkdir()
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, document) or 0)
+    assert host.run_stock_control("windows-x86_64", out) is None
+    printed = capsys.readouterr().out
+    assert "is not installed" in printed and "does not reach the platform provider" not in printed and "BROKEN CONTROL" in printed
+
+
+def test_a_stock_firefox_that_does_not_launch_says_why_and_one_that_ran_without_the_provider_leaves_its_evidence(tmp_path, monkeypatch, capsys):
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    def boom():
+        raise RuntimeError("BrowserType.launch: Timeout 180000ms exceeded.\nCall log: ...")
+
+    fake_playwright(monkeypatch, exe, launch=boom)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    problems = host.stock_control_problems(host.run_stock("windows-x86_64"))
+    assert problems == ["stock control: the stock Firefox of Playwright did not start: BrowserType.launch: Timeout 180000ms exceeded."]
+    # started, no provider: the claim is the same as ever, and the log has what the tree did
+    stock = a_stock(WIN_KINDS, files=["c:\\windows\\system32\\kernel32.dll", "c:\\windows\\system32\\ntdll.dll"])
+    stock["stock"]["processes"] = [{"label": "parent", "cmd": "firefox.exe -no-remote"}]
+    out = tmp_path / "o"
+    out.mkdir()
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, stock) or 0)
+    assert host.run_stock_control("windows-x86_64", out) is None
+    printed = capsys.readouterr().out
+    assert "did not start the Windows location utility process" in printed and "BROKEN CONTROL: the geolocation step does not reach the platform provider" in printed
+    assert "stock evidence: process parent: firefox.exe -no-remote" in printed and "kernel32.dll" in printed and "location modules loaded: none" in printed
+
+
+def test_the_windows_host_job_installs_playwright_s_firefox_with_the_python_of_the_tests_before_the_oracle_runs():
+    """Run 45121964904: the job did not install it and `run_stock` found no executable."""
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    start = text.index("\n  e2e-host-windows:\n")
+    job = text[start:text.index("\n  # ``The page oracle``", start)]
+    assert "runs-on: windows-2022" in job and "-m pytest tests/test_ab_host_e2e.py" in job
+    install = job.index("python -m playwright install firefox")
+    assert job.index("actions/setup-python") < job.index('python -m pip install "playwright==') < install < job.index("-m pytest tests/test_ab_host_e2e.py")
+    assert job.count("playwright install") == 1
+    diagnostic = job[job.index("      - name: The state of the Windows location service"):]
+    diagnostic = diagnostic[:diagnostic.index("      - name: The leg ran")]
+    assert "if: always()" in diagnostic and "shell: pwsh" in diagnostic and "Get-Service lfsvc" in diagnostic and "Format-List" in diagnostic
+    for key in ("HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\location",
+                "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\location",
+                "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\lfsvc\\Service\\Configuration"):
+        assert key in diagnostic
+    assert not re.search(r"Set-|New-|Remove-|Start-Service|Stop-Service", diagnostic), "read only"
 
 
 def test_the_stock_command_is_for_windows_only(tmp_path, monkeypatch, capsys):
@@ -1677,7 +1791,7 @@ def test_a_creator_pid_that_windows_reused_before_the_launch_is_not_in_its_tree(
 
 
 # -
-# The bare launch (no client, no page; never compared) and the evidence of how a browser ended and what a crash leaves; the creates of the host.
+# The evidence of how a browser ended and what a crash leaves; the creates of the host.
 
 def test_the_crash_files_are_read_when_they_appear_a_dmp_by_its_name_and_an_extra_by_its_content(tmp_path):
     folder = tmp_path / "minidumps"
@@ -1686,14 +1800,14 @@ def test_the_crash_files_are_read_when_they_appear_a_dmp_by_its_name_and_an_extr
     (folder / "a1b2.extra").write_text('{"MozCrashReason": "MOZ_CRASH(shutdown hang)", "ShutdownProgress": "profile-change-teardown", "CrashType": "SIGSEGV"}', encoding="utf-8")
     (folder / "notes.txt").write_text("not a crash file", encoding="utf-8")
     seen = {}
-    host.scan_crash_files([folder, tmp_path / "missing"], seen)
+    crash.scan_crash_files([folder, tmp_path / "missing"], seen)
     files = sorted(seen.values(), key=lambda f: f["name"])
     assert [f["name"] for f in files] == ["a1b2.dmp", "a1b2.extra"] and files[0]["size"] == 104 and "content" not in files[0]
     assert "MozCrashReason" in files[1]["content"] and "ShutdownProgress" in files[1]["content"]
-    host.scan_crash_files([folder], seen)
+    crash.scan_crash_files([folder], seen)
     assert "MozCrashReason" in seen[str(folder / "a1b2.extra")]["content"], "a file that did not change is not read again"
     (folder / "a1b2.extra").write_text('{"MozCrashReason": "later", "more": "a file seen half written is read again when its size changes"}', encoding="utf-8")
-    host.scan_crash_files([folder], seen)
+    crash.scan_crash_files([folder], seen)
     assert "later" in seen[str(folder / "a1b2.extra")]["content"]
 
 
@@ -1705,15 +1819,15 @@ def test_a_crash_file_seen_by_its_name_before_its_content_is_written_is_read_aga
     extra = folder / "x.extra"
     seen = {}
     extra.write_bytes(b"")
-    host.scan_crash_files([folder], seen)
+    crash.scan_crash_files([folder], seen)
     assert seen[str(extra)]["content"] == "" and seen[str(extra)]["size"] == 0
     extra.write_bytes(b'{"CrashType": "SIG')
-    host.scan_crash_files([folder], seen)
+    crash.scan_crash_files([folder], seen)
     assert seen[str(extra)]["content"] == '{"CrashType": "SIG'
     extra.write_bytes(b'{"CrashType": "SIGSEGV"}')
-    host.scan_crash_files([folder], seen)
+    crash.scan_crash_files([folder], seen)
     assert seen[str(extra)]["content"] == '{"CrashType": "SIGSEGV"}' and seen[str(extra)]["size"] == len(b'{"CrashType": "SIGSEGV"}')
-    host.scan_crash_files([folder], seen)
+    crash.scan_crash_files([folder], seen)
     assert len(seen) == 1, "a complete file is one entry"
 
 
@@ -1741,20 +1855,6 @@ def test_the_crash_folders_are_the_profiles_minidumps_and_the_pending_reports_of
     assert lin == [tmp_path / "home" / ".config" / "mozilla" / "firefox" / "Crash Reports" / "pending", tmp_path / "home" / ".mozilla" / "firefox" / "Crash Reports" / "pending"]
 
 
-def test_the_crash_evidence_says_how_the_parent_ended_who_the_crash_reporters_are_and_what_files_the_crash_left():
-    fp = {"lifecycle": [{"event": "start", "kind": "parent", "line": 0, "how": ""}, {"event": "end", "kind": "crashreporter", "line": 5, "how": "exited 0"},
-                        {"event": "end", "kind": "parent", "line": 9, "how": "killed by SIGSEGV"}],
-          "processes": [{"label": "parent", "exec": "firefox -profile /tmp/p"}, {"label": "crashreporter", "exec": "crashreporter --ping-cleanup /srv/lab/r/.config/mozilla/firefox/Crash Reports /tmp/p"},
-                        {"label": "minidump-analyzer", "exec": "minidump-analyzer /tmp/p/minidumps/x.dmp"}], "close": {"root_returncode": -11}}
-    got = host.crash_evidence({"files": [{"name": "x.dmp", "size": 5}], "scans": 7}, fp, {"core_pattern": "core", "cores": ["core.123"], "backtraces": {"core.123": "#0 0x0 in ?? ()"}})
-    assert got["parent_exits"] == ["killed by SIGSEGV"] and got["root_returncode"] == -11
-    assert [p["kind"] for p in got["crash_processes"]] == ["crashreporter", "minidump-analyzer"] and "--ping-cleanup" in got["crash_processes"][0]["argv"]
-    assert got["files"] == [{"name": "x.dmp", "size": 5}] and got["core"]["cores"] == ["core.123"]
-    summary = host._bare_summary({"notified": {"observed": False}, "crash": got})
-    assert summary["parent_exits"] == ["killed by SIGSEGV"] and summary["dump_files"] == ["x.dmp"] and summary["cores"] == ["core.123"]
-    assert host.crash_evidence({}, {"processes": []})["parent_exits"] is None, "no lifecycle: it is not said that the parent ended well"
-
-
 def test_a_linux_core_is_found_where_the_launch_ran_and_its_backtrace_is_asked_of_gdb(tmp_path, monkeypatch):
     (tmp_path / "core.4242").write_bytes(b"\x7fELF")
     (tmp_path / "other.txt").write_text("x", encoding="utf-8")
@@ -1764,15 +1864,15 @@ def test_a_linux_core_is_found_where_the_launch_ran_and_its_backtrace_is_asked_o
 
     calls = []
     monkeypatch.setattr(host.shutil, "which", lambda name: "/usr/bin/gdb")
-    got = host.core_info(tmp_path, "/e/firefox/firefox", run=lambda argv, **kw: calls.append(argv) or Done())
+    got = crash.core_info(tmp_path, "/e/firefox/firefox", run=lambda argv, **kw: calls.append(argv) or Done())
     assert got["cores"] == ["core.4242"] and "ShutdownXPCOM" in got["backtraces"]["core.4242"]
     assert calls == [["/usr/bin/gdb", "-batch", "-ex", "bt", "/e/firefox/firefox", str(tmp_path / "core.4242")]]
     monkeypatch.setattr(host.shutil, "which", lambda name: None)
-    assert host.core_info(tmp_path, "/e/firefox/firefox")["backtraces"] == {"core.4242": "gdb is not installed"}
-    assert host.core_info(tmp_path / "empty-nowhere", "x")["cores"] == []
+    assert crash.core_info(tmp_path, "/e/firefox/firefox")["backtraces"] == {"core.4242": "gdb is not installed"}
+    assert crash.core_info(tmp_path / "empty-nowhere", "x")["cores"] == []
 
 
-def test_the_stand_in_allows_core_dumps_in_every_launch_and_only_the_bare_one_moves_to_its_own_folder(tmp_path, monkeypatch):
+def test_the_stand_in_allows_core_dumps_in_every_launch_and_a_folder_asked_for_is_where_it_moves_to(tmp_path, monkeypatch):
     import _strace_stand_in as stand_in
 
     class Help:
@@ -1787,9 +1887,6 @@ def test_the_stand_in_allows_core_dumps_in_every_launch_and_only_the_bare_one_mo
     assert "ulimit" not in plain.read_text(encoding="utf-8"), "the font tests' stand-in is as it was"
     every = Path(stand_in._stand_in(str(real), tmp_path / "t3", tmp_path / "l3", tmp_path / "p3", cores=True)).read_text(encoding="utf-8")
     assert "ulimit -c unlimited\nexec " in every and "\ncd " not in every, "a measured launch may dump core and its working directory is the launcher's (the paths the trace reads are the same)"
-    cores = Path(stand_in._stand_in(str(real), tmp_path / "t2", tmp_path / "l2", tmp_path / "p2", core_dir=tmp_path / "cores"))
-    text = cores.read_text(encoding="utf-8")
-    assert "ulimit -c unlimited\ncd %s\nexec " % (tmp_path / "cores") in text
 
 
 def create_event(pid, name, options):
@@ -1808,19 +1905,6 @@ def test_a_path_the_tree_asked_the_system_to_make_is_told_from_one_it_only_opene
     got = host.creates_of({k: sorted(v) for k, v in dispositions.items()}, lambda pid: {10: "parent", 11: "tab"}[pid], host.Context("win32"))
     assert got == [{"path": "c:\\programdata\\mozilla-1de4eec8\\firefox_s-1-5-21-500_shortcuts.ini", "kinds": ["parent"], "how": ["OPEN_IF"]},
                    {"path": "d:\\lab\\r\\old.tmp", "kinds": ["parent"], "how": ["OVERWRITE_IF"]}, {"path": "d:\\lab\\r\\x.lnk", "kinds": ["tab"], "how": ["CREATE"]}]
-
-
-def test_the_report_carries_the_bare_launch_without_comparing_it(capsys):
-    a = footprint()
-    a["bare"] = {"seed": 11, "kinds": {"parent": 1, "crashreporter": 1}, "bare": {"notified": {"observed": False}, "crash": {
-        "parent_exits": ["exited 0"], "root_returncode": 0, "crash_processes": [{"kind": "crashreporter", "argv": "crashreporter --ping-cleanup /x /y"}], "files": [], "core": None}}}
-    b = footprint("again")
-    b["bare"] = {"seed": 11, "kinds": {"parent": 1}, "bare": {"notified": {"observed": False}, "crash": {"parent_exits": ["exited 0"], "root_returncode": 0, "crash_processes": [], "files": []}}}
-    report = judge(a, b, a_a=True)
-    assert report["verdict"] == "green", "the bare launch is evidence, not a leaf"
-    assert report["bare"]["A"]["crash_processes"] == [("crashreporter", "crashreporter --ping-cleanup /x /y")] and report["bare"]["B"]["crash_processes"] == []
-    host.print_report(report, "firefox-68", "firefox-68 again")
-    assert "BARE (no client, no page; not compared) firefox-68:" in capsys.readouterr().out
 
 
 # -
@@ -1894,11 +1978,11 @@ def test_a_launch_that_left_nothing_says_so_and_the_report_carries_the_summary_l
 def with_system(fp, per_launch):
     """`per_launch`: {seed or "warmup"/"idle": [paths]}: the paths added to that launch's files."""
     fp = copy.deepcopy(fp)
-    for key in ("warmup", "idle", "bare"):
+    for key in ("warmup", "idle"):
         if key in per_launch and not fp.get(key):
             fp[key] = seed_footprint(11)
     launches = {s["seed"]: s for s in fp["seeds"]}
-    launches.update({k: fp[k] for k in ("warmup", "idle", "bare") if fp.get(k)})
+    launches.update({k: fp[k] for k in ("warmup", "idle") if fp.get(k)})
     for key, add in per_launch.items():
         launch = launches[key]
         launch["files"] = sorted(set(launch["files"]) | set(add))
@@ -2100,35 +2184,25 @@ def test_a_fake_launch_that_died_with_minus_11_is_a_red_line_with_the_evidence_a
     log = tmp_path / "strace.log"
     log.write_text(CRASH_LOG, encoding="utf-8")
     watched = {"files": [{"name": "u.extra", "dir": "d", "size": 9, "content": '{"CrashType": "SIGSEGV"}'}], "scans": 2}
-    problems, left = host.end_of_launch(-11, False, 11, "measured", [], "/e/firefox", log, watched, None, 0.0, folders=[], run=Run({}))
+    problems, left = host.end_of_launch(-11, False, 11, "measured", [], "/e/firefox", log, watched, 0.0, folders=[], run=Run({}))
     assert problems == ["the parent process exited with code -11 (SIGSEGV): seed 11, launch measured"]
     assert left["exit"] == {"code": -11, "text": "-11 (SIGSEGV)"} and left["strace"]["signals"][0][1].startswith("100 --- SIGSEGV")
     assert left["crash_files"]["extra"][0]["name"] == "u.extra"
-    assert host.end_of_launch(0, False, 11, "measured", [], "/e/firefox", log, watched, None, 0.0, folders=[]) == ([], None)
-    problems, left = host.end_of_launch(None, False, 11, "idle", [], "/e/firefox", log, {}, None, 0.0, folders=[], run=Run({}))
+    assert host.end_of_launch(0, False, 11, "measured", [], "/e/firefox", log, watched, 0.0, folders=[]) == ([], None)
+    problems, left = host.end_of_launch(None, False, 11, "idle", [], "/e/firefox", log, {}, 0.0, folders=[], run=Run({}))
     assert "not seen" in problems[0] and left is not None
-    windows, kept = host.end_of_launch(3221225477, True, 11, "bare", [], "D:\\e\\firefox.exe", None, {"files": []}, None, 0.0, run=Run({}))
-    assert "0xC0000005 (access violation)" in windows[0] and "launch bare" in windows[0] and kept["strace"] is None
-
-
-def test_the_bare_launch_looks_in_its_own_folder_for_a_core_as_well(tmp_path, monkeypatch):
-    seen = {}
-    monkeypatch.setattr(host.crash, "collect", lambda code, binary, **kw: seen.update(kw) or {"exit": {}, "said": []})
-    monkeypatch.setattr(host.crash, "core_dirs", lambda *a, **k: [Path("/job/cores")])
-    host.end_of_launch(-11, False, 1, "bare", [], "b", tmp_path / "l", {}, tmp_path, 5.0)
-    assert seen["core_folders"] == [Path("/job/cores"), tmp_path] and seen["since"] == 5.0
+    windows, kept = host.end_of_launch(3221225477, True, 11, "idle", [], "D:\\e\\firefox.exe", None, {"files": []}, 0.0, run=Run({}))
+    assert "0xC0000005 (access violation)" in windows[0] and "launch idle" in windows[0] and kept["strace"] is None
 
 
 def test_a_launch_that_did_not_end_with_0_is_in_the_verdict_of_the_run_named_by_side_seed_and_launch_whatever_launch_it_was(monkeypatch, tmp_path):
     bad = crash.exit_problem(-11, False, seed=12, launch="measured")
 
-    def fake_run_seed(binary, seed, work, name=None, idle=False, bare=False):
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
         fp = seed_footprint(seed)
         if name is None and seed == 12:
             fp["problems"] = [bad]
             fp["crash"] = {"exit": {"code": -11, "text": "-11 (SIGSEGV)"}, "said": ["no core file written"], "strace": None, "cores": None, "crash_files": {"dmp": [], "extra": []}}
-        if name == "bare":
-            fp["exit_problems"] = [crash.exit_problem(-6, False, seed=11, launch="bare")]
         if name == "idle":
             fp["problems"] = [crash.exit_problem(1, False, seed=11, launch="idle")]
         return fp
@@ -2137,7 +2211,6 @@ def test_a_launch_that_did_not_end_with_0_is_in_the_verdict_of_the_run_named_by_
     monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
     doc = host.run_engine("ff", "linux-x86_64", [11, 12], "firefox-68", tmp_path / "x.crash")
     assert "idle: the parent process exited with code 1: seed 11, launch idle" in doc["problems"]
-    assert "bare: the parent process exited with code -6 (SIGABRT): seed 11, launch bare" in doc["problems"]
     assert (tmp_path / "x.crash" / "seed12" / "crash.json").is_file()
     assert (tmp_path / "x.crash" / "seed12" / "said.txt").read_text(encoding="utf-8") == "no core file written\n"
     other = footprint()
@@ -2716,3 +2789,257 @@ def test_a_staged_ancestor_that_only_one_run_read_is_still_a_difference(monkeypa
     a = with_files(footprint(), ["/srv/ci/work/_temp"], {"/srv/ci/work/_temp": ["forkserver"]}, {"/srv/ci/work/_temp": ["readlink"]})
     report = judge(a, footprint("candidate"), expected=[])
     assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"file./srv/ci/work/_temp"}
+
+
+# -
+# Glean: a launch with a page waits for it right after its first page, and the list of `datareporting` is saved before the close.
+
+def test_the_wait_for_glean_reads_the_profile_of_the_launch_says_how_long_and_a_condition_not_met_is_a_problem_that_does_not_stop_the_launch(monkeypatch, capsys):
+    seen = []
+
+    class GleanNotReady(Exception):
+        pass
+
+    # `raising=False`: the names are the contract of scripts/ci_crash_evidence.py (`wait_for_glean(profile)` and `GleanNotReady`), written by the other half of this work
+    monkeypatch.setattr(host.crash, "GleanNotReady", GleanNotReady, raising=False)
+    monkeypatch.setattr(host.crash, "wait_for_glean", lambda profile: seen.append(profile) or 1.5, raising=False)
+    profile = Path("/tmp/invisible_profile_x")
+    assert host.wait_for_glean_of_launch(lambda: profile, 11, "measured") is None and seen == [profile]
+    assert "glean ready after 1.5 s (seed 11, launch measured)" in capsys.readouterr().out
+
+    def not_ready(profile):
+        raise GleanNotReady("Glean did not initialise in 60 s: no data.safe.bin")
+
+    monkeypatch.setattr(host.crash, "wait_for_glean", not_ready, raising=False)
+    assert host.wait_for_glean_of_launch(lambda: profile, 12, "idle") == "Glean did not initialise in 60 s: no data.safe.bin"
+    assert "glean NOT ready (seed 12, launch idle)" in capsys.readouterr().out
+
+
+def test_run_seed_waits_for_glean_after_the_first_page_and_before_the_work_of_the_launch_in_the_measured_and_the_idle_launch_and_has_no_bare_launch():
+    source = inspect.getsource(host.run_seed)
+    measured = source[source.index("            else:\n                browser = p.firefox.connect"):]
+    idle = source[source.index("            elif idle:"):source.index("            else:\n                browser = p.firefox.connect")]
+    assert measured.index("page = context.new_page()") < measured.index("wait_for_glean_of_launch(") < measured.index("journey = profile_p4.Journey(") < measured.index("for n, (name, method) in enumerate(JOURNEY, 1)")
+    assert idle.index("context.new_page()") < idle.index("wait_for_glean_of_launch(") < idle.index("wait_for_notification(profile_prefs_reader(before))")
+    for part in (idle, measured):
+        assert part.index("save_datareporting(") < part.index("context.close()"), "the list is taken just before the close"
+    assert source.count("wait_for_glean_of_launch(") == 2
+    assert "bare" not in source and "bare" not in inspect.signature(host.run_seed).parameters
+    assert "close_after_glean" not in inspect.getsource(host), "the wait is not made at the close any more"
+    assert not [name for name in dir(host) if "bare" in name.lower()], "no bare launch is left in the oracle"
+
+
+def test_the_list_of_datareporting_is_relative_sorted_with_sizes_and_a_read_error_is_a_line_of_the_file(tmp_path, monkeypatch):
+    profile = tmp_path / "invisible_profile_x"
+    (profile / "datareporting" / "glean" / "db").mkdir(parents=True)
+    (profile / "datareporting" / "glean" / "db" / "data.safe.bin").write_bytes(b"x" * 7)
+    (profile / "datareporting" / "state.json").write_text("{}", encoding="utf-8")
+    (profile / "datareporting" / "glean" / "pending_pings").mkdir()
+    assert host.datareporting_listing(profile) == "path\tsize\nglean/db/data.safe.bin\t7\nstate.json\t2\n"
+    host.save_datareporting(profile, tmp_path / "out" / "dr", "measured", 11)
+    assert (tmp_path / "out" / "dr" / "measured-11.tsv").read_text(encoding="utf-8") == "path\tsize\nglean/db/data.safe.bin\t7\nstate.json\t2\n"
+    assert host.datareporting_listing(tmp_path / "nowhere").startswith("path\tsize\n# error\t")
+    assert host.datareporting_listing(None) == "path\tsize\n# error\tthe profile of the launch was not found\n"
+    real = Path.stat
+
+    def broken(self, *a, **k):
+        if self.name == "state.json":
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", broken)
+    assert "# error\t" in host.datareporting_listing(profile) and "state.json" in host.datareporting_listing(profile)
+    host.save_datareporting(profile, None, "idle", 11)  # no folder: nothing happens
+
+
+def test_an_engine_run_hands_the_datareporting_folder_to_every_launch_and_the_run_command_puts_it_next_to_the_footprint(tmp_path, monkeypatch):
+    got = []
+
+    def fake_run_seed(binary, seed, work, name=None, idle=False, datareporting_dir=None):
+        got.append((name, datareporting_dir))
+        return seed_footprint(seed)
+
+    monkeypatch.setattr(host, "run_seed", fake_run_seed)
+    monkeypatch.setattr(host.os.path, "realpath", lambda p: p)
+    host.run_engine("ff", "linux-x86_64", [11], "firefox-68", None, tmp_path / "dr")
+    assert got == [("warmup", tmp_path / "dr"), (None, tmp_path / "dr"), ("idle", tmp_path / "dr")]
+    seen = {}
+    monkeypatch.setattr(host, "run_engine", lambda binary, leg, seeds, label, crash_dir=None, datareporting_dir=None: seen.update(crash=crash_dir, dr=datareporting_dir) or {"format": host.FORMAT, "problems": []})
+    (tmp_path / "o").mkdir()
+    host.main(["run", "ff", "--leg", "linux-x86_64", "--out", str(tmp_path / "o" / "footprint-68.json"), "--seeds", "11"])
+    assert seen["dr"] == tmp_path / "o" / "footprint-68.datareporting" and seen["crash"] == tmp_path / "o" / "footprint-68.crash"
+
+
+# -
+# A stock control that stands still says where (run 45153612447, PR #578, Windows: more than 26 minutes with no word), and the test that runs the oracle kills its whole tree.
+
+def test_the_host_test_runs_the_oracle_through_run_tree_and_not_through_a_pipe_a_grandchild_holds():
+    source = (Path(__file__).resolve().parent / "test_ab_host_e2e.py").read_text(encoding="utf-8")
+    assert "crash.run_tree(" in source and "timeout_message(" in source and "done.timed_out" in source
+    assert "subprocess.run(" not in source and "capture_output" not in source, "the child alone is killed at the timeout and communicate() waits for the grandchild that holds the pipe"
+    assert "TIMEOUT_S = 35 * 60" in source
+
+
+def test_the_launches_and_the_stock_control_write_the_launch_line_the_test_reads_back_when_the_run_does_not_end(capsys, monkeypatch):
+    assert "crash.launch_line(seed, launch_name, HOST_LABEL)" in inspect.getsource(host.run_seed)
+    line = host.crash.launch_line(11, "measured", host.HOST_LABEL)
+    assert host.crash.last_launch("x\n" + line + "\n")["launch"] == "measured"
+    assert "crash.launch_line(0, \"stock\", STOCK_LABEL)" in inspect.getsource(host.run_stock)
+
+
+class FakeProc:
+    def __init__(self, pid, name, cmdline, created):
+        self.pid, self._name, self._cmd, self._created = pid, name, cmdline, created
+
+    def name(self):
+        return self._name
+
+    def cmdline(self):
+        return self._cmd
+
+    def create_time(self):
+        return self._created
+
+
+def fake_psutil(monkeypatch, children):
+    """A `psutil` whose process (the oracle) has these descendants."""
+    import types
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=False):
+            assert recursive, "the browser's parent is a grandchild of the oracle (the driver's child)"
+            return list(children)
+
+    module = types.ModuleType("psutil")
+    module.Process = Process
+    monkeypatch.setitem(sys.modules, "psutil", module)
+
+
+def phases(text):
+    return [m.group(1) for m in re.finditer(r"^stock phase (.*?) at \d{4}-\d\d-\d\dT[\d:]+\+00:00$", text, re.M)]
+
+
+def test_the_stock_step_says_each_call_before_it_makes_it_in_order_and_the_answer_after_it_and_a_declared_step_says_nothing(capsys):
+    host.geolocation_step(FakeBrowser(), "http://127.0.0.1:9", None, 5)
+    assert phases(capsys.readouterr().out) == ["new_context", "grant_permissions", "new_page", "goto", "evaluate begin", 'evaluate end: {"answer": "error", "code": 2}']
+    host.geolocation_step(FakeBrowser(), "http://127.0.0.1:9", host.GEO_DECLARED, 5)
+    assert "stock phase" not in capsys.readouterr().out
+
+
+def test_a_stock_step_that_stands_still_leaves_the_last_phase_as_the_place_it_stood(capsys):
+    class Stuck(FakePage):
+        def evaluate(self, script):
+            self.calls.append(("evaluate", script))
+            raise RuntimeError("stuck")
+
+    class B(FakeBrowser):
+        def new_context(self, **options):
+            context = FakeContext(self.calls, options)
+            context.new_page = lambda: Stuck(self.calls)
+            return context
+
+    host.geolocation_step(B(), "http://127.0.0.1:9", None, 5)
+    assert phases(capsys.readouterr().out) == ["new_context", "grant_permissions", "new_page", "goto", "evaluate begin"]
+
+
+def test_run_stock_says_its_phases_from_the_trace_to_the_result_and_the_subprocess_prints_them_on_the_log(tmp_path, monkeypatch, capsys):
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    class Browser(FakeBrowser):
+        def close(self):
+            self.calls.append(("browser-close",))
+
+    fake_playwright(monkeypatch, exe, launch=Browser)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    fake_psutil(monkeypatch, [FakeProc(4001, "firefox.exe", ["firefox.exe", "-no-remote"], 5.0)])
+    monkeypatch.setattr(host, "_seed_result", lambda *a, **k: {"seed": 0, "steps": [], "kinds": {}, "files": []})
+    document = host.run_stock("windows-x86_64")
+    out = capsys.readouterr().out
+    assert document["stock"]["started"] is True
+    assert out.splitlines()[0].startswith("=== launch stock seed 0 of stock control began at ")
+    assert phases(out) == ["trace start", "geolocation lab", "launch", "browser parent 4001", "new_context", "grant_permissions", "new_page", "goto", "evaluate begin",
+                           'evaluate end: {"answer": "error", "code": 2}', "browser close", "seed result"]
+    source = inspect.getsource(host.run_stock_subprocess)
+    assert "crash.run_tree(" in source and "sys.stdout.write(done.stdout)" in source, "its output is run_tree's files, printed on the output of the oracle: the phases are in the log"
+
+
+def test_a_stock_process_that_stands_still_is_a_broken_control_that_names_its_last_phase_within_the_limit_and_the_log_keeps_what_it_said(tmp_path, capsys, monkeypatch):
+    import time
+
+    script = ("import sys, time, datetime\n"
+              "print('stock phase launch at', datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), flush=True)\n"
+              "print('stock phase evaluate begin at', datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), flush=True)\n"
+              "time.sleep(60)\n")
+    out = tmp_path / "footprint-stock.json"
+    began = time.monotonic()
+    rc = host.run_stock_subprocess("windows-x86_64", out, limit_s=2, command=[sys.executable, "-u", "-c", script])
+    assert time.monotonic() - began < 20 and rc == 0
+    document = host.read_json(out)
+    problems = host.stock_control_problems(document)
+    assert len(problems) == 1 and "did not end within 2 s" in problems[0] and "`evaluate begin`" in problems[0] and "tree was killed" in problems[0]
+    assert "does not reach the platform provider" not in problems[0] and document["stock"]["started"] is False
+    printed = capsys.readouterr().out
+    assert "stock phase evaluate begin at" in printed, "the log keeps the phases"
+    # and the control reports it: the verdict is the broken control that says where it stood
+    monkey_out = tmp_path / "o"
+    monkey_out.mkdir()
+    real = host.run_stock_subprocess
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: real(leg, path, limit_s=2, command=[sys.executable, "-u", "-c", script]))
+    assert host.run_stock_control("windows-x86_64", monkey_out) is None
+    printed = capsys.readouterr().out
+    assert "FAIL stock control: the stock control did not end within 2 s" in printed and "BROKEN CONTROL: the stock control did not run to the end" in printed
+
+
+def test_the_stock_limit_is_short_and_declared_and_a_process_that_ends_returns_its_code_and_its_output(tmp_path, capsys):
+    assert host.STOCK_LIMIT_S == 120 and host.STOCK_LIMIT_S < host.RUN_TIMEOUT_S
+    assert host.last_stock_phase("stock phase a at 2026-11-23T10:00:00+00:00\nstock phase b c at 2026-11-23T10:00:05+00:00\n",
+                                 now=host.datetime.datetime(2026, 11, 23, 10, 0, 9, tzinfo=host.datetime.timezone.utc)) == ("b c", host.datetime.timedelta(seconds=4))
+    assert host.last_stock_phase("nothing") == (None, None)
+    rc = host.run_stock_subprocess("windows-x86_64", tmp_path / "f.json", limit_s=30, command=[sys.executable, "-c", "print('hello'); raise SystemExit(3)"])
+    assert rc == 3 and "hello" in capsys.readouterr().out and not (tmp_path / "f.json").exists()
+
+
+def test_the_root_of_the_stock_trace_is_the_parent_of_the_firefox_playwright_launched_and_never_the_oracle(tmp_path, monkeypatch, capsys):
+    """Run 45162128126: the oracle's own pid was the root, its tree cannot exit, and the trace waited all of EXIT_LIMIT_S (116 s in `seed result`) until the 120 s of the control ended it."""
+    children = [FakeProc(3001, "node.exe", ["node.exe", "driver"], 1.0), FakeProc(4101, "firefox.exe", ["firefox.exe", "-contentproc", "-isForBrowser", "tab"], 4.0),
+                FakeProc(4001, "Firefox.exe", ["firefox.exe", "-no-remote", "-profile", "x"], 3.0), FakeProc(4009, "firefox.exe", ["firefox.exe", "-no-remote"], 9.0)]
+    fake_psutil(monkeypatch, children)
+    assert host.stock_browser_parent() == 4001, "the oldest firefox.exe without -contentproc"
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    class Browser(FakeBrowser):
+        def close(self):
+            pass
+
+    fake_playwright(monkeypatch, exe, launch=Browser)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    roots = []
+    monkeypatch.setattr(host, "_seed_result", lambda *a, **k: roots.append(a[6]) or {"seed": 0, "steps": [], "kinds": {}, "files": []})
+    host.run_stock("windows-x86_64")
+    assert roots == [4001] and roots != [os.getpid()]
+    assert "stock phase browser parent 4001 at" in capsys.readouterr().out
+
+
+def test_a_stock_firefox_with_no_parent_found_is_a_broken_control_that_says_so_and_never_traces_the_oracle(tmp_path, monkeypatch, capsys):
+    fake_psutil(monkeypatch, [FakeProc(4101, "firefox.exe", ["firefox.exe", "-contentproc", "tab"], 4.0), FakeProc(3001, "node.exe", ["node.exe"], 1.0)])
+    exe = tmp_path / "firefox.exe"
+    exe.write_text("x")
+
+    class Browser(FakeBrowser):
+        def close(self):
+            self.calls.append(("browser-close",))
+
+    fake_playwright(monkeypatch, exe, launch=Browser)
+    monkeypatch.setattr(host, "WindowsTrace", FakeTrace)
+    monkeypatch.setattr(host, "start_geo_lab", lambda: ("http://127.0.0.1:1", lambda: None))
+    monkeypatch.setattr(host, "_seed_result", lambda *a, **k: pytest.fail("the trace must not be read with this process as its root"))
+    document = host.run_stock("windows-x86_64")
+    problems = host.stock_control_problems(document)
+    assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform provider" not in problems[0]

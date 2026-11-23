@@ -506,16 +506,17 @@ jobs:
           retention-days: 14
 
   # ``The network oracle``: the A/A of tests/test_ab_network_e2e.py (the P4 journey and the lab, the published engine against itself) on its own job, Linux and Windows,
-  # as its gate leg runs it. On a pull request that changes the oracle it visits all five seeds of the candidate set (scripts/ci_ab_pr_seeds.py), 30 minutes at most
-  # for the run (the test's own budget: 120 s to start and, for each of the two engine runs, 240 s for the first seed and 150 s for each next one; about 15 minutes on
-  # Linux and 19 on Windows expected), which would not fit in the shared job's 40 minutes next to everything else. The shared jobs leave this file out (OWN_JOB_FILES
+  # as its gate leg runs it. On a pull request that changes the oracle it visits all five seeds of the candidate set (scripts/ci_ab_pr_seeds.py), 37 minutes at most
+  # for the run (the test's own guard, from the measured runs plus 25%; about 20 minutes on Linux and 22 on Windows measured in run 45153612447), which would not fit in
+  # the shared job's 40 minutes next to everything else. The shared jobs leave this file out (OWN_JOB_FILES
   # above, `own_job` in the Windows parts). The same setup as the shared jobs: the security state, the engine, the GeoIP database made by the repository.
   e2e-network:
     name: e2e (network, linux)
     needs: core-on-index
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
@@ -592,7 +593,8 @@ jobs:
     needs: core-on-index
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
-    timeout-minutes: 40
+    # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
+    timeout-minutes: 50
     defaults:
       run:
         shell: bash
@@ -782,6 +784,37 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      # The geolocation control of the host oracle runs on Playwright's own Firefox (`run_stock`, `ci_ab_host.py stock`) on every run: the binary is not in the image (run
+      # 45121964904: `Executable doesn't exist at ms-playwright/firefox-1532/firefox/firefox.exe`, and the oracle blamed the platform provider). The same python as the tests.
+      - name: Playwright's own Firefox (the control of the geolocation step)
+        run: python -m playwright install firefox
+      # The laboratory, before any launch (the published engine, the candidate and the stock control then run on the same machine in the same state): the runner image has
+      # the Windows location service off and denied for the machine (run 45153612447: `lfsvc` Disabled and Stopped, `HKLM\...\ConsentStore\location` = Deny), so stock
+      # Firefox cannot reach the platform provider and its request waits on the system. A runner that is thrown away after the job: the service is made startable and started,
+      # and the consent is Allow for the machine and for the user's non-packaged apps. A setting that does not hold is red here with its reason, never a silent go-on.
+      - name: Turn on the Windows location service of the runner (the laboratory of the geolocation step)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $machine = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+          $user = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+          foreach ($key in @($machine, $user, "$user\NonPackaged")) {
+            if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
+            Set-ItemProperty -Path $key -Name Value -Value 'Allow'
+          }
+          Set-Service -Name lfsvc -StartupType Manual
+          Start-Service -Name lfsvc
+          $service = Get-Service -Name lfsvc
+          $bad = @()
+          if ($service.Status -ne 'Running') { $bad += "lfsvc is $($service.Status), not Running" }
+          if ($service.StartType -eq 'Disabled') { $bad += 'lfsvc is still Disabled' }
+          foreach ($key in @($machine, $user, "$user\NonPackaged")) {
+            $value = (Get-ItemProperty -Path $key -Name Value).Value
+            if ($value -ne 'Allow') { $bad += "$key is $value, not Allow" }
+            "$key = $value"
+          }
+          "lfsvc: $($service.Status), $($service.StartType)"
+          if ($bad) { throw ("the location service of the runner is not on: " + ($bad -join '; ')) }
       - name: The security state (a fixed directory of the repository)
         shell: bash
         run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
@@ -802,6 +835,30 @@ jobs:
           print(counts)
           sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
           PY
+      # What the Windows location provider needs, read only and printed when the control says the step does not reach it (the service, the consent of the location
+      # capability for the machine and for the user, its configuration): the runner's state, to be read next to the stock evidence of the oracle.
+      - name: The state of the Windows location service and of its consent (read only)
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "--- Get-Service lfsvc"
+          try { Get-Service lfsvc -ErrorAction Stop | Format-List * } catch { "lfsvc: not readable: $($_.Exception.Message)" }
+          foreach ($key in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+              'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration')) {
+            "--- $key"
+            if (-not (Test-Path -LiteralPath $key)) { "key absent: $key"; continue }
+            try { Get-ItemProperty -LiteralPath $key -ErrorAction Stop | Format-List * } catch { "not readable: $($_.Exception.Message)" }
+            foreach ($sub in @('NonPackaged')) {
+              $path = Join-Path $key $sub
+              if (Test-Path -LiteralPath $path) {
+                "--- $path"
+                try { Get-ItemProperty -LiteralPath $path -ErrorAction Stop | Format-List * } catch { "not readable: $($_.Exception.Message)" }
+              }
+            }
+          }
       - name: The leg ran with the pinned GeoIP database
         if: always()
         run: |

@@ -18,8 +18,8 @@ events, and the idle windows end at an event (see IDLE in scripts/ci_ab_network.
 from __future__ import annotations
 
 import json
+import math
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -31,26 +31,30 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_ab_network.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import ci_ab_network as oracle  # noqa: E402
+import ci_crash_evidence as crash  # noqa: E402
 from ci_ab_pr_seeds import pr_seed_count  # noqa: E402
 
 #: The fewest leaves a comparison holds, per system. A minimal but complete run of ONE seed (one request on each road, tests/test_ab_network.py) holds about 670; a real one holds several times that. A floor of
 #: 500 says "the run saw something on every road" and nothing more: it is raised to a fraction of the measured count once the A/A has measured it.
 FLOOR = {"linux": 500, "win32": 500}
 
-#: The hang guard of the test, sized from what it will run. It is a safety net and never a verdict: the pull request's default timeout of 420 s (`--timeout 420 --timeout-method thread`
-#: of run_e2e.py) killed the xdist worker of the A/A on 5 seeds, on Linux and on Windows (run 44963364060), because the run takes minutes per seed.
-#: Measured (runs 44946411675 and 44960767715, A/A of one seed, two engine runs): 4:00 on Linux and 4:50 on Windows, so 120 s and 145 s per engine run for the first seed, which also
-#: has the two idle launches. The budget allows 220 s for the first seed of an engine run (145 s measured on Windows), 120 s for each next one, and 120 s to start, so that the guard plus the 10 minutes of the job's own steps fit its 40 minutes: 5 seeds
-#: in an A/A are 30 minutes at most, expected about 18 on Linux and 22 on Windows (the exit-ping launch adds 1 to 2.3 minutes per engine run); with a candidate (three engine runs on every seed) 44 minutes at most.
-SETUP_S, FIRST_SEED_S, NEXT_SEED_S = 120, 220, 120
-#: The idle launch that waits for the engine to record that it told the user about its data reporting policy (60 s timer of the infobar, or the first-run tab) and then closes
-#: to count the exit pings: 140 s at most per engine run (the wait has a limit of 120 s, then the launch and the shutdown), on the first seed only.
-EXIT_PINGS_S = 140
+#: The hang guard of the test, sized from what it will run: the slowest launches MEASURED, plus a declared margin of 25%. It is a guard against a launch that hangs, never a
+#: verdict and never a threshold of the product (the pull request's default of 420 s killed the xdist worker of a 5-seed A/A: run 44963364060).
+#: Measured per engine run, 5 seeds: run 45121964904 (the gate of the series, Windows, the slowest runner seen: main launches of 139-170 s, idle c1 10 s) and run 45153612447
+#: (pull request #578, every launch with a page and the wait for Glean: main launches of 123-135 s on Windows and 110-118 s on Linux, idle c2 4-5 s, exit pings 6 s, and 15 s
+#: of the test before the first launch and after the last). An engine run is the idle launches of the first seed and one main launch per seed: 650-659 s on Windows and 590 s
+#: on Linux in 45153612447, 925-941 s in 45121964904.
+MEASURED_SETUP_S = 15
+#: idle c1 (10 s, 45121964904) + idle c2 (5 s, 45153612447) + the exit pings (6 s, 45153612447)
+MEASURED_IDLE_S = 21
+#: the slowest main launch (45121964904, Windows)
+MEASURED_MAIN_S = 170
+MARGIN = 1.25
 
 
 def budget_s(seeds: int, engine_runs: int) -> int:
-    """Seconds the test may take for ``seeds`` seeds in ``engine_runs`` runs of an engine (the A/A is two, with a candidate three)."""
-    return SETUP_S + engine_runs * (FIRST_SEED_S + EXIT_PINGS_S + (seeds - 1) * NEXT_SEED_S)
+    """Seconds the test may take for ``seeds`` seeds in ``engine_runs`` runs of an engine (the A/A is two, with a candidate three): the measured time of that run plus ``MARGIN``."""
+    return math.ceil(MARGIN * (MEASURED_SETUP_S + engine_runs * (MEASURED_IDLE_S + seeds * MEASURED_MAIN_S)))
 
 
 def plan() -> tuple:
@@ -88,8 +92,11 @@ def test_the_network_a_a_is_the_control_and_the_candidate_puts_on_the_wire_what_
         command += ["--candidate", firefox_binary, "--candidate-seal", seal]
     else:
         command += ["--a-a", "--published-binary", firefox_binary, "--seeds", ",".join(str(s) for s in oracle.default_seeds()[:plan()[0]])]
-    done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
+    # Output in files and the whole tree killed at the limit: `subprocess.run(capture_output=True, timeout=...)` killed the python child alone, the firefox grandchild held the pipe
+    # and pytest ended with its own timeout 120 s later and no word about the launch (run 45121964904, Windows, job.log 546-557).
+    done = crash.run_tree(command, out / "tree", TIMEOUT_S)
     (out / "oracle.log").write_text(done.stdout + "\n--- stderr\n" + done.stderr, encoding="utf-8")
+    assert not done.timed_out, done.timeout_message("the network oracle", TIMEOUT_S) + ":\n" + "\n".join(done.stdout.splitlines()[-30:]) + "\n" + done.stderr[-1500:]
     verdict = [line for line in done.stdout.splitlines() if line.startswith(("DIFF ", "FAIL ", "AB NETWORK", "ERROR "))]
     control = out / "diff-a-a.json"
     assert control.is_file(), "the A/A did not run to its end (exit %s):\n%s\n%s" % (done.returncode, "\n".join(verdict[:40]), done.stderr[-1500:])

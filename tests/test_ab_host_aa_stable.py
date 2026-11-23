@@ -1,6 +1,6 @@
 """The host oracle judges a path by ONE rule, in the A/A and in the A/B, on Linux and on Windows, over every host path (the system modules and the shortcut inventory included):
 
-  red if and only if a path is in ALL the measured launches (the warm-up and the seeds) of one engine and in NO launch of the other (its long idle and bare launches included);
+  red if and only if a path is in ALL the measured launches (the warm-up and the seeds) of one engine and in NO launch of the other (its long idle launch included);
   everything else that differs is listed, not judged (`report["not_judged"]`, the file `not-judged[-a-a].json` of the artifact), and the paths that are in at least half of the
   launches of one engine and in none of the other's are marked `watch`.
 
@@ -42,7 +42,7 @@ def rebuild(doc: dict) -> dict:
         launch["inventory"] = launch["inventory"] or []
         launches[name] = launch
     out = {"format": host.FORMAT, "engine": doc["engine"], "platform": doc["platform"], "problems": [], "seeds": [launches[n] for n in names if n.startswith("s")]}
-    out.update({k: launches[k] for k in ("warmup", "idle", "bare") if k in launches})
+    out.update({k: launches[k] for k in ("warmup", "idle") if k in launches})
     return out
 
 
@@ -93,11 +93,11 @@ def test_the_declared_difference_of_a_real_linux_run_is_still_declared_and_not_r
 
 
 # -
-# The rule on built footprints: six measured launches (the warm-up and five seeds), then the idle and the bare launch.
+# The rule on built footprints: six measured launches (the warm-up and five seeds), then the idle launch.
 
 SEEDS = (1, 2, 3, 4, 5)
 MEASURED = ("warmup",) + tuple("s%d" % s for s in SEEDS)
-LONG = ("idle", "bare")
+LONG = ("idle",)
 KINDS = {"parent": 1, "tab/isForBrowser": 2, "gpu": 1}
 BASE = ["/etc/fonts/fonts.conf", "/etc/hosts", "/usr/lib/x86_64-linux-gnu/libc.so.6"]
 P = "/var/lib/probe/the-path"
@@ -162,9 +162,9 @@ def test_a_path_in_every_measured_launch_of_one_engine_and_in_one_launch_of_the_
 
 
 def test_the_long_launches_of_the_other_engine_count_as_a_launch_of_it_and_a_path_only_a_long_launch_has_is_only_listed():
-    assert judge(built("A", only_in(MEASURED)), built("B", {"bare": [P]}), a_a=True)["verdict"] == "green"
+    assert judge(built("A", only_in(MEASURED)), built("B", {"idle": [P]}), a_a=True)["verdict"] == "green"
     report = judge(built("A"), built("B", only_in(LONG)), a_a=True)
-    assert report["verdict"] == "green" and listed(report)[P]["B"] == {"measured": [0, 6], "long": [2, 2]}
+    assert report["verdict"] == "green" and listed(report)[P]["B"] == {"measured": [0, 6], "long": [1, 1]}
     assert judge(built("A", only_in(LONG)), built("B"), a_a=True)["verdict"] == "green", "what the long launches of one engine alone do is not red either"
 
 
@@ -278,13 +278,13 @@ def test_the_not_judged_file_has_the_fields_of_each_entry(tmp_path, monkeypatch)
             "footprint-68-again.json": built("firefox-68 again", only_in(MEASURED[1:5]), platform="win32"), "footprint-candidate.json": built("candidate", platform="win32")}
     assert run_ab(tmp_path, monkeypatch, docs) == 0
     a_a = json.loads((tmp_path / "o" / "not-judged-a-a.json").read_text(encoding="utf-8"))
-    assert a_a["launches"] == {"A": {"measured": 6, "long": 2}, "B": {"measured": 6, "long": 2}}
-    assert a_a["paths"] == [{"path": P, "watch": False, "A": {"measured": [5, 6], "long": [0, 2]}, "B": {"measured": [4, 6], "long": [0, 2]},
+    assert a_a["launches"] == {"A": {"measured": 6, "long": 1}, "B": {"measured": 6, "long": 1}}
+    assert a_a["paths"] == [{"path": P, "watch": False, "A": {"measured": [5, 6], "long": [0, 1]}, "B": {"measured": [4, 6], "long": [0, 1]},
                              "touched_by": {"A": ["rdd"], "B": ["parent"]}}]
     a_b = json.loads((tmp_path / "o" / "not-judged.json").read_text(encoding="utf-8"))
-    assert a_b["launches"] == {"A": {"measured": 12, "long": 4}, "B": {"measured": 6, "long": 2}}, "the 68 is its two runs"
-    assert a_b["paths"] == [{"path": P, "watch": True, "A": {"measured": [9, 12], "long": [0, 4]}, "B": {"measured": [0, 6], "long": [0, 2]},
-                             "touched_by": {"A": ["parent", "rdd"], "B": []}}], "9 of the 16 launches of the 68 and none of the candidate's"
+    assert a_b["launches"] == {"A": {"measured": 12, "long": 2}, "B": {"measured": 6, "long": 1}}, "the 68 is its two runs"
+    assert a_b["paths"] == [{"path": P, "watch": True, "A": {"measured": [9, 12], "long": [0, 2]}, "B": {"measured": [0, 6], "long": [0, 1]},
+                             "touched_by": {"A": ["parent", "rdd"], "B": []}}], "9 of the 14 launches of the 68 and none of the candidate's"
 
 
 def test_the_log_prints_the_not_judged_list_with_the_watched_paths_before_the_others(capsys):
