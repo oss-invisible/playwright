@@ -4,12 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.58.1] - 2026-11-22
+## [0.59.0] - 2026-11-23
+
+### Changed
+- Pins invisible-core 69.82.0 on the engine firefox-69 (Firefox 159.0).
+
+### Added
+- An element handle serves the methods of Playwright's `ElementHandle` that it used to refuse as a gap: `query_selector`, `query_selector_all`,
+  `eval_on_selector`, `eval_on_selector_all` (rooted at the element), `evaluate_handle`, `is_visible`, `is_hidden`, `is_enabled`, `is_disabled`,
+  `is_checked`, `is_editable`, `wait_for_element_state`, `dblclick`, `select_text` and `dispatch_event`, with the answers and the errors
+  Playwright's own server gives. `wait_for_selector` on an element handle is still refused.
+- `set_input_files` with a file path works from a client attached with `connect`: the file is streamed into the session, as a stock client does
+  over a remote connection, and a stream can be used only by the context that made it.
 
 ### Fixed
+- The argument of `evaluate` and its kin (`page.evaluate(fn, element)`, `evaluate_handle`, `eval_on_selector`, `eval_on_selector_all` and the
+  frame and handle forms) reaches the page as Playwright sends it: element and JS handles, dates, URLs, errors, shared references, `undefined`,
+  `-0` and `ArrayBuffer` are decoded in the page instead of arriving as `null`.
+- `screenshot(scale="css")` is a picture in CSS pixels, as in stock Playwright; the scale was ignored and the picture was in device pixels.
+- `tap` on a context without `has_touch` is refused with Playwright's own message before anything is sent to the page.
 - A read that waits for its element (`inner_text`, `text_content`, `get_attribute` and the others) and runs out of time now always fails with
   Playwright's own `Timeout Nms exceeded`. On Windows it could fail with the engine connection's `no response in 0s` instead, when the last
   probe ran out of the caller's time a moment before the clock said so.
+
+### Engine firefox-69
+- On Linux the engine no longer runs the host's GL probe when the machine is declared: whether WebGL is available comes from the declaration alone.
+- A navigation that changes process is no longer ended by the document it left, and a page is reported ready only after its document.
+- A request to a page process that went away is answered instead of being left waiting, and the end of a network request and the contexts of a
+  frame are reported as Playwright expects.
+- The engine's security-state generation no longer ends in a crash now and then (the telemetry was starting during shutdown).
+- On Windows, the port a WebRTC connection holds is its own.
+
+### Known issues
+- `tap` with `has_touch` fails with an engine error: the engine cannot send a touch event since Firefox 159. It will be fixed in the engine.
 
 ## [0.58.0] - 2026-11-21
 
