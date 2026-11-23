@@ -97,7 +97,6 @@ SERVER_ROOT = {"JugglerServer": "Root"}
 #: The channels that exist in the client and are never created by the server, because the ONLY way to create them is a method the server refuses.
 #: {channel: (the methods that create it)}. Each creator must be sent by the client, and every send of it must be DECLARED (checked below).
 UNREACHABLE = {
-    "WritableStream": ("createTempFiles",),                                     # `convert_input_files`, `_set_input_files_helpers.py` (a remote connection streams the files)
     "CDPSession": ("newCDPSession", "newBrowserCDPSession"),                    # `BrowserContext.new_cdp_session`, `Browser.new_browser_cdp_session`
     "WebSocketRoute": ("setWebSocketInterceptionPatterns",),                    # `BrowserContext.route_web_socket`, `Page.route_web_socket`
     "JsonPipe": ("connect",),                                                   # `BrowserType.connect`, on LocalUtils (`pipe` of the answer)

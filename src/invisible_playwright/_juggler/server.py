@@ -373,7 +373,7 @@ def _launch_environment(named) -> Dict[str, str]:
     return {e["name"]: e["value"] for e in named}
 
 
-def _upload_paths(server: "JugglerServer", params: Dict) -> list:
+def _upload_paths(server: "JugglerServer", params: Dict, context: Optional["BrowserContextDispatcher"] = None) -> list:
     """The local paths a `setInputFiles` request stands for.
 
     ⛔ ONE READER, because there are two senders. The same request arrives at
@@ -394,27 +394,94 @@ def _upload_paths(server: "JugglerServer", params: Dict) -> list:
     same engine command as a path, so the page receives it the way it
     receives a file a user picked - and, as for a user's pick, Firefox derives
     the file's type from its name; the payload's `mimeType` is not carried.
-    `streams` are the remote-connection path (`createTempFiles`), outside the
-    perimeter by decision; this client never sends them to a local server.
+    `streams` are what a client on a REMOTE connection (`connect`) sends for a
+    path: it copied each file into a `WritableStream` made by
+    `createTempFiles` (`BrowserContextDispatcher.op_create_temp_files`) and
+    names those streams here. Each one is a file of this session, already
+    closed, and goes through the engine like any other path.
+
+    ⛔ A STREAM IS USABLE ONLY BY THE CONTEXT THAT MADE IT. `context` is the
+    one of the frame or the handle doing the `setInputFiles`; a stream that is
+    not its child is answered as the stock server answers a guid outside the
+    connection (`streams[i]: no object with guid <g>`), whether it belongs to
+    another context of the same client or to another client's. Without a
+    context no stream is usable.
 
     ⛔ A FOLDER IS REFUSED, BY NAME. The engine's `Page.setFileInputFiles`
     takes files: handed the folder's path it took the TAB down (the next call
     answered "cannot find session"), measured on firefox-34 and on the engine
     after it. Read as an empty list, as before, the engine answered with an
     exception naming neither the folder nor the reason. Both are worse than
-    saying it.
+    saying it. A folder over `connect` is `directoryStream` (and
+    `createTempFiles` with a `rootDirName`): the same sentence.
     """
     directory = params.get("localDirectory")
     if directory:
-        raise ProtocolException(
-            "set_input_files with a folder (%s) is not supported: the engine "
-            "takes files, so pass the files inside it instead" % directory)
+        raise _folder_refused(directory)
+    if params.get("directoryStream"):
+        raise _folder_refused("a folder streamed by the client")
+    streams = params.get("streams")
+    if streams:
+        return [_streamed_file(server, channel, context, "streams[%d]" % n) for n, channel in enumerate(streams)]
     raw = params.get("localPaths") or params.get("files")
     if raw:
         return [entry.get("name") if isinstance(entry, dict) else entry
                 for entry in raw]
     return [server.stage_upload(payload)
             for payload in params.get("payloads") or []]
+
+
+def _folder_refused(what: str) -> ProtocolException:
+    """The refusal of an upload of a folder, in the one sentence every door of it says."""
+    return ProtocolException(
+        "set_input_files with a folder (%s) is not supported: the engine "
+        "takes files, so pass the files inside it instead" % what)
+
+
+def _streamed_file(server: "JugglerServer", channel: Any, context: Any, where: str) -> str:
+    """The path of the file a `streams` entry of `setInputFiles` names: a `WritableStream` of `context` that the client closed.
+
+    The sentences are the stock server's (`_tChannelImplFromWire`, playwright 1.61.0 coreBundle.js:18308-18318): `<where>: no object with guid <g>`,
+    `<where>: object with guid <g> has type <t>, expected WritableStream`. A stream of another context is "no object": it is not in the scope the
+    request came from.
+    """
+    guid = channel.get("guid") if isinstance(channel, dict) else None
+    if not isinstance(guid, str):
+        raise ProtocolException("%s: expected guid for WritableStream" % where)
+    stream = server._objects.get(guid)
+    if stream is None or (isinstance(stream, WritableStreamDispatcher) and (context is None or stream.parent is not context)):
+        raise ProtocolException("%s: no object with guid %s" % (where, guid))
+    if not isinstance(stream, WritableStreamDispatcher):
+        raise ProtocolException("%s: object with guid %s has type %s, expected WritableStream" % (where, guid, stream.TYPE))
+    if not stream.closed:
+        raise ProtocolException(
+            "the stream %s is not closed: the client has not finished copying the file, and the page would read half of it" % guid)
+    return stream.path
+
+
+#: Names a Windows file system opens as a DEVICE, not a file (`CON`, `NUL`, `COM1`...), with or without an extension.
+_WINDOWS_DEVICES = frozenset(["CON", "PRN", "AUX", "NUL"] + ["COM%d" % n for n in range(1, 10)] + ["LPT%d" % n for n in range(1, 10)])
+_BACKSLASH, _NUL = chr(92), chr(0)
+
+
+def _upload_file_name(name: Any) -> str:
+    """The name a client gave a file it streams, if and only if it is ONE file name.
+
+    ⛔ THE NAME IS WHAT A CLIENT CHOSE, and it is joined to a folder of this machine. `stage_upload` reduces a payload's name to its last component
+    and writes it; here the name is REFUSED when it is anything else, because a path that is not a bare name is a client that means something
+    other than "a file called this" (a folder, a way out of the call's folder), and writing it somewhere is the wrong answer to that.
+    """
+    if not isinstance(name, str) or not name:
+        raise ProtocolException("a streamed file needs a name: the page reads it as File.name")
+    bad = (name in (".", "..") or "/" in name or _BACKSLASH in name or _NUL in name
+           or os.path.isabs(name) or os.path.splitdrive(name)[0] != "")
+    if os.name == "nt":
+        bad = (bad or ":" in name or name[-1] in ". "
+               or name.split(".")[0].rstrip(" ").upper() in _WINDOWS_DEVICES)
+    if bad:
+        raise ProtocolException(
+            "the name %r of a streamed file is not a file name: it must be one name, with no folder, no drive and no '..' in it" % name)
+    return name
 
 
 #: The four numbers JSON cannot carry, as the engine names them in a
@@ -462,6 +529,17 @@ _CALL = "(f, ...a) => f(...a)"
 _READ = "o => o"
 #: The receivers of `eval_on_selector_all`: one array, in the caller's world.
 _ARRAY = "(...a) => a"
+#: The queries of a selector with an ELEMENT as root, which the core's `InjectedScript.query_selector` and `query_selector_all` cannot be asked (they pass `document`):
+#: the injected script's own `querySelector(parsed, root, strict)` and `querySelectorAll(parsed, root)`, the ones stock runs with `scope || document`
+#: (`FrameSelectors.query`, `queryAll`). The list of a `querySelectorAll` is read once (`FrameDispatcher._all`) and released there.
+_QUERY_IN = ("(injected, root, selector, strict) => injected.querySelector("
+             "injected.parseSelector(selector), root, strict) || null")
+_QUERY_ALL_IN = ("(injected, root, selector) => injected.querySelectorAll("
+                 "injected.parseSelector(selector), root)")
+#: Playwright's own sentence for a node that is no longer in the document (`throwElementIsNotAttached`).
+_NOT_ATTACHED = "Element is not attached to the DOM"
+#: The waits between the turns of an action that retries, in seconds (`ElementHandle._retryAction`: 0, 20, 100, 100, then 500 ms for every turn after).
+_RETRY_WAITS = (0.0, 0.02, 0.1, 0.1, 0.5)
 
 
 def _object_lookup(dispatcher):
@@ -636,6 +714,26 @@ class ElementHandleDispatcher(Dispatcher):
         "uncheck": "op_uncheck",
         "selectOption": "op_select_option",
         "setInputFiles": "op_set_input_files",
+        # What the client sends a handle and this table lacked, each through the
+        # path its sibling has: the Frame's queries with this element as root,
+        # the injected script's state of THIS node, the actions of THIS node,
+        # the caller's code with this element as its receiver.
+        "querySelector": "op_query_selector",
+        "querySelectorAll": "op_query_selector_all",
+        "evalOnSelector": "op_eval_on_selector",
+        "evalOnSelectorAll": "op_eval_on_selector_all",
+        "evaluateExpressionHandle": "op_evaluate_handle",
+        "isVisible": "op_is_visible",
+        "isHidden": "op_is_hidden",
+        "isEnabled": "op_is_enabled",
+        "isDisabled": "op_is_disabled",
+        "isChecked": "op_is_checked",
+        "isEditable": "op_is_editable",
+        "waitForElementState": "op_wait_for_element_state",
+        "dblclick": "op_dblclick",
+        "tap": "op_tap",
+        "selectText": "op_select_text",
+        "dispatchEvent": "op_dispatch_event",
     }
 
     def __init__(self, server, frame: "FrameDispatcher", object_id: str,
@@ -772,6 +870,93 @@ class ElementHandleDispatcher(Dispatcher):
                 by_value=True, objects=_object_lookup(self))))}
         return {"value": _serialize(self.frame._call_on_elements(
             self.frame.frame_id, [self.object_id], params))}
+
+    def op_evaluate_handle(self, params: Dict) -> Any:
+        """`handle.evaluate_handle(fn, arg)`: `fn(element, arg)` in the
+        caller's world, as `op_evaluate`, and a HANDLE of what it returned
+        (`_handle_from_caller`, as the frame's `evaluate_handle`)."""
+        if self.world == "caller":
+            remote = _run_callers_code(
+                self.injected, self.frame.frame_id, params, [self.object_id],
+                by_value=False, objects=_object_lookup(self))
+        else:
+            remote = self.frame._call_on_elements(
+                self.frame.frame_id, [self.object_id], params, by_value=False)
+        return {"handle": self.frame._handle_from_caller(remote).channel}
+
+    # ── the queries and the state of THIS element ───────────────────────────
+    #
+    # ⛔ THE FRAME'S, WITH THE ELEMENT AS ROOT. A selector asked of a handle is
+    # looked for inside it (stock: `selectors.query(selector, options, this)`),
+    # which is the Frame's own query with a root: one definition of how a
+    # selector is resolved, entering frames included.
+    def op_query_selector(self, params: Dict) -> Any:
+        return self.frame._query_selector(params, root=self.object_id)
+
+    def op_query_selector_all(self, params: Dict) -> Any:
+        return self.frame._query_selector_all(params, root=self.object_id)
+
+    def op_eval_on_selector(self, params: Dict) -> Any:
+        return self.frame._eval_on_selector(params, root=self.object_id)
+
+    def op_eval_on_selector_all(self, params: Dict) -> Any:
+        return self.frame._eval_on_selector_all(params, root=self.object_id)
+
+    def _state(self, state: str, *, if_detached: Optional[bool] = None) -> bool:
+        """The state of THIS node, read once and not waited for (stock's
+        `Frame._elementState` with `:scope`). A node that is not in the
+        document has none: Playwright's own error, or `if_detached` for the
+        state that is only a "no" (`isVisible`)."""
+        try:
+            return self.injected.element_state(
+                self.frame.frame_id, self.object_id, state)
+        except EvaluationError as failure:
+            if "error:notconnected" not in str(failure):
+                raise
+            if if_detached is None:
+                raise ProtocolException(_NOT_ATTACHED) from failure
+            return if_detached
+
+    def op_is_visible(self, params: Dict) -> Any:
+        return {"value": self._state("visible", if_detached=False)}
+
+    def op_is_hidden(self, params: Dict) -> Any:
+        return {"value": not self._state("visible", if_detached=False)}
+
+    def op_is_enabled(self, params: Dict) -> Any:
+        return {"value": self._state("enabled")}
+
+    def op_is_disabled(self, params: Dict) -> Any:
+        return {"value": self._state("disabled")}
+
+    def op_is_checked(self, params: Dict) -> Any:
+        return {"value": self._state("checked")}
+
+    def op_is_editable(self, params: Dict) -> Any:
+        return {"value": self._state("editable")}
+
+    def op_wait_for_element_state(self, params: Dict) -> Any:
+        """Wait until THIS node is in `state`: the injected script's own
+        actionability check, asked again after 0, 20, 100, 100 and then 500 ms
+        (stock's `ElementHandle.waitForElementState` through `_retryAction`).
+        A node that left the document is not waited for: it never will be, and
+        stock says so at once."""
+        state = params["state"]
+        deadline = Deadline(self.frame._timeout(params))
+        turn = 0
+        while True:
+            verdict = self.injected.element_states(
+                self.frame.frame_id, self.object_id, [state])
+            if verdict.get("ok"):
+                return None
+            if verdict.get("missing") == "error:notconnected":
+                raise ProtocolException(_NOT_ATTACHED)
+            if deadline.passed():
+                raise TimeoutError(
+                    "Timeout %dms exceeded waiting for the element to be %s"
+                    % (round(deadline.seconds * 1000), state))
+            time.sleep(deadline.slice(_RETRY_WAITS[min(turn, len(_RETRY_WAITS) - 1)]))
+            turn += 1
 
     def op_text_content(self, params: Dict) -> Any:
         return {"value": self.injected.text_content(
@@ -977,6 +1162,30 @@ class ElementHandleDispatcher(Dispatcher):
                                  **self._act_args(params))
         return None
 
+    def op_dblclick(self, params: Dict) -> Any:
+        pointer = self.frame._pointer(params)
+        # dblclick sets its own clickCount; the caller's is not a second one.
+        pointer.pop("clicks", None)
+        self.frame.actions.dblclick(
+            _HANDLE, position=self.frame._position(params), **pointer,
+            **self._act_args(params))
+        return None
+
+    def op_tap(self, params: Dict) -> Any:
+        self.frame.actions.tap(_HANDLE, position=self.frame._position(params),
+                               **self._act_args(params))
+        return None
+
+    def op_select_text(self, params: Dict) -> Any:
+        self.frame.actions.select_text(_HANDLE, **self._act_args(params))
+        return None
+
+    def op_dispatch_event(self, params: Dict) -> Any:
+        self.frame.actions.dispatch_event(
+            _HANDLE, params["type"], self.frame._event_init(params),
+            **self._act_args(params))
+        return None
+
     def op_check(self, params: Dict) -> Any:
         self.frame.actions.check(_HANDLE, position=self.frame._position(params),
                                  **self._act_args(params))
@@ -1032,7 +1241,7 @@ class ElementHandleDispatcher(Dispatcher):
         upload, not two.
         """
         self.frame.actions.set_input_files(
-            _HANDLE, _upload_paths(self.server, params),
+            _HANDLE, _upload_paths(self.server, params, self.frame.page.context),
             **self._act_args(params))
         return None
 
@@ -1248,13 +1457,69 @@ class FrameDispatcher(Dispatcher):
         return {"value": self.injected.content(self.frame_id)}
 
     def op_query_selector(self, params: Dict) -> Any:
-        frame_id, selector = self.enter_frames(params["selector"])
-        object_id = self.injected.query_selector(frame_id, selector)
+        return self._query_selector(params)
+
+    def _query_selector(self, params: Dict, root: Optional[str] = None) -> Any:
+        """`querySelector`, of the frame (`root` None: the document) or of an
+        element handle (`root`: its objectId, so the match is looked for
+        inside it, as stock's `FrameSelectors.query` with `scope`)."""
+        frame_id, selector = self._enter(params["selector"], root)
+        object_id = self._first(frame_id, selector, self._scope(frame_id, root),
+                                self._act_opts(params)["strict"])
         if not object_id:
             return {"element": None}
         handle = ElementHandleDispatcher(
             self.server, self.page.frame_for(frame_id), object_id)
         return {"element": handle.channel}
+
+    def _enter(self, selector: str, root: Optional[str]):
+        """`enter_frames`, with `root` the element the selector is looked for
+        in (None: the document, and the call is the one a frame has always made)."""
+        if root is None:
+            return self.enter_frames(selector)
+        return self.enter_frames(selector, root=root)
+
+    def _scope(self, frame_id: str, root: Optional[str]) -> Optional[str]:
+        """The root a selector's last chunk runs in: the element when the
+        selector stayed in the element's frame, none once it entered another
+        (stock's `resolveFrameForSelector`: `if (frame !== this.frame) scope =
+        undefined`)."""
+        return root if frame_id == self.frame_id else None
+
+    def _first(self, frame_id: str, selector: str, root: Optional[str] = None,
+               strict: bool = False) -> Optional[str]:
+        """The objectId of the first match of `selector` in `frame_id`'s world
+        (a node the caller must dispose), inside `root` when there is one and
+        in the document when there is not. THE ONE PLACE a selector is
+        resolved with an element as root."""
+        if root is None:
+            return self.injected.query_selector(frame_id, selector)
+        return self.injected.call(frame_id, _QUERY_IN, {"objectId": root},
+                                  selector, strict, by_value=False)
+
+    def _all(self, frame_id: str, selector: str,
+             root: Optional[str] = None) -> List[str]:
+        """Every match of `selector`, as objectIds the caller must dispose;
+        inside `root` when there is one. The list that held them is released
+        here."""
+        if root is None:
+            return self.injected.query_selector_all(frame_id, selector)
+        found = self.injected.call(frame_id, _QUERY_ALL_IN, {"objectId": root},
+                                   selector, by_value=False)
+        try:
+            # ⛔ THE ARRAY IS READ ONCE, whatever its length: the core's own
+            # `query_selector_all` asks for the length and then for each place
+            # (N + 2 commands for N matches), and `properties` is the engine's
+            # `Runtime.getObjectProperties`, which lists the places of the array
+            # with the object of each node. The places are named "0", "1", ...
+            # and are put in numeric order here, so "10" never comes before "2".
+            places = self.injected.properties(
+                self.injected.context_id(frame_id), found)
+            indexed = sorted((int(place["name"]), place["value"].get("objectId"))
+                             for place in places if place["name"].isdigit())
+            return [object_id for _, object_id in indexed if object_id]
+        finally:
+            self.injected.dispose(frame_id, found)
 
     def _read(self, params: Dict, what: str, *args) -> Any:
         """A read of the element `params["selector"]` names, as Playwright's
@@ -1385,8 +1650,12 @@ class FrameDispatcher(Dispatcher):
     # ⛔ frame-crossing selectors
     ENTER_FRAME = " >> internal:control=enter-frame >> "
 
-    def enter_frames(self, selector: str):
+    def enter_frames(self, selector: str, root: Optional[str] = None):
         """`(frame_id, tail)` for a selector that crosses into an iframe.
+
+        `root` is the element an element handle looks inside: the owner of the
+        FIRST frame is looked for in it, and nothing after (stock's
+        `scope: i === 0 ? scope : undefined`).
 
         ⛔ THE HOP IS SERVER-SIDE, and that is not an implementation detail:
         the injected script lives in ONE document and cannot reach inside an
@@ -1408,7 +1677,8 @@ class FrameDispatcher(Dispatcher):
             head, _, tail = selector.partition(self.ENTER_FRAME)
             if not tail:
                 return frame.frame_id, head
-            owner = frame.page.injected.query_selector(frame.frame_id, head)
+            owner = frame._first(frame.frame_id, head, root)
+            root = None
             if not owner:
                 raise ProtocolException(
                     "the frame owner %r matched nothing, so there is nothing "
@@ -1658,13 +1928,17 @@ class FrameDispatcher(Dispatcher):
     def op_set_input_files(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
         self.actions.set_input_files(selector,
-                                     _upload_paths(self.server, params),
+                                     _upload_paths(self.server, params, self.page.context),
                                      timeout=self._timeout(params),
                                      frame_id=frame_id,
                                      **self._act_opts(params))
         return None
 
     def op_tap(self, params: Dict) -> Any:
+        # Stock's `Frame.tap` opens with this refusal (the handle's `tap` has none): without touch the page has no `ontouchstart` to hear it, so a tap that went on would answer success and do nothing.
+        if not self.page.context.options.get("hasTouch"):
+            raise ProtocolException(
+                "The page does not support tap. Use hasTouch context option to enable touch support.")
         frame_id, selector = self.enter_frames(params["selector"])
         self._by_hand(params, frame_id, selector,
                       lambda position, timeout: self.actions.tap(
@@ -1674,24 +1948,32 @@ class FrameDispatcher(Dispatcher):
 
     def op_dispatch_event(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
-        # ⛔ THE ARGUMENT ARRIVES IN PLAYWRIGHT'S SERIALISED ENVELOPE, not as
-        # a plain value: `{"value": {...}, "handles": []}`. Passing it through
-        # is rejected by Juggler's closed-world schema with `Found property
-        # "<root>.args[3].handles" - [] which is not described in this scheme`,
-        # and the message names a field the caller never wrote. Nothing to do
-        # with frames: it failed on the main frame too, and only an iframe test
-        # happened to exercise it.
-        # ⛔ A HANDLE IN THE INIT IS REFUSED, NOT SENT AS null: the event is built
-        # in the utility world by the core, where the handle's object does not
-        # exist (stock takes it to the page's own world).
-        refuse_handles(params.get("eventInit"), "dispatch_event's eventInit",
-                       "the utility world, through the core")
         self.actions.dispatch_event(
-            selector, params["type"],
-            _deserialize(params.get("eventInit")) or {},
+            selector, params["type"], self._event_init(params),
             timeout=self._timeout(params), frame_id=frame_id,
             **self._act_opts(params))
         return None
+
+    @staticmethod
+    def _event_init(params: Dict) -> Dict:
+        """The `eventInit` of a `dispatchEvent`, as the plain dictionary the
+        core builds the event from. THE ONE PLACE it is read, for a frame's
+        selector and for an element handle.
+
+        ⛔ THE ARGUMENT ARRIVES IN PLAYWRIGHT'S SERIALISED ENVELOPE, not as a
+        plain value: `{"value": {...}, "handles": []}`. Passing it through is
+        rejected by Juggler's closed-world schema with `Found property
+        "<root>.args[3].handles" - [] which is not described in this scheme`,
+        and the message names a field the caller never wrote. Nothing to do
+        with frames: it failed on the main frame too, and only an iframe test
+        happened to exercise it.
+
+        ⛔ A HANDLE IN THE INIT IS REFUSED, NOT SENT AS null: the event is built
+        in the utility world by the core, where the handle's object does not
+        exist (stock takes it to the page's own world)."""
+        refuse_handles(params.get("eventInit"), "dispatch_event's eventInit",
+                       "the utility world, through the core")
+        return _deserialize(params.get("eventInit")) or {}
 
     def op_drag_and_drop(self, params: Dict) -> Any:
         self.actions.drag_and_drop(params["source"], params["target"],
@@ -1758,7 +2040,8 @@ class FrameDispatcher(Dispatcher):
         return {"element": handle.channel}
 
     def _call_on_elements(self, frame_id: str, elements: List[str],
-                          params: Dict, *, as_array: bool = False) -> Any:
+                          params: Dict, *, as_array: bool = False,
+                          by_value: bool = True) -> Any:
         """The caller's code on elements this server holds in the utility
         world, run in the caller's world by `_run_callers_code` with the
         elements as its receivers, or as ONE array of them (`as_array`, for
@@ -1774,7 +2057,11 @@ class FrameDispatcher(Dispatcher):
         node, in the other world) and the copies are released after the call.
         The caller's code is sent once ([B285]); finding the elements is this
         package's read, made before it. The caller's code never sees this
-        package's script."""
+        package's script.
+
+        `by_value=False` answers the engine's RemoteObject of what the code
+        returned instead of its value, for `_handle_from_caller`
+        (`evaluate_handle` of an element handle)."""
         context = self.injected.caller_context(frame_id)
         adopted: List[str] = []
         array: Optional[str] = None
@@ -1782,7 +2069,7 @@ class FrameDispatcher(Dispatcher):
             for element in elements:
                 copy = self.injected.node_to_caller(frame_id, element)
                 if not copy:
-                    raise ProtocolException("Element is not attached to the DOM")
+                    raise ProtocolException(_NOT_ATTACHED)
                 adopted.append(copy)
             receivers = adopted
             if as_array:
@@ -1790,9 +2077,10 @@ class FrameDispatcher(Dispatcher):
                     context, _ARRAY, [{"objectId": a} for a in adopted],
                     by_value=False)["objectId"]
                 receivers = [array]
-            return _remote_value(_run_callers_code(
-                self.injected, frame_id, params, receivers, by_value=True,
-                objects=_object_lookup(self)))
+            remote = _run_callers_code(
+                self.injected, frame_id, params, receivers, by_value=by_value,
+                objects=_object_lookup(self))
+            return _remote_value(remote) if by_value else remote
         finally:
             if array:
                 self.injected.release(context, array)
@@ -2241,23 +2529,31 @@ class FrameDispatcher(Dispatcher):
         return {"value": self.injected.count(frame_id, selector)}
 
     def op_query_selector_all(self, params: Dict) -> Any:
-        frame_id, selector = self.enter_frames(params["selector"])
+        return self._query_selector_all(params)
+
+    def _query_selector_all(self, params: Dict, root: Optional[str] = None) -> Any:
+        frame_id, selector = self._enter(params["selector"], root)
         target = self.page.frame_for(frame_id)
-        ids = self.injected.query_selector_all(frame_id, selector)
+        ids = self._all(frame_id, selector, self._scope(frame_id, root))
         handles = [ElementHandleDispatcher(self.server, target, oid)
                    for oid in ids]
         return {"elements": [h.channel for h in handles]}
 
     def op_eval_on_selector(self, params: Dict) -> Any:
+        return self._eval_on_selector(params)
+
+    def _eval_on_selector(self, params: Dict, root: Optional[str] = None) -> Any:
         """`page.eval_on_selector`: ONE attempt, as Playwright's `$eval`. It
         does not wait, and an element that is not there is an error; a frame
         that navigates between the query and the call is `ContextDestroyed`,
-        which says so in Playwright's words."""
-        frame_id, selector = self.enter_frames(params["selector"])
-        object_id = self.injected.query_selector(frame_id, selector)
+        which says so in Playwright's words. With `root` (an element handle's
+        `eval_on_selector`) the match is looked for inside that element."""
+        frame_id, selector = self._enter(params["selector"], root)
+        object_id = self._first(frame_id, selector, self._scope(frame_id, root),
+                                self._act_opts(params)["strict"])
         if not object_id:
             raise ProtocolException(
-                "failed to find element matching selector %r" % selector)
+                'Failed to find element matching selector "%s"' % params["selector"])
         try:
             return {"value": _serialize(self._call_on_elements(
                 frame_id, [object_id], params))}
@@ -2280,11 +2576,15 @@ class FrameDispatcher(Dispatcher):
         return {"value": self.injected.read_all(frame_id, selector, what)}
 
     def op_eval_on_selector_all(self, params: Dict) -> Any:
+        return self._eval_on_selector_all(params)
+
+    def _eval_on_selector_all(self, params: Dict, root: Optional[str] = None) -> Any:
         """`page.eval_on_selector_all`: the caller's function, sent ONCE. A
         frame that navigates under it is `ContextDestroyed`, as Playwright
-        raises; sending it again ran it twice ([B285])."""
-        frame_id, selector = self.enter_frames(params["selector"])
-        ids = self.injected.query_selector_all(frame_id, selector)
+        raises; sending it again ran it twice ([B285]). With `root` the
+        matches are looked for inside that element."""
+        frame_id, selector = self._enter(params["selector"], root)
+        ids = self._all(frame_id, selector, self._scope(frame_id, root))
         try:
             return {"value": _serialize(self._call_on_elements(
                 frame_id, ids, params, as_array=True))}
@@ -3800,11 +4100,21 @@ class PageDispatcher(Dispatcher):
         a field, which is the shape of thing that is right until the first
         `<input multiple>`.
         """
+        def dropped(why: str) -> None:
+            # ⛔ A CHOOSER THAT CANNOT BE ANNOUNCED LEAVES A TRACE, whatever the reason. The client waits for an event nobody will send and ends on
+            # its own timeout, saying nothing of why; `handler_errors` is where this repository keeps a dropped event (the adoption of a
+            # target does the same), and the four exits below were bare `return`s: the only ones of this function that left nothing.
+            conn = self.conn
+            if len(conn.handler_errors) < 32:
+                conn.handler_errors.append("fileChooser: %s" % why)
+
         try:
             element = params.get("element") or {}
             object_id = element.get("objectId")
             context_id = params.get("executionContextId")
             if not object_id or not context_id:
+                dropped("the engine's event names no %s: %r" % (
+                    "element" if not object_id else "execution context", params))
                 return
             frame_id = self.injected.frame_of_context(context_id)
             if not frame_id:
@@ -3812,9 +4122,11 @@ class PageDispatcher(Dispatcher):
                 # the wrong frame's world answers about a different document.
                 # Saying nothing loses the event; saying the wrong thing loses
                 # the trust in every event.
+                dropped("execution context %s belongs to no frame this page knows" % context_id)
                 return
             adopted = self.injected.adopt(frame_id, object_id)
             if not adopted:
+                dropped("the input %s could not be adopted into frame %s" % (object_id, frame_id))
                 return
             frame = self.frame_for(frame_id)
             handle = ElementHandleDispatcher(self.server, frame, adopted,
@@ -3825,9 +4137,7 @@ class PageDispatcher(Dispatcher):
             self.emit("fileChooser", {"element": handle.channel,
                                       "isMultiple": multiple})
         except Exception as failure:
-            conn = self.conn
-            if len(conn.handler_errors) < 32:
-                conn.handler_errors.append("fileChooser: %s" % failure)
+            dropped(str(failure))
 
     def frame_for(self, frame_id: str) -> "FrameDispatcher":
         """The dispatcher for a frame of this page, made on first sight.
@@ -4654,6 +4964,71 @@ class StreamDispatcher(Dispatcher):
             pass
 
 
+class WritableStreamDispatcher(Dispatcher):
+    """One file a remote client copies INTO this machine: what `set_input_files` with a path does over `connect`.
+
+    A stock client on a remote connection cannot hand the server a path (it is a path of ITS disk): `createTempFiles` made one of these per
+    file, the client sends the bytes in `write` chunks (base64) and ends with `close`, and the upload then names the stream
+    (`_upload_paths`, `streams`). The file is in the call's folder (`BrowserContextDispatcher.op_create_temp_files`), under the name
+    the client gave, and `close` sets its mtime to the client's `lastModifiedMs`, which is what the page reads as `File.lastModified`.
+
+    ⛔ CLOSED IS FINAL. A `write` after `close`, or a second `close`, is refused by name: the file is what the page may already be reading, and
+    an `open(..., "wb")` again would empty it. The folder is NOT this object's to remove (a stream that the registry lets go of, by its
+    bucket's limit, must not take the file from an input that holds it): it closes the handle, and the context removes the folder.
+    """
+
+    TYPE = "WritableStream"
+    METHODS = {"write": "op_write", "close": "op_close"}
+
+    def __init__(self, server, parent, path: str, last_modified_ms: Any) -> None:
+        self.path = path
+        self._last_modified_ms = last_modified_ms
+        self._io = threading.Lock()
+        self._state = "open"
+        self._file = open(path, "wb")
+        super().__init__(server, parent, {})
+
+    @property
+    def closed(self) -> bool:
+        return self._state == "closed"
+
+    def op_write(self, params: Dict) -> Any:
+        try:
+            chunk = base64.b64decode(params.get("binary") or "", validate=True)
+        except (ValueError, TypeError) as bad:
+            raise ProtocolException("a chunk of a streamed file is base64, and this one is not: %s" % bad)
+        with self._io:
+            if self._state != "open":
+                raise ProtocolException("the stream of %r is closed: a file is written once" % os.path.basename(self.path))
+            self._file.write(chunk)
+        return None
+
+    def op_close(self, params: Dict) -> Any:
+        with self._io:
+            if self._state != "open":
+                raise ProtocolException("the stream of %r is closed already" % os.path.basename(self.path))
+            self._file.close()
+            self._state = "closed"
+        if self._last_modified_ms is not None:
+            stamp = int(self._last_modified_ms) * 1_000_000
+            os.utime(self.path, ns=(stamp, stamp))
+        return None
+
+    def release_file(self) -> None:
+        """Let go of the open handle, and of nothing else: a Windows folder cannot be removed while a file of it is open."""
+        with self._io:
+            if self._state == "open":
+                self._state = "abandoned"
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+
+    def released(self) -> None:
+        """⛔ ALSO WHEN A PARENT'S DISPOSE FORGETS IT (a client that drops in the middle of the copy: its context closes and the stream goes with it)."""
+        self.release_file()
+
+
 class ArtifactDispatcher(Dispatcher):
     """One download, as Playwright's server has it (`server/artifact.ts`).
 
@@ -4758,11 +5133,15 @@ class BrowserContextDispatcher(Dispatcher):
         "setStorageState": "op_set_storage_state",
         "setNetworkInterceptionPatterns": "op_set_interception",
         "setWebSocketInterceptionPatterns": "op_set_ws_interception",
+        "createTempFiles": "op_create_temp_files",
     }
 
     def __init__(self, server, browser: "BrowserDispatcher", options: Dict,
                  context_id: Optional[str]) -> None:
         self.browser = browser
+        #: The folders of this context's `createTempFiles` calls, removed when it ends (`released`).
+        self._upload_folders: List[str] = []
+        self._upload_folders_lock = threading.Lock()
         self.options = options
         #: `None` is the DEFAULT context - userContextId 0, the one whose
         #: cookies and storage are the profile's. It is what a persistent
@@ -4860,6 +5239,61 @@ class BrowserContextDispatcher(Dispatcher):
         forget = getattr(self.browser, "_forget_downloads_of", None)
         if forget is not None:
             forget(self.context_id)
+        self._remove_upload_folders()
+
+    def op_create_temp_files(self, params: Dict) -> Any:
+        """The streams a client on a remote connection copies its files into (`set_input_files` with a path, over `connect`).
+
+        The answer is the stock server's (`BrowserContext.createTempFiles`, playwright 1.61.0): `writableStreams`, one per item and in the item's order,
+        and `rootDir` only when the client named a folder - which is refused here, as `set_input_files` refuses a folder everywhere.
+
+        ⛔ ONE NEW FOLDER PER CALL, in the session's upload area (the one `stage_upload` uses), and one file per item in it, under the name the client
+        gave (the page reads it as `File.name`; a second call with the same name must not overwrite the first, which an input may still hold).
+        EVERY NAME IS CHECKED BEFORE ANYTHING IS MADE: a refused call leaves no folder.
+
+        ⛔ THE FOLDER LIVES AS LONG AS THIS CONTEXT, not as long as the call: a page reads an uploaded file when it submits it, which can be minutes
+        after `set_input_files` returned. It goes in `released`, which every end of a context passes - its own `close`, and the close that
+        `RemoteEndpoint._client_gone` does for a client that dropped in the middle of a copy.
+        """
+        if params.get("rootDirName"):
+            raise _folder_refused(params["rootDirName"])
+        items = params.get("items") or []
+        names = [_upload_file_name(item.get("name")) for item in items]
+        for n, name in enumerate(names):
+            if name in names[:n]:
+                raise ProtocolException(
+                    "two files of one upload have the same name (%r): the page would read one of them twice" % name)
+        folder = tempfile.mkdtemp(dir=self.server.upload_root())
+        with self._upload_folders_lock:
+            self._upload_folders.append(folder)
+        streams: List[WritableStreamDispatcher] = []
+        try:
+            for name, item in zip(names, items):
+                streams.append(WritableStreamDispatcher(self.server, self, os.path.join(folder, name), item.get("lastModifiedMs")))
+        except Exception:
+            for stream in streams:
+                stream.release_file()
+            self._remove_upload_folders(folders=[folder])
+            raise
+        return {"writableStreams": [stream.channel for stream in streams]}
+
+    def _remove_upload_folders(self, folders: Optional[List[str]] = None) -> None:
+        """Remove the folders of `createTempFiles` calls - all of them, or the ones named - after closing the files still open in them.
+
+        ⛔ THE HANDLES FIRST: this runs before the registry lets go of the streams (`Dispatcher.dispose` calls the parent's `released` first), and a
+        Windows folder with an open file in it does not go. Closing all the context's streams is for the end of the context; a call that failed
+        half way closes its own (`op_create_temp_files`).
+        """
+        with self._upload_folders_lock:
+            ending = folders is None
+            folders = list(self._upload_folders) if ending else folders
+            self._upload_folders = [f for f in self._upload_folders if f not in folders]
+        if ending:
+            for stream in self.server.descendants_of(self):
+                if isinstance(stream, WritableStreamDispatcher):
+                    stream.release_file()
+        for folder in folders:
+            remove_profile(folder)
 
     def op_context_init_script(self, params: Dict) -> Any:
         """The same, for every page of this context - present and future.
@@ -6476,15 +6910,35 @@ class JugglerServer(Server):
         if not name:
             raise ProtocolException(
                 "a file payload needs a name: the page reads it as File.name")
-        root = getattr(self, "_upload_root", None)
-        if root is None:
-            root = tempfile.mkdtemp(prefix="invisible_upload_")
-            self._upload_root = root
-            self.after_reapers(lambda: remove_profile(root))
-        path = os.path.join(tempfile.mkdtemp(dir=root), name)
+        path = os.path.join(tempfile.mkdtemp(dir=self.upload_root()), name)
         with open(path, "wb") as out:
             out.write(base64.b64decode(payload.get("buffer") or ""))
         return path
+
+    #: Guards the making of the upload area: two uploads that arrive together on a new session must find ONE folder.
+    _upload_lock = threading.Lock()
+
+    def upload_root(self) -> str:
+        """The folder this session stages every uploaded file in (a payload, a stream of `createTempFiles`), made on first use and removed with the session.
+
+        ONE AREA, ONE OWNER OF ITS END: `after_reapers` removes it when the session ends. What a context made inside it (the folder of a
+        `createTempFiles` call) it removes itself, when it closes (`BrowserContextDispatcher.released`).
+        """
+        with self._upload_lock:
+            root = getattr(self, "_upload_root", None)
+            if root is None:
+                root = tempfile.mkdtemp(prefix="invisible_upload_")
+                self._upload_root = root
+                self.after_reapers(lambda: self._remove_upload_root(root))
+            return root
+
+    def _remove_upload_root(self, root: str) -> None:
+        """The end of the session: the files a client was still copying are closed first (a Windows folder with an open file in it does not go)."""
+        with self._lock:
+            streams = [o for o in self._objects.values() if isinstance(o, WritableStreamDispatcher)]
+        for stream in streams:
+            stream.release_file()
+        remove_profile(root)
 
     def handle_root(self, method: str, params: Dict) -> Any:
         name = self.METHODS.get(method)
