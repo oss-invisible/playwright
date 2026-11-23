@@ -98,6 +98,11 @@ H3_VISITS = 5
 #: The safety nets of a run, in seconds: a launch that does not come back, a run that does not end. Never a verdict.
 RUN_TIMEOUT_S = 40 * 60
 WAIT_S = 30
+#: The guard of the two waits that end a visit of the HTTPS and HTTP/3 walks (``settle_visit``): the deadline of a HANG, as ``profile_p4.HANG_GUARD_MS`` is for the journey
+#: (a test holds the two equal). A healthy browser reaches both far inside it; one that reaches it has stopped, and the visit says so as an error of the transcript.
+LEAVE_GUARD_MS = 120000
+#: The favicon of an origin: the one request the browser makes on its own, once per origin of a launch, that the pages of the walk do not ask for.
+FAVICON = "/favicon.ico"
 #: How many times a lab is made again when two of its servers share a port number.
 MAX_LAB_TRIES = 50
 #: Whose categories a transcript holds under each seed.
@@ -1127,7 +1132,7 @@ def wire_summary(server: Any, phase: str, norm: Normalizer) -> Dict[str, Any]:
         item: Dict[str, Any] = {"alpn": c["alpn"], "tls": c["tls"]}
         if "h2" in c:
             h2 = dict(c["h2"])
-            h2["requests"] = [{k: v for k, v in r.items() if k not in ("answered",)} for r in h2["requests"]]
+            h2["requests"] = [{k: v for k, v in r.items() if k not in ("answered", "written_t")} for r in h2["requests"]]
             item["h2"] = h2
         if "http1" in c:
             item["http1"] = [{"request_line": r["request_line"], "headers": r["headers"], "body_length": r["body_length"]} for r in c["http1"]]
@@ -1303,16 +1308,61 @@ def walk_journey(browser: Any, lab: Lab) -> Dict[str, Any]:
     return dict(journey_data(lab), steps=steps)
 
 
-def walk_https(browser: Any, lab: Lab, which: str, server: Any, name: str) -> Dict[str, Any]:
+#: How a visit and a walk are named in the error of a visit that cannot be left. In words, because ``guarded`` writes the first line of an error with every digit as ``N`` (a run's own numbers
+#: must not tell two runs apart): "v1" and "v2", "h1" and "h2" would come out the same.
+ORDINALS = ("first", "second", "third", "fourth", "fifth")
+WALK_NAMES = {"h1": "HTTP one", "h2": "HTTP two", "h3": "HTTP three"}
+
+
+def visit_name(which: str, visit: int) -> str:
+    return "the %s visit of the %s walk" % (ORDINALS[visit - 1], WALK_NAMES[which])
+
+
+class VisitNotSettled(Exception):
+    """A visit of the HTTPS or HTTP/3 walk reached its guard before it could be left (``settle_visit``). The first line names the visit and the wait that did not end, and nothing
+    that changes from run to run, so that two runs that stop at the same place say the same words."""
+
+
+def settle_visit(page: Any, server: Any, visit: str, pump: Callable[[], Any], guard_ms: int = LEAVE_GUARD_MS) -> None:
+    """The one point from which a visit of the HTTPS and HTTP/3 walks is left: before the next ``goto``, the snapshot of the wire and the close of the context.
+
+    (1) The favicon of the page's ORIGIN (``server``: one server is one origin) has been asked for AND served in full by the lab in this launch (``server.answered_at``: the request
+    arrived and its answer was written to the last byte). A second visit of the same origin finds that already true and waits for nothing: the browser asks once per origin of a launch.
+    (2) THEN the page reaches ``networkidle``: no request for 500 ms after the last answer, so after the favicon's too.
+    Each wait has the guard; one that reaches it raises :class:`VisitNotSettled`, which says the visit (``visit_name``) and which of the two is missing (the walk's ``guarded`` makes it an ``error`` leaf
+    of the transcript, red), and the walk does not go on in silence.
+
+    Why. A/A run 45189518824 (e2e, Linux): ``seeds/0/h3/wire/requests/*`` red, the second visit (``?v=2``) of the HTTP/3 page asked for ``/favicon.ico`` in the first run and not in the
+    second. 14 transcripts of the day (runs 45118341246, 45121964904 Linux and Windows, 45153612447 Linux and Windows, 45176061220, 45189518824): Firefox asks for the favicon of an
+    origin once per launch; in the journey only on the FIRST page of each origin (steps 01 and 10: 140 launches of 140 asked at both), on no page of the other steps (0 of 980) and on
+    the last page of the walk (0 of 70). In ``walk_h3`` and ``walk_https`` (h1, h2) ``?v=1`` always asks; ``?v=2``, same origin, did not in 59 launches of 60 over HTTP/3 and in 60 of 60 over h1
+    and h2. The one that did ask was the second one: NOT PROVED, the hypothesis is a race: the ``goto`` of ``?v=2`` leaves before the browser has recorded the result of the favicon
+    of ``?v=1``, and a favicon that is still in flight is asked for again. If a red falls again with this wait in place the measure to make is, from ``wire_evidence`` (``h3`` and
+    ``https``: ``t`` the arrival and ``written`` the end of the answer, seconds from the start of each server), the moment the answer to the favicon of ``?v=1`` was written against the
+    moment the ``goto`` of ``?v=2`` began (the ``t`` of its first request): written before it = the hypothesis is wrong and the cause is elsewhere."""
+    from _waits import wait_until
+
+    guard_s = guard_ms / 1000
+    if server.answered_at(FAVICON) is None and not wait_until(lambda: server.answered_at(FAVICON) is not None, guard_s, pump):
+        raise VisitNotSettled("%s: the favicon of its origin was not served in full by the lab within %g s (guard)" % (visit, guard_s))
+    try:
+        page.wait_for_load_state("networkidle", timeout=guard_ms)
+    except Exception as exc:  # noqa: BLE001 - the client's own timeout, or a page that is gone: both mean the visit cannot be left
+        raise VisitNotSettled("%s: networkidle was not reached within %g s (guard): %s" % (visit, guard_s, _first_line(exc))) from exc
+
+
+def walk_https(browser: Any, lab: Lab, which: str, server: Any, name: str, guard_ms: int = LEAVE_GUARD_MS) -> Dict[str, Any]:
     context = browser.new_context(ignore_https_errors=True)
     try:
         page = context.new_page()
+        pump = lambda: page.wait_for_timeout(100)  # noqa: E731
         out: Dict[str, Any] = {}
         for visit in (1, 2):
             phase = "https.%s.v%d" % (which, visit)
             lab.rec.set_phase(phase)
             page.goto("https://%s:%d/?v=%d" % (name, server.port, visit), wait_until="load", timeout=60000)
             page.evaluate(FETCH_JS)
+            settle_visit(page, server, visit_name(which, visit), pump, guard_ms)      # before the next visit enters its stage: the favicon of this one is this stage's
             out["v%d" % visit] = {"dns": phase_data(lab, phase)["dns"]}
         out["wire"] = fold_wire(wire_summary(server, "https.%s" % which, lab.norm))     # the whole walk, read once it is over: see fold_wire
         return out
@@ -1320,7 +1370,7 @@ def walk_https(browser: Any, lab: Lab, which: str, server: Any, name: str) -> Di
         context.close()
 
 
-def walk_h3(browser: Any, lab: Lab) -> Dict[str, Any]:
+def walk_h3(browser: Any, lab: Lab, guard_ms: int = LEAVE_GUARD_MS) -> Dict[str, Any]:
     from _waits import wait_until
 
     context = browser.new_context(ignore_https_errors=True)
@@ -1336,6 +1386,7 @@ def walk_h3(browser: Any, lab: Lab) -> Dict[str, Any]:
                 wait_until(lambda: bool(lab.h3.quic), WAIT_S, pump)
             out["quic_seen"] = bool(lab.h3.quic)
             protocol = page.evaluate(NAV_JS)
+            settle_visit(page, lab.h3, visit_name("h3", visit), pump, guard_ms)      # the favicon rides h2 or QUIC: the server reads it on both
             out["visits"].append(protocol)
             out["v%d" % visit] = {"dns": phase_data(lab, phase)["dns"]}
             if protocol == "h3" or not out["quic_seen"]:
@@ -1452,12 +1503,19 @@ def wire_evidence(lab: Lab) -> Dict[str, Any]:
         for c in server.snapshot()["connections"]:
             item = {"id": c["id"], "t": c.get("t"), "phase": c["phase"], "alpn": c["alpn"], "resumed": _resumed(c["tls"] or {})}
             if "http1" in c:
-                item["requests"] = [{"t": r.get("t"), "request": r["request_line"]} for r in c["http1"]]
+                item["requests"] = [{"t": r.get("t"), "written": r.get("written_t"), "request": r["request_line"]} for r in c["http1"]]
             if "h2" in c:
                 item["requests"] = len(c["h2"].get("requests") or [])
             connections.append(item)
         https[role] = connections
-    return {"journey": journey, "https": https}
+    # The requests of the HTTP/3 site over QUIC, with the moment each arrived and the moment its answer was written to the last datagram (``written``: ``settle_visit`` says what it
+    # is for); both seconds since the HTTP/3 server started, as the ``t`` of an HTTP/1.1 request is since its own.
+    h3 = []
+    if lab.h3 is not None:
+        for q in lab.h3.snapshot()["quic"]:
+            h3.append({"phase": q["phase"], "requests": [{"t": r.get("t"), "written": r.get("written_t"),
+                                                         "request": "%s %s" % (dict(r["headers"]).get(":method"), lab.norm.text(dict(r["headers"]).get(":path", "")))} for r in q["requests"]]})
+    return {"journey": journey, "https": https, "h3": h3}
 
 
 def sentinel_signature(lab: Lab) -> Dict[str, Any]:

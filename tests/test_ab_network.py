@@ -393,7 +393,7 @@ def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests
         if arrivals:
             arrivals.pop(0)()
 
-    monkeypatch.setattr(profile_p4, "time", SimpleNamespace(monotonic=time.monotonic, sleep=sleep))
+    monkeypatch.setattr(profile_p4, "time", SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=sleep))
 
     class Tab:
         url = "http://journey-o.test:1/partner/8"
@@ -577,7 +577,7 @@ def _h3_run(visits, message="quic-short"):
 
     rec = ab.Recorder()
     rec.attach("doh", [])
-    lab = SimpleNamespace(rec=rec, norm=ab.Normalizer({}), h3=SimpleNamespace(port=5, quic=[object()]))
+    lab = SimpleNamespace(rec=rec, norm=ab.Normalizer({}), h3=SimpleNamespace(port=5, quic=[object()], answered_at=lambda path: 0.5))
     state = {"visit": 0}
 
     class Page:
@@ -590,6 +590,9 @@ def _h3_run(visits, message="quic-short"):
             return "h3" if state["visit"] == len(visits) else "h2"
 
         def wait_for_timeout(self, ms):
+            pass
+
+        def wait_for_load_state(self, state, timeout=None):
             pass
 
     class Context:
@@ -606,6 +609,147 @@ def _h3_run(visits, message="quic-short"):
         return ab.walk_h3(browser, lab)
     finally:
         ab.wire_summary = original
+
+
+class _FaviconServer:
+    """The lab server of a walk as ``settle_visit`` reads it: it has served the favicon once ``serve_after`` seconds have passed since the first look at it (a timer thread, as the real one is
+    another thread), or never (``serve_after=None``)."""
+
+    def __init__(self, log, serve_after=0.0):
+        import threading
+
+        self.log, self.serve_after, self.port, self.quic = log, serve_after, 5, [object()]
+        self.served = threading.Event()
+        self._started = False
+
+    def answered_at(self, path):
+        import threading
+
+        assert path == ab.FAVICON
+        if not self._started and self.serve_after is not None:
+            self._started = True
+            threading.Timer(self.serve_after, self._serve).start()
+        return 0.25 if self.served.is_set() else None
+
+    def _serve(self):
+        self.log.append("favicon served")
+        self.served.set()
+
+
+def _visits(monkeypatch, kind, serve_after=0.0, guard_ms=60000, idle_error=False):
+    """``ab.walk_https`` or ``ab.walk_h3`` against a fake page and a fake lab server that write what they are asked, in order, to ``log``: ``(log, outcome)``, the outcome being what ``guarded``
+    makes of the walk. The page is read over HTTP/3 at its second visit, which ends the HTTP/3 walk."""
+    from types import SimpleNamespace
+
+    log = []
+    rec = ab.Recorder()
+    rec.attach("doh", [])
+    server = _FaviconServer(log, serve_after)
+    lab = SimpleNamespace(rec=rec, norm=ab.Normalizer({}), h3=server)
+    monkeypatch.setattr(ab, "phase_data", lambda lab_, phase: log.append("phase_data %s" % phase) or {"dns": {}, "udp": {"counts": {}}})
+    monkeypatch.setattr(ab, "wire_summary", lambda *a, **k: log.append("wire_summary") or {"connections": [], "quic": []})
+    visit = {"n": 0}
+
+    class Page:
+        def goto(self, url, **options):
+            visit["n"] += 1
+            log.append("goto %s" % url.split("/")[-1])
+
+        def evaluate(self, script):
+            return "h3" if visit["n"] == 2 else "h2"
+
+        def wait_for_timeout(self, ms):
+            log.append("pump")
+            time.sleep(ms / 1000)
+
+        def wait_for_load_state(self, state, timeout=None):
+            assert state == "networkidle" and timeout == guard_ms
+            if idle_error:
+                raise Exception("Timeout %dms exceeded." % timeout)
+            log.append("networkidle after the favicon" if server.served.is_set() else "networkidle BEFORE the favicon")
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            pass
+
+    browser = SimpleNamespace(new_context=lambda **kw: Context())
+    if kind == "h3":
+        run = lambda: ab.walk_h3(browser, lab, guard_ms=guard_ms)  # noqa: E731
+    else:
+        run = lambda: ab.walk_https(browser, lab, "h2", server, "h2.lab.test", guard_ms=guard_ms)  # noqa: E731
+    return log, ab.guarded(run)
+
+
+def test_the_leave_guard_of_the_oracle_is_the_one_of_the_journey():
+    from fakeweb import profile_p4
+
+    assert ab.LEAVE_GUARD_MS == profile_p4.HANG_GUARD_MS == 120000
+
+
+def test_a_visit_waits_for_the_favicon_to_be_served_in_full_however_long_it_takes_and_then_for_the_network_to_be_idle(monkeypatch):
+    """A/A run 45189518824 (e2e, Linux): the second visit of the HTTP/3 page asked for the favicon in one run and not in the other (``seeds/0/h3/wire/requests/*``). A visit that is left
+    before the favicon of its origin has been served leaves it to the next one."""
+    for kind, phase in (("https", "https.h2.v1"), ("h3", "h3.v1")):
+        log, outcome = _visits(monkeypatch, kind, serve_after=0.35)
+        assert "error" not in outcome, outcome
+        first = log[:log.index("phase_data %s" % phase)]
+        assert "pump" in first, "the visit waited for the favicon"
+        assert [e for e in first if e != "pump"] == ["goto ?v=1", "favicon served", "networkidle after the favicon"], first
+
+
+def test_the_order_of_a_visit_is_the_page_then_the_favicon_then_the_network_idle_then_the_snapshot_and_only_then_the_next_visit(monkeypatch):
+    for kind, expected in (
+        ("https", ["goto ?v=1", "favicon served", "networkidle after the favicon", "phase_data https.h2.v1",
+                   "goto ?v=2", "networkidle after the favicon", "phase_data https.h2.v2", "wire_summary"]),
+        ("h3", ["goto ?v=1", "favicon served", "networkidle after the favicon", "phase_data h3.v1",
+                "goto ?v=2", "networkidle after the favicon", "phase_data h3.v2", "wire_summary", "phase_data h3"]),
+    ):
+        log, outcome = _visits(monkeypatch, kind, serve_after=0.15)
+        assert "error" not in outcome, outcome
+        assert [e for e in log if e != "pump"] == expected
+
+
+def test_a_second_visit_of_the_same_origin_finds_the_favicon_served_and_does_not_wait_for_it(monkeypatch):
+    for kind in ("https", "h3"):
+        log, outcome = _visits(monkeypatch, kind, serve_after=0.25)
+        assert "error" not in outcome, outcome
+        second = log[log.index("goto ?v=2"):]
+        assert second[:3] == ["goto ?v=2", "networkidle after the favicon", second[2]] and second[2].startswith("phase_data"), second
+        assert "pump" not in second, "the second visit waits only for the network to be idle"
+
+
+@pytest.mark.parametrize("kind,visit", [("https", "the first visit of the HTTP two walk"), ("h3", "the first visit of the HTTP three walk")])
+def test_a_favicon_the_lab_never_serves_is_an_error_of_the_transcript_that_names_the_visit_and_the_favicon_and_the_walk_stops(monkeypatch, kind, visit):
+    log, outcome = _visits(monkeypatch, kind, serve_after=None, guard_ms=300)
+    assert list(outcome) == ["error"] and visit in outcome["error"] and "favicon" in outcome["error"] and "VisitNotSettled" in outcome["error"], outcome
+    assert "networkidle" not in outcome["error"]
+    assert not any(e.startswith(("phase_data", "networkidle", "goto ?v=2")) for e in log) and "wire_summary" not in log, log
+    assert ab.transcript_errors({"0": {kind: outcome}}) == ["seeds/0/%s/error" % kind], "the red is a leaf the run itself reports"
+
+
+@pytest.mark.parametrize("kind,visit", [("https", "the first visit of the HTTP two walk"), ("h3", "the first visit of the HTTP three walk")])
+def test_a_network_that_never_goes_idle_is_an_error_of_the_transcript_that_names_the_visit_and_networkidle_and_the_walk_stops(monkeypatch, kind, visit):
+    log, outcome = _visits(monkeypatch, kind, serve_after=0.0, guard_ms=300, idle_error=True)
+    assert list(outcome) == ["error"] and visit in outcome["error"] and "networkidle" in outcome["error"] and "favicon" not in outcome["error"], outcome
+    assert "favicon served" in log, "the favicon was there: it is the second wait that did not end"
+    assert not any(e.startswith(("phase_data", "goto ?v=2")) for e in log) and "wire_summary" not in log, log
+    assert ab.transcript_errors({"0": {kind: outcome}}) == ["seeds/0/%s/error" % kind]
+
+
+def test_the_evidence_of_a_seed_keeps_the_moment_the_http3_requests_arrived_and_the_moment_their_answers_were_written():
+    """The measure to make if the red of the second visit falls again (``settle_visit`` says which): the moment the favicon of ``?v=1`` was written against the ``goto`` of ``?v=2``."""
+    from types import SimpleNamespace
+
+    quic = [{"phase": "h3.v1", "requests": [{"t": 1.5, "written_t": 1.75, "headers": [[":method", "GET"], [":path", "/favicon.ico"]]},
+                                            {"t": 2.0, "headers": [[":method", "GET"], [":path", "/wire.css"]]}]}]
+    lab = SimpleNamespace(rec=ab.Recorder(), norm=ab.Normalizer({}), h1=None, h2=None, h3=SimpleNamespace(snapshot=lambda: {"connections": [], "quic": quic}))
+    lab.rec.attach("doh", [])
+    evidence = ab.wire_evidence(lab)
+    assert evidence["h3"] == [{"phase": "h3.v1", "requests": [{"t": 1.5, "written": 1.75, "request": "GET /favicon.ico"}, {"t": 2.0, "written": None, "request": "GET /wire.css"}]}]
+    json.dumps(evidence)
 
 
 def test_the_datagrams_of_the_http3_walk_are_summarised_over_the_walk_and_by_kind_not_by_number():

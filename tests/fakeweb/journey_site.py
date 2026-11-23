@@ -18,6 +18,7 @@ Pages (A): /  /category/<name>[?sort=new|top]  /article/<id>  /search[?q=..]
 /signin (GET form, POST sets cookies, 303 to /account)  /account  /signout (POST)
 /download/<id>.txt (Content-Disposition: attachment).  O: /partner/<id>.
 Both origins also serve /r?kind=.. (finite resources), /hold, /release, /stream, /jf/<kind> and POST /beacon.
+/slowlink and /slowload are for a test of the walk's hang guard only: no page of the walk links to them (see page_slowload).
 User: alice / secret.
 """
 import bisect
@@ -384,6 +385,20 @@ def page_partner(ctx, i):
     return layout(ctx, "partner-%d" % i, "Partner %d" % i, "Partner %d (other origin)" % i, body)
 
 
+def page_slowlink(ctx, ms, rid):
+    """A page with one link (#go) to a page that holds `load` (page_slowload). No page of the walk links to it."""
+    body = '<p><a id=go href="%s">Go</a></p>' % html.escape(link(ctx, "/slowload", ms=ms, id=rid))
+    return layout(ctx, "slowlink", "Slow link", "Slow link", body)
+
+
+def page_slowload(ctx, ms, rid):
+    """A page whose `load` is held by a parser-blocking script, which the server answers after `ms` milliseconds, or when /release?id=slow-<rid>
+    comes (a test that wants a page that never loads gives no `ms`, and releases it when it is done). For a test of the hang guard of the walk
+    (run 45176061220: a `load` that took 15.7 to 22.1 s on a slow runner ended steps with the 15 s deadline). Not part of the walk."""
+    body = '<p>Loading.</p><script src="%s"></script>' % html.escape(link(ctx, "/slowload.js", ms=ms, id=rid))
+    return layout(ctx, "slowload", "Slow load", "Slow load", body)
+
+
 class State:
     def __init__(self):
         self.origins = ["", ""]
@@ -626,6 +641,14 @@ class Handler(BaseHTTPRequestHandler):
             text = ("Summary of article %s.\nThe quick brown fox jumps over the lazy dog.\n" % num).encode()
             return self._send(200, "text/plain; charset=utf-8", text, [
                 ("Content-Disposition", 'attachment; filename="summary-%s.txt"' % num)])
+        if p in ("/slowlink", "/slowload"):
+            ms, rid = q.get("ms", [None])[0], q.get("id", ["0"])[0]
+            return self._html((page_slowlink if p == "/slowlink" else page_slowload)(ctx, ms, rid))
+        if p == "/slowload.js":
+            # held by the server until its time is up (`ms`; with none, 90 s at most) or until the test releases it
+            ms = q.get("ms", [None])[0]
+            self.server.state.hold("slow-" + q.get("id", ["0"])[0], 0, failsafe=int(ms) / 1000 if ms else 90.0)
+            return self._send(200, "application/javascript", b"/* released */\n", cache="no-store")
         if p == "/search":
             return self._html(page_search(ctx, q["q"][0] if "q" in q else None))
         if p == "/signin":

@@ -363,10 +363,12 @@ class Http1Parser:
 
 
 def serve_http1(sock: Any, responder: Callable[[Dict[str, Any]], Tuple[int, List[Tuple[str, str]], bytes]],
-                on_request: Callable[[Dict[str, Any]], None], alt_svc: Optional[str] = None, close_after_response: bool = False) -> None:
+                on_request: Callable[[Dict[str, Any]], None], alt_svc: Optional[str] = None, close_after_response: bool = False,
+                on_answered: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
     """Serve the requests of a connection (a TLS socket, or a plain one) until the peer closes: each request is handed to ``on_request`` and answered by
     ``responder(request) -> (status, headers, body)``. With ``close_after_response`` the answer says ``Connection: close`` and the connection ends after it: the client
-    needs a new connection for its next request, and by then it has read the session ticket the server sent with the first answer."""
+    needs a new connection for its next request, and by then it has read the session ticket the server sent with the first answer. ``on_answered(request)`` is called once the
+    whole answer (head and body) has been handed to the socket, in the same thread and before the next request is read: the moment a client can have all of it."""
     parser = Http1Parser()
     while True:
         data = sock.recv(65536)
@@ -383,6 +385,8 @@ def serve_http1(sock: Any, responder: Callable[[Dict[str, Any]], Tuple[int, List
             if close_after_response:
                 lines.append("Connection: close")
             sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
+            if on_answered is not None:
+                on_answered(request)
             if close_after_response:
                 return
 
@@ -476,7 +480,8 @@ class H2Connection:
     """The server side of one HTTP/2 connection, with a tap on the frames. ``serve(sock)`` blocks until the peer closes. Each request is recorded as
     ``{"stream", "pseudo_order": [":method", ...], "header_names": [...], "headers": [[name, value], ...], "end_stream"}`` and answered by ``responder``."""
 
-    def __init__(self, responder: Callable[[Dict[str, Any]], Tuple[int, List[Tuple[str, str]], bytes]], alt_svc: Optional[str] = None) -> None:
+    def __init__(self, responder: Callable[[Dict[str, Any]], Tuple[int, List[Tuple[str, str]], bytes]], alt_svc: Optional[str] = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         import h2.config
         import h2.connection
 
@@ -488,6 +493,9 @@ class H2Connection:
         self.tap = FrameTap()
         self.requests: List[Dict[str, Any]] = []
         self._bodies: Dict[int, int] = {}
+        #: ``clock()`` is stamped on a request as ``written_t`` once its whole answer (headers, body, end of stream) has been written to the socket; the answers waiting for that are here.
+        self._clock = clock
+        self._unwritten: List[Dict[str, Any]] = []
 
     def summary(self) -> Dict[str, Any]:
         return dict(summarize_frames(self.tap.frames), requests=list(self.requests))
@@ -525,6 +533,9 @@ class H2Connection:
             out = self.conn.data_to_send()
             if out:
                 sock.sendall(out)
+            for request in self._unwritten:
+                request["written_t"] = round(self._clock(), 3)
+            self._unwritten.clear()
 
     def _request(self, event: Any) -> None:
         headers = [[_text(n), _text(v)] for n, v in event.headers]
@@ -537,6 +548,7 @@ class H2Connection:
         if request is None:
             return
         request["answered"] = True
+        self._unwritten.append(request)
         fields = {n: v for n, v in request["headers"]}
         status, headers, body = self.responder({"method": fields.get(":method", ""), "target": fields.get(":path", ""), "headers": request["headers"],
                                                 "scheme": "https", "protocol": "h2", "body_length": self._bodies.get(stream_id, 0)})
@@ -687,11 +699,20 @@ class WireServer:
             record["alpn"] = tls.selected_alpn_protocol() or "http/1.1"
             tls.settimeout(60)
             if record["alpn"] == "h2":
-                record["h2"] = connection = H2Connection(self.responder, self.alt_svc)
+                record["h2"] = connection = H2Connection(self.responder, self.alt_svc, clock=self._now)
                 connection.serve(tls)
             else:
                 record["http1"] = []
-                serve_http1(tls, self.responder, lambda r: record["http1"].append(dict(r, phase=self.phase(), t=self._now())), self.alt_svc, self.close_after_response)
+                arrived: List[Dict[str, Any]] = []      # the request being answered: a connection serves one at a time, and the mark goes on the record kept for it
+
+                def on_request(r: Dict[str, Any]) -> None:
+                    arrived[:] = [dict(r, phase=self.phase(), t=self._now())]
+                    record["http1"].append(arrived[0])
+
+                def on_answered(_request: Dict[str, Any]) -> None:
+                    arrived[0]["written_t"] = self._now()
+
+                serve_http1(tls, self.responder, on_request, self.alt_svc, self.close_after_response, on_answered)
         except (ssl.SSLError, OSError, ConnectionError, NotAClientHello, TimeoutError) as exc:
             record["error"] = "%s: %s" % (type(exc).__name__, exc)
         finally:
@@ -740,10 +761,11 @@ class WireServer:
                     if isinstance(http_event, HeadersReceived):
                         headers = [[_text(n), _text(v)] for n, v in http_event.headers]
                         self._record["h3_settings"] = h3_settings(self._http.received_settings)
-                        self._record["requests"].append({
+                        request = {
                             "stream": http_event.stream_id, "pseudo_order": [n for n, _v in headers if n.startswith(":")],
                             "header_names": [n for n, _v in headers if not n.startswith(":")], "headers": headers,
-                            "phase": server.phase()})
+                            "phase": server.phase(), "t": server._now()}
+                        self._record["requests"].append(request)
                         fields = dict(headers)
                         status, out, body = server.responder({"method": fields.get(":method", ""), "target": fields.get(":path", ""), "headers": headers,
                                                               "scheme": "https", "protocol": "h3", "body_length": 0})
@@ -752,6 +774,7 @@ class WireServer:
                                                 [(b"content-length", str(len(body)).encode())])
                         self._http.send_data(http_event.stream_id, body, end_stream=True)
                         self.transmit()
+                        request["written_t"] = server._now()      # the datagrams that carry the whole answer have left the socket
 
         configuration = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
         configuration.load_cert_chain(str(certificate), str(key))
@@ -779,6 +802,23 @@ class WireServer:
             raise RuntimeError("the QUIC server did not start")
 
     # --- what a test or the oracle reads --------------------------------------------------------------------------------------------------
+    def answered_at(self, path: str) -> Optional[float]:
+        """When the server finished WRITING the answer to a request for ``path`` (the query is not part of it), whatever the transport it rode: seconds since the server started
+        (the scale of ``t``), or None while no such request has been answered in full. A request that has arrived but whose answer is not all written is not answered: the mark is
+        stamped after the last byte (HTTP/1.1, HTTP/2) or the last datagram (HTTP/3) is handed to the socket, in the one place that writes it."""
+        with self._lock:
+            connections = list(self.connections)
+            quic = list(self.quic)
+        marks: List[float] = []
+        for c in connections:
+            requests = [(r["target"], r) for r in list(c.get("http1") or [])]
+            if "h2" in c:
+                requests += [(dict(r["headers"]).get(":path", ""), r) for r in list(c["h2"].requests)]
+            marks += [r["written_t"] for target, r in requests if target.split("?")[0] == path and "written_t" in r]
+        for q in quic:
+            marks += [r["written_t"] for r in list(q["requests"]) if dict(r["headers"]).get(":path", "").split("?")[0] == path and "written_t" in r]
+        return min(marks) if marks else None
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             connections = list(self.connections)

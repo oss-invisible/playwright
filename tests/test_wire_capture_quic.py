@@ -64,3 +64,33 @@ def test_a_quic_client_is_recorded_transport_parameters_settings_and_the_order_o
     assert request["pseudo_order"] == [":method", ":scheme", ":authority", ":path"]
     assert request["header_names"] == ["user-agent", "accept", "x-last"]
     assert [n for n, _v in request["headers"]][:4] == [":method", ":scheme", ":authority", ":path"]
+
+
+def test_an_http3_request_is_answered_in_full_only_when_the_datagrams_of_its_answer_have_left_and_it_keeps_the_moment_it_arrived():
+    import threading
+    import time
+
+    from _waits import wait_until
+
+    release = threading.Event()
+
+    def responder(request):
+        release.wait(60)      # the loop of the QUIC server is held here, which is what a request that has arrived and is not yet answered is
+        return wc.default_responder(request)
+
+    with wc.WireServer(h3=True, responder=responder) as server:
+        statuses = []
+        thread = threading.Thread(target=lambda: statuses.append(asyncio.run(_get(server.port))), daemon=True)
+        thread.start()
+        try:
+            assert wait_until(lambda: any(q["requests"] for q in server.snapshot()["quic"]), 30, lambda: time.sleep(0.01)), "the request never arrived"
+            assert server.answered_at("/wire.css") is None, "the request has arrived and its answer is not written"
+        finally:
+            release.set()
+        thread.join(60)
+        assert statuses == [200]
+        assert wait_until(lambda: server.answered_at("/wire.css") is not None, 30, lambda: time.sleep(0.01)), "the answer was never marked as written"
+        written = server.answered_at("/wire.css")
+        (connection,) = server.snapshot()["quic"]
+        (request,) = connection["requests"]
+    assert isinstance(written, float) and request["t"] <= written == request["written_t"]
