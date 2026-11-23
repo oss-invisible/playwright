@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 
 DATA = Path(__file__).resolve().parent / "data" / "ab_host_aa"
 SMALL = {"proc": 2, "file": 3}
-WINDOWS_RUNS = ("45060573559", "45077433049", "45088980743", "45077330681")
+WINDOWS_RUNS = ("45060573559", "45077433049", "45088980743", "45077330681", "45228081536")
 LINUX_RUN = "45088980743-linux"
 BS = chr(92)
 
@@ -295,3 +295,27 @@ def test_the_log_prints_the_not_judged_list_with_the_watched_paths_before_the_ot
     watch = next(i for i, line in enumerate(lines) if line.startswith("WATCH") and "/p/watched" in line)
     other = next(i for i, line in enumerate(lines) if line.startswith("LISTED") and "/p/once" in line)
     assert summary < watch < other and "2 paths, 1 to watch" in lines[summary]
+
+
+def test_the_a_a_of_run_45228081536_was_red_on_the_pingsenders_and_is_green_now_that_they_are_listed():
+    """Run 45228081536 (oss-invisible/playwright, job 137879971705, `e2e (host, windows)`): the A/A of the 68 was red on two lines, seed 4 side B `2 pingsender processes, not 0 or 3` and
+    seed 63 `proc.socket<-pingsender: A 3 | B <missing>`. The pingsenders of the 68 were in all 6 measured launches of the first run and in 4 of the second, the sockets they start in 3 and
+    in none: Mozilla's pingsender starts or not from a launch to the next. Now they are listed, not judged."""
+    first, again = real("45228081536", "68"), real("45228081536", "68-again")
+    assert [s["kinds"].get(host.PINGSENDER_KIND, 0) for s in again["seeds"]] == [3, 0, 2, 0, 3], "the data are the run's: 2 pingsenders in seed 4 of B"
+    assert first["seeds"][4]["kinds"]["socket<-pingsender"] == 3 and "socket<-pingsender" not in again["seeds"][4]["kinds"], "seed 63"
+    for a, b, mine, other in ((first, again, "A", "B"), (again, first, "B", "A")):
+        report = host.judge(a, b, a_a=True)
+        assert report["verdict"] == "green", report["problems"]
+        assert report["problems"] == [] and report["differences"] == []
+        listed = {e["kind"]: e for e in report["not_judged"]["kinds"]}
+        assert set(listed) == {host.PINGSENDER_KIND, "socket<-pingsender"}, "the pingsenders and what they start are in the list of what is not judged"
+        assert listed[host.PINGSENDER_KIND][mine]["measured"] == [6, 6] and listed[host.PINGSENDER_KIND][other]["measured"] == [4, 6]
+        assert listed["socket<-pingsender"][mine]["measured"] == [3, 6] and listed["socket<-pingsender"][other]["measured"] == [0, 6]
+        assert listed[host.PINGSENDER_KIND]["spawned_by"][mine] == ["parent"]
+
+
+def test_the_kinds_of_a_real_run_that_are_there_in_every_launch_of_both_engines_are_not_listed():
+    first, again = real("45228081536", "68"), real("45228081536", "68-again")
+    report = host.judge(first, again, a_a=True)
+    assert {"parent", "rdd", "tab/isForBrowser"} & {e["kind"] for e in report["not_judged"]["kinds"]} == set()
