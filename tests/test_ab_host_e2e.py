@@ -53,6 +53,13 @@ TIMEOUT_S = 35 * 60  # the job of its own (e2e-host, e2e-host-windows) has 45 mi
 PR_SEEDS = 2
 
 
+def expected_footprints(candidate: bool, platform: str) -> list:
+    """The footprints a green run writes, sorted: the two runs of the published engine, the candidate's in the A/B, and on Windows the stock control's, which runs after a green
+    A/A on every Windows run, a pull request included (run 45165805370: the control passed and the list without it was red)."""
+    names = ["footprint-68-again.json", "footprint-68.json"] + (["footprint-candidate.json"] if candidate else [])
+    return sorted(names + (["footprint-stock.json"] if platform == "win32" else []))
+
+
 def _evidence_dir(tmp_path: Path) -> Path:
     base = os.environ.get("AB_ORACLE_OUT")
     if base:
@@ -98,8 +105,7 @@ def test_the_engine_leaves_the_same_footprint_on_the_host_after_the_same_journey
     assert done.returncode == 0, "the host footprint differs:\n" + "\n".join(verdict[:80]) + "\n" + done.stderr[-1500:]
     assert control.get("verdict") == "green" and control.get("differences") == [] and control.get("problems") == []
     names = sorted(p.name for p in out.glob("footprint-*.json"))
-    assert names == (["footprint-68-again.json", "footprint-68.json", "footprint-candidate.json"] if candidate
-                     else ["footprint-68-again.json", "footprint-68.json"])
+    assert names == expected_footprints(candidate, sys.platform)
     listed = ["not-judged-a-a.json"] + (["not-judged.json"] if candidate else [])
     for name in listed:
         document = json.loads((out / name).read_text(encoding="utf-8"))

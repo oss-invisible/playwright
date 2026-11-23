@@ -689,6 +689,18 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
     assert host_e2e.TIMEOUT_S + 10 * 60 <= 45 * 60, "the test's own limit fits the Windows job"
 
 
+def test_the_host_e2e_expects_the_stock_footprint_on_windows_in_both_modes_and_never_on_linux():
+    """Run 45165805370: the stock control now runs after a green A/A on every Windows run, and the e2e that expected only the two runs of the published engine was red on a
+    control that had passed. The four cases, so that the gate (the candidate mode) does not find a fifth."""
+    import test_ab_host_e2e as host_e2e
+
+    a_a, a_b = ["footprint-68-again.json", "footprint-68.json"], ["footprint-68-again.json", "footprint-68.json", "footprint-candidate.json"]
+    assert host_e2e.expected_footprints(False, "linux") == a_a
+    assert host_e2e.expected_footprints(True, "linux") == a_b
+    assert host_e2e.expected_footprints(False, "win32") == sorted(a_a + ["footprint-stock.json"])
+    assert host_e2e.expected_footprints(True, "win32") == sorted(a_b + ["footprint-stock.json"])
+
+
 def test_the_windows_host_job_turns_on_the_location_service_of_the_runner_before_any_launch():
     """Run 45153612447: the runner had `lfsvc` Disabled and the machine's location consent Deny, so the stock control of the geolocation step could not reach the platform
     provider and waited 26 minutes. The laboratory is set before any launch (the published engine, the candidate and the stock then run on the same machine in the same state),
