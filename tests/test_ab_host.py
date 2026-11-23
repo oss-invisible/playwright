@@ -1214,7 +1214,8 @@ def test_the_stand_in_traces_the_network_only_when_the_host_oracle_asks(tmp_path
 
 
 # -
-# The geolocation step: the candidate starts no Windows location utility process and loads no location module; stock Firefox, the control, must start it.
+# The geolocation step: our engine starts no Windows location utility process and loads no location module; stock Firefox, the control, must load the first read of the
+# host for the position (`capabilityaccessmanagerclient.dll`).
 
 LOCATION_CMD = '"%s" -contentproc --channel="100.7.8" -sandboxingKind 3 -notForBrowser utility' % FIREFOX
 WIN_FILES = ["c:\\windows\\system32\\kernel32.dll", "c:\\windows\\system32\\ntdll.dll", "c:\\windows\\system32\\user32.dll"]
@@ -1275,10 +1276,11 @@ def test_the_warm_up_launch_of_the_candidate_is_checked_too():
     assert report["verdict"] == "red" and any(p.startswith("warm-up side B: the engine started the Windows location utility process") for p in report["problems"])
 
 
-def test_the_rule_is_for_the_candidate_on_windows_not_for_the_a_a_nor_for_linux():
+def test_the_rule_is_for_our_engine_on_windows_both_sides_of_the_a_a_and_the_candidate_of_the_a_b_not_for_linux():
     published, candidate = windows_footprints(candidate_kinds=dict(WIN_KINDS, **{LOCATION_KIND: 1}))
     a_a = judge(candidate, copy.deepcopy(candidate), a_a=True)
-    assert not any("location" in p for p in a_a["problems"])
+    for side in ("A", "B"):
+        assert sum(" side %s: the engine started the Windows location utility process" % side in p for p in a_a["problems"]) == len(SEEDS), side
     side_a = judge(candidate, published, expected=[])
     assert not any("side B: the engine started" in p for p in side_a["problems"])
     on_linux = judge(footprint(), footprint("candidate", kinds=dict(KINDS, **{LOCATION_KIND: 1})), expected=[])
@@ -1291,23 +1293,127 @@ def a_stock(kinds, files=(), steps=None, problems=()):
                       "problems": list(problems)}}
 
 
-def test_stock_that_starts_the_location_utility_process_is_a_working_control():
-    stock = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=["c:\\windows\\system32\\geolocation.dll"])
+FIRST_READ = "capabilityaccessmanagerclient.dll"
+FIRST_READ_PATH = "c:\\windows\\system32\\capabilityaccessmanagerclient.dll"
+
+
+def test_stock_that_loads_the_first_read_of_the_host_for_the_position_is_a_working_control():
+    stock = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=["c:\\windows\\system32\\geolocation.dll", FIRST_READ_PATH])
     assert host.stock_control_problems(stock) == []
+    assert host.stock_control_problems(a_stock(WIN_KINDS, files=["C:\\Windows\\System32\\CapabilityAccessManagerClient.dll"])) == []
 
 
-def test_stock_that_does_not_start_it_is_a_broken_control_and_says_the_step_does_not_reach_the_provider():
+def test_stock_that_does_not_load_it_is_a_broken_control_and_says_the_step_does_not_reach_the_platform():
     problems = host.stock_control_problems(a_stock(WIN_KINDS))
-    assert len(problems) == 1 and "did not start the Windows location utility process (-sandboxingKind 3)" in problems[0]
-    assert "does not reach the platform provider" in problems[0]
+    assert len(problems) == 1 and "did not load %s" % FIRST_READ in problems[0]
+    assert "does not reach the platform" in problems[0]
 
 
 def test_a_stock_run_that_failed_or_was_not_traced_is_a_broken_control_too():
     kinds = dict(WIN_KINDS, **{LOCATION_KIND: 1})
-    assert host.stock_control_problems(a_stock(kinds, steps=[{"n": 5, "name": host.GEO_STEP, "ok": False, "error": "timeout"}])) == [
+    assert host.stock_control_problems(a_stock(kinds, files=[FIRST_READ_PATH], steps=[{"n": 5, "name": host.GEO_STEP, "ok": False, "error": "timeout"}])) == [
         "stock control: step 5 (%s) failed: timeout" % host.GEO_STEP]
-    assert host.stock_control_problems(a_stock(kinds, problems=["the file trace lost 3 events"])) == ["stock control: the file trace lost 3 events"]
+    assert host.stock_control_problems(a_stock(kinds, files=[FIRST_READ_PATH], problems=["the file trace lost 3 events"])) == ["stock control: the file trace lost 3 events"]
     assert host.stock_control_problems({"stock": {}}) == ["stock control: the run made no footprint"]
+
+
+# The signal of the stock control is the first read of the host that Firefox makes for the position, not the utility process of the provider. Real footprints, reduced
+# to what the rules read (tests/data/ab_host_geo/*/SOURCES.md): the stock of the gate republish 45257636942 (windows-2022: the module is loaded, the utility process is
+# not), the stock of the pull request 45165805370 (windows-2022: both), and the candidate of 45257636942 (neither, in any launch).
+GEO_DATA = Path(__file__).resolve().parent / "data" / "ab_host_geo"
+
+
+def geo_fixture(run, name):
+    return json.loads((GEO_DATA / run / name).read_text(encoding="utf-8"))
+
+
+def without_first_read(stock):
+    stock = copy.deepcopy(stock)
+    stock["stock"]["files"] = [f for f in stock["stock"]["files"] if not f.endswith("\\" + FIRST_READ)]
+    stock["stock"]["touched_by"] = {}
+    return stock
+
+
+def test_the_stock_of_45257636942_loaded_the_first_read_without_the_utility_process_and_the_control_is_working():
+    """Run 45257636942 (windows-2022): the stock loaded `capabilityaccessmanagerclient.dll` and started no `-sandboxingKind 3` process (the runner has no location source: the
+    provider answers `code 2`). The old control asked for the process and was broken; the first read is in every stock footprint measured (45165805370, 45170547415,
+    45252267809, 45206303882, 45257636942), the process in 3 of the 5."""
+    stock = geo_fixture("45257636942", "footprint-stock.json")
+    assert host.location_first_reads(stock["stock"]["files"]) == [FIRST_READ_PATH]
+    assert host.location_utility_kinds(stock["stock"]["kinds"]) == []
+    assert host.stock_control_problems(stock) == []
+
+
+def test_the_stock_of_45165805370_loaded_the_first_read_and_started_the_utility_process_and_the_control_is_working():
+    stock = geo_fixture("45165805370", "footprint-stock.json")
+    assert host.location_first_reads(stock["stock"]["files"]) == [FIRST_READ_PATH]
+    assert host.location_utility_kinds(stock["stock"]["kinds"]) == ["utility/sandboxingKind=3"]
+    assert host.stock_control_problems(stock) == []
+
+
+def test_a_stock_that_did_not_load_the_first_read_is_a_broken_control_that_names_the_module_whatever_the_utility_process():
+    for run in ("45257636942", "45165805370"):
+        problems = host.stock_control_problems(without_first_read(geo_fixture(run, "footprint-stock.json")))
+        assert len(problems) == 1 and FIRST_READ in problems[0] and "first read of the host for the position" in problems[0], run
+        assert "does not reach the platform" in problems[0]
+    # the utility process is not the signal: with it, and without the module, the control is broken all the same
+    with_process = without_first_read(geo_fixture("45165805370", "footprint-stock.json"))
+    assert host.location_utility_kinds(with_process["stock"]["kinds"]) == ["utility/sandboxingKind=3"]
+    assert len(host.stock_control_problems(with_process)) == 1
+
+
+def test_a_stock_control_says_on_the_output_which_module_is_missing_or_that_it_loaded_it(tmp_path, monkeypatch, capsys):
+    broken = without_first_read(geo_fixture("45257636942", "footprint-stock.json"))
+    out = tmp_path / "o"
+    out.mkdir()
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, broken) or 0)
+    assert host.run_stock_control("windows-x86_64", out) is None
+    printed = capsys.readouterr().out
+    assert "BROKEN CONTROL" in printed and "%s is not loaded" % FIRST_READ in printed and "stock evidence: location modules loaded: wlanapi.dll" in printed
+    working = geo_fixture("45257636942", "footprint-stock.json")
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, working) or 0)
+    assert host.run_stock_control("windows-x86_64", out) == working
+    assert "GEOLOCATION CONTROL: stock Firefox loaded %s; location utility process: none" % FIRST_READ in capsys.readouterr().out
+
+
+def geo_problems(report):
+    return [p for p in report["problems"] if "location" in p]
+
+
+def test_the_candidate_of_45257636942_is_not_red_for_the_geolocation_rule_in_any_launch():
+    candidate = geo_fixture("45257636942", "footprint-candidate.json")
+    for launch in [candidate["warmup"], candidate["idle"]] + candidate["seeds"]:
+        assert host.location_first_reads(launch["files"]) == [] and host.location_utility_kinds(launch["kinds"]) == []
+    assert geo_problems(judge(copy.deepcopy(candidate), candidate, floors={}, expected=[])) == []
+
+
+@pytest.mark.parametrize("launch", ["warmup", "idle", "seed 0", "seed 1"])
+def test_a_candidate_that_loads_the_first_read_in_one_launch_is_red_and_names_the_launch_and_the_module(launch):
+    """The idle launch was not looked at by the old rule (it was in no launch of the candidates measured, so nothing showed it)."""
+    candidate = geo_fixture("45257636942", "footprint-candidate.json")
+    published = copy.deepcopy(candidate)
+    target = candidate[launch] if launch in ("warmup", "idle") else candidate["seeds"][int(launch.split()[1])]
+    target["files"] = sorted(target["files"] + [FIRST_READ_PATH])
+    problems = geo_problems(judge(published, candidate, floors={}, expected=[]))
+    label = {"warmup": "warm-up", "idle": "idle"}.get(launch, "seed %s" % target["seed"])
+    assert len(problems) == 1, problems
+    assert problems[0].startswith("%s side B: the engine loaded location modules: %s" % (label, FIRST_READ_PATH)) and "first read of the host" in problems[0]
+
+
+def test_the_a_a_is_red_for_the_geolocation_rule_on_either_side_and_the_a_b_judges_the_candidate_only():
+    """The 68 has neither the module nor the process in any launch measured (45121964904, 45206303882, 45257629988, 45257636942): the rule is on our engine, so on both
+    sides of the A/A. In the A/B only the candidate (side B) is judged: side A is the published engine, which the A/A of the same job has judged."""
+    engine = geo_fixture("45257636942", "footprint-candidate.json")
+    assert geo_problems(judge(copy.deepcopy(engine), copy.deepcopy(engine), a_a=True, floors={}, expected=[])) == []
+    first = copy.deepcopy(engine)
+    first["idle"]["files"] = sorted(first["idle"]["files"] + [FIRST_READ_PATH])
+    problems = geo_problems(judge(first, copy.deepcopy(engine), a_a=True, floors={}, expected=[]))
+    assert len(problems) == 1 and problems[0].startswith("idle side A: the engine loaded location modules: %s" % FIRST_READ_PATH)
+    second = copy.deepcopy(engine)
+    second["seeds"][0]["kinds"] = dict(second["seeds"][0]["kinds"], **{LOCATION_KIND: 1})
+    problems = geo_problems(judge(copy.deepcopy(engine), second, a_a=True, floors={}, expected=[]))
+    assert len(problems) == 1 and problems[0].startswith("seed %s side B: the engine started the Windows location utility process" % second["seeds"][0]["seed"])
+    assert geo_problems(judge(first, copy.deepcopy(engine), floors={}, expected=[])) == [], "the A/B does not judge the published engine"
 
 
 class FakePage:
@@ -1432,7 +1538,7 @@ def test_a_windows_ab_runs_the_stock_control_after_the_a_a_and_before_the_verdic
     assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
     assert order == [("run", "firefox-68"), ("run", "firefox-68 again"), ("run", "candidate"), ("judge", "a-a"), ("stock", "windows-x86_64")]
     order.clear()
-    stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}))
+    stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=[FIRST_READ_PATH])
     assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
     assert order[-2:] == [("stock", "windows-x86_64"), ("judge", "a-b")]
     order.clear()
@@ -1500,14 +1606,14 @@ def test_a_stock_firefox_that_is_not_installed_is_said_by_name_and_is_not_blamed
     document = host.run_stock("windows-x86_64")
     text = "\n".join(host.stock_control_problems(document))
     assert "is not installed" in text and str(missing) in text and "python -m playwright install firefox" in text
-    assert "does not reach the platform provider" not in text and "did not start the Windows location utility" not in text
+    assert "does not reach the platform" not in text and "did not load %s" % FIRST_READ not in text
     # and the control says the same on the output
     out = tmp_path / "o"
     out.mkdir()
     monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, document) or 0)
     assert host.run_stock_control("windows-x86_64", out) is None
     printed = capsys.readouterr().out
-    assert "is not installed" in printed and "does not reach the platform provider" not in printed and "BROKEN CONTROL" in printed
+    assert "is not installed" in printed and "does not reach the platform" not in printed and "BROKEN CONTROL" in printed
 
 
 def test_a_stock_firefox_that_does_not_launch_says_why_and_one_that_ran_without_the_provider_leaves_its_evidence(tmp_path, monkeypatch, capsys):
@@ -1530,7 +1636,7 @@ def test_a_stock_firefox_that_does_not_launch_says_why_and_one_that_ran_without_
     monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, stock) or 0)
     assert host.run_stock_control("windows-x86_64", out) is None
     printed = capsys.readouterr().out
-    assert "did not start the Windows location utility process" in printed and "BROKEN CONTROL: the geolocation step does not reach the platform provider" in printed
+    assert "did not load %s" % FIRST_READ in printed and "BROKEN CONTROL: the geolocation step does not reach the platform on stock Firefox (%s is not loaded)" % FIRST_READ in printed
     assert "stock evidence: process parent: firefox.exe -no-remote" in printed and "kernel32.dll" in printed and "location modules loaded: none" in printed
 
 
@@ -3094,7 +3200,7 @@ def test_a_stock_process_that_stands_still_is_a_broken_control_that_names_its_la
     document = host.read_json(out)
     problems = host.stock_control_problems(document)
     assert len(problems) == 1 and "did not end within 2 s" in problems[0] and "`evaluate begin`" in problems[0] and "tree was killed" in problems[0]
-    assert "does not reach the platform provider" not in problems[0] and document["stock"]["started"] is False
+    assert "does not reach the platform" not in problems[0] and document["stock"]["started"] is False
     printed = capsys.readouterr().out
     assert "stock phase evaluate begin at" in printed, "the log keeps the phases"
     # and the control reports it: the verdict is the broken control that says where it stood
@@ -3154,7 +3260,7 @@ def test_a_stock_firefox_with_no_parent_found_is_a_broken_control_that_says_so_a
     monkeypatch.setattr(host, "_seed_result", lambda *a, **k: pytest.fail("the trace must not be read with this process as its root"))
     document = host.run_stock("windows-x86_64")
     problems = host.stock_control_problems(document)
-    assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform provider" not in problems[0]
+    assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform" not in problems[0]
 
 
 # -
