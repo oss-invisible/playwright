@@ -244,7 +244,7 @@ def _request(m, site, method, path, referer=None, status=200, ctype=None, step=1
 
 def _noise(m, site, path):
     """The last stage of a page and its five woff2, from moment `m` on."""
-    referrer = (A + path) if site == 0 else (O + "/")
+    referrer = ([A, O][site]) + path      # a page asks its own origin for the stylesheet: same origin, the whole URL
     return [_request(m, 0, "GET", "/r?kind=css&id=ld3", referrer)] + [
         _request(m + 0.01 * (k + 1), 1, "GET", "/r?kind=woff2&id=font", O + "/r?kind=fontcss&id=fc", ctype="font/woff2") for k in range(5)]
 
@@ -290,6 +290,22 @@ def test_the_page_of_the_other_origin_counts_its_fonts_with_the_page_open_beside
     left = journey_site.pages_left_before_their_noise(records, [A, O])
     assert left == ["GET A/article/2 (step 1), GET O/partner/2 (step 1): 7 woff2 had arrived when the walk left, 10 expected "
                     "(5 @font-face per page)"]
+
+
+def test_the_page_of_the_other_origin_is_found_by_its_own_url_as_the_referrer_of_its_late_stylesheet():
+    """The partner page (origin O) loads its stylesheet ld3 from O itself: a same-origin request carries the whole URL of the page, as in
+    the run 45074928774 (job 137370233977: `GET /r?kind=css&id=ld3` with the referrer `O/partner/8`, 3 s after `load`). A partner tab
+    closed before that stage, and a stylesheet of another partner page, are not the page's."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/article/8")] + _noise(2, 0, "/article/8") + [_request(3, 1, "GET", "/partner/8")]
+               + _noise(4, 1, "/partner/8") + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search"))
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == []
+    closed_early = ([_request(1, 0, "GET", "/article/8")] + _noise(2, 0, "/article/8") + [_request(3, 1, "GET", "/partner/8")]
+                    + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search") + _noise(7, 1, "/partner/9"))
+    left = journey_site.pages_left_before_their_noise(closed_early, [A, O])
+    assert left[0] == ("GET O/partner/8 (step 1): its stylesheet ld3 (referrer %s/partner/8) had not arrived when the walk left the "
+                       "page" % O)
 
 
 def test_the_site_keeps_the_referrer_and_the_type_of_every_answer_and_the_lab_can_make_the_last_stage_long():
@@ -472,16 +488,56 @@ def test_the_tab_and_the_last_page_are_left_only_once_their_noise_is_done(monkey
     assert records[0]["ok"] and log[0] == "step" and log[-1][:2] == ("wait", profile_p4.NOISE_DONE)
 
 
+def test_step_10_closes_the_partner_tab_only_once_its_noise_is_done():
+    """The cleanup step 10 returns closes the tab the click opened, and only after the wait for the tab's own declaration (the last stage of
+    the partner page comes seconds after `load`: a tab closed at once never sends its late stylesheet)."""
+    from fakeweb import profile_p4
+
+    log = []
+
+    class Tab(_Page):
+        def inner_text(self, selector):
+            return "Partner 8 (other origin)"
+
+        def wait_for_selector(self, selector):
+            self.log.append("selector " + selector)
+
+    tab = Tab(log, O + "/partner/8")
+
+    class Context:
+        pages = [object(), tab]
+
+        def expect_page(self):
+            class Opened:
+                value = tab
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return Opened()
+
+    journey = profile_p4.Journey(Context(), _Page([], A + "/article/8"), A, O)
+    seen, cleanup = journey.s10_blank_tab()
+    assert seen is tab and "close" not in log
+    cleanup()
+    assert log[-1] == "close" and _waited_before(log, "close")
+
+
 def test_every_navigation_back_forward_and_close_of_the_walk_goes_through_its_one_point_of_leaving():
     """Read from the source: the walk waits for a navigation only in Journey.navigate, presses back or forward only in Journey._press
-    (and in the popstate step, which stays on its document), and closes a page only through Journey.leave."""
+    (and in the popstate step, which stays on its document), opens an address only to open the first page, never reloads, and closes
+    a page only through Journey.leave."""
     import ast
 
     from fakeweb import profile_p4
 
     tree = ast.parse(Path(profile_p4.__file__).read_text(encoding="utf-8"))
     journey = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Journey")
-    allowed = {"expect_navigation": {"navigate"}, "go_back": {"_press", "s8_filter_popstate"}, "go_forward": {"_press"}}
+    allowed = {"expect_navigation": {"navigate"}, "go_back": {"_press", "s8_filter_popstate"}, "go_forward": {"_press"},
+               "goto": {"s1_open_home"}, "reload": set()}      # goto: the first page, from a blank one
     wrong = []
     for method in (n for n in journey.body if isinstance(n, ast.FunctionDef)):
         passed_to_leave = {id(a) for c in ast.walk(method) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)

@@ -751,8 +751,8 @@ def pages_left_before_their_noise(records, origins):
 
     A page is an HTML answer to a navigation. The walk leaves a page of the site's tab (origin A) at its next navigation request to A; the
     one page of the other origin (the partner tab) is closed before the walk's next navigation of A; the last page is left when the walk
-    ends. Before that moment the last stage of the page must have arrived: its stylesheet `ld3` with the page as its referrer (the whole URL
-    from a page of A; from the page of O only its origin, as a request to another origin carries), and the woff2 of its five @font-face
+    ends. Before that moment the last stage of the page must have arrived: its stylesheet `ld3` with the page as its referrer (a page asks
+    its own origin for it, A or O: a same-origin request, so the whole URL of the page), and the woff2 of its five @font-face
     rules. Those all have the font stylesheet as their referrer, so they are counted per stretch that ends where the walk leaves: every
     page that starts in a stretch brings five."""
     requests = sorted((r for r in records if r.get("ev") == "request"), key=lambda r: r["m_arrive"])
@@ -766,7 +766,7 @@ def pages_left_before_their_noise(records, origins):
     for page in pages:
         i = bisect.bisect_right(leaves, page["m_arrive"])
         left_at = leaves[i] if i < len(leaves) else float("inf")
-        referrer = origins[0] + page["path"] if page["site"] == 0 else origins[1] + "/"
+        referrer = origins[page["site"]] + page["path"]
         if not any(r.get("referer") == referrer and page["m_arrive"] < r["m_arrive"] < left_at for r in late_css):
             problems.append("%s: its stylesheet ld3 (referrer %s) had not arrived when the walk left the page" % (_name(page), referrer))
         stretches.setdefault(left_at, []).append(page)
