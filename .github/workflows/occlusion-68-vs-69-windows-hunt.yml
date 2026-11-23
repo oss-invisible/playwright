@@ -28,7 +28,7 @@ name: occlusion 68 vs 69 windows hunt
 
 on:
   push:
-    branches: [hunt/occlusion-68-vs-69-windows]
+    branches: [hunt/occlusion-fix-windows]
 
 permissions:
   contents: read
