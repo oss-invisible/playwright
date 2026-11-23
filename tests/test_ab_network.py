@@ -407,6 +407,9 @@ def test_the_walk_waits_for_what_a_closed_tab_sends_as_it_leaves_so_the_requests
         def inner_text(self, *a, **k):
             return "Partner"
 
+        def wait_for_function(self, *a, **k):
+            pass  # the walk leaves the tab from its one point (Journey.leave), once the page has declared its noise done
+
         def close(self):
             pass  # the requests of the leaving page come after close() has returned, while the walk waits
 
