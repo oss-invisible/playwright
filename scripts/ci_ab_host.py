@@ -9,7 +9,11 @@ journey (the first steps of the fake web's P4 walk, tests/fakeweb/profile_p4.py,
 After the four steps of the journey comes a fifth: the geolocation permission is granted to a page of the oracle's own and `getCurrentPosition` is called and awaited
 (the callback or the error, an event). On Windows the candidate must start NO utility process of the kind WINDOWS_UTILS (`-sandboxingKind 3`) and load none of the modules of
 the platform's location provider (an absolute rule, `geolocation_problems`); the NEGATIVE CONTROL is Playwright's own Firefox on the same runner with the same step
-(`run_stock`, command `stock`), which MUST start that process: if it does not the step does not reach the provider and the leg is a broken control (exit 2).
+(`run_stock`, command `stock`), which MUST read the host for the position: its tree must load `capabilityaccessmanagerclient.dll`, the FIRST read of the host that
+Firefox makes for the position on Windows (`CheckAccess` of dom/geolocation/GeolocationSystemWin.cpp, the consent check that runs before any provider is created). If it
+does not, the step does not reach the platform and the leg is a broken control (exit 2). The utility process of the provider (`-sandboxingKind 3`) is recorded and listed,
+never required of the stock: on the same windows-2022 image it started in some runs and not in others (the runner has no location source and the provider answers
+`code 2` at once), while the consent check ran in every one.
 On Linux the same step runs and its footprint is compared like the rest.
 
 Three things are compared, over the whole trace:
@@ -66,7 +70,8 @@ How the trace is taken:
     line, switched on for the run and put back after it): the kernel writes one per process, so a short-lived child cannot be missed, which a
     poll of the job's pids can. The files come from an ETW session on Microsoft-Windows-Kernel-File (the Create events: every path a process
     opens, a library included) taken with `logman` and read with `tracerpt`, both part of Windows. It needs an administrator (the hosted runners
-    are). Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
+    are): a failure says so only when Windows answered "access denied" (0x80070005), any other failure says its command, its code and Windows' text.
+    The session of a launch is gone from the list of `logman query -ets` before the next launch may start. Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
     see them is red, not empty.
 
 EVERY launch is also judged by how its parent ended (scripts/ci_crash_evidence.py): the warm-up, each measured seed and the idle launch alike. A root exit code other
@@ -152,8 +157,15 @@ GEO_READ = """() => new Promise(resolve => navigator.geolocation.getCurrentPosit
   {timeout: %d, maximumAge: 0}))""" % 20000
 #: The Windows location provider of Firefox runs in the utility process of the kind WINDOWS_UTILS: `-sandboxingKind 3` (the enum of
 #: ipc/glue/UtilityProcessSandboxing.h: GENERIC_UTILITY 0, UTILITY_AUDIO_DECODING_WMF 1, MF_MEDIA_ENGINE_CDM 2, WINDOWS_UTILS 3, WINDOWS_FILE_DIALOG 4).
-#: Our engine has no caller of it left (acceptance contract, item 4, of the engine's geolocation_windows_provider_never_selected.test.mjs).
+#: Our engine has no caller of it left (acceptance contract, item 4, of the engine's geolocation_windows_provider_never_selected.test.mjs). It is the RULE on our engine
+#: (the candidate, and the 68 of the A/A), never the proof that the stock control reached the platform: the stock starts it only when the runner lets the provider run.
 LOCATION_UTILITY_KIND = "3"
+#: The first read of the host that Firefox makes for the position on Windows: `CheckAccess` (dom/geolocation/GeolocationSystemWin.cpp) loads the Capability Access Manager
+#: client to ask the consent store, before the provider is created and whatever the provider then answers. This is the signal of the stock control. Measured on every footprint
+#: with a stock control: it is in the tree (with or without the utility process `-sandboxingKind 3`) of 45165805370, 45170547415, 45252267809 (PR, windows-2022), 45206303882
+#: (gate, windows-2025) and 45257636942 (gate republish, windows-2022); the utility process is in 3 of those 5 (45206303882 and 45257636942 have none). The engine, the 68 and the
+#: 69 candidate, has neither in any launch (warm-up, idle, seeds) of 45121964904, 45206303882, 45257629988 and 45257636942.
+LOCATION_FIRST_READ = "capabilityaccessmanagerclient.dll"
 #: The modules the provider loads (a Windows trace sees a library as a file opened): the engine's contract names the first four as ABSENT (item 3 of the
 #: same test); the WinRT geolocation modules are matched by their prefix.
 LOCATION_MODULES = frozenset({"geolocation.dll", "locationframeworkps.dll", "locationapi.dll", "wlanapi.dll", "capabilityaccessmanagerclient.dll"})
@@ -1044,8 +1056,43 @@ FILE_PROVIDER, FILE_CREATE_KEYWORD = "Microsoft-Windows-Kernel-File", "0x80"  # 
 PROCESS_PROVIDER, PROCESS_KEYWORD = "Microsoft-Windows-Kernel-Process", "0x10"  # WINEVENT_KEYWORD_PROCESS: starts and stops, with the exit code
 
 
+ACCESS_DENIED = (5, 0x80070005)  # ERROR_ACCESS_DENIED, as a Win32 code and as an HRESULT: the only failure that says "it needs an administrator"
+SESSION_GONE_LIMIT = 120.0  # the guard of the wait for a stopped session to leave the list of the sessions (a fence, not a pace: the wait is a condition read every 0.25 s)
+
+
 class TraceError(RuntimeError):
-    """The trace of a Windows run could not be taken (not an administrator, no audit, no session): said as such, never an empty trace."""
+    """The trace of a Windows run could not be taken (not an administrator, no audit, no session): said as such, never an empty trace. `code` is the exit
+    code of the Windows tool that failed (None when there was none)."""
+
+    def __init__(self, message, code=None) -> None:
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def access_denied(self) -> bool:
+        return self.code is not None and (self.code & 0xFFFFFFFF) in ACCESS_DENIED
+
+
+def trace_not_started(e: TraceError) -> str:
+    """The problem line of a trace that could not be started: what Windows said, and "it needs an administrator" only when Windows said access denied
+    (run 45257629988, seed 6: `logman query` failed with 0x80071068, ERROR_WMI_GUID_NOT_FOUND, and the line blamed the administrator)."""
+    return "the trace of a Windows run could not be started%s: %s" % (" (it needs an administrator)" if e.access_denied else "", e)
+
+
+def parse_sessions(text: str) -> dict:
+    """The sessions of `logman query -ets` as {name: status}: a header (Data Collector Set, Type, Status), a line of dashes, one row per session
+    (columns apart by two spaces or more; a name can hold single spaces), then "The command completed successfully."."""
+    sessions = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or set(line) == {"-"} or line.startswith("Data Collector Set") or line.startswith("The command completed"):
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) >= 2:
+            sessions[parts[0]] = parts[-1]
+    return sessions
 
 
 def split_command_line(text: str) -> list:
@@ -1271,10 +1318,10 @@ def _tool(argv, timeout: float = 300.0) -> str:
     try:
         done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise TraceError("%s: %s" % (argv[0], e))
+        raise TraceError("%s: %s" % (" ".join(str(a) for a in argv), e))
     if done.returncode != 0:
-        raise TraceError("%s %s failed with %d: %s" % (argv[0], argv[1] if len(argv) > 1 else "", done.returncode,
-                                                       (done.stdout + done.stderr).strip()[:300]))
+        code = done.returncode & 0xFFFFFFFF
+        raise TraceError("%s failed with 0x%08X (%d): %s" % (" ".join(str(a) for a in argv), code, code, (done.stdout + done.stderr).strip()[:500]), code)
     return done.stdout
 
 
@@ -1303,7 +1350,7 @@ class WindowsTrace:
         path.read_text(encoding="utf-8")
         return str(path)
 
-    def start(self) -> None:
+    def start(self, sleep=time.sleep, now=time.monotonic, limit=SESSION_GONE_LIMIT) -> None:
         self.before = {"setting": parse_audit_setting(_tool(["auditpol", "/get", "/subcategory:" + AUDIT_GUID, "/r"])),
                        "value": self._registry_value()}
         _tool(["auditpol", "/set", "/subcategory:" + AUDIT_GUID, "/success:enable"])
@@ -1326,10 +1373,63 @@ class WindowsTrace:
         except TraceError:
             self.exits_ok = False
         # The provider is enabled a moment after the session exists (the first canary of the first launch of run 44963364060 was not seen): the canaries are written
-        # with a round trip to the session between them, and it is the LAST one, written just before the launch, that must be in the trace.
+        # with a round trip to the session between them, and it is the LAST one, written just before the launch, that must be in the trace. The round trip is the
+        # LIST of the sessions, not the query of this one: `logman query <name>` resolves the GUIDs of its providers through WMI and failed with 0x80071068
+        # (ERROR_WMI_GUID_NOT_FOUND) in run 45257629988, seed 6, side A, after `logman create` had succeeded.
         for n in (1, 2, 3):
-            _tool(["logman", "query", self.name, "-ets"])
+            self._expect_running(sleep, now, limit)
             self._start_canary = self._canary("start%d" % n)
+
+    def _sessions(self) -> dict:
+        return parse_sessions(_tool(["logman", "query", "-ets"]))
+
+    def _wait_sessions(self, done, timed_out, sleep, now, limit) -> None:
+        """Reads the list of the sessions every 0.25 s until `done(sessions)` is true, or the guard `limit` runs out (then `timed_out(last list, last read error or None)` is the TraceError: the error when the last read failed, the list when it did not). A read that fails (4200 in run 45257629988, or any error) is read again: it is a read of a state, it changes nothing."""
+        deadline = now() + limit
+        sessions = error = None
+        while True:
+            try:
+                sessions, error = self._sessions(), None
+            except TraceError as e:
+                error = e
+            if error is None and done(sessions):
+                return
+            if now() >= deadline:
+                raise timed_out(sessions, error)
+            sleep(0.25)
+
+    def _expect_running(self, sleep=time.sleep, now=time.monotonic, limit=SESSION_GONE_LIMIT) -> None:
+        """The round trip to the session: it is in the list and it is running, or the launch does not start (the guard `limit` is the fence)."""
+        def timed_out(sessions, error):
+            if error is not None:
+                return TraceError("the list of the sessions (`logman query -ets`) could not be read in %g s, the last error: %s" % (limit, error), getattr(error, "code", None))
+            return TraceError("the session %s is not running in the list of `logman query -ets` (it says %s); the sessions read: %s" % (
+                self.name, repr(sessions[self.name]) if self.name in sessions else "nothing of it",
+                ", ".join("%s (%s)" % kv for kv in sorted(sessions.items())) or "none"))
+
+        self._wait_sessions(lambda sessions: sessions.get(self.name, "").lower() == "running", timed_out, sleep, now, limit)
+
+    def _stop_session(self, sleep=time.sleep, now=time.monotonic, limit=SESSION_GONE_LIMIT) -> None:
+        """Stops the session and returns when it is gone from the list of the sessions: the next launch starts with no session of this one. A `logman stop`
+        that fails because the session is no longer there (4201, ERROR_WMI_INSTANCE_NOT_FOUND) is not an error when the list confirms it is not; while the
+        list says it is still there, the error of `stop` is the error."""
+        failed = None
+        try:
+            _tool(["logman", "stop", self.name, "-ets"])
+        except TraceError as e:
+            failed = e
+
+        def gone(sessions):
+            if self.name in sessions and failed is not None:
+                raise failed
+            return self.name not in sessions
+
+        def timed_out(sessions, error):
+            if error is not None:
+                return TraceError("the list of the sessions (`logman query -ets`) could not be read in %g s after `logman stop`, the last error: %s" % (limit, error), getattr(error, "code", None))
+            return TraceError("the session %s is still in the list of `logman query -ets` %g s after `logman stop` (it says %s)" % (self.name, limit, repr(sessions[self.name])))
+
+        self._wait_sessions(gone, timed_out, sleep, now, limit)
 
     def _registry_value(self):
         try:
@@ -1347,7 +1447,7 @@ class WindowsTrace:
         self.audit_raw = (events, ends)
         return process_tree(events, roots, ends)
 
-    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None) -> dict:
+    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None, gone_limit=SESSION_GONE_LIMIT) -> dict:
         """`{"tree": [4688 events], "files": {(pid, name)}, "outside": {process name: paths}, "exited": {...}, "events": n}`: what the TREE did from its
         first process to its last (the ancestry by the creator's pid from the launched process). What a process outside the tree opened (a service, the
         antivirus, the oracle itself apart) is not the engine's: it is counted by process name and left out of the comparison."""
@@ -1367,7 +1467,7 @@ class WindowsTrace:
         events, ends = self.audit_raw
         audit = (events, ends, sorted(roots))
         end_canary = self._canary("end")
-        _tool(["logman", "stop", self.name, "-ets"])
+        self._stop_session(sleep, now, gone_limit)
         self.session = False
         summary = self.work / "files.txt"
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
@@ -1397,11 +1497,11 @@ class WindowsTrace:
                 "order": {k: v for k, v in order.items() if k[0] in tree_pids},
                 "dispositions": {k: sorted(v) for k, v in dispositions.items() if k[0] in tree_pids}}
 
-    def cleanup(self) -> None:
-        """Put the machine back: the session closed, the audit as it was."""
+    def cleanup(self, sleep=time.sleep, now=time.monotonic, gone_limit=SESSION_GONE_LIMIT) -> None:
+        """Put the machine back: the session closed and gone from the list, the audit as it was."""
         if self.session:
             try:
-                _tool(["logman", "stop", self.name, "-ets"])
+                self._stop_session(sleep, now, gone_limit)
             except TraceError:
                 pass
             self.session = False
@@ -1595,6 +1695,11 @@ def location_utility_kinds(kinds) -> list:
     return sorted(k for k in kinds if "sandboxingKind=%s" % LOCATION_UTILITY_KIND in k.split("/"))
 
 
+def location_first_reads(paths) -> list:
+    """The paths (host paths of a footprint, either separator) of the module that is the first read of the host for the position (`LOCATION_FIRST_READ`)."""
+    return sorted(path for path in paths if _base(path).lower() == LOCATION_FIRST_READ)
+
+
 def location_modules(paths) -> list:
     """The paths (host paths of a footprint, either separator) of a module the Windows location provider loads."""
     out = []
@@ -1605,33 +1710,37 @@ def location_modules(paths) -> list:
     return sorted(out)
 
 
-def geolocation_problems(seed_footprint: dict, where: str) -> list:
-    """What a candidate's launch did to the host that only the platform's location provider does: a process of the kind `-sandboxingKind 3` and
-    the modules it loads. Absolute (it does not read the published engine): the candidate answers from the core's declaration and asks nobody."""
+def geolocation_problems(seed_footprint: dict, where: str, side: str = "B") -> list:
+    """What a launch of OUR engine did to the host that only the platform's location check and provider do: a process of the kind `-sandboxingKind 3` and the modules
+    they load, `capabilityaccessmanagerclient.dll` (the first read of the host for the position) among them. Absolute (it does not read the other engine): the engine
+    answers from the core's declaration and asks nobody. `where` names the launch (`seed 11`, `warm-up`, `idle`), the message the module."""
     problems = []
     kinds = location_utility_kinds(seed_footprint.get("kinds", {}))
     if kinds:
-        problems.append("%s side B: the engine started the Windows location utility process (-sandboxingKind %s): %s"
-                        % (where, LOCATION_UTILITY_KIND, ", ".join(kinds)))
+        problems.append("%s side %s: the engine started the Windows location utility process (-sandboxingKind %s): %s"
+                        % (where, side, LOCATION_UTILITY_KIND, ", ".join(kinds)))
     modules = location_modules(seed_footprint.get("files", []))
     if modules:
-        problems.append("%s side B: the engine loaded location modules: %s" % (where, ", ".join(modules[:10])))
+        problems.append("%s side %s: the engine loaded location modules: %s%s" % (
+            where, side, ", ".join(modules[:10]),
+            " (%s is the first read of the host that Firefox makes for the position: the engine asked the platform)" % LOCATION_FIRST_READ if location_first_reads(modules) else ""))
     return problems
 
 
 def stock_control_problems(stock: dict) -> list:
     """What makes the stock control BROKEN (exit 2, the A/B says nothing): its own trace or step failed, or stock Firefox, given the permission and the
-    same request, did not start the Windows location utility process, so the step does not reach the platform provider."""
+    same request, did not load `capabilityaccessmanagerclient.dll` (the first read of the host for the position), so the step does not reach the platform. The utility
+    process of the provider is not asked of it: on the same image it started in some runs and not in others (see LOCATION_FIRST_READ for the runs)."""
     seed = stock.get("stock") or {}
     problems = ["stock control: %s" % p for p in seed.get("problems", [])]
     problems += ["stock control: step %s (%s) failed: %s" % (st.get("n"), st.get("name"), st.get("error")) for st in seed.get("steps", []) if not st.get("ok")]
     if not seed:
         problems.append("stock control: the run made no footprint")
-    elif seed.get("started", True) and not location_utility_kinds(seed.get("kinds", {})):
-        # only a stock Firefox that RAN says anything about the provider: one that never started (not installed, did not launch) is a different broken control
-        problems.append("stock control: stock Firefox did not start the Windows location utility process (-sandboxingKind %s) after getCurrentPosition with the "
-                        "permission granted: the step does not reach the platform provider, so a candidate without that process proves nothing"
-                        % LOCATION_UTILITY_KIND)
+    elif seed.get("started", True) and not location_first_reads(seed.get("files", [])):
+        # only a stock Firefox that RAN says anything about the position: one that never started (not installed, did not launch) is a different broken control
+        problems.append("stock control: stock Firefox did not load %s (the first read of the host for the position, the consent check of the Windows location code) after "
+                        "getCurrentPosition with the permission granted: the step does not reach the platform, so a candidate without that read proves nothing"
+                        % LOCATION_FIRST_READ)
     return problems
 
 
@@ -1687,9 +1796,15 @@ def judge(a: dict, b: dict, expected: list | None = None, a_a: bool = False, pla
                     differences.append({"seed": seed, "category": category, "leaf": leaf, "a": value if side == "A" else MISSING, "b": value if side == "B" else MISSING,
                                         "by": {side: _by(seeds[seed], leaf), other: []}, "calls": {side: _calls(seeds[seed], leaf), other: []}})
     differences.sort(key=lambda d: (d["seed"], d["leaf"]))
-    if os_name == "windows" and not a_a:
-        for where, fp in [("seed %s" % seed, seeds_b[seed]) for seed in sorted(seeds_b)] + ([("warm-up", b["warmup"])] if b.get("warmup") else []):
-            problems += geolocation_problems(fp, where)
+    if os_name == "windows":
+        # The rule is on every launch of OUR engine (the seeds, the warm-up and the idle one): the candidate in the A/B; in the A/A the 68 on both sides (it has neither the
+        # module nor the process in any launch measured, 45121964904, 45206303882, 45257629988, 45257636942), so a published engine that starts asking the platform is red
+        # before the candidate is looked at. In the A/B side A is the published engine, which the A/A of the same job has judged.
+        for side, fp_side, seeds_side in ((("A", a, seeds_a), ("B", b, seeds_b)) if a_a else (("B", b, seeds_b),)):
+            launches = [("seed %s" % seed, seeds_side[seed]) for seed in sorted(seeds_side)]
+            launches += [(label, fp_side[name]) for name, label in (("warmup", "warm-up"), ("idle", "idle")) if fp_side.get(name)]
+            for where, fp in launches:
+                problems += geolocation_problems(fp, where, side)
     problems += idle_problems(a, b)
     wa, wb = a.get("warmup") or {}, b.get("warmup") or {}
     if wa.get("kinds", {}).get(PINGSENDER_KIND) and wb.get("kinds", {}).get(PINGSENDER_KIND):
@@ -2001,7 +2116,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         except TraceError as e:
             trace.cleanup()
             return {"seed": seed, "steps": [], "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False},
-                    "problems": ["the trace of a Windows run could not be started (it needs an administrator): %s" % e]}
+                    "problems": [trace_not_started(e)]}
     else:
         from _strace_stand_in import _stand_in
 
@@ -2422,7 +2537,7 @@ def stock_browser_parent(root_pid: int | None = None) -> int | None:
 
 def run_stock(leg: str, audit_dir=None) -> dict:
     """The negative control of the geolocation step, Windows only: Playwright's own Firefox (`p.firefox.launch()`, as the fake web's stock control), with
-    no declared position, the same step, the same trace. It must start the Windows location utility process (`stock_control_problems`). The tree is the
+    no declared position, the same step, the same trace. Its tree must load the first read of the host for the position (`stock_control_problems`). The tree is the
     one of this process (the driver and the browser it launches): only the kinds and the modules of the run are read."""
     from playwright.sync_api import sync_playwright
 
@@ -2446,7 +2561,7 @@ def run_stock(leg: str, audit_dir=None) -> dict:
         try:
             trace.start()
         except TraceError as e:
-            return not_started("the trace of a Windows run could not be started (it needs an administrator): %s" % e)
+            return not_started(trace_not_started(e))
         stock_phase("geolocation lab")
         geo_origin, stop_geo = start_geo_lab()
         try:
@@ -2647,15 +2762,16 @@ def run_stock_control(leg: str, out: Path) -> dict | None:
     if broken:
         print("\n".join("FAIL " + b for b in broken))
         seed = (stock or {}).get("stock") or {}
-        if seed and seed.get("started", True) and not location_utility_kinds(seed.get("kinds", {})):
+        if seed and seed.get("started", True) and not location_first_reads(seed.get("files", [])):
             # the claim of the step is kept; the proof that goes with it is what the tree that did start left
             print("\n".join(stock_evidence(seed)))
-            print("BROKEN CONTROL: the geolocation step does not reach the platform provider on stock Firefox; the A/B says nothing")
+            print("BROKEN CONTROL: the geolocation step does not reach the platform on stock Firefox (%s is not loaded); the A/B says nothing" % LOCATION_FIRST_READ)
         else:
             print("BROKEN CONTROL: the stock control did not run to the end (the reason is above); the A/B says nothing")
         return None
-    print("GEOLOCATION CONTROL: stock Firefox started %s; modules: %s" % (
-        ", ".join(location_utility_kinds(stock["stock"]["kinds"])), ", ".join(location_modules(stock["stock"]["files"])) or "-"))
+    print("GEOLOCATION CONTROL: stock Firefox loaded %s; location utility process: %s; modules: %s" % (
+        LOCATION_FIRST_READ, ", ".join(location_utility_kinds(stock["stock"]["kinds"])) or "none (the runner has no location source, the provider answered at once)",
+        ", ".join(location_modules(stock["stock"]["files"])) or "-"))
     return stock
 
 

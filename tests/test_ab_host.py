@@ -634,15 +634,59 @@ def test_the_audit_setting_is_read_from_the_csv_of_auditpol():
     assert host.parse_audit_setting(csv) == "Success" and host.parse_audit_setting("") == ""
 
 
+REAL_SESSION_LIST = """
+Data Collector Set                      Type                          Status
+-------------------------------------------------------------------------------
+Circular Kernel Context Logger          Trace                         Running
+EventLog-Application                    Trace                         Running
+EventLog-Security                       Trace                         Running
+EventLog-System                         Trace                         Running
+Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace Trace                     Running
+DiagLog                                 Trace                         Running
+abhost-4242-123456789                   Trace                         Running
+SgrmEtwSession                          Trace                         Stopped
+UBPM                                    Trace                         Running
+
+The command completed successfully.
+"""
+
+
+def logman_list(sessions):
+    """The output of `logman query -ets` for {name: status}: a header, a line of dashes, a row per session, the closing line."""
+    rows = "".join("%-39s %-29s %s\n" % (name, "Trace", status) for name, status in sessions.items())
+    return "\nData Collector Set                      Type                          Status\n" + "-" * 79 + "\n" + rows + "\nThe command completed successfully.\n"
+
+
 class FakeTools:
     """`_tool` of a Windows machine: the audit, the registry, the Security log, logman and tracerpt, with a record of what was asked."""
 
-    def __init__(self, work, tree, files, canaries=("start", "end")):
+    def __init__(self, work, tree, files, canaries=("start", "end"), still_listed=0, list_failures=0):
         self.work, self.tree, self.files, self.canaries, self.calls = work, tree, files, canaries, []
+        self.list_failures = list_failures  # the first reads of the list fail with 4200 (ERROR_WMI_GUID_NOT_FOUND)
+        self.sessions, self.still_listed, self.stopped = {}, still_listed, {}  # a stopped session is listed `still_listed` more times, then gone
 
     def __call__(self, argv, timeout=300.0):
         self.calls.append(list(argv))
         tool = argv[0]
+        if tool == "logman":
+            if argv[1] == "create":
+                self.sessions[argv[3]] = "Running"
+            elif argv[1] == "query" and argv[2:] == ["-ets"]:
+                if self.list_failures > 0:
+                    self.list_failures -= 1
+                    raise host.TraceError("logman query -ets failed with 0x80071068 (2147946600): The GUID passed was not recognized as valid by a WMI data provider.", 2147946600)
+                for name in [n for n, left in self.stopped.items() if left == 0]:
+                    self.sessions.pop(name, None)
+                    del self.stopped[name]
+                for name in self.stopped:
+                    self.stopped[name] -= 1
+                return logman_list(self.sessions)
+            elif argv[1] == "query":  # the query of one session resolves the GUIDs of its providers through WMI: run 45257629988
+                raise host.TraceError("logman query failed with 0x80071068", 2147946600)
+            elif argv[1] == "stop":
+                if argv[2] not in self.sessions or argv[2] in self.stopped:
+                    raise host.TraceError("logman stop failed with 0x80071069", 2147946601)  # 4201, ERROR_WMI_INSTANCE_NOT_FOUND
+                self.stopped[argv[2]] = self.still_listed
         if tool == "auditpol" and argv[1] == "/get":
             return "Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting\nM,System,Process Creation,{G},No Auditing,\n"
         if tool == "reg" and argv[1] == "query":
@@ -762,7 +806,8 @@ def test_the_session_is_recording_when_the_last_start_canary_is_in_the_trace_eve
     trace, fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start3", "end"))
     got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
     assert got["problems"] == []
-    assert sum(1 for c in fake.calls if c[:2] == ["logman", "query"]) == 3, "a round trip to the session before each canary"
+    stop = next(i for i, c in enumerate(fake.calls) if c[:2] == ["logman", "stop"])
+    assert sum(1 for c in fake.calls[:stop] if c == ["logman", "query", "-ets"]) == 3, "a round trip to the list of the sessions before each canary"
     trace, _fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES, canaries=("start1", "start2", "end"))
     problems = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"]
     assert len(problems) == 1 and "last start canary" in problems[0]
@@ -1169,7 +1214,8 @@ def test_the_stand_in_traces_the_network_only_when_the_host_oracle_asks(tmp_path
 
 
 # -
-# The geolocation step: the candidate starts no Windows location utility process and loads no location module; stock Firefox, the control, must start it.
+# The geolocation step: our engine starts no Windows location utility process and loads no location module; stock Firefox, the control, must load the first read of the
+# host for the position (`capabilityaccessmanagerclient.dll`).
 
 LOCATION_CMD = '"%s" -contentproc --channel="100.7.8" -sandboxingKind 3 -notForBrowser utility' % FIREFOX
 WIN_FILES = ["c:\\windows\\system32\\kernel32.dll", "c:\\windows\\system32\\ntdll.dll", "c:\\windows\\system32\\user32.dll"]
@@ -1230,10 +1276,11 @@ def test_the_warm_up_launch_of_the_candidate_is_checked_too():
     assert report["verdict"] == "red" and any(p.startswith("warm-up side B: the engine started the Windows location utility process") for p in report["problems"])
 
 
-def test_the_rule_is_for_the_candidate_on_windows_not_for_the_a_a_nor_for_linux():
+def test_the_rule_is_for_our_engine_on_windows_both_sides_of_the_a_a_and_the_candidate_of_the_a_b_not_for_linux():
     published, candidate = windows_footprints(candidate_kinds=dict(WIN_KINDS, **{LOCATION_KIND: 1}))
     a_a = judge(candidate, copy.deepcopy(candidate), a_a=True)
-    assert not any("location" in p for p in a_a["problems"])
+    for side in ("A", "B"):
+        assert sum(" side %s: the engine started the Windows location utility process" % side in p for p in a_a["problems"]) == len(SEEDS), side
     side_a = judge(candidate, published, expected=[])
     assert not any("side B: the engine started" in p for p in side_a["problems"])
     on_linux = judge(footprint(), footprint("candidate", kinds=dict(KINDS, **{LOCATION_KIND: 1})), expected=[])
@@ -1246,23 +1293,127 @@ def a_stock(kinds, files=(), steps=None, problems=()):
                       "problems": list(problems)}}
 
 
-def test_stock_that_starts_the_location_utility_process_is_a_working_control():
-    stock = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=["c:\\windows\\system32\\geolocation.dll"])
+FIRST_READ = "capabilityaccessmanagerclient.dll"
+FIRST_READ_PATH = "c:\\windows\\system32\\capabilityaccessmanagerclient.dll"
+
+
+def test_stock_that_loads_the_first_read_of_the_host_for_the_position_is_a_working_control():
+    stock = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=["c:\\windows\\system32\\geolocation.dll", FIRST_READ_PATH])
     assert host.stock_control_problems(stock) == []
+    assert host.stock_control_problems(a_stock(WIN_KINDS, files=["C:\\Windows\\System32\\CapabilityAccessManagerClient.dll"])) == []
 
 
-def test_stock_that_does_not_start_it_is_a_broken_control_and_says_the_step_does_not_reach_the_provider():
+def test_stock_that_does_not_load_it_is_a_broken_control_and_says_the_step_does_not_reach_the_platform():
     problems = host.stock_control_problems(a_stock(WIN_KINDS))
-    assert len(problems) == 1 and "did not start the Windows location utility process (-sandboxingKind 3)" in problems[0]
-    assert "does not reach the platform provider" in problems[0]
+    assert len(problems) == 1 and "did not load %s" % FIRST_READ in problems[0]
+    assert "does not reach the platform" in problems[0]
 
 
 def test_a_stock_run_that_failed_or_was_not_traced_is_a_broken_control_too():
     kinds = dict(WIN_KINDS, **{LOCATION_KIND: 1})
-    assert host.stock_control_problems(a_stock(kinds, steps=[{"n": 5, "name": host.GEO_STEP, "ok": False, "error": "timeout"}])) == [
+    assert host.stock_control_problems(a_stock(kinds, files=[FIRST_READ_PATH], steps=[{"n": 5, "name": host.GEO_STEP, "ok": False, "error": "timeout"}])) == [
         "stock control: step 5 (%s) failed: timeout" % host.GEO_STEP]
-    assert host.stock_control_problems(a_stock(kinds, problems=["the file trace lost 3 events"])) == ["stock control: the file trace lost 3 events"]
+    assert host.stock_control_problems(a_stock(kinds, files=[FIRST_READ_PATH], problems=["the file trace lost 3 events"])) == ["stock control: the file trace lost 3 events"]
     assert host.stock_control_problems({"stock": {}}) == ["stock control: the run made no footprint"]
+
+
+# The signal of the stock control is the first read of the host that Firefox makes for the position, not the utility process of the provider. Real footprints, reduced
+# to what the rules read (tests/data/ab_host_geo/*/SOURCES.md): the stock of the gate republish 45257636942 (windows-2022: the module is loaded, the utility process is
+# not), the stock of the pull request 45165805370 (windows-2022: both), and the candidate of 45257636942 (neither, in any launch).
+GEO_DATA = Path(__file__).resolve().parent / "data" / "ab_host_geo"
+
+
+def geo_fixture(run, name):
+    return json.loads((GEO_DATA / run / name).read_text(encoding="utf-8"))
+
+
+def without_first_read(stock):
+    stock = copy.deepcopy(stock)
+    stock["stock"]["files"] = [f for f in stock["stock"]["files"] if not f.endswith("\\" + FIRST_READ)]
+    stock["stock"]["touched_by"] = {}
+    return stock
+
+
+def test_the_stock_of_45257636942_loaded_the_first_read_without_the_utility_process_and_the_control_is_working():
+    """Run 45257636942 (windows-2022): the stock loaded `capabilityaccessmanagerclient.dll` and started no `-sandboxingKind 3` process (the runner has no location source: the
+    provider answers `code 2`). The old control asked for the process and was broken; the first read is in every stock footprint measured (45165805370, 45170547415,
+    45252267809, 45206303882, 45257636942), the process in 3 of the 5."""
+    stock = geo_fixture("45257636942", "footprint-stock.json")
+    assert host.location_first_reads(stock["stock"]["files"]) == [FIRST_READ_PATH]
+    assert host.location_utility_kinds(stock["stock"]["kinds"]) == []
+    assert host.stock_control_problems(stock) == []
+
+
+def test_the_stock_of_45165805370_loaded_the_first_read_and_started_the_utility_process_and_the_control_is_working():
+    stock = geo_fixture("45165805370", "footprint-stock.json")
+    assert host.location_first_reads(stock["stock"]["files"]) == [FIRST_READ_PATH]
+    assert host.location_utility_kinds(stock["stock"]["kinds"]) == ["utility/sandboxingKind=3"]
+    assert host.stock_control_problems(stock) == []
+
+
+def test_a_stock_that_did_not_load_the_first_read_is_a_broken_control_that_names_the_module_whatever_the_utility_process():
+    for run in ("45257636942", "45165805370"):
+        problems = host.stock_control_problems(without_first_read(geo_fixture(run, "footprint-stock.json")))
+        assert len(problems) == 1 and FIRST_READ in problems[0] and "first read of the host for the position" in problems[0], run
+        assert "does not reach the platform" in problems[0]
+    # the utility process is not the signal: with it, and without the module, the control is broken all the same
+    with_process = without_first_read(geo_fixture("45165805370", "footprint-stock.json"))
+    assert host.location_utility_kinds(with_process["stock"]["kinds"]) == ["utility/sandboxingKind=3"]
+    assert len(host.stock_control_problems(with_process)) == 1
+
+
+def test_a_stock_control_says_on_the_output_which_module_is_missing_or_that_it_loaded_it(tmp_path, monkeypatch, capsys):
+    broken = without_first_read(geo_fixture("45257636942", "footprint-stock.json"))
+    out = tmp_path / "o"
+    out.mkdir()
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, broken) or 0)
+    assert host.run_stock_control("windows-x86_64", out) is None
+    printed = capsys.readouterr().out
+    assert "BROKEN CONTROL" in printed and "%s is not loaded" % FIRST_READ in printed and "stock evidence: location modules loaded: wlanapi.dll" in printed
+    working = geo_fixture("45257636942", "footprint-stock.json")
+    monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, working) or 0)
+    assert host.run_stock_control("windows-x86_64", out) == working
+    assert "GEOLOCATION CONTROL: stock Firefox loaded %s; location utility process: none" % FIRST_READ in capsys.readouterr().out
+
+
+def geo_problems(report):
+    return [p for p in report["problems"] if "location" in p]
+
+
+def test_the_candidate_of_45257636942_is_not_red_for_the_geolocation_rule_in_any_launch():
+    candidate = geo_fixture("45257636942", "footprint-candidate.json")
+    for launch in [candidate["warmup"], candidate["idle"]] + candidate["seeds"]:
+        assert host.location_first_reads(launch["files"]) == [] and host.location_utility_kinds(launch["kinds"]) == []
+    assert geo_problems(judge(copy.deepcopy(candidate), candidate, floors={}, expected=[])) == []
+
+
+@pytest.mark.parametrize("launch", ["warmup", "idle", "seed 0", "seed 1"])
+def test_a_candidate_that_loads_the_first_read_in_one_launch_is_red_and_names_the_launch_and_the_module(launch):
+    """The idle launch was not looked at by the old rule (it was in no launch of the candidates measured, so nothing showed it)."""
+    candidate = geo_fixture("45257636942", "footprint-candidate.json")
+    published = copy.deepcopy(candidate)
+    target = candidate[launch] if launch in ("warmup", "idle") else candidate["seeds"][int(launch.split()[1])]
+    target["files"] = sorted(target["files"] + [FIRST_READ_PATH])
+    problems = geo_problems(judge(published, candidate, floors={}, expected=[]))
+    label = {"warmup": "warm-up", "idle": "idle"}.get(launch, "seed %s" % target["seed"])
+    assert len(problems) == 1, problems
+    assert problems[0].startswith("%s side B: the engine loaded location modules: %s" % (label, FIRST_READ_PATH)) and "first read of the host" in problems[0]
+
+
+def test_the_a_a_is_red_for_the_geolocation_rule_on_either_side_and_the_a_b_judges_the_candidate_only():
+    """The 68 has neither the module nor the process in any launch measured (45121964904, 45206303882, 45257629988, 45257636942): the rule is on our engine, so on both
+    sides of the A/A. In the A/B only the candidate (side B) is judged: side A is the published engine, which the A/A of the same job has judged."""
+    engine = geo_fixture("45257636942", "footprint-candidate.json")
+    assert geo_problems(judge(copy.deepcopy(engine), copy.deepcopy(engine), a_a=True, floors={}, expected=[])) == []
+    first = copy.deepcopy(engine)
+    first["idle"]["files"] = sorted(first["idle"]["files"] + [FIRST_READ_PATH])
+    problems = geo_problems(judge(first, copy.deepcopy(engine), a_a=True, floors={}, expected=[]))
+    assert len(problems) == 1 and problems[0].startswith("idle side A: the engine loaded location modules: %s" % FIRST_READ_PATH)
+    second = copy.deepcopy(engine)
+    second["seeds"][0]["kinds"] = dict(second["seeds"][0]["kinds"], **{LOCATION_KIND: 1})
+    problems = geo_problems(judge(copy.deepcopy(engine), second, a_a=True, floors={}, expected=[]))
+    assert len(problems) == 1 and problems[0].startswith("seed %s side B: the engine started the Windows location utility process" % second["seeds"][0]["seed"])
+    assert geo_problems(judge(first, copy.deepcopy(engine), floors={}, expected=[])) == [], "the A/B does not judge the published engine"
 
 
 class FakePage:
@@ -1387,7 +1538,7 @@ def test_a_windows_ab_runs_the_stock_control_after_the_a_a_and_before_the_verdic
     assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o1", "firefox-68", [11]) == 2
     assert order == [("run", "firefox-68"), ("run", "firefox-68 again"), ("run", "candidate"), ("judge", "a-a"), ("stock", "windows-x86_64")]
     order.clear()
-    stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}))
+    stock["doc"] = a_stock(dict(WIN_KINDS, **{LOCATION_KIND: 1}), files=[FIRST_READ_PATH])
     assert host.ab(cand, Path("seal"), "windows-x86_64", tmp_path / "o2", "firefox-68", [11]) == 0
     assert order[-2:] == [("stock", "windows-x86_64"), ("judge", "a-b")]
     order.clear()
@@ -1455,14 +1606,14 @@ def test_a_stock_firefox_that_is_not_installed_is_said_by_name_and_is_not_blamed
     document = host.run_stock("windows-x86_64")
     text = "\n".join(host.stock_control_problems(document))
     assert "is not installed" in text and str(missing) in text and "python -m playwright install firefox" in text
-    assert "does not reach the platform provider" not in text and "did not start the Windows location utility" not in text
+    assert "does not reach the platform" not in text and "did not load %s" % FIRST_READ not in text
     # and the control says the same on the output
     out = tmp_path / "o"
     out.mkdir()
     monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, document) or 0)
     assert host.run_stock_control("windows-x86_64", out) is None
     printed = capsys.readouterr().out
-    assert "is not installed" in printed and "does not reach the platform provider" not in printed and "BROKEN CONTROL" in printed
+    assert "is not installed" in printed and "does not reach the platform" not in printed and "BROKEN CONTROL" in printed
 
 
 def test_a_stock_firefox_that_does_not_launch_says_why_and_one_that_ran_without_the_provider_leaves_its_evidence(tmp_path, monkeypatch, capsys):
@@ -1485,7 +1636,7 @@ def test_a_stock_firefox_that_does_not_launch_says_why_and_one_that_ran_without_
     monkeypatch.setattr(host, "run_stock_subprocess", lambda leg, path: host.write_json(path, stock) or 0)
     assert host.run_stock_control("windows-x86_64", out) is None
     printed = capsys.readouterr().out
-    assert "did not start the Windows location utility process" in printed and "BROKEN CONTROL: the geolocation step does not reach the platform provider" in printed
+    assert "did not load %s" % FIRST_READ in printed and "BROKEN CONTROL: the geolocation step does not reach the platform on stock Firefox (%s is not loaded)" % FIRST_READ in printed
     assert "stock evidence: process parent: firefox.exe -no-remote" in printed and "kernel32.dll" in printed and "location modules loaded: none" in printed
 
 
@@ -3049,7 +3200,7 @@ def test_a_stock_process_that_stands_still_is_a_broken_control_that_names_its_la
     document = host.read_json(out)
     problems = host.stock_control_problems(document)
     assert len(problems) == 1 and "did not end within 2 s" in problems[0] and "`evaluate begin`" in problems[0] and "tree was killed" in problems[0]
-    assert "does not reach the platform provider" not in problems[0] and document["stock"]["started"] is False
+    assert "does not reach the platform" not in problems[0] and document["stock"]["started"] is False
     printed = capsys.readouterr().out
     assert "stock phase evaluate begin at" in printed, "the log keeps the phases"
     # and the control reports it: the verdict is the broken control that says where it stood
@@ -3109,7 +3260,7 @@ def test_a_stock_firefox_with_no_parent_found_is_a_broken_control_that_says_so_a
     monkeypatch.setattr(host, "_seed_result", lambda *a, **k: pytest.fail("the trace must not be read with this process as its root"))
     document = host.run_stock("windows-x86_64")
     problems = host.stock_control_problems(document)
-    assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform provider" not in problems[0]
+    assert len(problems) == 1 and "parent process of the stock Firefox of Playwright was not found" in problems[0] and "does not reach the platform" not in problems[0]
 
 
 # -
@@ -3329,3 +3480,188 @@ def test_a_machine_that_cannot_audit_the_ends_says_so_and_tells_the_strangers_by
     assert trace.ends_ok is False and got["problems"] == []
     assert [e["pid"] for e in got["tree"]] == [100, 101, 102, 103, 104, 107], "107 is the pingsender: the svchost that took its pid has a creator that is not in the tree"
     assert [c[2] for c in fake.calls if c[:2] == ["auditpol", "/set"]] == ["/subcategory:" + host.AUDIT_GUID] * 2
+
+
+# -
+# The session of a Windows launch (run 45257629988, seed 6, side A: `logman query <name> -ets` failed with 0x80071068 after `logman create` had succeeded, the launch had no trace).
+
+def test_the_round_trip_before_the_canaries_is_the_list_of_the_sessions_and_never_the_query_of_one(tmp_path, monkeypatch):
+    trace, fake = a_windows_run(tmp_path, monkeypatch, TREE_FILES)  # the fake fails `logman query <name>` with 2147946600, as the runner did
+    queries = [c for c in fake.calls if c[:2] == ["logman", "query"]]
+    assert queries == [["logman", "query", "-ets"]] * 3 and trace._start_canary
+    assert trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"] == []
+
+
+@pytest.mark.parametrize("listed", [{}, {"abhost-other": "Running"}, "stopped"])
+def test_a_session_that_is_not_in_the_list_or_not_running_is_an_error_that_says_what_was_read(tmp_path, monkeypatch, listed):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+
+    def lists(argv, timeout=300.0):
+        out = fake(argv, timeout)
+        if argv == ["logman", "query", "-ets"]:
+            return logman_list({trace.name: "Stopped"} if listed == "stopped" else listed)
+        return out
+
+    monkeypatch.setattr(host, "_tool", lists)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    with pytest.raises(host.TraceError, match="is not running in the list of `logman query -ets`") as err:
+        trace.start(sleep=clock.sleep, now=clock.now, limit=1.0)
+    assert clock.t >= 1.0, "read again every quarter of a second until the guard"
+    assert trace.name in str(err.value) and ("Stopped" in str(err.value) if listed == "stopped" else "nothing of it" in str(err.value))
+    assert ("abhost-other (Running)" in str(err.value)) == (listed == {"abhost-other": "Running"})
+
+
+class Clock:
+    """A clock that only the sleeps move: a wait for a condition is read without waiting."""
+
+    def __init__(self):
+        self.t, self.sleeps = 0.0, []
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+    def now(self):
+        return self.t
+
+
+def test_a_stopped_session_that_is_still_listed_is_waited_for_and_then_the_launch_goes_on(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, still_listed=2)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=clock.sleep, now=clock.now)
+    names = [c[:2] for c in fake.calls]
+    after_stop = [c for c in fake.calls[names.index(["logman", "stop"]):] if c == ["logman", "query", "-ets"]]
+    assert got["problems"] == [] and len(after_stop) == 3, "listed for two reads, gone at the third"
+    assert trace.name not in fake.sessions and trace.session is False
+    assert names.index(["logman", "stop"]) < max(i for i, c in enumerate(fake.calls) if c == ["logman", "query", "-ets"]) < names.index(["tracerpt", str(tmp_path / "files.etl")])
+
+
+def test_a_stopped_session_that_never_leaves_the_list_is_an_error_after_the_guard(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, still_listed=10 ** 9)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    with pytest.raises(host.TraceError, match="is still in the list of `logman query -ets` 2 s after `logman stop`"):
+        trace.finish({100}, alive=lambda pid: False, sleep=clock.sleep, now=clock.now, gone_limit=2.0)
+    assert clock.t >= 2.0 and trace.session is True, "the session is not taken for closed"
+    assert not any(c[:1] == ["tracerpt"] for c in fake.calls)
+
+
+def test_a_stop_that_fails_because_the_session_is_gone_is_not_an_error_when_the_list_says_so(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    fake.sessions.clear()  # the session ended by itself: `logman stop` says 4201
+    assert trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None, now=Clock().now)["exited"]["exited"] is True
+
+
+def test_a_stop_that_fails_while_the_session_is_still_listed_is_an_error(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+
+    def refusing(argv, timeout=300.0):
+        if argv[:2] == ["logman", "stop"]:
+            raise host.TraceError("logman stop failed with 0x80070005: Access is denied.", 5)
+        return fake(argv, timeout)
+
+    monkeypatch.setattr(host, "_tool", refusing)
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    with pytest.raises(host.TraceError, match="Access is denied"):
+        trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+
+
+def test_the_cleanup_of_a_launch_also_waits_for_its_session_to_leave_the_list(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, still_listed=2)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    trace.cleanup(sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [0.25, 0.25] and trace.name not in fake.sessions and trace.session is False
+
+
+class Done:
+    def __init__(self, code, text):
+        self.returncode, self.stdout, self.stderr = code, "", text
+
+
+WMI_TEXT = "Error:\nThe GUID passed was not recognized as valid by a WMI data provider."
+
+
+def a_tool_that_fails_with(monkeypatch, code, text, *argv):
+    monkeypatch.setattr(host.subprocess, "run", lambda *a, **k: Done(code, text))
+    with pytest.raises(host.TraceError) as err:
+        host._tool(list(argv))
+    return err.value
+
+
+def test_a_failed_windows_tool_says_its_command_its_code_in_hex_and_the_text_of_windows(monkeypatch):
+    e = a_tool_that_fails_with(monkeypatch, 2147946600, WMI_TEXT, "logman", "query", "abhost-1-2", "-ets")
+    assert "logman query abhost-1-2 -ets" in str(e) and "0x80071068" in str(e) and "The GUID passed was not recognized as valid by a WMI data provider." in str(e)
+    assert e.code == 2147946600 and e.access_denied is False
+    line = host.trace_not_started(e)
+    assert line.startswith("the trace of a Windows run could not be started: logman query") and "needs an administrator" not in line
+
+
+@pytest.mark.parametrize("code", [5, 0x80070005, -2147024891])
+def test_access_denied_is_the_one_failure_that_says_the_trace_needs_an_administrator(monkeypatch, code):
+    e = a_tool_that_fails_with(monkeypatch, code, "Access is denied.", "auditpol", "/set", "/subcategory:{G}")
+    assert e.access_denied is True and "Access is denied." in str(e)
+    assert "(it needs an administrator): auditpol /set" in host.trace_not_started(e)
+
+
+def test_a_tool_that_could_not_run_has_no_code_and_does_not_blame_the_administrator(monkeypatch):
+    def missing(*a, **k):
+        raise FileNotFoundError("logman")
+
+    monkeypatch.setattr(host.subprocess, "run", missing)
+    with pytest.raises(host.TraceError) as err:
+        host._tool(["logman", "create"])
+    assert err.value.code is None and "needs an administrator" not in host.trace_not_started(err.value) and "logman create" in str(err.value)
+
+
+def test_the_list_of_the_sessions_is_read_from_the_output_of_logman_query_ets():
+    got = host.parse_sessions(REAL_SESSION_LIST)
+    assert got["abhost-4242-123456789"] == "Running" and got["SgrmEtwSession"] == "Stopped" and got["Circular Kernel Context Logger"] == "Running"
+    assert got["Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace"] == "Running", "a name as wide as its column leaves one space before the type"
+    assert len(got) == 9 and not any(k.startswith(("Data", "-", "The command")) for k in got)
+    assert host.parse_sessions("") == {} and host.parse_sessions("The command completed successfully.\n") == {}
+
+
+def test_a_read_of_the_list_that_fails_is_read_again_until_the_session_is_running(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, list_failures=2)  # run 45257629988: the read failed with 2147946600, the session was there
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start(sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [0.25, 0.25] and trace._start_canary
+    assert sum(1 for c in fake.calls if c == ["logman", "query", "-ets"]) == 5, "two failed reads, then the three of the canaries"
+    assert trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)["problems"] == []
+
+
+def test_a_read_of_the_list_that_always_fails_ends_at_the_guard_with_its_last_error(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES, list_failures=10 ** 9)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    with pytest.raises(host.TraceError, match="could not be read in 3 s, the last error") as err:
+        trace.start(sleep=clock.sleep, now=clock.now, limit=3.0)
+    assert "0x80071068" in str(err.value) and "WMI data provider" in str(err.value) and err.value.code == 2147946600 and clock.t >= 3.0
+    assert "needs an administrator" not in host.trace_not_started(err.value)
+    assert not any(c[:1] == ["tracerpt"] for c in fake.calls) and trace.session is True, "the launch does not start; cleanup closes the session"
+
+
+def test_a_read_of_the_list_that_fails_after_stop_is_read_again_until_the_session_is_gone(tmp_path, monkeypatch):
+    fake = FakeTools(tmp_path, TREE, TREE_FILES)
+    monkeypatch.setattr(host, "_tool", fake)
+    trace, clock = host.WindowsTrace(tmp_path), Clock()
+    trace.start()
+    fake.list_failures = 2
+    trace.cleanup(sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [0.25, 0.25] and trace.name not in fake.sessions and trace.session is False
+    trace2 = host.WindowsTrace(tmp_path)
+    trace2.start()
+    fake.list_failures = 10 ** 9
+    with pytest.raises(host.TraceError, match="could not be read in 1 s after `logman stop`, the last error: logman query -ets failed with 0x80071068"):
+        trace2._stop_session(clock.sleep, clock.now, 1.0)
+
