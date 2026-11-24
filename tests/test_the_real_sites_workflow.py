@@ -70,7 +70,7 @@ def test_a_pull_request_that_touches_the_list_runs_the_admission_and_the_round()
     assert "admission: ${{ steps.plan.outputs.admission }}" in jobs["plan"]
     assert re.search(r"(?m)^    if: needs\.plan\.outputs\.admission == 'true'$", jobs["admit"])
     assert not re.search(r"(?m)^    if:.*admission", jobs["round"]), "the round is not skipped by the admission"
-    assert "needs: plan" in jobs["round"] and "outputs.mode" not in _code(jobs["round"])
+    assert "needs: [plan, linux-deps-real-sites]" in jobs["round"] and "outputs.mode" not in _code(jobs["round"])
 
 
 # --- the admission is decided per push -----------------------------------------------------------------------------------------------------

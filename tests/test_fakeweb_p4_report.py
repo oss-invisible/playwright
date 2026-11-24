@@ -593,7 +593,7 @@ WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb.yml").read_text(encoding="
 
 
 def test_the_workflow_has_four_legs_and_one_verdict_job():
-    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses):", WORKFLOW, re.MULTILINE)) == 3     # core-on-index, walk, verdict
+    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses):", WORKFLOW, re.MULTILINE)) == 4     # core-on-index, linux-deps-fakeweb, walk, verdict
     assert WORKFLOW.count("{ profile: ") == 4
     for leg in ("p2, os: linux", "p2, os: windows", "p4, os: linux", "p4, os: windows"):
         assert "profile: " + leg in WORKFLOW

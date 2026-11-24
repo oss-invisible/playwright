@@ -53,9 +53,20 @@ jobs:
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
+  # The Ubuntu packages of the Linux legs, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a leg.
+  linux-deps-fakeweb:
+    name: linux-deps-fakeweb
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true'
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: fakeweb
+      packages: xvfb
+      playwright: true
+
   walk:
     name: fakeweb ${{ matrix.profile }} (${{ matrix.os }})
-    needs: core-on-index
+    needs: [core-on-index, linux-deps-fakeweb]
     if: needs.core-on-index.outputs.available == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -80,12 +91,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-fakeweb job, no mirror)
+        if: matrix.os == 'linux'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-fakeweb.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb + Firefox runtime libs; the files of the linux-deps-fakeweb job)
         if: matrix.os == 'linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
       - name: Playwright's own Firefox (the control)
         run: python -m playwright install firefox
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with

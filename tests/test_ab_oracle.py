@@ -626,6 +626,18 @@ def _job(text, name):
     return text[start:start + 1 + following.start()] if following else text[start:]
 
 
+def _needs_core_on_index(body, linux):
+    """A Linux job of e2e.yml waits for the core on the index and for the run's linux-deps-e2e job (its Ubuntu packages, from the archive once, never by the job);
+    a Windows job waits for the core only."""
+    return ("needs: [core-on-index, linux-deps-e2e]" in body) if linux else ("needs: core-on-index\n" in body)
+
+
+def _linux_deps_e2e_packages(text):
+    """The packages the job linux-deps-e2e of e2e.yml asks linux-deps.yml for."""
+    job = _job(text, "linux-deps-e2e")
+    return job[job.index("packages:"):].split("\n", 1)[0]
+
+
 def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
@@ -649,7 +661,7 @@ def test_the_network_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_j
     linux, windows = _job(text, "e2e-network"), _job(text, "e2e-network-windows")
     assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
     for body in (linux, windows):
-        assert body.count(network) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 50" in body and "needs: core-on-index" in body
+        assert body.count(network) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 50" in body and _needs_core_on_index(body, body is linux)
         assert "      - name: Run the network oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
     assert "xvfb-run -a" in linux
     shared_linux, shared_windows = _job(text, "e2e-linux"), _job(text, "e2e-windows")
@@ -679,9 +691,9 @@ def test_the_host_oracle_has_a_job_of_its_own_on_each_system_with_the_tools_it_t
     linux, windows = _job(text, "e2e-host"), _job(text, "e2e-host-windows")
     assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
     for body, minutes in ((linux, 65), (windows, 45)):
-        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: %d" % minutes in body and "needs: core-on-index" in body
+        assert body.count("tests/test_ab_host_e2e.py") == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: %d" % minutes in body and _needs_core_on_index(body, body is linux)
         assert "      - name: Run the host oracle's A/A\n" in body and "skipped\": 0" in body
-    assert "apt-get install -y strace" in linux and "xvfb-run -a" in linux, "Linux traces the tree with strace"
+    assert "xvfb-run -a" in linux and "strace" in _linux_deps_e2e_packages(text), "Linux traces the tree with strace (the packages of the run's linux-deps-e2e job)"
     import test_ab_host_e2e as host_e2e
     import test_ab_host_crash_linux_e2e as crash_e2e
 
@@ -731,7 +743,7 @@ def test_the_linux_jobs_of_the_three_oracles_install_gdb_and_elfutils_and_point_
         body = _job(text, name)
         step = body[body.index("      - name: Cores of a browser that did not end with 0"):]
         step = step[:step.index("      - name: The security state")]
-        assert "apt-get install -y gdb elfutils" in step and 'sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"' in step, name
+        assert "apt-get install" not in step and 'sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"' in step, name
         assert 'INVPW_CORE_DIR=$RUNNER_TEMP/cores' in step, name
         assert body.index("System deps (xvfb") < body.index("Cores of a browser") < body.index("Fetch the published firefox binary"), "after the apt update, before any launch"
         assert "MOZ_CRASHREPORTER" not in body and "extra_prefs" not in step, "no environment variable of the browser, no pref, no crash reporter option"
@@ -765,7 +777,7 @@ def test_the_page_oracle_has_a_job_of_its_own_on_each_system_and_the_shared_jobs
     assert "name: e2e (page oracle, linux)" in linux and "name: e2e (page oracle, windows)" in windows
     assert "runs-on: ubuntu-24.04" in linux and "runs-on: windows-2022" in windows
     for body in (linux, windows):
-        assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and "needs: core-on-index" in body
+        assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 45" in body and _needs_core_on_index(body, body is linux)
         assert "AB_ORACLE_SEED_SET" not in body, "the A/A of a pull request, not a shard of the final seeds (those have their own jobs)"
         assert "      - name: Run the page oracle's A/A\n" in body and "skipped\": 0" in body, "the job refuses a skipped test: one test, passed"
     assert "xvfb-run -a" in linux
@@ -1077,7 +1089,7 @@ def test_the_final_set_has_jobs_of_its_own_in_four_shards_on_each_system_and_the
     for body in (linux, windows):
         assert "shard: [1, 2, 3, 4]" in body and "AB_ORACLE_SEED_SET: final" in body and "AB_ORACLE_SHARD: ${{ matrix.shard }}/4" in body
         assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 40" in body and "fail-fast: false" in body
-        assert "needs: [core-on-index, e2e-page-final-touched]" in body and "needs.e2e-page-final-touched.outputs.touched == 'true'" in body
+        assert ("needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]" if body is linux else "needs: [core-on-index, e2e-page-final-touched]") in body and "needs.e2e-page-final-touched.outputs.touched == 'true'" in body
         assert "skipped\": 0" in body and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in body, "one test, passed: a skipped one is red"
         assert "matrix.shard" in body.split("name: invpw-evidence-page-final", 1)[1].split("path:", 1)[0], "four shards, four artifact names"
     assert "scripts/ci_ab_oracle.py touched" in touched and "pull_request" in touched and "outputs:" in touched

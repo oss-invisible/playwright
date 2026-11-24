@@ -1,0 +1,129 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# linux-deps.yml - the Ubuntu packages of a workflow's Linux jobs, fetched from Ubuntu's archive ONCE per runner image and list, never by the jobs.
+#
+# A run of the wrapper's workflows lost a green leg to its time limit with every step green, because `playwright install-deps firefox` fetched 48.8 MB from
+# the archive's mirror at 102 kB/s ("Fetched 48.8 MB in 7min 59s"): every Linux leg spent 450-600 s on that step, 20 s in the run before. The speed of a
+# mirror is a third party's: no leg reads it any more.
+#
+# This job resolves the list on the runner image the jobs run on (the packages named here with their recommends, those named without, and what
+# `playwright install-deps --dry-run firefox` lists missing for the Playwright of scripts/playwright_pin.txt), keeps the .deb files in an entry whose key is
+# the image (ImageOS, ImageVersion) and the sha of the list, and hands them to the jobs of the run as the artifact linux-deps-<name>. On an entry that exists
+# it reads nothing from the archive. The jobs install them with `apt-get install --no-download` on the local files: a package that is not there is red with
+# its name, never a silent fetch (tests/test_ci_linux_legs_read_no_mirror.py refuses `apt-get update`, `install-deps` and an install without --no-download
+# in a Linux leg). The entry is written and read on GitHub's runners only, by this file only.
+# ─────────────────────────────────────────────────────────────────────────────
+name: linux-deps
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: the artifact is linux-deps-<name>
+        type: string
+        required: true
+      packages:
+        description: packages installed with their recommends (as `apt-get install -y` did)
+        type: string
+        default: ''
+      packages_no_recommends:
+        description: packages installed without their recommends
+        type: string
+        default: ''
+      playwright:
+        description: add what `playwright install-deps firefox` names for the Playwright of scripts/playwright_pin.txt
+        type: boolean
+        default: false
+    outputs:
+      artifact:
+        description: the artifact that holds the .deb files
+        value: ${{ jobs.debs.outputs.artifact }}
+
+permissions: { contents: read }
+
+jobs:
+  debs:
+    name: debs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact: linux-deps-${{ inputs.name }}
+    steps:
+      - name: Checkout (the Playwright pin)
+        if: inputs.playwright
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: scripts/playwright_pin.txt
+          sparse-checkout-cone-mode: false
+      - name: Set up Python
+        if: inputs.playwright
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: The list and its entry (the runner image and the sha of the list)
+        id: spec
+        shell: bash
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          NO_REC: ${{ inputs.packages_no_recommends }}
+          PW: ${{ inputs.playwright }}
+        run: |
+          set -euo pipefail
+          : "${ImageOS:?no ImageOS: not a GitHub runner image}" "${ImageVersion:?no ImageVersion: not a GitHub runner image}"
+          PIN=""
+          if [ "$PW" = true ]; then PIN="$(tr -d '[:space:]' < scripts/playwright_pin.txt)"; [ -n "$PIN" ] || { echo "ERROR: empty scripts/playwright_pin.txt"; exit 1; }; fi
+          mkdir -p "$RUNNER_TEMP/linux-deps-spec"
+          printf 'recommends: %s\nno-recommends: %s\nplaywright-install-deps-firefox: %s\n' "$PACKAGES" "$NO_REC" "$PIN" > "$RUNNER_TEMP/linux-deps-spec/spec.txt"
+          cat "$RUNNER_TEMP/linux-deps-spec/spec.txt"
+          SHA="$(sha256sum < "$RUNNER_TEMP/linux-deps-spec/spec.txt" | cut -c1-16)"
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+          echo "key=linux-deps-$ImageOS-$ImageVersion-$SHA" | tee -a "$GITHUB_OUTPUT"
+      - name: The entry of this image and list
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/linux-deps
+          key: ${{ steps.spec.outputs.key }}
+      - name: A new image or list - the packages from Ubuntu's archive, once
+        if: steps.restore.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          NO_REC: ${{ inputs.packages_no_recommends }}
+          PIN: ${{ steps.spec.outputs.pin }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'Acquire::http::Timeout "60";' 'Acquire::https::Timeout "60";' 'Acquire::Retries "5";' \
+            | sudo tee /etc/apt/apt.conf.d/80-ci-network >/dev/null
+          sudo apt-get clean
+          sudo apt-get update -qq
+          PW_PKGS=""
+          if [ -n "$PIN" ]; then
+            python -m pip install --quiet "playwright==$PIN"
+            # exit 1 when something is missing (the list follows "Missing system dependencies (N):", two spaces before each name)
+            python -m playwright install-deps --dry-run firefox > "$RUNNER_TEMP/pw-deps.txt" 2>&1 || true
+            cat "$RUNNER_TEMP/pw-deps.txt"
+            PW_PKGS="$(sed -n 's/^  \([a-z0-9][a-z0-9.+:-]*\)$/\1/p' "$RUNNER_TEMP/pw-deps.txt" | tr '\n' ' ')"
+            [ -n "$PW_PKGS" ] || grep -q "All system dependencies are installed." "$RUNNER_TEMP/pw-deps.txt" \
+              || { echo "ERROR: playwright install-deps --dry-run firefox gave no list"; exit 1; }
+          fi
+          [ -z "$PACKAGES" ] || sudo apt-get install -y -qq --download-only $PACKAGES
+          [ -z "$NO_REC$PW_PKGS" ] || sudo apt-get install -y -qq --download-only --no-install-recommends $NO_REC $PW_PKGS
+          rm -rf /tmp/linux-deps && mkdir -p /tmp/linux-deps
+          find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /tmp/linux-deps/ \;
+          cp "$RUNNER_TEMP/linux-deps-spec/spec.txt" /tmp/linux-deps/spec.txt
+          echo "$PW_PKGS" > /tmp/linux-deps/playwright-firefox.txt
+          echo "$ImageOS $ImageVersion" > /tmp/linux-deps/image.txt
+          echo "$(find /tmp/linux-deps -name '*.deb' | wc -l) packages, $(du -sh /tmp/linux-deps | cut -f1)"
+      - name: Keep the entry
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/linux-deps
+          key: ${{ steps.spec.outputs.key }}
+      - name: The packages for the jobs of this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-deps-${{ inputs.name }}
+          path: /tmp/linux-deps
+          retention-days: 1
+          if-no-files-found: error

@@ -80,6 +80,20 @@ jobs:
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
+  # THE UBUNTU PACKAGES OF THE LINUX JOBS, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a job: a run lost a green leg to its time
+  # limit because a mirror served `playwright install-deps firefox` at 102 kB/s. One list for every Linux job of this file: xvfb (with xauth, its recommend, for
+  # xvfb-run), strace (the fontconfig suite, the host oracle and its recorder), gdb and elfutils (the cores of a browser that did not end with 0), and what
+  # Playwright's install-deps names for Firefox. The jobs install the files with --no-download.
+  linux-deps-e2e:
+    name: linux-deps-e2e
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: e2e
+      packages: xvfb strace gdb elfutils
+      playwright: true
+
   # THE e2e ON LINUX, IN THREE PARTS. One job ran the whole Linux e2e in 24.6 minutes on a normal runner and 35.7 on a slow one (the same tests, every
   # one slower by the same 1.44x), close to the 40-minute ceiling. The files of each part are the rows `wrapper.e2e.suite.linux.1` to `.3` of
   # ci/required-suites.json, the same partition the gate of the candidate runs on the engine under test (tests/test_the_e2e_suite_is_accounted_for.py
@@ -89,7 +103,7 @@ jobs:
   # branch protection read.
   e2e-linux:
     name: e2e (linux, part ${{ matrix.part }})
-    needs: core-on-index
+    needs: [core-on-index, linux-deps-e2e]
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -117,30 +131,37 @@ jobs:
           python -m pip install ".[dev]"
           # ⛔ The playwright package is NO LONGER a product dependency: the
           # client lives in invisible_playwright._pw and the driver in _driver. It
-          # is installed here for ONE thing only, the `playwright install-deps
-          # firefox` step below, which downloads the SYSTEM libraries Firefox
-          # needs on a bare runner. The fork does not expose that subcommand
-          # on purpose (it is meant to drive, not to be a toolchain).
+          # is installed here as a system tool, not as a product dependency (the
+          # SYSTEM libraries Firefox needs on a bare runner come from the run's
+          # linux-deps-e2e job, which asks `install-deps --dry-run firefox` of the
+          # same pin once per runner image and list).
           #
           # That the product does not IMPORT it is verified by tests/test_fork.py,
           # not from here: if someone one day reintroduced
           # `from playwright...` in src/, this line would mask it, and that is
           # exactly why that test exists.
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
           # the fontconfig e2e trace the opens of the browser: strace is not in the runner image (setsid is, util-linux)
-          sudo apt-get install -y strace
           # TEMPORARY (the -11 at the exit of the security state's generate): a core file of any crash where kernel.core_pattern says, and gdb to read it. tests/conftest.py
           # lifts the core limit of the pytest session (the runner's default soft limit is 0) and, after a test that fails, tests/_crash_cores.py saves gdb's text of every
           # core in INVPW_CORE_DIR under invpw-evidence/cores/<test>/ and deletes the core.
-          sudo apt-get install -y gdb
           mkdir -p "$RUNNER_TEMP/invpw-cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%e.%p"
           echo "INVPW_CORE_DIR=$RUNNER_TEMP/invpw-cores" >> "$GITHUB_ENV"
-          sudo "$(which python)" -m playwright install-deps firefox
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
       # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
       - name: The security state (a fixed directory of the repository)
@@ -512,7 +533,7 @@ jobs:
   # above, `own_job` in the Windows parts). The same setup as the shared jobs: the security state, the engine, the GeoIP database made by the repository.
   e2e-network:
     name: e2e (network, linux)
-    needs: core-on-index
+    needs: [core-on-index, linux-deps-e2e]
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
@@ -533,18 +554,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
       # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
       - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
         run: |
-          sudo apt-get install -y gdb elfutils
           mkdir -p "$RUNNER_TEMP/cores"
           chmod 1777 "$RUNNER_TEMP/cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
@@ -663,7 +692,7 @@ jobs:
   # 35 for the test.
   e2e-host:
     name: e2e (host, linux)
-    needs: core-on-index
+    needs: [core-on-index, linux-deps-e2e]
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 65
@@ -683,20 +712,27 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
           # the host oracle traces the whole tree of the browser with strace
-          sudo apt-get install -y strace
-          sudo "$(which python)" -m playwright install-deps firefox
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
       # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
       - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
         run: |
-          sudo apt-get install -y gdb elfutils
           mkdir -p "$RUNNER_TEMP/cores"
           chmod 1777 "$RUNNER_TEMP/cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
@@ -900,7 +936,7 @@ jobs:
   # `own_job` in the Windows parts). 45 minutes for the job, as the host oracle's: the setup of the job plus the guard of the test with the margin of Windows. The same setup as the shared jobs.
   e2e-page:
     name: e2e (page oracle, linux)
-    needs: core-on-index
+    needs: [core-on-index, linux-deps-e2e]
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -920,18 +956,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
       # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
       - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
         run: |
-          sudo apt-get install -y gdb elfutils
           mkdir -p "$RUNNER_TEMP/cores"
           chmod 1777 "$RUNNER_TEMP/cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
@@ -1076,7 +1120,7 @@ jobs:
 
   e2e-page-final:
     name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, linux)
-    needs: [core-on-index, e2e-page-final-touched]
+    needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]
     if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -1094,18 +1138,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
       # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
       - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
         run: |
-          sudo apt-get install -y gdb elfutils
           mkdir -p "$RUNNER_TEMP/cores"
           chmod 1777 "$RUNNER_TEMP/cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"

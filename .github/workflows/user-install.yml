@@ -79,7 +79,16 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The Ubuntu packages of the Linux leg, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by the leg.
+  linux-deps-user-install:
+    name: linux-deps-user-install
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: user-install
+      packages: xvfb libgtk-3-0 libdbus-glib-1-2 libasound2t64
+
   install:
+    needs: linux-deps-user-install
     name: ${{ matrix.os }} - install from ${{ github.event.inputs.source || 'index' }} and launch
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -197,11 +206,21 @@ jobs:
               time.sleep(poll)
           PY
 
-      - name: Linux runtime libraries for the browser
+      - name: The Linux packages (the run's linux-deps-user-install job, no mirror)
+        if: runner.os == 'Linux'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-user-install.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: Linux runtime libraries for the browser (the files of the linux-deps-user-install job)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb libgtk-3-0 libdbus-glib-1-2 libasound2t64
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
 
       - name: The user path, end to end
         env:
