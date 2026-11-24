@@ -59,8 +59,21 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
+  # The Ubuntu packages of the Linux hunt, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by the hunt. On Windows this job is
+  # skipped and the hunt runs on (the condition below accepts `skipped` and `success`, nothing else).
+  linux-deps-hunt:
+    name: linux-deps-hunt
+    if: startsWith(inputs.os, 'ubuntu')
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: hunt
+      packages: xvfb
+      playwright: true
+
   hunt:
     name: hunt (${{ inputs.os }})
+    needs: linux-deps-hunt
+    if: ${{ !cancelled() && (needs.linux-deps-hunt.result == 'success' || needs.linux-deps-hunt.result == 'skipped') }}
     runs-on: ${{ inputs.os }}
     # 18 runs of ~6 minutes plus install time. Deliberately generous: the
     # ceiling here must NEVER be the thing that stops the hunt, or we're back
@@ -88,12 +101,21 @@ jobs:
       # Linux only: on Windows the browser launches on the runner's desktop,
       # and `firefox-launch-matrix.yml` has shown for months that it really
       # starts there.
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-hunt job, no mirror)
+        if: runner.os == 'Linux'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-hunt.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb + Firefox runtime libs; the files of the linux-deps-hunt job)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
+          set -- /tmp/linux-deps/*.deb
+          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
+          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
 
