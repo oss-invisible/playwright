@@ -52,6 +52,18 @@ foreground window and its process, read once after the arrangement and again whe
 ``$RUNNER_TEMP/invpw-evidence/test_window_occlusion/`` on every run, green or red, with one line per half ("foreground: pid X (engine yes/no)").
 
 A page reads it from ``document.visibilityState`` and the ``visibilitychange`` event.
+
+What the control judges: that the page recorded ``hidden`` AFTER X's ``FullyObscured`` (``control_sees_hidden``, a list of the ``visibilitychange`` events the
+page records, not the state it reads at the end). ``nsWindow::OnExposeEvent`` calls ``NotifyOcclusionState(VISIBLE)`` at every draw of the window's container,
+Mozilla's own code and the same in retail: a draw after the ``FullyObscured`` turns the window ``VISIBLE`` again, X (whose state did not change) says nothing
+more, and the page ends ``visible`` in a run in which it was ``hidden``: ``visible, hidden, visible``. The product half is unchanged: ``hidden`` is never seen.
+
+That sequence is also a case of its own, on Linux, deterministic: in the control half, once the page has recorded ``hidden``, the test draws the covered window
+again and leaves it covered (``XVisibility.shrink_by_one``: one pixel narrower through X, the cover above it and larger), and the page must end ``visible``
+with the changes ``visible, hidden, visible``: the state at the end, which was the criterion of the control before, is ``visible`` here, so it would be red.
+
+The engine's own log of its window system (``MOZ_LOG=Widget:5``; the core passes it, ``environment.MOZ_DIAGNOSTICS``) is written into the evidence
+folder with the rest.
 """
 from __future__ import annotations
 
@@ -65,7 +77,7 @@ from _evidence_on_failure import FailureEvidence
 from _os_focus import a_display_of_its_own
 from _waits import watch
 from _window_sessions import DEADLINE_S, in_a_thread_of_its_own, launch, wait_for_condition
-from _x_visibility import XVisibility
+from _x_visibility import XVisibility, control_sees_hidden, product_stays_visible
 
 pytestmark = pytest.mark.e2e
 
@@ -85,6 +97,8 @@ TWO_FRAMES = "() => new Promise(done => requestAnimationFrame(() => requestAnima
 #: Names the page, so that on Windows its top-level window is found by its title.
 NAME = "(name) => { document.title = name; return document.title; }"
 COVERED_TITLE, COVER_TITLE = "occlusion-covered-window", "occlusion-covering-window"
+#: The engine's log of its window system, written into the evidence (a diagnostic no page reads).
+WIDGET_LOG = "Widget:5"
 
 #: How far inside the covering window's rectangle the covered one is put, in device pixels.
 INSET = 32
@@ -424,6 +438,9 @@ class CoveringOnX:
         self.first = self.cover = None
         self.visibility = None
         self.after_raise = None
+        #: The length of the page's list of changes at the last look made before X's ``FullyObscured`` showed up (1: the start).
+        self.not_before = 1
+        self.drawn = None
 
     def watch_the_covered_window(self, covered):
         """Finds the covered page's toplevel by its title and selects its visibility events, before the cover is mapped."""
@@ -441,14 +458,35 @@ class CoveringOnX:
 
     def wait_until_x_says_fully_obscured(self, covered):
         """The ground truth: X sends the covered toplevel ``VisibilityNotify FullyObscured``."""
-        seen = watch(lambda: self.x.drain().first(), lambda first: first is not None, DEADLINE_S, lambda: covered.wait_for_timeout(100))
+
+        def look():
+            changes = covered.evaluate(CHANGES)     # read before X is asked: what it holds happened before an event X has not yet delivered
+            first = self.x.drain().first()
+            if first is None:
+                self.not_before = len(changes)
+            return first
+
+        seen = watch(look, lambda first: first is not None, DEADLINE_S, lambda: covered.wait_for_timeout(100))
         assert seen.ok, "arrangement: X never sent the covered toplevel VisibilityNotify FullyObscured (%s), so the page proves nothing: %r" % (
             self.line(), self.evidence())
 
-    def engine_message(self, seen):
-        return ("ENGINE: X sent the covered toplevel VisibilityNotify FullyObscured (%s) and with occlusion tracking enabled its page never turned hidden "
-                "(nsWindow::OnVisibilityNotifyEvent did not make the window OCCLUDED, or the state never reached the page); seen: %s; X: %r" % (
-                    self.line(), seen.render(), self.evidence()))
+    def engine_message(self, seen, changes):
+        return ("ENGINE: X sent the covered toplevel VisibilityNotify FullyObscured (%s) and with occlusion tracking enabled its page never recorded hidden "
+                "after it (nsWindow::OnVisibilityNotifyEvent did not make the window OCCLUDED, or the state never reached the page); the changes it "
+                "recorded: %r (from index %d on); seen: %s; X: %r" % (self.line(), changes, self.not_before, seen.render(), self.evidence()))
+
+    def draw_while_covered(self, covered):
+        """The covered toplevel one pixel narrower through X, the cover above it and larger, and a wait until the page reads ``visible``: the draw
+        (``nsWindow::OnExposeEvent``) says ``VISIBLE`` and X, whose state of the window did not change, says nothing more. With the state and the changes."""
+        resized = self.x.shrink_by_one(self.first)
+        before, after = resized["before"], resized["after"]
+        assert before and after and after["width"] == before["width"] - 1, (
+            "arrangement: XResizeWindow did not make the covered toplevel one pixel narrower: %r" % (resized,))
+        seen = watch(lambda: covered.evaluate(STATE), lambda state: state == "visible", DEADLINE_S, lambda: covered.wait_for_timeout(100))
+        covered.evaluate(TWO_FRAMES)
+        self.drawn = {"resize": resized, "state": covered.evaluate(STATE), "changes": covered.evaluate(CHANGES), "seen": seen.render()}
+        assert seen.ok, "the covered window was drawn again, still covered, and the page never read visible again; %r" % ((self.drawn, self.evidence()),)
+        return self.drawn
 
     def line(self):
         """One line: the read-back after the raise and the visibility events X sent the covered toplevel so far."""
@@ -463,7 +501,7 @@ class CoveringOnX:
         """The window ids, the read-back after the raise, and every visibility event of the covered toplevel with its time."""
         line = self.line()
         return {"line": line, "covered": None if self.first is None else "0x%x" % self.first, "cover": None if self.cover is None else "0x%x" % self.cover,
-                "after the raise": self.after_raise, "visibility": self.visibility.as_dict() if self.visibility else None}
+                "after the raise": self.after_raise, "forced draw": self.drawn, "not before": self.not_before, "visibility": self.visibility.as_dict() if self.visibility else None}
 
 
 class Record:
@@ -479,8 +517,10 @@ class Record:
 
 
 def second_window_over_the_first(firefox_binary, tracking, record, x):
-    """(state, changes, windows) of the first session's page after a second session's window is up over it; ``windows`` is the evidence of the
-    covering (Windows: the tracker's view, Linux: X's), also added to ``record`` for the evidence file.
+    """A dict of what the first session's page recorded after a second session's window is up over it: ``state`` and ``changes`` at the end, ``verdict_changes``
+    and ``not_before`` (the list of changes when the wait for ``hidden`` ended, and the index it counts from), ``windows`` (the evidence of the covering: on
+    Windows the tracker's view, on Linux X's, also added to ``record`` for the evidence file) and, in the control half on Linux, ``drawn`` (the covered window
+    drawn again while it stays covered).
 
     ``tracking`` is None for the product as it launches, or the value both tracking prefs are given; ``x`` is the test's own connection to the private
     display on Linux, None on Windows."""
@@ -492,6 +532,7 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
         covered.evaluate(NAME, COVERED_TITLE)
         on_x = CoveringOnX(x) if x is not None else None
         covering = None
+        verdict_changes, drawn = None, None
         try:
             if sys.platform == "win32":
                 covering = CoveringOnWindows(covered)
@@ -506,15 +547,20 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
             if on_x:
                 on_x.raise_the_cover_and_read_back(covered)
                 on_x.wait_until_x_says_fully_obscured(covered)
+            not_before = on_x.not_before if on_x else 1
             if tracking:
-                seen = covering.wait_for_hidden(covered) if covering else watch_state(covered)
-                assert seen.ok, on_x.engine_message(seen) if on_x else (
-                    "a window that another one covers never turned hidden with occlusion tracking enabled; seen: %s; windows: %r" % (
-                        seen.render(), covering.evidence() if covering else None))
+                seen = covering.wait_for_hidden(covered) if covering else watch_hidden_change(covered, not_before)
+                verdict_changes = covered.evaluate(CHANGES)
+                assert seen.ok and control_sees_hidden(verdict_changes, not_before), on_x.engine_message(seen, verdict_changes) if on_x else (
+                    "a window that another one covers never turned hidden with occlusion tracking enabled; the changes the page recorded: %r; seen: %s; "
+                    "windows: %r" % (verdict_changes, seen.render(), covering.evidence() if covering else None))
+                if on_x:
+                    drawn = on_x.draw_while_covered(covered)
             else:
                 covered.evaluate(TWO_FRAMES)
             windows = covering.evidence() if covering else on_x.evidence() if on_x else None
-            return covered.evaluate(STATE), covered.evaluate(CHANGES), windows
+            return {"state": covered.evaluate(STATE), "changes": covered.evaluate(CHANGES), "verdict_changes": verdict_changes, "not_before": not_before,
+                    "windows": windows, "drawn": drawn}
         finally:
             if covering:
                 record.add({"half": half, **covering.evidence()})
@@ -522,9 +568,11 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
                 record.add({"half": half, **on_x.evidence()})
 
 
-def watch_state(covered):
-    """Until the covered page reads ``hidden`` (the deadline of ``wait_for_condition``), with what was seen on the way."""
-    return watch(lambda: covered.evaluate(STATE), lambda state: state == "hidden", DEADLINE_S, lambda: covered.wait_for_timeout(100))
+def watch_hidden_change(covered, not_before):
+    """Until the page's list of changes holds ``hidden`` from index ``not_before`` on (the deadline of ``wait_for_condition``; a ``hidden`` that a draw has
+    already undone is in it), with the lists seen on the way."""
+    return watch(lambda: covered.evaluate(CHANGES), lambda changes: control_sees_hidden(changes, not_before), DEADLINE_S,
+                 lambda: covered.wait_for_timeout(100))
 
 
 def lines(record):
@@ -551,15 +599,21 @@ def test_a_covered_window_stays_visible_unless_occlusion_tracking_is_enabled(fir
     record = Record()
     with FailureEvidence("test_window_occlusion") as evidence, the_display(monkeypatch) as x:
         evidence.note_records("windows", record)
-        tracked_state, tracked_changes, tracked_windows = second_window_over_the_first(firefox_binary, True, record, x)
-        assert tracked_state == "hidden" and tracked_changes == ["visible", "hidden"], (
-            "control: with tracking enabled the covered page reads %r, changes %r; %s; windows: %r" % (
-                tracked_state, tracked_changes, lines(record), tracked_windows))
+        evidence.arm(moz_log=WIDGET_LOG)
+        tracked = second_window_over_the_first(firefox_binary, True, record, x)
+        assert control_sees_hidden(tracked["verdict_changes"], tracked["not_before"]), (
+            "control: with tracking enabled the covered page never recorded hidden after X's FullyObscured; the changes it recorded: %r (from index %d on); %s; "
+            "windows: %r" % (tracked["verdict_changes"], tracked["not_before"], lines(record), tracked["windows"]))
+        drawn = tracked["drawn"]
+        if x is not None:
+            assert drawn["state"] == "visible" and drawn["changes"] == ["visible", "hidden", "visible"], (
+                "a draw of the covered window that stays covered must turn its page visible again, and the page records visible, hidden, visible: it reads %r, "
+                "the changes it recorded: %r; %s; windows: %r" % (drawn["state"], drawn["changes"], lines(record), tracked["windows"]))
 
-        state, changes, windows = second_window_over_the_first(firefox_binary, None, record, x)
-        assert state == "visible" and changes == ["visible"], (
+        product = second_window_over_the_first(firefox_binary, None, record, x)
+        assert product["state"] == "visible" and product_stays_visible(product["changes"]), (
             "the product's covered page reads %r, changes %r: it must stay visible, with no visibilitychange; %s; windows: %r" % (
-                state, changes, lines(record), windows))
-        assert state != tracked_state, "enabled and disabled read the same: the declaration decides nothing"
+                product["state"], product["changes"], lines(record), product["windows"]))
+        assert product["changes"] != tracked["verdict_changes"], "enabled and disabled recorded the same changes: the declaration decides nothing"
         evidence.keep("always kept: %s" % (lines(record),))
         sys.stderr.write("occlusion arrangement: %s\n" % (lines(record),))
