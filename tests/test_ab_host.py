@@ -543,7 +543,7 @@ def test_a_tree_that_keeps_growing_after_every_process_is_gone_is_read_again():
     assert info == {"exited": True, "reads": 3}
 
 
-# A pid is not a process: Windows hands the pid of a process that ended to the next one it makes (run 45334478026: pid 7352 of the tree ended at 05:05:33 and was
+# A pid is not a process: Windows hands the pid of a process that ended to the next one it makes (run 45328762166: pid 7352 of the tree ended at 05:05:33 and was
 # `TiWorker.exe`, a service that lives minutes, at 05:05:38; the wait for the exit saw "alive" for 120 s and the A/A was red).
 BIRTH = "2026-11-24T05:05:20.5000000Z"
 BIRTH_EPOCH = datetime.datetime(2026, 11, 24, 5, 5, 20, 500000, tzinfo=datetime.timezone.utc).timestamp()

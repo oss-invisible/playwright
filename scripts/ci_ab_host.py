@@ -1575,7 +1575,7 @@ def audit_epoch(text: str):
 
 def process_has_ended(event, ends=(), create_time=None) -> bool:
     """Whether the process the audit BORE as `event` (a 4688 of the tree) has ended, whatever `pid_exists` says of its pid: Windows hands the pid of an ended process to the next
-    one it makes (run 45334478026: pid 7352 of the tree ended at 05:05:33, was `TiWorker.exe` at 05:05:38, a service that lives minutes, and the wait for the exit saw the tree alive
+    one it makes (run 45328762166: pid 7352 of the tree ended at 05:05:33, was `TiWorker.exe` at 05:05:38, a service that lives minutes, and the wait for the exit saw the tree alive
     for 120 s). A pid is the process of the tree only while it is THAT process:
       - the audit has a 4689 of the pid after the 4688 (by record id, by time when a record id is missing): it ended;
       - no 4689: the process the pid names now (`create_time(pid)`, seconds since the epoch, None when there is none) was created after the birth the audit gives (`BIRTH_SLACK_S`):
