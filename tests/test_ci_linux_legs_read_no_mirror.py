@@ -82,6 +82,8 @@ def deps_violations(text):
                       ("xargs -n 20 -P 8 apt-get download", "the closure is downloaded 8 at a time"),
                       ("apt-get download -qq -o Acquire::Retries=5", "each fetch of the closure retries 5 times"),
                       ("MB in $((T1 - T0)) s", "the MB and seconds of the download are logged"),
+                      ("Reverse Provides:", "a root only provided is resolved to its provider (apt-cache depends does not walk from a virtual root)"),
+                      ("not by one package", "a root provided by more than one package is refused"),
                       ("of the closure was not downloaded", "every package of the closure is checked")):
         if need not in code:
             bad.append("%s: %s: `%s` is missing" % (LINUX_DEPS, why, need))

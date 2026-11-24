@@ -138,7 +138,18 @@ jobs:
           RECS=""
           [ -z "$PACKAGES" ] || RECS="$(apt-cache depends --no-depends --no-pre-depends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances $PACKAGES \
             | sed -n 's/^ *|\{0,1\}Recommends: \([a-z0-9][^ <>]*\)$/\1/p' | sort -u | tr '\n' ' ')"
-          ROOTS="$(echo $PACKAGES $RECS $NO_REC $PW_ROOTS | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+          NAMED="$(echo $PACKAGES $RECS $NO_REC $PW_ROOTS | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+          # A name only provided (libgtk-3-0, libgtk-3-0t64's on noble) is its provider, as `apt-get install` resolved it: `apt-cache depends
+          # --recurse` does not walk from a virtual root (wrapper PR #585: the closure of libgtk-3-0 came without libgtk-3-0t64, 92 packages of 230).
+          ROOTS=""
+          for r in $NAMED; do
+            if apt-cache show --no-all-versions "$r" 2>/dev/null | grep -qx "Package: $r"; then ROOTS="$ROOTS $r"; continue; fi
+            p="$(apt-cache showpkg "$r" | sed -n '/^Reverse Provides:/,$p' | sed '1d' | awk 'NF {sub(/:.*/, "", $1); print $1}' | sort -u)"
+            [ "$(echo "$p" | wc -w)" = 1 ] || { echo "ERROR: the root $r is not a package and is provided by [$p], not by one package"; exit 1; }
+            echo "the root $r is provided by $p"
+            ROOTS="$ROOTS $p"
+          done
+          ROOTS="$(echo $ROOTS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
           echo "roots: $ROOTS"
           # The closure: Depends and Pre-Depends, recursively, the providers of every virtual package, what the image has included.
           CLOSURE="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances $ROOTS \
