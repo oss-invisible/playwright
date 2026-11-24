@@ -62,7 +62,7 @@ That sequence is also a case of its own, on Linux, deterministic: in the control
 again and leaves it covered (``XVisibility.shrink_by_one``: one pixel narrower through X, the cover above it and larger), and the page must end ``visible``
 with the changes ``visible, hidden, visible``: the state at the end, which was the criterion of the control before, is ``visible`` here, so it would be red.
 
-The engine's own log of its window system (``MOZ_LOG=Widget:5``; the core passes it, ``environment.MOZ_DIAGNOSTICS``) is written into the evidence
+The engine's own log of its window system (``MOZ_LOG=Widget:4``, the level of nsWindow's LOG; the core passes it, ``environment.MOZ_DIAGNOSTICS``) is written into the evidence
 folder with the rest.
 """
 from __future__ import annotations
@@ -98,7 +98,7 @@ TWO_FRAMES = "() => new Promise(done => requestAnimationFrame(() => requestAnima
 NAME = "(name) => { document.title = name; return document.title; }"
 COVERED_TITLE, COVER_TITLE = "occlusion-covered-window", "occlusion-covering-window"
 #: The engine's log of its window system, written into the evidence (a diagnostic no page reads).
-WIDGET_LOG = "Widget:5"
+WIDGET_LOG = "Widget:4"
 
 #: How far inside the covering window's rectangle the covered one is put, in device pixels.
 INSET = 32
