@@ -45,7 +45,7 @@ and the other in none is red.
 
 The exit pings (`firefox --backgroundtask pingsender`, through the session's route, never the separate `pingsender[.exe]`) leave only when Mozilla's `canUpload()` is
 true (TelemetrySend.sys.mjs:1083), which the core's declared terms of use make true from the start; whether a launch starts them, and how many, varies from a launch to the next (run
-45228081536: 3 in every launch of one run of the 68 and 3, 0, 2, 0, 3 in the other, the sockets they start in 3 launches and in none): their number, their types and what spawned them are listed, not judged (a pingsender kind is red by the rule of every kind). The paths only they touch are paths like any other (`file_rule`); the destinations only they reach are compared when they are
+45228081536: 3 in every launch of one run of the 68 and 3, 0, 2, 0, 3 in the other, the sockets they start in 3 launches and in none): their presence, their number, their types and what spawned them are listed, not judged (`listed_not_judged_kind`: run 45364818483, the A/A of the 68, had the socket of a pingsender in every launch of one run and in none of the other). The paths only they touch are paths like any other (`file_rule`); the destinations only they reach are compared when they are
 there on both sides of a launch, and left out when they are there on one side only (a destination is `public, telemetry`: the telemetry host is the third party's, and
 whether the connection succeeded is not in the verdict). The IDLE launch of each engine run (a page, no pref changed, up to 120 s) is evidence: which pings leave in a long launch is not a rule until it is proven (the core declares
 the terms of use accepted, so `canUpload()` is true from the start and the notification of the data policy is never recorded; Linux started 1 pingsender in it, Windows 0).
@@ -55,7 +55,7 @@ ACCEPTED LOSSES (the rule of the host paths trades them for a verdict that does 
   * a path that one engine has in every measured launch and the other in only some of them is not red: always against sometimes is listed, never judged;
   * a reading tied to one seed is not judged: no path is compared seed by seed;
   * what happens only in the long launch (idle) is only listed: judging it would take two idle launches per engine;
-  * the cause of the variable start of the pingsender is not known: how many of it a launch has, and what it spawns, are listed, and red only by the rule of every kind (in all the measured launches of one engine and in none of the other's); no type of the pings is held, no preference for it;
+  * the cause of the variable start of the pingsender is not known: whether a launch has it, how many, and what it spawns are listed, never red (a candidate whose pingsender starts in every launch where the 68's never does is not seen by the kinds; its paths and destinations are); no type of the pings is held, no preference for it;
   * how many processes of a kind a launch has is not compared (a candidate that spawns two gpu processes where the 68 spawns one is not seen): only that a kind is there in every launch of one
     engine and in none of the other's;
   * a pid that Windows reuses may attribute to the engine the tools of the oracle itself, among the processes that touched a path.
@@ -219,6 +219,13 @@ NOTIFY_LIMIT_S, NOTIFY_PERIOD_S = 120.0, 0.5
 
 def is_pingsender(kind: str) -> bool:
     return kind == PINGSENDER_KIND or kind in PINGSENDER_EXES
+
+
+def listed_not_judged_kind(kind: str) -> bool:
+    """A kind whose PRESENCE is listed, never red: the pingsender of the engine (`backgroundtask/pingsender`) and what it spawns (`<kind><-pingsender`). Whether a launch
+    starts one is Mozilla's `canUpload()`, not the engine's to hold, so the rule of every kind cannot hold it: run 45364818483 (A/A of the 68, Windows) had the socket of a
+    pingsender in every launch of one run and in none of the other, and the control was broken. Their paths, their destinations and the separate `pingsender[.exe]` stay judged."""
+    return kind == PINGSENDER_KIND or kind.endswith("<-pingsender")
 
 
 def kind_of(cmdline) -> str:
@@ -560,12 +567,12 @@ def presence_table(fps: list, items_of, by_of) -> dict:
     return {"launches": launches, "seen": seen, "by": {thing: sorted(who) for thing, who in by.items()}}
 
 
-def presence_rule(ta: dict, tb: dict, key: str, by_key: str) -> tuple:
+def presence_rule(ta: dict, tb: dict, key: str, by_key: str, listed_only=lambda thing: False) -> tuple:
     """`(red, entries)` of two `presence_table`s by the rule above, whatever the things are. `red` is `{"A": [things only A has, in all its measured launches], "B": [...]}`; the
     entries are the other things that are not in the same share of the launches of both engines, `{key: thing, "watch", "A": {layer: [in n launches, of m]}, "B": ..., by_key: {"A": [who],
     "B": [who]}}`, the ones to watch first."""
     red = {side: sorted(p for p, c in mine["seen"].items()
-                        if mine["launches"]["measured"] and c["measured"] == mine["launches"]["measured"] and p not in other["seen"])
+                        if mine["launches"]["measured"] and c["measured"] == mine["launches"]["measured"] and p not in other["seen"] and not listed_only(p))
            for side, mine, other in (("A", ta, tb), ("B", tb, ta))}
     judged = set(red["A"]) | set(red["B"])
     every = {side: sum(t["launches"].values()) for side, t in (("A", ta), ("B", tb))}
@@ -615,7 +622,7 @@ def file_rule(a: dict, b: dict, a_a: bool, also_68=()) -> tuple:
     ta, tb = path_table(fa), path_table(fb)
     ka, kb = kind_table(fa), kind_table(fb)
     red_files, paths = presence_rule(ta, tb, "path", "touched_by")
-    red_kinds, kinds = presence_rule(ka, kb, "kind", "spawned_by")
+    red_kinds, kinds = presence_rule(ka, kb, "kind", "spawned_by", listed_only=listed_not_judged_kind)
     return ({"files": red_files, "kinds": red_kinds},
             {"format": NOT_JUDGED_FORMAT, "mode": "a-a" if a_a else "a-b", "reason": NOT_JUDGED_REASON, "launches": {"A": ta["launches"], "B": tb["launches"]},
              "paths": paths, "kinds": kinds})
