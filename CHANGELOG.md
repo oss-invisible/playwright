@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.59.0] - 2026-11-23
+## [0.59.0] - 2026-11-24
 
 ### Changed
 - Pins invisible-core 69.82.0 on the engine firefox-69 (Firefox 159.0).
