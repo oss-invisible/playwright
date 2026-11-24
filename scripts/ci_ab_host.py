@@ -1447,7 +1447,7 @@ class WindowsTrace:
         self.audit_raw = (events, ends)
         return process_tree(events, roots, ends)
 
-    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None, gone_limit=SESSION_GONE_LIMIT) -> dict:
+    def finish(self, roots, alive=None, sleep=time.sleep, now=time.monotonic, namer=None, gone_limit=SESSION_GONE_LIMIT, create_time=None) -> dict:
         """`{"tree": [4688 events], "files": {(pid, name)}, "outside": {process name: paths}, "exited": {...}, "events": n}`: what the TREE did from its
         first process to its last (the ancestry by the creator's pid from the launched process). What a process outside the tree opened (a service, the
         antivirus, the oracle itself apart) is not the engine's: it is counted by process name and left out of the comparison."""
@@ -1463,7 +1463,7 @@ class WindowsTrace:
                     return psutil.Process(pid).name().lower()
                 except Exception:  # noqa: BLE001 - a process that is gone has no name
                     return "pid %d" % pid
-        tree, exited = wait_exited(lambda: self.tree(roots), alive, sleep=sleep, now=now)
+        tree, exited = wait_exited(lambda: self.tree(roots), alive, sleep=sleep, now=now, read_ends=lambda: self.audit_raw[1], create_time=create_time or process_create_time)
         events, ends = self.audit_raw
         audit = (events, ends, sorted(roots))
         end_canary = self._canary("end")
@@ -1557,9 +1557,63 @@ def windows_device_map() -> dict:
 # -
 # The exit of a closed run: the quiet point is the process exit, not a wait.
 
-def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sleep=time.sleep, now=time.monotonic) -> tuple:
-    """Reads the tree of the run (`read_tree()` returns the events of its processes, in their order) until every process of it is gone (`alive(pid)`)
-    and two reads in a row say the same thing, or until `limit_s`. Returns (the last tree, {"exited": bool, "reads": n}): a tree that was
+#: A process whose `create_time` is later than the birth the audit gives it by more than this is not that process: the audit writes the 4688 when the process is made, so a
+#: process that is the audit's cannot have been created after it.
+BIRTH_SLACK_S = 1.0
+
+
+def audit_epoch(text: str):
+    """The seconds since the epoch of a `SystemTime` of the audit (`2026-11-24T05:05:33.1812345Z`, UTC), or None when it is missing or not a time."""
+    import datetime
+
+    m = re.match(r"^\s*(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z?\s*$", text or "")
+    if not m:
+        return None
+    base = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()
+    return base + (float("0." + m.group(2)) if m.group(2) else 0.0)
+
+
+def process_has_ended(event, ends=(), create_time=None) -> bool:
+    """Whether the process the audit BORE as `event` (a 4688 of the tree) has ended, whatever `pid_exists` says of its pid: Windows hands the pid of an ended process to the next
+    one it makes (run 45328762166: pid 7352 of the tree ended at 05:05:33, was `TiWorker.exe` at 05:05:38, a service that lives minutes, and the wait for the exit saw the tree alive
+    for 120 s). A pid is the process of the tree only while it is THAT process:
+      - the audit has a 4689 of the pid after the 4688 (by record id, by time when a record id is missing): it ended;
+      - no 4689: the process the pid names now (`create_time(pid)`, seconds since the epoch, None when there is none) was created after the birth the audit gives (`BIRTH_SLACK_S`):
+        it is another process that has the pid, and the one of the tree ended;
+      - otherwise (no way to tell: no time, no `create_time`) it is the same process, and it is alive."""
+    pid, rid, born = event["pid"], event.get("rid", 0), audit_epoch(event.get("time", ""))
+    for end in ends:
+        if end["pid"] != pid:
+            continue
+        if rid and end.get("rid", 0):
+            if end["rid"] > rid:
+                return True
+        elif born is not None and (audit_epoch(end.get("time", "")) or 0.0) >= born:
+            return True
+    if born is not None and create_time is not None:
+        try:
+            created = create_time(pid)
+        except Exception:  # noqa: BLE001 - a process we cannot read says nothing: it is not made to look ended
+            return False
+        if created is not None and created > born + BIRTH_SLACK_S:
+            return True
+    return False
+
+
+def process_create_time(pid: int):
+    """`create_time` of the process that has `pid` now (psutil), None when no process has it."""
+    import psutil
+
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return None
+
+
+def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sleep=time.sleep, now=time.monotonic, read_ends=None, create_time=None) -> tuple:
+    """Reads the tree of the run (`read_tree()` returns the events of its processes, in their order) until every process of it is gone and two reads in a row say the same thing,
+    or until `limit_s`. A process is gone when `alive(pid)` says its pid is free, or when the pid is no longer the process of the tree (`process_has_ended`: `read_ends()` are the 4689
+    of the same read, `create_time(pid)` is the creation time of the process that has the pid now). Returns (the last tree, {"exited": bool, "reads": n}): a tree that was
     still running at the limit says so, it is not made to look quiet."""
     end = now() + limit_s
     previous, reads = None, 0
@@ -1567,7 +1621,8 @@ def wait_exited(read_tree, alive, period=EXIT_PERIOD_S, limit_s=EXIT_LIMIT_S, sl
         tree = read_tree()
         reads += 1
         pids = tuple(e["pid"] for e in tree)
-        if not any(alive(p) for p in pids) and pids == previous:
+        ends = read_ends() if read_ends is not None else ()
+        if not any(alive(e["pid"]) and not process_has_ended(e, ends, create_time) for e in tree) and pids == previous:
             return tree, {"exited": True, "reads": reads}
         previous = pids
         if now() >= end:
