@@ -248,10 +248,36 @@ jobs:
         run: python scripts/ci_lab_geoip.py build
 
       - name: Run pytest
+        if: matrix.python != '3.11'
         shell: bash
         run: |
           set -o pipefail   # or tee would swallow pytest's exit code
           pytest tests/ -v --tb=short -rs | tee tests-report.txt
+
+      # The legs of Python 3.11 (the version the engine series' gate runs, on both of its systems) run the suite the way that gate does: the files and the
+      # marker of the row wrapper.unit.all.<os> of ci/required-suites.json (printed by scripts/ci_verdict.py args), one junit, and the judge below reads
+      # it. Until 2026-11-24 this workflow ran `pytest tests/` with a floor of 380 and nothing judged the exact counts the gate holds: PR #590 added a test
+      # without raising min_tests, this workflow was green, and the gate went red on main's next series run ("the suite is exact").
+      # No test runs twice: the row leaves out the files of the environment (a clone with its hooks armed, one with origin/main, the package index, ...: named,
+      # each with its reason, in tests/test_the_unit_suite_is_accounted_for.py), so a second pytest, with --ignore for every file of the row, runs those
+      # and any file that is in no row: together the two runs are what `pytest tests/` ran.
+      - name: Run pytest (the selection of the gate, then the files outside the row)
+        if: matrix.python == '3.11'
+        shell: bash
+        env:
+          SUITE_OS: ${{ startsWith(matrix.os, 'windows') && 'windows' || 'linux' }}
+        run: |
+          unset PYTEST_ADDOPTS
+          python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.unit.all.$SUITE_OS" --os "$SUITE_OS" --with-marker | tr -d '\r' > "$RUNNER_TEMP/unit_args.txt"
+          mapfile -t ARGS < "$RUNNER_TEMP/unit_args.txt"
+          IGNORE=()
+          for a in "${ARGS[@]}"; do
+            case "$a" in tests/*::*) ;; tests/*) IGNORE+=("--ignore=$a") ;; esac
+          done
+          rc=0
+          python -m pytest "${ARGS[@]}" -o addopts='' -o junit_family=xunit2 -q --tb=short -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$RUNNER_TEMP/unit-junit.xml" || rc=$?
+          python -m pytest tests/ "${IGNORE[@]}" -v --tb=short -rs || rc=$?
+          exit $rc
 
       # The leg ran with the pinned database, and the core never went past it to GitHub (tests/geoip_used.py wrote what it did).
       - name: The leg ran with the pinned GeoIP database
@@ -267,6 +293,7 @@ jobs:
       # already filters on two markers - one more, or a typo in one, silently
       # turns 726 tests into 0 and reports success.
       - name: Refuse a run in which the suite deselected itself
+        if: matrix.python != '3.11'
         shell: bash
         run: |
           python - <<'PY'
@@ -292,6 +319,22 @@ jobs:
               sys.exit(1)
           print(f"{passed} tests ran")
           PY
+
+      # The judge of the engine series' gate on the junit of the step above: the exact count of the row (not one test more, not one less), no skip, every
+      # file of the row passed, and the list only grows against main. The judge and the list it compares with are read from main, never from the branch under
+      # judgment (a branch that edits its own judge or its own list cannot pass itself): a PR that adds a test and does not raise min_tests is red here.
+      # The suite launches no browser, so --binary names the interpreter that ran it (the judge wants a file to hash; nothing reads that hash: no --out).
+      - name: Judge the suite wrapper.unit.all (the exact count, with the judge and the list of main)
+        if: always() && matrix.python == '3.11'
+        shell: bash
+        env:
+          SUITE_OS: ${{ startsWith(matrix.os, 'windows') && 'windows' || 'linux' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/main"
+          git show origin/main:scripts/ci_verdict.py > "$RUNNER_TEMP/main/ci_verdict.py"
+          git show origin/main:ci/required-suites.json > "$RUNNER_TEMP/main/required-suites.json"
+          if git cat-file -e origin/main:ci/retired-tests.json; then git show origin/main:ci/retired-tests.json > "$RUNNER_TEMP/main/retired-tests.json"; fi
+          python "$RUNNER_TEMP/main/ci_verdict.py" judge --required ci/required-suites.json --suite "wrapper.unit.all.$SUITE_OS" --os "$SUITE_OS" --junit "$RUNNER_TEMP/unit-junit.xml" --binary "$(python -c 'import sys; print(sys.executable)')" --main-required "$RUNNER_TEMP/main/required-suites.json"
 
   # ONE SINGLE CONTEXT FOR BRANCH PROTECTION. Measured 2026-08-13: this
   # repo's protection required `pytest (windows-latest, py3.11)`, which the
