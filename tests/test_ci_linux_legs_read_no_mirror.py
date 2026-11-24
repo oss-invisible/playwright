@@ -80,6 +80,8 @@ def deps_violations(text):
     for need, why in (("Provides: (.*, )?$e", "a root may be a name a package of the repository provides"),
                       ('RELEASE="${ImageVersion%%.*}"', "the entry is per release of the image, not per build"),
                       ("xargs -n 20 -P 8 apt-get download", "the closure is downloaded 8 at a time"),
+                      ("apt-get download -qq -o Acquire::Retries=5", "each fetch of the closure retries 5 times"),
+                      ("MB in $((T1 - T0)) s", "the MB and seconds of the download are logged"),
                       ("of the closure was not downloaded", "every package of the closure is checked")):
         if need not in code:
             bad.append("%s: %s: `%s` is missing" % (LINUX_DEPS, why, need))

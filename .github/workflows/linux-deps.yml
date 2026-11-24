@@ -145,7 +145,13 @@ jobs:
             | grep -E '^[a-z0-9]' | sed 's/:amd64$//' | grep -v ':' | sort -u)"
           REAL="$({ apt-cache show --no-all-versions $CLOSURE 2>/dev/null || true; } | sed -n 's/^Package: //p' | sort -u)"
           rm -rf /tmp/linux-deps && mkdir -p /tmp/linux-deps
-          ( cd /tmp/linux-deps && echo "$REAL" | xargs -n 20 -P 8 apt-get download -qq && apt-ftparchive packages . > Packages )
+          # The lists were refreshed above (apt-get update), so every closure name has its current version; each fetch retries 5 times. The MB and
+          # the seconds of the download go to the log, so the archive's speed is measured run after run.
+          T0="$(date +%s)"
+          ( cd /tmp/linux-deps && echo "$REAL" | xargs -n 20 -P 8 apt-get download -qq -o Acquire::Retries=5 )
+          T1="$(date +%s)"
+          echo "download: $(echo "$REAL" | wc -w) packages, $(du -sm /tmp/linux-deps | cut -f1) MB in $((T1 - T0)) s"
+          ( cd /tmp/linux-deps && apt-ftparchive packages . > Packages )
           for p in $REAL; do grep -qx "Package: $p" /tmp/linux-deps/Packages || { echo "ERROR: $p of the closure was not downloaded"; exit 1; }; done
           # A root is a package of the repository or a name one of them provides (libgtk-3-0 is libgtk-3-0t64's on noble, as `apt-get install` resolved it)
           for r in $ROOTS; do
