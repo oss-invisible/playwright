@@ -68,7 +68,7 @@ jobs:
     with:
       name: hunt
       packages: xvfb
-      playwright: true
+      playwright_wrapper_ref: ${{ github.sha }}
 
   hunt:
     name: hunt (${{ inputs.os }})
@@ -107,15 +107,20 @@ jobs:
         with:
           name: ${{ needs.linux-deps-hunt.outputs.artifact }}
           path: /tmp/linux-deps
-      - name: System deps (xvfb + Firefox runtime libs; the files of the linux-deps-hunt job)
+      - name: System deps (xvfb + Firefox runtime libs; the repository of the linux-deps-hunt job)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
           read -r OS VER < /tmp/linux-deps/image.txt
-          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
-          set -- /tmp/linux-deps/*.deb
-          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
 

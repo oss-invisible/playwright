@@ -1,16 +1,22 @@
-"""No Linux leg of the wrapper's workflows reads Ubuntu's mirror: the packages come from the run's linux-deps job.
+"""No Linux leg of the wrapper's workflows reads Ubuntu's mirror: their apt reads only the run's linux-deps repository.
 
 A run lost a green leg to its time limit with every step green, because `playwright install-deps firefox` fetched 48.8 MB from the archive's mirror at 102 kB/s
-("Fetched 48.8 MB in 7min 59s"): every Linux leg of that run spent 450-600 s on that step, 20 s in the run before. The speed of a mirror is a third party's, so
-.github/workflows/linux-deps.yml fetches the .deb files once per runner image and list (a cache entry, written and read on GitHub's runners only), hands them to
-the jobs of the run as the artifact linux-deps-<name>, and the legs install the local files. What the workflows promise, checked on the files themselves:
+("Fetched 48.8 MB in 7min 59s"). The speed of a mirror is a third party's, so .github/workflows/linux-deps.yml reads Ubuntu's archive once per runner image and
+list (a cache entry, written and read on GitHub's runners only) and hands the jobs of the run a REPOSITORY, the artifact linux-deps-<name>: the roots, their
+whole closure of Depends and Pre-Depends (what the image already has included, because GitHub mixes builds of one image in one run, and a first form that handed
+over only the missing files had legs fail with "E: Unable to fetch some archives"), a Packages index and roots.txt. The same file is in the series. What the
+workflows promise, checked on the files themselves:
 
-  1. No job runs `apt-get update` (or `apt`, upgrade, dist-upgrade), `playwright install-deps` (the one use that is allowed is `--dry-run`, in linux-deps.yml, which
-     asks which packages the Playwright pin names), or an `apt-get install` without `--no-download`. Only linux-deps.yml reads the archive.
-  2. A job that installs the packages names a job that calls linux-deps.yml in its `needs`, downloads that job's artifact (`needs.<job>.outputs.artifact`) into
-     /tmp/linux-deps, and does so BEFORE its first install.
+  1. In a leg the only apt lines are `sudo apt-get $APT update` and `sudo apt-get $APT install -y --no-download --no-install-recommends $(cat
+     /tmp/linux-deps/roots.txt)`, where APT names a sources list, a sources folder and a lists folder under /tmp/linux-deps-apt (and Acquire::Languages=none):
+     apt reads the repository and nothing else. The sources list holds the one line `deb [trusted=yes] file:/tmp/linux-deps ./`, and the files are copied into
+     apt's archives first. No leg runs `playwright install-deps` (not even `--dry-run`: linux-deps.yml reads the table of the pin itself).
+  2. A job that installs names a job that calls linux-deps.yml in its `needs`, downloads that job's artifact (`needs.<job>.outputs.artifact`) into /tmp/linux-deps,
+     and does so BEFORE its install.
   3. A job that starts a virtual display (`xvfb-run`) installs from the artifact: a leg with no package step would run on whatever the image has.
   4. A workflow calls linux-deps.yml once per name, and each call names what the artifact is for.
+  5. linux-deps.yml builds the repository (closure, `apt-get download`, Packages index, roots.txt, every root checked), never with --download-only, and reads
+     the archive only in the steps that run when the cache entry is missing.
 
 The checker is tested on known-bad inputs first, because a check that has only ever said "fine" is not known to be able to say anything else. PyYAML is not a
 dependency of this package, so the files are read as text: jobs by their header at two spaces, comments dropped, a line continued by a backslash joined.
@@ -28,7 +34,15 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 LINUX_DEPS = "linux-deps.yml"
 INSTALL_DEPS = r"(?<![-\w])install-deps(?![-\w])"
 CALL = "uses: ./.github/workflows/linux-deps.yml"
-APT = re.compile(r"\bapt(?:-get)?\s+(?:-\S+\s+)*(update|upgrade|dist-upgrade|install)\b")
+APT_LOCAL = ("-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts "
+             "-o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none")
+UPDATE = "sudo apt-get $APT update"
+INSTALL = "sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)"
+ALLOWED = (UPDATE, INSTALL)
+SOURCES_LINE = 'echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null'
+COPY = "sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/"
+MISS = "if: steps.restore.outputs.cache-hit != 'true'"
+APT_WORDS = re.compile(r"apt-get|apt install|apt update|apt upgrade|apt-cache")
 DOWNLOAD = re.compile(
     r"uses: actions/download-artifact@\S+[^\n]*\n\s+with:\s*\n\s+name: \$\{\{ needs\.([A-Za-z0-9_-]+)\.outputs\.artifact \}\}\n\s+path: /tmp/linux-deps\b")
 
@@ -53,29 +67,58 @@ def needs_of(code):
     return set(re.findall(r"[A-Za-z0-9_-]+", block.group(1))) if block else set()
 
 
+def deps_violations(text):
+    """What linux-deps.yml breaks: the repository of the closure, built from the archive only when the entry is missing."""
+    bad = []
+    code = jobs_of(text).get("debs", "")
+    for need in ("apt-cache depends --recurse --no-recommends", "apt-get download", "apt-ftparchive packages . > Packages", "roots.txt",
+                 "is not in the repository", 'for group in ("tools", "firefox")'):
+        if need not in code:
+            bad.append("%s: the repository is not built: `%s` is missing" % (LINUX_DEPS, need))
+    if "--download-only" in code:
+        bad.append("%s: `--download-only` fetches only what the image lacks; the repository holds the whole closure" % LINUX_DEPS)
+    for step in re.split(r"(?m)^      - ", code)[1:]:
+        if (APT_WORDS.search(step) or "actions/cache/save" in step) and MISS not in step:
+            bad.append("%s: a step reads the archive or saves the entry without `%s`: %s" % (LINUX_DEPS, MISS, step.splitlines()[0].strip()))
+    return bad
+
+
 def violations(name, text):
-    """What `text` (the workflow `name`) breaks of the four rules, one line each."""
+    """What `text` (the workflow `name`) breaks of the rules, one line each."""
+    if name == LINUX_DEPS:
+        return deps_violations(text)
     bad = []
     jobs = jobs_of(text)
     callers = {j: c for j, c in jobs.items() if CALL in c}
     names = []
     for job, code in jobs.items():
-        for line in code.splitlines():
-            m = APT.search(line)
-            if name != LINUX_DEPS and m:
-                if m.group(1) != "install":
-                    bad.append("%s %s: `apt-get %s` reads the archive; the packages come from the run's linux-deps job" % (name, job, m.group(1)))
-                elif "--no-download" not in line:
-                    bad.append("%s %s: an `apt-get install` without --no-download reads the archive: %s" % (name, job, line.strip()))
-            if re.search(INSTALL_DEPS, line) and "--dry-run" not in line:
-                bad.append("%s %s: `playwright install-deps` installs from the archive (only `--dry-run` in linux-deps.yml): %s" % (name, job, line.strip()))
-            if re.search(INSTALL_DEPS, line) and "--dry-run" in line and name != LINUX_DEPS:
-                bad.append("%s %s: `install-deps --dry-run` belongs to linux-deps.yml" % (name, job))
-        installs = [m.start() for m in re.finditer(r"apt-get install[^\n]*--no-download", code)]
+        lines = code.splitlines()
+        apt_lines = [l.strip() for l in lines if APT_WORDS.search(l)]
+        for line in lines:
+            if re.search(INSTALL_DEPS, line):
+                bad.append("%s %s: `playwright install-deps` installs from the archive: %s" % (name, job, line.strip()))
+        for line in apt_lines:
+            if line not in ALLOWED:
+                bad.append("%s %s: an apt line that is not one of the two the repository allows: %s" % (name, job, line))
+        installs = [m.start() for m in re.finditer(re.escape(INSTALL), code)]
+        if apt_lines or installs:
+            for need in ALLOWED:
+                if need not in apt_lines:
+                    bad.append("%s %s: lacks `%s`" % (name, job, need))
+            if ('APT="%s"' % APT_LOCAL) not in code:
+                bad.append("%s %s: APT is not the local sources list, sources folder and lists folder under /tmp/linux-deps-apt, with Acquire::Languages=none" % (name, job))
+            if SOURCES_LINE not in code:
+                bad.append("%s %s: the sources list is not the one line `deb [trusted=yes] file:/tmp/linux-deps ./`" % (name, job))
+            if [l.strip() for l in lines if "sources.list" in l and not l.lstrip().startswith("APT=")] != [SOURCES_LINE]:
+                bad.append("%s %s: something else writes or names the sources list" % (name, job))
+            if COPY not in code:
+                bad.append("%s %s: lacks `%s`" % (name, job, COPY))
+            elif installs and code.index(COPY) > installs[0]:
+                bad.append("%s %s: copies the files into apt's archives after the install" % (name, job))
         if installs:
             wanted = DOWNLOAD.search(code)
             if not wanted:
-                bad.append("%s %s: installs with --no-download but does not download the artifact of a linux-deps job into /tmp/linux-deps" % (name, job))
+                bad.append("%s %s: installs from the repository but does not download the artifact of a linux-deps job into /tmp/linux-deps" % (name, job))
             else:
                 source = wanted.group(1)
                 if source not in callers:
@@ -92,6 +135,8 @@ def violations(name, text):
                 bad.append("%s %s: a call of linux-deps.yml without a name" % (name, job))
             else:
                 names.append(m.group(1))
+            if re.search(r"(?m)^      playwright:", code):
+                bad.append("%s %s: the input `playwright` is gone (the pin is read from `playwright_wrapper_ref`)" % (name, job))
     if len(names) != len(set(names)):
         bad.append("%s: two calls of linux-deps.yml with the same name (one artifact for both)" % name)
     return bad
@@ -121,10 +166,21 @@ jobs:
           path: /tmp/linux-deps
       - name: System deps
         run: |
-          set -- /tmp/linux-deps/*.deb
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          set -euo pipefail
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
           xvfb-run -a true
 """
+APT_UPDATE = "          sudo apt-get $APT update\n"
+APT_INSTALL = "          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)\n"
+FIRST_FORM = ('          set -- /tmp/linux-deps/*.deb\n'
+              '          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"\n')
 
 
 def test_the_good_input_is_clean():
@@ -132,17 +188,31 @@ def test_the_good_input_is_clean():
 
 
 @pytest.mark.parametrize("old, new, expected", [
-    ("          set -- /tmp/linux-deps/*.deb\n", "          sudo apt-get update\n          set -- /tmp/linux-deps/*.deb\n", "apt-get update"),
-    ("          set -- /tmp/linux-deps/*.deb\n", "          sudo apt-get upgrade -y\n          set -- /tmp/linux-deps/*.deb\n", "apt-get upgrade"),
-    ("          set -- /tmp/linux-deps/*.deb\n", "          sudo \"$(which python)\" -m playwright install-deps firefox\n          set -- /tmp/linux-deps/*.deb\n", "install-deps"),
-    ("          set -- /tmp/linux-deps/*.deb\n", "          sudo apt-get install -y gdb\n          set -- /tmp/linux-deps/*.deb\n", "without --no-download"),
-    ("          set -- /tmp/linux-deps/*.deb\n", "          sudo apt-get install -y \\\n            gdb\n          set -- /tmp/linux-deps/*.deb\n", "without --no-download"),
-    ("          set -- /tmp/linux-deps/*.deb\n", "          sudo apt install -y gdb\n          set -- /tmp/linux-deps/*.deb\n", "without --no-download"),
-    ("          set -- /tmp/linux-deps/*.deb\n", "          python -m playwright install-deps --dry-run firefox\n          set -- /tmp/linux-deps/*.deb\n", "belongs to linux-deps.yml"),
+    (APT_UPDATE, "          sudo apt-get update\n", "not one of the two"),
+    (APT_UPDATE, APT_UPDATE + "          sudo apt-get upgrade -y\n", "not one of the two"),
+    (APT_UPDATE, APT_UPDATE + "          sudo apt-get $APT update -qq\n", "not one of the two"),
+    (APT_UPDATE, APT_UPDATE + "          sudo \"$(which python)\" -m playwright install-deps firefox\n", "install-deps"),
+    (APT_UPDATE, APT_UPDATE + "          python -m playwright install-deps --dry-run firefox\n", "install-deps"),
+    (APT_UPDATE, APT_UPDATE + "          sudo apt-get install -y gdb\n", "not one of the two"),
+    (APT_UPDATE, APT_UPDATE + "          sudo apt-get install -y \\\n            gdb\n", "not one of the two"),
+    (APT_UPDATE, APT_UPDATE + "          sudo apt install -y gdb\n", "not one of the two"),
+    (APT_UPDATE, APT_UPDATE + "          sudo apt-get $APT install -y gdb\n", "not one of the two"),
+    (APT_INSTALL, FIRST_FORM, "not one of the two"),
+    (APT_INSTALL, APT_INSTALL.replace(" --no-download", ""), "not one of the two"),
+    (APT_INSTALL, APT_INSTALL.replace("$(cat /tmp/linux-deps/roots.txt)", "gdb"), "not one of the two"),
+    ("-o Acquire::Languages=none", "-o Acquire::Foo=none", "APT is not the local"),
+    ("-o Dir::State::Lists=/tmp/linux-deps-apt/lists ", "", "APT is not the local"),
+    ("-o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts ", "", "APT is not the local"),
+    ('echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null\n',
+     'echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null\n'
+     '          echo "deb http://archive.ubuntu.com/ubuntu noble main" | sudo tee -a /tmp/linux-deps-apt/sources.list >/dev/null\n', "sources list"),
+    ('echo "deb [trusted=yes] file:/tmp/linux-deps ./"', 'echo "deb file:/tmp/linux-deps ./"', "the one line"),
+    ("          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/\n", "", "lacks `sudo cp"),
     ("          path: /tmp/linux-deps\n", "          path: /tmp/other\n", "does not download the artifact"),
     ("    needs: [core, linux-deps-x]\n", "    needs: [core]\n", "without `needs`"),
     ("    needs: [core, linux-deps-x]\n", "    needs: core\n", "without `needs`"),
     ("needs.linux-deps-x.outputs.artifact", "needs.core.outputs.artifact", "not a call of linux-deps.yml"),
+    ("      packages: xvfb\n", "      packages: xvfb\n      playwright: true\n", "input `playwright` is gone"),
 ])
 def test_the_known_bad_inputs_are_found(old, new, expected):
     assert old in GOOD
@@ -150,10 +220,25 @@ def test_the_known_bad_inputs_are_found(old, new, expected):
     assert found and any(expected in v for v in found), found
 
 
+def test_the_first_form_is_found_whole():
+    """The first form (the .deb files installed against the leg's own image and lists) fails the rules on every count."""
+    first = GOOD.replace(
+        GOOD[GOOD.index("          echo \"the repository was read"):GOOD.index("          xvfb-run")],
+        FIRST_FORM)
+    found = violations("x.yml", first)
+    assert any("not one of the two" in v for v in found) and any("lacks" in v for v in found), found
+
+
 def test_a_leg_that_installs_before_it_downloads_is_found():
     step = GOOD[GOOD.index("      - name: The Linux packages"):GOOD.index("      - name: System deps")]
     swapped = GOOD.replace(step, "").replace("          xvfb-run -a true\n", "          xvfb-run -a true\n" + step)
     assert any("before it downloads" in v for v in violations("x.yml", swapped)), violations("x.yml", swapped)
+
+
+def test_a_leg_that_copies_the_files_after_the_install_is_found():
+    cp = "          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/\n"
+    late = GOOD.replace(cp, "").replace("          xvfb-run -a true\n", cp + "          xvfb-run -a true\n")
+    assert any("after the install" in v for v in violations("x.yml", late)), violations("x.yml", late)
 
 
 def test_a_leg_with_a_virtual_display_and_no_package_step_is_found():
@@ -170,11 +255,36 @@ def test_a_comment_that_names_the_old_command_is_not_a_violation():
     assert violations("x.yml", GOOD.replace("      - name: System deps\n", "      # it was `sudo apt-get update` and `playwright install-deps firefox`\n      - name: System deps\n")) == []
 
 
-def test_linux_deps_yml_may_read_the_archive_but_install_deps_only_as_a_dry_run():
-    text = (WORKFLOWS / LINUX_DEPS).read_text(encoding="utf-8")
-    assert "apt-get update" in text and "--download-only" in text, "the one place that reads the archive"
-    assert violations(LINUX_DEPS, text) == []
-    assert any("install-deps" in v for v in violations(LINUX_DEPS, text.replace("install-deps --dry-run firefox", "install-deps firefox")))
+# ---- linux-deps.yml ---------------------------------------------------------------------------------------------------------------------------
+def deps_text():
+    return (WORKFLOWS / LINUX_DEPS).read_text(encoding="utf-8")
+
+
+def test_linux_deps_yml_builds_the_repository_and_reads_the_archive_only_when_the_entry_is_missing():
+    assert deps_violations(deps_text()) == []
+
+
+@pytest.mark.parametrize("old, new, expected", [
+    ("apt-cache depends --recurse --no-recommends", "apt-cache depends --no-recommends", "apt-cache depends --recurse"),
+    ("apt-ftparchive packages . > Packages", "true", "apt-ftparchive packages"),
+    ("is not in the repository", "is missing", "is not in the repository"),
+    ("apt-get download -qq", "apt-get download --download-only -qq", "--download-only"),
+    ('for group in ("tools", "firefox")', 'for group in ("tools",)', "for group"),
+    ("      - name: A new image or list - the repository from Ubuntu's archive, once\n        if: steps.restore.outputs.cache-hit != 'true'\n",
+     "      - name: A new image or list - the repository from Ubuntu's archive, once\n", "reads the archive"),
+    ("      - name: Keep the entry\n        if: steps.restore.outputs.cache-hit != 'true'\n", "      - name: Keep the entry\n", "saves the entry"),
+])
+def test_linux_deps_yml_known_bad_inputs_are_found(old, new, expected):
+    text = deps_text()
+    assert old in text
+    found = deps_violations(text.replace(old, new, 1))
+    assert found and any(expected in v for v in found), found
+
+
+def test_linux_deps_yml_takes_the_wrapper_ref_not_a_flag():
+    text = deps_text()
+    assert re.search(r"(?m)^      playwright_wrapper_ref:$", text) and not re.search(r"(?m)^      playwright:$", text)
+    assert "repository: oss-invisible/playwright" in text and "scripts/playwright_pin.txt" in text
 
 
 # ---- the workflows of the repository -----------------------------------------------------------------------------------------------------------
@@ -184,7 +294,7 @@ def test_the_workflows_of_the_repository_are_found():
 
 
 @pytest.mark.parametrize("path", repository_workflows(), ids=lambda p: p.name)
-def test_no_linux_leg_reads_the_mirror_and_each_installs_the_files_of_its_linux_deps_job(path):
+def test_no_linux_leg_reads_the_mirror_and_each_installs_the_repository_of_its_linux_deps_job(path):
     assert violations(path.name, path.read_text(encoding="utf-8")) == []
 
 
@@ -200,7 +310,7 @@ def test_the_workflows_that_had_apt_in_their_legs_call_linux_deps(workflow, call
     assert {j for j, c in jobs.items() if CALL in c} == calls
 
 
-def test_the_legs_of_e2e_yml_that_start_a_display_install_the_files_of_the_one_list():
+def test_the_legs_of_e2e_yml_that_start_a_display_install_the_repository_of_the_one_list():
     jobs = jobs_of((WORKFLOWS / "e2e.yml").read_text(encoding="utf-8"))
     legs = {j for j, c in jobs.items() if "xvfb-run" in c}
     assert legs == {"e2e-linux", "e2e-network", "e2e-host", "e2e-page", "e2e-page-final"}, legs
@@ -208,4 +318,10 @@ def test_the_legs_of_e2e_yml_that_start_a_display_install_the_files_of_the_one_l
         assert "linux-deps-e2e" in needs_of(jobs[leg]), leg
     pkgs = re.search(r"(?m)^      packages: (.+)$", jobs["linux-deps-e2e"]).group(1).split()
     assert {"xvfb", "strace", "gdb", "elfutils"} <= set(pkgs), "what the legs installed one by one, as one list"
-    assert re.search(r"(?m)^      playwright: true$", jobs["linux-deps-e2e"]), "and what install-deps names for Firefox"
+
+
+@pytest.mark.parametrize("workflow, call", [("e2e.yml", "linux-deps-e2e"), ("fakeweb.yml", "linux-deps-fakeweb"), ("e2e-hunt.yml", "linux-deps-hunt")])
+def test_the_calls_that_need_install_deps_roots_name_the_pin_of_this_commit(workflow, call):
+    """The roots `playwright install-deps firefox` installs come from the Playwright of the wrapper's pin, read at the commit that runs."""
+    jobs = jobs_of((WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    assert re.search(r"(?m)^      playwright_wrapper_ref: \$\{\{ github\.sha \}\}$", jobs[call]), jobs[call]

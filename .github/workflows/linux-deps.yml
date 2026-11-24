@@ -1,16 +1,20 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# linux-deps.yml - the Ubuntu packages of a workflow's Linux jobs, fetched from Ubuntu's archive ONCE per runner image and list, never by the jobs.
+# linux-deps.yml — the Ubuntu packages of a workflow's Linux jobs, read from Ubuntu's archive ONCE per runner image and list, never by the jobs.
+# The same file in the series and in the wrapper.
 #
-# A run of the wrapper's workflows lost a green leg to its time limit with every step green, because `playwright install-deps firefox` fetched 48.8 MB from
-# the archive's mirror at 102 kB/s ("Fetched 48.8 MB in 7min 59s"): every Linux leg spent 450-600 s on that step, 20 s in the run before. The speed of a
-# mirror is a third party's: no leg reads it any more.
+# Republish 45297517213: wrapper.e2e.fakeweb-linux-x86_64 was cancelled at its 25 minutes with every step green, because `playwright install-deps
+# firefox` fetched 48.8 MB from the archive's mirror at 102 kB/s ("Fetched 48.8 MB in 7min 59s"). The speed of a mirror is a third party's.
+# The first form of this file handed the jobs only the packages missing on ITS runner image and installed them against the job's own image: the
+# wrapper's PR #584 ran that job on ubuntu24 20261116.376.1 and the legs on 20261116.133.1, and the legs' apt wanted a package the files did not
+# hold ("E: Unable to fetch some archives"). GitHub mixes builds of an image in one run, so the files cannot depend on the image they were read on.
 #
-# This job resolves the list on the runner image the jobs run on (the packages named here with their recommends, those named without, and what
-# `playwright install-deps --dry-run firefox` lists missing for the Playwright of scripts/playwright_pin.txt), keeps the .deb files in an entry whose key is
-# the image (ImageOS, ImageVersion) and the sha of the list, and hands them to the jobs of the run as the artifact linux-deps-<name>. On an entry that exists
-# it reads nothing from the archive. The jobs install them with `apt-get install --no-download` on the local files: a package that is not there is red with
-# its name, never a silent fetch (tests/test_ci_linux_legs_read_no_mirror.py refuses `apt-get update`, `install-deps` and an install without --no-download
-# in a Linux leg). The entry is written and read on GitHub's runners only, by this file only.
+# So this job hands the jobs a REPOSITORY: the roots (the packages named with their recommends, the recommends themselves, the packages named without,
+# and the roots `playwright install-deps firefox` installs for the Playwright of the wrapper's pin, read from its table), their whole closure of
+# Depends and Pre-Depends with the virtual packages' providers, INCLUDING what the image already has, a Packages index, and roots.txt. A job
+# installs the roots BY NAME with an apt that reads only that repository (its own sources list and lists folder) and --no-download: whatever its
+# image has or lacks is resolved from the files, and a package that is not there is named by apt, red, never fetched from a mirror.
+# The files are kept in a cache entry keyed by the image and the sha of the list (an entry of .deb files on GitHub's runners, this file only), and
+# handed to the run's jobs as the artifact linux-deps-<name>.
 # ─────────────────────────────────────────────────────────────────────────────
 name: linux-deps
 
@@ -29,13 +33,13 @@ on:
         description: packages installed without their recommends
         type: string
         default: ''
-      playwright:
-        description: add what `playwright install-deps firefox` names for the Playwright of scripts/playwright_pin.txt
-        type: boolean
-        default: false
+      playwright_wrapper_ref:
+        description: the oss-invisible/playwright ref whose scripts/playwright_pin.txt names the Playwright of `install-deps firefox`; empty for none
+        type: string
+        default: ''
     outputs:
       artifact:
-        description: the artifact that holds the .deb files
+        description: the artifact that holds the repository
         value: ${{ jobs.debs.outputs.artifact }}
 
 permissions: { contents: read }
@@ -48,15 +52,18 @@ jobs:
     outputs:
       artifact: linux-deps-${{ inputs.name }}
     steps:
-      - name: Checkout (the Playwright pin)
-        if: inputs.playwright
+      - name: Checkout wrapper (its Playwright pin)
+        if: inputs.playwright_wrapper_ref != ''
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: oss-invisible/playwright
+          ref: ${{ inputs.playwright_wrapper_ref }}
+          path: linux-deps-pin
           fetch-depth: 1
           sparse-checkout: scripts/playwright_pin.txt
           sparse-checkout-cone-mode: false
       - name: Set up Python
-        if: inputs.playwright
+        if: inputs.playwright_wrapper_ref != ''
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: The list and its entry (the runner image and the sha of the list)
@@ -65,14 +72,14 @@ jobs:
         env:
           PACKAGES: ${{ inputs.packages }}
           NO_REC: ${{ inputs.packages_no_recommends }}
-          PW: ${{ inputs.playwright }}
+          PW_REF: ${{ inputs.playwright_wrapper_ref }}
         run: |
           set -euo pipefail
           : "${ImageOS:?no ImageOS: not a GitHub runner image}" "${ImageVersion:?no ImageVersion: not a GitHub runner image}"
           PIN=""
-          if [ "$PW" = true ]; then PIN="$(tr -d '[:space:]' < scripts/playwright_pin.txt)"; [ -n "$PIN" ] || { echo "ERROR: empty scripts/playwright_pin.txt"; exit 1; }; fi
+          if [ -n "$PW_REF" ]; then PIN="$(tr -d '[:space:]' < linux-deps-pin/scripts/playwright_pin.txt)"; [ -n "$PIN" ] || { echo "ERROR: empty scripts/playwright_pin.txt at $PW_REF"; exit 1; }; fi
           mkdir -p "$RUNNER_TEMP/linux-deps-spec"
-          printf 'recommends: %s\nno-recommends: %s\nplaywright-install-deps-firefox: %s\n' "$PACKAGES" "$NO_REC" "$PIN" > "$RUNNER_TEMP/linux-deps-spec/spec.txt"
+          printf 'form: repository of the closure\nrecommends: %s\nno-recommends: %s\nplaywright-roots-firefox: %s\n' "$PACKAGES" "$NO_REC" "$PIN" > "$RUNNER_TEMP/linux-deps-spec/spec.txt"
           cat "$RUNNER_TEMP/linux-deps-spec/spec.txt"
           SHA="$(sha256sum < "$RUNNER_TEMP/linux-deps-spec/spec.txt" | cut -c1-16)"
           echo "pin=$PIN" >> "$GITHUB_OUTPUT"
@@ -83,7 +90,7 @@ jobs:
         with:
           path: /tmp/linux-deps
           key: ${{ steps.spec.outputs.key }}
-      - name: A new image or list - the packages from Ubuntu's archive, once
+      - name: A new image or list - the repository from Ubuntu's archive, once
         if: steps.restore.outputs.cache-hit != 'true'
         shell: bash
         env:
@@ -94,33 +101,59 @@ jobs:
           set -euo pipefail
           printf '%s\n' 'Acquire::http::Timeout "60";' 'Acquire::https::Timeout "60";' 'Acquire::Retries "5";' \
             | sudo tee /etc/apt/apt.conf.d/80-ci-network >/dev/null
-          sudo apt-get clean
           sudo apt-get update -qq
-          PW_PKGS=""
+          command -v apt-ftparchive >/dev/null || sudo apt-get install -y -qq apt-utils
+          PW_ROOTS=""
           if [ -n "$PIN" ]; then
             python -m pip install --quiet "playwright==$PIN"
-            # exit 1 when something is missing (the list follows "Missing system dependencies (N):", two spaces before each name)
-            python -m playwright install-deps --dry-run firefox > "$RUNNER_TEMP/pw-deps.txt" 2>&1 || true
-            cat "$RUNNER_TEMP/pw-deps.txt"
-            PW_PKGS="$(sed -n 's/^  \([a-z0-9][a-z0-9.+:-]*\)$/\1/p' "$RUNNER_TEMP/pw-deps.txt" | tr '\n' ' ')"
-            [ -n "$PW_PKGS" ] || grep -q "All system dependencies are installed." "$RUNNER_TEMP/pw-deps.txt" \
-              || { echo "ERROR: playwright install-deps --dry-run firefox gave no list"; exit 1; }
+            # The roots `playwright install-deps firefox` installs (with --no-install-recommends): the `tools` and `firefox` lists of this system's
+            # entry in the driver's table, the list install-deps itself reads.
+            PLATFORM="ubuntu$(. /etc/os-release && echo "$VERSION_ID")-x64"
+            PW_ROOTS="$(python - "$PLATFORM" <<'PY'
+          import os, re, sys
+          import playwright
+          path = os.path.join(os.path.dirname(playwright.__file__), "driver", "package", "lib", "coreBundle.js")
+          text = open(path, encoding="utf-8").read()
+          at = text.find('"%s": {' % sys.argv[1])
+          if at < 0:
+              sys.exit("no entry %s in %s" % (sys.argv[1], path))
+          roots = []
+          for group in ("tools", "firefox"):
+              m = re.compile(r"\b%s: \[(.*?)\]" % group, re.S).search(text, at)
+              if not m:
+                  sys.exit("no %s list after the entry %s" % (group, sys.argv[1]))
+              roots += re.findall(r'"([a-z0-9][a-z0-9.+-]*)"', m.group(1))
+          if "xvfb" not in roots or len(roots) < 10:
+              sys.exit("the roots read from %s are not install-deps' list: %s" % (path, roots))
+          print(" ".join(sorted(set(roots))))
+          PY
+          )"
+            echo "playwright install-deps firefox roots: $PW_ROOTS"
           fi
-          [ -z "$PACKAGES" ] || sudo apt-get install -y -qq --download-only $PACKAGES
-          [ -z "$NO_REC$PW_PKGS" ] || sudo apt-get install -y -qq --download-only --no-install-recommends $NO_REC $PW_PKGS
+          # The recommends of the packages named with their recommends (as `apt-get install -y` installed them), one level, as roots themselves.
+          RECS=""
+          [ -z "$PACKAGES" ] || RECS="$(apt-cache depends --no-depends --no-pre-depends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances $PACKAGES \
+            | sed -n 's/^ *|\{0,1\}Recommends: \([a-z0-9][^ <>]*\)$/\1/p' | sort -u | tr '\n' ' ')"
+          ROOTS="$(echo $PACKAGES $RECS $NO_REC $PW_ROOTS | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+          echo "roots: $ROOTS"
+          # The closure: Depends and Pre-Depends, recursively, the providers of every virtual package, what the image has included.
+          CLOSURE="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances $ROOTS \
+            | grep -E '^[a-z0-9]' | sed 's/:amd64$//' | grep -v ':' | sort -u)"
+          REAL="$({ apt-cache show --no-all-versions $CLOSURE 2>/dev/null || true; } | sed -n 's/^Package: //p' | sort -u)"
           rm -rf /tmp/linux-deps && mkdir -p /tmp/linux-deps
-          find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /tmp/linux-deps/ \;
+          ( cd /tmp/linux-deps && apt-get download -qq $REAL && apt-ftparchive packages . > Packages )
+          for r in $ROOTS; do grep -qx "Package: $r" /tmp/linux-deps/Packages || { echo "ERROR: the root $r is not in the repository"; exit 1; }; done
+          echo "$ROOTS" | tr ' ' '\n' | sed '/^$/d' > /tmp/linux-deps/roots.txt
           cp "$RUNNER_TEMP/linux-deps-spec/spec.txt" /tmp/linux-deps/spec.txt
-          echo "$PW_PKGS" > /tmp/linux-deps/playwright-firefox.txt
           echo "$ImageOS $ImageVersion" > /tmp/linux-deps/image.txt
-          echo "$(find /tmp/linux-deps -name '*.deb' | wc -l) packages, $(du -sh /tmp/linux-deps | cut -f1)"
+          echo "$(wc -l < /tmp/linux-deps/roots.txt) roots, $(find /tmp/linux-deps -name '*.deb' | wc -l) packages in the closure, $(du -sh /tmp/linux-deps | cut -f1)"
       - name: Keep the entry
         if: steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/linux-deps
           key: ${{ steps.spec.outputs.key }}
-      - name: The packages for the jobs of this run
+      - name: The repository for the jobs of this run
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-deps-${{ inputs.name }}
