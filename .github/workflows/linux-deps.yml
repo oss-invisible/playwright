@@ -13,8 +13,11 @@
 # Depends and Pre-Depends with the virtual packages' providers, INCLUDING what the image already has, a Packages index, and roots.txt. A job
 # installs the roots BY NAME with an apt that reads only that repository (its own sources list and lists folder) and --no-download: whatever its
 # image has or lacks is resolved from the files, and a package that is not there is named by apt, red, never fetched from a mirror.
-# The files are kept in a cache entry keyed by the image and the sha of the list (an entry of .deb files on GitHub's runners, this file only), and
-# handed to the run's jobs as the artifact linux-deps-<name>.
+# The files are kept in a cache entry keyed by the image's OS, the date of its release and the sha of the list (an entry of .deb files on GitHub's
+# runners, this file only), and handed to the run's jobs as the artifact linux-deps-<name>. Not by the image's build: the repository does not depend
+# on it, and the builds of one release are mixed in a run (20261116.133.1, 20261116.376.1), so a key per build missed the entry run after run and
+# read the archive each time (wrapper PR #585: 13 minutes for a closure, from a slow mirror). The download runs 8 at a time: the slowness seen is
+# per connection.
 # ─────────────────────────────────────────────────────────────────────────────
 name: linux-deps
 
@@ -83,7 +86,8 @@ jobs:
           cat "$RUNNER_TEMP/linux-deps-spec/spec.txt"
           SHA="$(sha256sum < "$RUNNER_TEMP/linux-deps-spec/spec.txt" | cut -c1-16)"
           echo "pin=$PIN" >> "$GITHUB_OUTPUT"
-          echo "key=linux-deps-$ImageOS-$ImageVersion-$SHA" | tee -a "$GITHUB_OUTPUT"
+          RELEASE="${ImageVersion%%.*}"
+          echo "key=linux-deps-$ImageOS-$RELEASE-$SHA" | tee -a "$GITHUB_OUTPUT"
       - name: The entry of this image and list
         id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -141,8 +145,13 @@ jobs:
             | grep -E '^[a-z0-9]' | sed 's/:amd64$//' | grep -v ':' | sort -u)"
           REAL="$({ apt-cache show --no-all-versions $CLOSURE 2>/dev/null || true; } | sed -n 's/^Package: //p' | sort -u)"
           rm -rf /tmp/linux-deps && mkdir -p /tmp/linux-deps
-          ( cd /tmp/linux-deps && apt-get download -qq $REAL && apt-ftparchive packages . > Packages )
-          for r in $ROOTS; do grep -qx "Package: $r" /tmp/linux-deps/Packages || { echo "ERROR: the root $r is not in the repository"; exit 1; }; done
+          ( cd /tmp/linux-deps && echo "$REAL" | xargs -n 20 -P 8 apt-get download -qq && apt-ftparchive packages . > Packages )
+          for p in $REAL; do grep -qx "Package: $p" /tmp/linux-deps/Packages || { echo "ERROR: $p of the closure was not downloaded"; exit 1; }; done
+          # A root is a package of the repository or a name one of them provides (libgtk-3-0 is libgtk-3-0t64's on noble, as `apt-get install` resolved it)
+          for r in $ROOTS; do
+            e="$(printf '%s' "$r" | sed 's/[.+]/\\&/g')"
+            grep -qE "^(Package: $e|Provides: (.*, )?$e( \(.*\))?(,.*)?)$" /tmp/linux-deps/Packages || { echo "ERROR: the root $r is not in the repository"; exit 1; }
+          done
           echo "$ROOTS" | tr ' ' '\n' | sed '/^$/d' > /tmp/linux-deps/roots.txt
           cp "$RUNNER_TEMP/linux-deps-spec/spec.txt" /tmp/linux-deps/spec.txt
           echo "$ImageOS $ImageVersion" > /tmp/linux-deps/image.txt

@@ -75,6 +75,16 @@ def deps_violations(text):
                  "is not in the repository", 'for group in ("tools", "firefox")'):
         if need not in code:
             bad.append("%s: the repository is not built: `%s` is missing" % (LINUX_DEPS, need))
+    # PR #585: libgtk-3-0 is a name libgtk-3-0t64 provides (a root check on Package: alone refused it); a key per image build missed the entry run after
+    # run (the builds of one release are mixed in a run); the closure read one package at a time took 13 minutes from a slow mirror.
+    for need, why in (("Provides: (.*, )?$e", "a root may be a name a package of the repository provides"),
+                      ('RELEASE="${ImageVersion%%.*}"', "the entry is per release of the image, not per build"),
+                      ("xargs -n 20 -P 8 apt-get download", "the closure is downloaded 8 at a time"),
+                      ("of the closure was not downloaded", "every package of the closure is checked")):
+        if need not in code:
+            bad.append("%s: %s: `%s` is missing" % (LINUX_DEPS, why, need))
+    if "$ImageVersion-$SHA" in code:
+        bad.append("%s: the entry is keyed by the image build ($ImageVersion), so it misses whenever the builds of a release are mixed" % LINUX_DEPS)
     if "--download-only" in code:
         bad.append("%s: `--download-only` fetches only what the image lacks; the repository holds the whole closure" % LINUX_DEPS)
     for step in re.split(r"(?m)^      - ", code)[1:]:
@@ -270,6 +280,10 @@ def test_linux_deps_yml_builds_the_repository_and_reads_the_archive_only_when_th
     ("is not in the repository", "is missing", "is not in the repository"),
     ("apt-get download -qq", "apt-get download --download-only -qq", "--download-only"),
     ('for group in ("tools", "firefox")', 'for group in ("tools",)', "for group"),
+    ("Provides: (.*, )?$e", "Provides: none", "provides"),
+    ('RELEASE="${ImageVersion%%.*}"', 'RELEASE="$ImageVersion"', "release of the image"),
+    ("xargs -n 20 -P 8 apt-get download", "xargs -n 20 -P 1 apt-get download", "8 at a time"),
+    ('echo "key=linux-deps-$ImageOS-$RELEASE-$SHA"', 'echo "key=linux-deps-$ImageOS-$ImageVersion-$SHA"', "image build"),
     ("      - name: A new image or list - the repository from Ubuntu's archive, once\n        if: steps.restore.outputs.cache-hit != 'true'\n",
      "      - name: A new image or list - the repository from Ubuntu's archive, once\n", "reads the archive"),
     ("      - name: Keep the entry\n        if: steps.restore.outputs.cache-hit != 'true'\n", "      - name: Keep the entry\n", "saves the entry"),
