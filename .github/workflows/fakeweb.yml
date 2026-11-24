@@ -105,7 +105,16 @@ jobs:
           if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
           set -- /tmp/linux-deps/*.deb
           [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          # DIAGNOSIS (PR toward integ/candidate-69, not to keep): what apt wants to fetch beyond the files, and why
+          set +e
+          echo "--- simulate"; sudo apt-get install -s --no-download --no-install-recommends "$@" 2>&1 | grep -E "^(Inst|Conf|Remv) |NEW|upgraded|E: "
+          WANT="$(sudo apt-get install -s --no-download --no-install-recommends "$@" 2>/dev/null | awk '$1 == "Inst" {print $2}')"
+          HAVE="$(for f in "$@"; do dpkg-deb -f "$f" Package; done | sort -u)"
+          for p in $WANT; do echo "$HAVE" | grep -qx "$p" || { echo "--- NOT IN THE FILES: $p"; apt-cache policy "$p" | head -8; dpkg-query -W -f '${Status} ${Version}\n' "$p"; for f in "$@"; do dpkg-deb -f "$f" Package Version Depends Pre-Depends Breaks 2>/dev/null | grep -B2 -E "(^| |,)$p( |,|$)" | head -6; done; }; done
+          echo "--- installed versions on this image vs the files"; for f in "$@"; do n="$(dpkg-deb -f "$f" Package)"; v="$(dpkg-deb -f "$f" Version)"; i="$(dpkg-query -W -f '${Version}' "$n" 2>/dev/null)"; if [ -n "$i" ]; then echo "$n file=$v installed=$i"; fi; done
+          ls -la /var/lib/apt/lists | head -5; ls /var/lib/apt/lists | wc -l
+          set -e
+          sudo apt-get install -y --no-download --no-install-recommends "$@"
       - name: Playwright's own Firefox (the control)
         run: python -m playwright install firefox
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
