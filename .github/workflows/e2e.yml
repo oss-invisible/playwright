@@ -83,7 +83,7 @@ jobs:
   # THE UBUNTU PACKAGES OF THE LINUX JOBS, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a job: a run lost a green leg to its time
   # limit because a mirror served `playwright install-deps firefox` at 102 kB/s. One list for every Linux job of this file: xvfb (with xauth, its recommend, for
   # xvfb-run), strace (the fontconfig suite, the host oracle and its recorder), gdb and elfutils (the cores of a browser that did not end with 0), and what
-  # Playwright's install-deps names for Firefox. The jobs install the files with --no-download.
+  # Playwright's install-deps names for Firefox. The jobs install its roots by name from that repository, with --no-download.
   linux-deps-e2e:
     name: linux-deps-e2e
     needs: core-on-index
@@ -92,7 +92,7 @@ jobs:
     with:
       name: e2e
       packages: xvfb strace gdb elfutils
-      playwright: true
+      playwright_wrapper_ref: ${{ github.sha }}
 
   # THE e2e ON LINUX, IN THREE PARTS. One job ran the whole Linux e2e in 24.6 minutes on a normal runner and 35.7 on a slow one (the same tests, every
   # one slower by the same 1.44x), close to the 40-minute ceiling. The files of each part are the rows `wrapper.e2e.suite.linux.1` to `.3` of
@@ -133,8 +133,8 @@ jobs:
           # client lives in invisible_playwright._pw and the driver in _driver. It
           # is installed here as a system tool, not as a product dependency (the
           # SYSTEM libraries Firefox needs on a bare runner come from the run's
-          # linux-deps-e2e job, which asks `install-deps --dry-run firefox` of the
-          # same pin once per runner image and list).
+          # linux-deps-e2e job, which reads the roots `install-deps firefox` installs from the
+          # table of the same pin, once per runner image and list).
           #
           # That the product does not IMPORT it is verified by tests/test_fork.py,
           # not from here: if someone one day reintroduced
@@ -146,15 +146,20 @@ jobs:
         with:
           name: ${{ needs.linux-deps-e2e.outputs.artifact }}
           path: /tmp/linux-deps
-      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
         shell: bash
         run: |
           set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
           read -r OS VER < /tmp/linux-deps/image.txt
-          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
-          set -- /tmp/linux-deps/*.deb
-          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
           # the fontconfig e2e trace the opens of the browser: strace is not in the runner image (setsid is, util-linux)
           # TEMPORARY (the -11 at the exit of the security state's generate): a core file of any crash where kernel.core_pattern says, and gdb to read it. tests/conftest.py
           # lifts the core limit of the pytest session (the runner's default soft limit is 0) and, after a test that fails, tests/_crash_cores.py saves gdb's text of every
@@ -559,15 +564,20 @@ jobs:
         with:
           name: ${{ needs.linux-deps-e2e.outputs.artifact }}
           path: /tmp/linux-deps
-      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
         shell: bash
         run: |
           set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
           read -r OS VER < /tmp/linux-deps/image.txt
-          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
-          set -- /tmp/linux-deps/*.deb
-          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
@@ -717,15 +727,20 @@ jobs:
         with:
           name: ${{ needs.linux-deps-e2e.outputs.artifact }}
           path: /tmp/linux-deps
-      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
         shell: bash
         run: |
           set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
           read -r OS VER < /tmp/linux-deps/image.txt
-          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
-          set -- /tmp/linux-deps/*.deb
-          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
           # the host oracle traces the whole tree of the browser with strace
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
@@ -961,15 +976,20 @@ jobs:
         with:
           name: ${{ needs.linux-deps-e2e.outputs.artifact }}
           path: /tmp/linux-deps
-      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
         shell: bash
         run: |
           set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
           read -r OS VER < /tmp/linux-deps/image.txt
-          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
-          set -- /tmp/linux-deps/*.deb
-          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
@@ -1143,15 +1163,20 @@ jobs:
         with:
           name: ${{ needs.linux-deps-e2e.outputs.artifact }}
           path: /tmp/linux-deps
-      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the files of the linux-deps-e2e job)
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
         shell: bash
         run: |
           set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
           read -r OS VER < /tmp/linux-deps/image.txt
-          if [ "$OS $VER" != "$ImageOS $ImageVersion" ]; then echo "::warning::the packages were resolved on $OS $VER, this runner is $ImageOS $ImageVersion: a package apt names as missing below is the difference of the two images"; fi
-          set -- /tmp/linux-deps/*.deb
-          [ -e "$1" ] || { echo "ERROR: no .deb in the artifact of linux-deps"; exit 1; }
-          sudo apt-get install -y -qq --no-download --no-install-recommends "$@"
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
       # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
       # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
       # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
