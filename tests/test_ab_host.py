@@ -11,6 +11,7 @@ only is red while a loopback or lab destination is not compared.
 from __future__ import annotations
 
 import copy
+import datetime
 import inspect
 import json
 import shutil
@@ -540,6 +541,66 @@ def test_a_tree_that_keeps_growing_after_every_process_is_gone_is_read_again():
     now = iter(range(1000))
     _tree, info = host.wait_exited(lambda: next(reads), lambda pid: False, sleep=lambda s: None, now=lambda: next(now))
     assert info == {"exited": True, "reads": 3}
+
+
+# A pid is not a process: Windows hands the pid of a process that ended to the next one it makes (run 45334478026: pid 7352 of the tree ended at 05:05:33 and was
+# `TiWorker.exe`, a service that lives minutes, at 05:05:38; the wait for the exit saw "alive" for 120 s and the A/A was red).
+BIRTH = "2026-11-24T05:05:20.5000000Z"
+BIRTH_EPOCH = datetime.datetime(2026, 11, 24, 5, 5, 20, 500000, tzinfo=datetime.timezone.utc).timestamp()
+
+
+def _exit_with(tree, ends, create_time=None, alive=lambda pid: True):
+    now = iter(range(0, 10 ** 6, 10))
+    return host.wait_exited(lambda: tree, alive, limit_s=100, sleep=lambda s: None, now=lambda: next(now), read_ends=lambda: ends, create_time=create_time)
+
+
+def test_a_pid_that_ended_in_the_audit_and_was_handed_to_another_process_is_not_the_tree_alive():
+    tree = [{"rid": 10, "pid": 7352, "time": BIRTH}, {"rid": 11, "pid": 7360, "time": BIRTH}]
+    ends = [{"rid": 40, "pid": 7352, "time": "2026-11-24T05:05:33.1800000Z"}, {"rid": 41, "pid": 7360, "time": "2026-11-24T05:05:33.2000000Z"}]
+    # `pid_exists` says yes for both (TiWorker has 7352 now), and the process that has it was created at 05:05:38, long after the birth
+    _tree, info = _exit_with(tree, ends, create_time=lambda pid: BIRTH_EPOCH + 18.1)
+    assert info == {"exited": True, "reads": 2}
+
+
+def test_an_end_of_the_pid_before_its_birth_is_not_the_end_of_that_process():
+    # the 4689 of an earlier process that had the pid (record 5 < 10): the process born at record 10 is still there
+    tree = [{"rid": 10, "pid": 7352, "time": BIRTH}]
+    _tree, info = _exit_with(tree, [{"rid": 5, "pid": 7352, "time": "2026-11-24T05:00:00.0000000Z"}], create_time=lambda pid: BIRTH_EPOCH)
+    assert info["exited"] is False
+
+
+def test_a_process_with_no_end_and_the_creation_time_of_its_birth_is_still_alive():
+    tree = [{"rid": 10, "pid": 7352, "time": BIRTH}]
+    _tree, info = _exit_with(tree, [], create_time=lambda pid: BIRTH_EPOCH - 0.01)
+    assert info["exited"] is False
+
+
+def test_a_pid_with_no_audit_end_and_a_later_creation_time_is_another_process():
+    tree = [{"rid": 10, "pid": 7352, "time": BIRTH}]
+    _tree, info = _exit_with(tree, [], create_time=lambda pid: BIRTH_EPOCH + 18.1)
+    assert info == {"exited": True, "reads": 2}
+
+
+def test_a_pid_that_nobody_has_is_gone_and_a_process_that_cannot_be_read_is_not_made_to_look_ended():
+    tree = [{"rid": 10, "pid": 7352, "time": BIRTH}]
+    assert _exit_with(tree, [], alive=lambda pid: False)[1]["exited"] is True
+
+    def denied(pid):
+        raise PermissionError(pid)
+
+    assert _exit_with(tree, [], create_time=denied)[1]["exited"] is False
+    assert _exit_with(tree, [], create_time=lambda pid: None)[1]["exited"] is False  # no process has it: `alive` is the one that says so
+
+
+def test_the_audit_time_is_read_as_utc_to_the_microsecond():
+    assert host.audit_epoch(BIRTH) == BIRTH_EPOCH and host.audit_epoch("") is None and host.audit_epoch("not a time") is None
+
+
+def test_the_decision_reads_the_end_by_time_when_the_records_have_no_id():
+    event = {"pid": 7, "time": BIRTH}
+    assert host.process_has_ended(event, [{"pid": 7, "time": "2026-11-24T05:05:33.0000000Z"}]) is True
+    assert host.process_has_ended(event, [{"pid": 7, "time": "2026-11-24T05:00:00.0000000Z"}]) is False
+    assert host.process_has_ended({"pid": 7}, []) is False
 
 
 # -
