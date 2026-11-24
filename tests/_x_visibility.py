@@ -10,9 +10,11 @@ reuses):
   the event, so the engine's own selection is untouched;
 * ``raise_and_read``: ``XRaiseWindow`` of the covering toplevel, then ONE read-back of the stacking (``XQueryTree`` of the root, bottom to top: no window
   manager reparents the toplevels) and of the two geometries (``XGetWindowAttributes``, relative to the root);
-* ``drain``: the ``VisibilityNotify`` events that arrived, with the time since ``watch`` (evidence only, never a verdict).
+* ``drain``: the ``VisibilityNotify`` events that arrived, with the time since ``watch`` (evidence only, never a verdict);
+* ``shrink_by_one``: ``XResizeWindow`` of the covered toplevel, one pixel narrower, the cover left above it and larger: a draw of a window that stays
+  covered (see ``control_sees_hidden``).
 
-The pure parts (``visibility_of``, ``arrangement``, ``VisibilityRecord``) are tested without a display in ``test_the_x_record_of_the_occlusion_test.py``.
+The pure parts (``visibility_of``, ``arrangement``, ``VisibilityRecord``, ``control_sees_hidden``, ``product_stays_visible``) are tested without a display in ``test_the_x_record_of_the_occlusion_test.py``.
 """
 from __future__ import annotations
 
@@ -30,6 +32,24 @@ STATES = {0: "Unobscured", 1: "PartiallyObscured", 2: "FullyObscured"}
 FULLY_OBSCURED = "FullyObscured"
 #: ``map_state`` of ``XGetWindowAttributes``.
 MAP_STATES = {0: "IsUnmapped", 1: "IsUnviewable", 2: "IsViewable"}
+
+
+def control_sees_hidden(changes: Sequence[str], not_before: int = 1) -> bool:
+    """The verdict of the control half (tracking enabled): the page recorded ``hidden`` among its ``visibilitychange`` events at or after index ``not_before``.
+
+    ``changes`` is the list the page records (``document.visibilityState`` at the start, then one entry per ``visibilitychange``); ``not_before`` is the length
+    that list had at the last look made BEFORE X's ``FullyObscured`` showed up (1: the start), so a ``hidden`` at an index below it cannot be its effect.
+
+    Not the final state: Firefox's ``nsWindow::OnExposeEvent`` calls ``NotifyOcclusionState(VISIBLE)`` on every draw of the window's container, and a
+    draw that comes after the ``FullyObscured`` turns the window ``VISIBLE`` again while X, whose state has not changed, says nothing more. The page then
+    reads ``visible`` at the end of a run in which the engine did make it ``hidden``: ``visible, hidden, visible``.
+    """
+    return "hidden" in list(changes)[max(not_before, 0):]
+
+
+def product_stays_visible(changes: Sequence[str]) -> bool:
+    """The verdict of the product half (tracking off): the page never turned ``hidden`` and got no ``visibilitychange`` at all."""
+    return list(changes) == ["visible"]
 
 
 class XVisibilityEvent(ctypes.Structure):
@@ -104,6 +124,7 @@ class XVisibility(XFocus):
         x11 = self.x11
         x11.XSelectInput.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long)
         x11.XRaiseWindow.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        x11.XResizeWindow.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint)
         x11.XPending.argtypes = (ctypes.c_void_p,)
         x11.XNextEvent.argtypes = (ctypes.c_void_p, ctypes.POINTER(XEvent))
         self.record: Optional[VisibilityRecord] = None
@@ -162,3 +183,12 @@ class XVisibility(XFocus):
                 viewable.append({"window": "0x%x" % window, "title": self._title(window), **seen})
         return {**verdict, "covered": "0x%x" % covered, "cover": "0x%x" % cover, "covered geometry": geometries[covered],
                 "cover geometry": geometries[cover], "viewable children of the root, bottom to top": viewable}
+
+    def shrink_by_one(self, window: int) -> Dict[str, object]:
+        """``XResizeWindow``: ``window`` one pixel narrower, its place and its stacking as they are. The window system draws the new size, a draw of a window
+        that a larger one still covers. The geometry before and after, read through the same connection."""
+        before = self.geometry(window)
+        if before and before["width"] > 1:
+            self.x11.XResizeWindow(self.connection, window, before["width"] - 1, before["height"])
+            self.x11.XSync(self.connection, False)
+        return {"before": before, "after": self.geometry(window)}

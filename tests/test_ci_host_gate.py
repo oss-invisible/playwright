@@ -461,3 +461,70 @@ def test_a_known_defect_of_linux_covers_every_linux_leg_of_the_gate():
     for e in scoped:
         if any(leg.startswith("linux-") for leg in e["legs"]):
             assert sorted(leg for leg in e["legs"] if leg.startswith("linux-")) == linux, e
+
+
+# The junit of the compare step: one testcase per invariant, by the name the hook tests spell.
+
+def junit_of(tmp_path, items, retail=None, legs=None, make_dumps=True):
+    import xml.etree.ElementTree as ET
+    if make_dumps:
+        dumps, ref = write(tmp_path, items, retail or {}, legs)
+    else:
+        dumps, ref = tmp_path / "dumps", tmp_path / "ref"
+        dumps.mkdir(parents=True)
+        ref.mkdir(parents=True)
+    out = tmp_path / "gate-junit" / "host-gate.xml"
+    from unittest import mock
+    with mock.patch.object(gate, "load_exceptions", lambda: {}):  # the repository's own list is not the subject here
+        rc = gate.main(["compare", str(dumps), "--reference", str(ref), "--junit", str(out)])
+    cases = {}
+    for tc in ET.parse(out).getroot().iter("testcase"):
+        assert tc.get("classname") == "scripts.ci_host_gate"  # the judge reads it as scripts/ci_host_gate.py
+        kids = [k.tag for k in tc]
+        cases[tc.get("name")] = "failed" if "failure" in kids else "skipped" if "skipped" in kids else "passed"
+    return rc, cases
+
+
+def test_the_junit_has_one_testcase_per_invariant_with_the_name_the_hooks_spell(tmp_path):
+    rc, cases = junit_of(tmp_path, lambda leg, seed: {})
+    assert rc == 0
+    assert {"invariant:" + inv.name for inv in gate.INVARIANTS} <= set(cases)
+    assert "invariant:fullscreen_is_the_screen" in cases
+    assert set(cases.values()) == {"passed"}
+    assert gate.JUNIT_CLASSNAME.replace(".", "/") + ".py" == "scripts/ci_host_gate.py"
+
+
+def test_the_junit_fails_the_invariant_that_broke_and_only_it_and_its_check(tmp_path):
+    items = lambda leg, seed: retail_states(fullscreen=XVFB_FULLSCREEN) if leg.startswith("linux") else {}
+    rc, cases = junit_of(tmp_path, items)
+    assert rc == 1
+    failed = {n for n, s in cases.items() if s == "failed"}
+    assert {"invariant:fullscreen_is_the_screen", "invariant:fullscreen_declared"} <= failed
+    assert cases["invariant:measured"] == "passed" and cases["invariant:back_to_normal"] == "passed"
+
+
+def test_the_junit_fails_a_host_difference_and_a_retail_difference(tmp_path):
+    rc, cases = junit_of(tmp_path, lambda leg, seed: {"surface.x": leg}, {"surface.x": "win-x86_64"})
+    assert rc == 1 and cases["check:host_independence"] == "failed"
+    rc, cases = junit_of(tmp_path / "r", lambda leg, seed: {"surface.y": 1}, {"surface.y": 2})
+    assert rc == 1 and cases["check:retail_equality"] == "failed" and cases["check:host_independence"] == "passed"
+
+
+def test_the_junit_skips_what_it_could_not_look_at_never_passes_it(tmp_path):
+    rc, cases = junit_of(tmp_path, None, make_dumps=False)
+    assert rc == 1
+    assert cases["check:dumps_complete"] == "failed"
+    assert all(s == "skipped" for n, s in cases.items() if n != "check:dumps_complete")
+    assert "invariant:fullscreen_is_the_screen" in cases
+
+
+def test_the_junit_is_xunit2_with_the_counts_of_its_cases(tmp_path):
+    import xml.etree.ElementTree as ET
+    items = lambda leg, seed: retail_states(fullscreen=BUG_FULLSCREEN)
+    junit_of(tmp_path, items)
+    root = ET.parse(tmp_path / "gate-junit" / "host-gate.xml").getroot()
+    suite = root.find("testsuite")
+    cases = list(suite.iter("testcase"))
+    assert root.tag == "testsuites" and int(suite.get("tests")) == len(cases)
+    assert int(suite.get("failures")) == len([c for c in cases if c.find("failure") is not None]) == 3
+    assert all(c.find("failure").text for c in cases if c.find("failure") is not None)

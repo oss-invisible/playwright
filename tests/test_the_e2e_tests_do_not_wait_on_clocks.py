@@ -149,7 +149,7 @@ def test_a_limit_that_is_a_named_variable_or_has_a_slack_added_is_refused_and_a_
     assert rules_of(fake("def test_x(took, limit_s):\n    assert took < limit_s\n")) == ["bound"], "a limit is a limit when it is not written in capitals"
     assert rules_of(fake("def test_x(elapsed, max_ms):\n    assert elapsed <= max_ms\n")) == ["bound"]
     assert rules_of(fake("def test_x(limit_s, took):\n    assert limit_s > took\n")) == ["bound"]
-    assert rules_of(fake("def test_x(wait, rtt_ms):\n    assert wait < rtt_ms + 250\n")) == ["bound"], "an absolute slack added to a measure is an absolute limit"
+    assert rules_of(fake("def test_x(wait, expected_ms):\n    assert wait < expected_ms + 250\n")) == ["bound"], "an absolute slack added to a measure is an absolute limit"
     assert rules_of(fake("def test_x(took, control):\n    assert took <= control + 0.5\n")) == ["bound"]
     assert rules_of(fake("def test_x(res):\n    assert res['opened'] < 3000\n")) == ["bound"], "the time a connection took to open is a duration"
     assert rules_of(fake("def test_x(took, control):\n    assert took <= control * 3\n")) == [], "a factor of a measure of the same run is relative"
@@ -248,6 +248,56 @@ def test_a_count_of_processes_is_refused_outside_the_helpers_that_count():
     assert clocks.analyze(source, "_processes.py") == []
 
 
+def test_a_lab_server_given_a_delay_needs_the_serial_lane_and_one_given_none_does_not():
+    """A test that gives a lab gateway or server a delay (the round trip of a far gateway, a DoH that answers late, a slow page) and then waits for an outcome
+    the product decides with a time budget (the core's UDP measurement, a DoH timeout) reads the wall clock: the lab's own threads, starved on a loaded
+    runner, make the answer late by a margin the budget never allowed for. Such a test runs in the ``wall_clock`` lane (serial, the machine alone)."""
+    gateway = "def test_x(monkeypatch):\n    with coherent(user='a', password='b', rtt_ms=250) as gateway:\n        gateway.proxy\n"
+    assert rules_of(fake(gateway)) == ["lab-delay"]
+    assert rules_of(fake("def test_x():\n    with Chain(rtt_ms=130, exit_host=exit_ip) as chain:\n        chain.proxy\n")) == ["lab-delay"]
+    assert rules_of(fake("def test_x(gateway):\n    gw = gateway('gw1', first_connection_delay=1.0)\n")) == ["lab-delay"]
+    assert rules_of(fake("def test_x(doh):\n    doh.delay_names['slow-a.test'] = 2.0\n")) == ["lab-delay"]
+    assert rules_of(fake("def test_x(sites):\n    sites.route('B', '/late', 'one', delay=0.3)\n")) == ["lab-delay"]
+    assert rules_of(fake("def test_x():\n    slow, port = _serve(SLOW, delay=1.5)\n")) == ["lab-delay"]
+    assert rules_of(fake("def test_x(monkeypatch, rtt_ms):\n    helper(monkeypatch, rtt_ms)\n")) == ["lab-delay"], "a parameter named rtt_ms is a distance given by a parametrize"
+    assert rules_of(fake("def test_x():\n    coherent(rtt_ms=rtt)\n")) == ["lab-delay"], "a value the test computes is a delay until it is shown to be 0"
+    found = clocks.analyze(fake("def test_x(monkeypatch):\n    pass\n\ndef test_y():\n    coherent(rtt_ms=250)\n"), "test_fake_e2e.py")
+    assert [(v.scope, v.rule, v.nth, v.klass) for v in found] == [("test_y", "lab-delay", 1, "A")]
+
+    fixture = ("@pytest.fixture\ndef gateway():\n    with Chain(rtt_ms=130) as chain:\n        yield chain\n\n"
+               "@pytest.fixture\ndef through(gateway):\n    return gateway\n\n")
+    assert [v.scope for v in clocks.analyze(fake(fixture + "def test_x(through):\n    pass\n\ndef test_y(page):\n    pass\n"), "test_fake_e2e.py")] == ["test_x"], \
+        "a test is as delayed as the fixture it takes, through the fixtures that take that one"
+    assert rules_of(fake(fixture + "@pytest.mark.usefixtures('gateway')\ndef test_x():\n    pass\n")) == ["lab-delay"]
+
+    # green: the same test in the serial lane, whichever way the lane is declared
+    assert rules_of(fake("@pytest.mark.wall_clock\n" + gateway)) == []
+    assert rules_of("import pytest\n\npytestmark = [pytest.mark.e2e, pytest.mark.wall_clock]\n\n" + gateway) == []
+    assert rules_of(fake("@pytest.mark.wall_clock\nclass TestFar:\n    def test_x(self):\n        coherent(rtt_ms=250)\n")) == []
+    assert rules_of(fake(fixture + "@pytest.mark.wall_clock\ndef test_x(through):\n    pass\n")) == []
+    # green: a lab server with no delay, and a delay of nothing
+    assert rules_of(fake("def test_x():\n    with coherent(user='a', password='b', relay_host=host) as gateway:\n        gateway.proxy\n")) == []
+    assert rules_of(fake("def test_x():\n    coherent(rtt_ms=0)\n    gateway('gw1', first_connection_delay=0.0)\n")) == []
+    assert rules_of(fake("def test_x(page):\n    page.keyboard.type('abc', delay=120)\n    helper(delay=0.5)\n")) == [], "only the knobs of the lab servers are delays"
+    unit_source = "\n".join(["import pytest", "", "@pytest.mark.unit", "def test_x():", "    coherent(rtt_ms=250)", ""])
+    assert rules_of(unit_source, "test_unit_fake.py") == [], "a unit test is not read"
+
+
+def test_the_far_away_gateway_family_runs_in_the_serial_lane():
+    """Run 45058944650: on a runner with no CPU left the core's UDP measurement (a fixed 3 s budget) ran out 0.3 s before a gateway 250 ms away was
+    scheduled to answer. The tests that give the lab gateway a distance and wait for what the product decides in time are wall-clock tests."""
+    import ast
+
+    names = {"test_a_gateway_that_is_far_away_still_gives_the_page_a_srflx_born_through_its_relay",
+             "test_the_first_candidate_of_a_gather_does_not_wait_for_a_gateway_that_is_far_away",
+             "test_a_gather_after_the_page_loaded_through_the_gateway_costs_only_the_road_to_the_server"}
+    tree = ast.parse((ROOT / "tests" / "test_webrtc_realness.py").read_text(encoding="utf-8"))
+    found = {n.name: any("wall_clock" in clocks._marks(d) for d in n.decorator_list)
+             for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names}
+    assert set(found) == names
+    assert [n for n, marked in found.items() if not marked] == []
+
+
 def test_a_polling_step_with_a_deadline_is_accepted():
     for body in (
         "import time\n\ndef test_x(ready):\n    deadline = time.monotonic() + 30\n    while not ready() and time.monotonic() < deadline:\n        time.sleep(0.05)\n",
@@ -300,7 +350,8 @@ def test_a_file_with_every_violation_is_red_and_one_that_waits_on_conditions_is_
         "    page.click('#go', timeout=5000)\n"
         "    time.sleep(1)\n"
         "    assert took < 3\n"
-        "    assert len(pids) == 2\n")
+        "    assert len(pids) == 2\n"
+        "    coherent(rtt_ms=250)\n")
     assert rules_of(bad) == sorted(set(clocks.RULES) - {"egress"})
     good = fake(
         "import time\n"

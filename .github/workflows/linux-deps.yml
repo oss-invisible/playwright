@@ -1,0 +1,188 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# linux-deps.yml — the Ubuntu packages of a workflow's Linux jobs, read from Ubuntu's archive ONCE per runner image and list, never by the jobs.
+# The same file in the series and in the wrapper.
+#
+# Republish 45297517213: wrapper.e2e.fakeweb-linux-x86_64 was cancelled at its 25 minutes with every step green, because `playwright install-deps
+# firefox` fetched 48.8 MB from the archive's mirror at 102 kB/s ("Fetched 48.8 MB in 7min 59s"). The speed of a mirror is a third party's.
+# The first form of this file handed the jobs only the packages missing on ITS runner image and installed them against the job's own image: the
+# wrapper's PR #584 ran that job on ubuntu24 20261116.376.1 and the legs on 20261116.133.1, and the legs' apt wanted a package the files did not
+# hold ("E: Unable to fetch some archives"). GitHub mixes builds of an image in one run, so the files cannot depend on the image they were read on.
+#
+# So this job hands the jobs a REPOSITORY: the roots (the packages named with their recommends, the recommends themselves, the packages named without,
+# and the roots `playwright install-deps firefox` installs for the Playwright of the wrapper's pin, read from its table), their whole closure of
+# Depends and Pre-Depends with the virtual packages' providers, INCLUDING what the image already has, a Packages index, and roots.txt. A job
+# installs the roots BY NAME with an apt that reads only that repository (its own sources list and lists folder) and --no-download: whatever its
+# image has or lacks is resolved from the files, and a package that is not there is named by apt, red, never fetched from a mirror.
+# The files are kept in a cache entry keyed by the image's OS, the date of its release and the sha of the list (an entry of .deb files on GitHub's
+# runners, this file only), and handed to the run's jobs as the artifact linux-deps-<name>. Not by the image's build: the repository does not depend
+# on it, and the builds of one release are mixed in a run (20261116.133.1, 20261116.376.1), so a key per build missed the entry run after run and
+# read the archive each time (wrapper PR #585: 13 minutes for a closure, from a slow mirror). The download runs 8 at a time: the slowness seen is
+# per connection.
+# ─────────────────────────────────────────────────────────────────────────────
+name: linux-deps
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: the artifact is linux-deps-<name>
+        type: string
+        required: true
+      packages:
+        description: packages installed with their recommends (as `apt-get install -y` did)
+        type: string
+        default: ''
+      packages_no_recommends:
+        description: packages installed without their recommends
+        type: string
+        default: ''
+      playwright_wrapper_ref:
+        description: the oss-invisible/playwright ref whose scripts/playwright_pin.txt names the Playwright of `install-deps firefox`; empty for none
+        type: string
+        default: ''
+    outputs:
+      artifact:
+        description: the artifact that holds the repository
+        value: ${{ jobs.debs.outputs.artifact }}
+
+permissions: { contents: read }
+
+jobs:
+  debs:
+    name: debs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact: linux-deps-${{ inputs.name }}
+    steps:
+      - name: Checkout wrapper (its Playwright pin)
+        if: inputs.playwright_wrapper_ref != ''
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: oss-invisible/playwright
+          ref: ${{ inputs.playwright_wrapper_ref }}
+          path: linux-deps-pin
+          fetch-depth: 1
+          sparse-checkout: scripts/playwright_pin.txt
+          sparse-checkout-cone-mode: false
+      - name: Set up Python
+        if: inputs.playwright_wrapper_ref != ''
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: The list and its entry (the runner image and the sha of the list)
+        id: spec
+        shell: bash
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          NO_REC: ${{ inputs.packages_no_recommends }}
+          PW_REF: ${{ inputs.playwright_wrapper_ref }}
+        run: |
+          set -euo pipefail
+          : "${ImageOS:?no ImageOS: not a GitHub runner image}" "${ImageVersion:?no ImageVersion: not a GitHub runner image}"
+          PIN=""
+          if [ -n "$PW_REF" ]; then PIN="$(tr -d '[:space:]' < linux-deps-pin/scripts/playwright_pin.txt)"; [ -n "$PIN" ] || { echo "ERROR: empty scripts/playwright_pin.txt at $PW_REF"; exit 1; }; fi
+          mkdir -p "$RUNNER_TEMP/linux-deps-spec"
+          printf 'form: repository of the closure\nrecommends: %s\nno-recommends: %s\nplaywright-roots-firefox: %s\n' "$PACKAGES" "$NO_REC" "$PIN" > "$RUNNER_TEMP/linux-deps-spec/spec.txt"
+          cat "$RUNNER_TEMP/linux-deps-spec/spec.txt"
+          SHA="$(sha256sum < "$RUNNER_TEMP/linux-deps-spec/spec.txt" | cut -c1-16)"
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+          RELEASE="${ImageVersion%%.*}"
+          echo "key=linux-deps-$ImageOS-$RELEASE-$SHA" | tee -a "$GITHUB_OUTPUT"
+      - name: The entry of this image and list
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/linux-deps
+          key: ${{ steps.spec.outputs.key }}
+      - name: A new image or list - the repository from Ubuntu's archive, once
+        if: steps.restore.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          NO_REC: ${{ inputs.packages_no_recommends }}
+          PIN: ${{ steps.spec.outputs.pin }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'Acquire::http::Timeout "60";' 'Acquire::https::Timeout "60";' 'Acquire::Retries "5";' \
+            | sudo tee /etc/apt/apt.conf.d/80-ci-network >/dev/null
+          sudo apt-get update -qq
+          command -v apt-ftparchive >/dev/null || sudo apt-get install -y -qq apt-utils
+          PW_ROOTS=""
+          if [ -n "$PIN" ]; then
+            python -m pip install --quiet "playwright==$PIN"
+            # The roots `playwright install-deps firefox` installs (with --no-install-recommends): the `tools` and `firefox` lists of this system's
+            # entry in the driver's table, the list install-deps itself reads.
+            PLATFORM="ubuntu$(. /etc/os-release && echo "$VERSION_ID")-x64"
+            PW_ROOTS="$(python - "$PLATFORM" <<'PY'
+          import os, re, sys
+          import playwright
+          path = os.path.join(os.path.dirname(playwright.__file__), "driver", "package", "lib", "coreBundle.js")
+          text = open(path, encoding="utf-8").read()
+          at = text.find('"%s": {' % sys.argv[1])
+          if at < 0:
+              sys.exit("no entry %s in %s" % (sys.argv[1], path))
+          roots = []
+          for group in ("tools", "firefox"):
+              m = re.compile(r"\b%s: \[(.*?)\]" % group, re.S).search(text, at)
+              if not m:
+                  sys.exit("no %s list after the entry %s" % (group, sys.argv[1]))
+              roots += re.findall(r'"([a-z0-9][a-z0-9.+-]*)"', m.group(1))
+          if "xvfb" not in roots or len(roots) < 10:
+              sys.exit("the roots read from %s are not install-deps' list: %s" % (path, roots))
+          print(" ".join(sorted(set(roots))))
+          PY
+          )"
+            echo "playwright install-deps firefox roots: $PW_ROOTS"
+          fi
+          # The recommends of the packages named with their recommends (as `apt-get install -y` installed them), one level, as roots themselves.
+          RECS=""
+          [ -z "$PACKAGES" ] || RECS="$(apt-cache depends --no-depends --no-pre-depends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances $PACKAGES \
+            | sed -n 's/^ *|\{0,1\}Recommends: \([a-z0-9][^ <>]*\)$/\1/p' | sort -u | tr '\n' ' ')"
+          NAMED="$(echo $PACKAGES $RECS $NO_REC $PW_ROOTS | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+          # A name only provided (libgtk-3-0, libgtk-3-0t64's on noble) is its provider, as `apt-get install` resolved it: `apt-cache depends
+          # --recurse` does not walk from a virtual root (wrapper PR #585: the closure of libgtk-3-0 came without libgtk-3-0t64, 92 packages of 230).
+          ROOTS=""
+          for r in $NAMED; do
+            if apt-cache show --no-all-versions "$r" 2>/dev/null | grep -qx "Package: $r"; then ROOTS="$ROOTS $r"; continue; fi
+            p="$(apt-cache showpkg "$r" | sed -n '/^Reverse Provides:/,$p' | sed '1d' | awk 'NF {sub(/:.*/, "", $1); print $1}' | sort -u)"
+            [ "$(echo "$p" | wc -w)" = 1 ] || { echo "ERROR: the root $r is not a package and is provided by [$p], not by one package"; exit 1; }
+            echo "the root $r is provided by $p"
+            ROOTS="$ROOTS $p"
+          done
+          ROOTS="$(echo $ROOTS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+          echo "roots: $ROOTS"
+          # The closure: Depends and Pre-Depends, recursively, the providers of every virtual package, what the image has included.
+          CLOSURE="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances $ROOTS \
+            | grep -E '^[a-z0-9]' | sed 's/:amd64$//' | grep -v ':' | sort -u)"
+          REAL="$({ apt-cache show --no-all-versions $CLOSURE 2>/dev/null || true; } | sed -n 's/^Package: //p' | sort -u)"
+          rm -rf /tmp/linux-deps && mkdir -p /tmp/linux-deps
+          # The lists were refreshed above (apt-get update), so every closure name has its current version; each fetch retries 5 times. The MB and
+          # the seconds of the download go to the log, so the archive's speed is measured run after run.
+          T0="$(date +%s)"
+          ( cd /tmp/linux-deps && echo "$REAL" | xargs -n 20 -P 8 apt-get download -qq -o Acquire::Retries=5 )
+          T1="$(date +%s)"
+          echo "download: $(echo "$REAL" | wc -w) packages, $(du -sm /tmp/linux-deps | cut -f1) MB in $((T1 - T0)) s"
+          ( cd /tmp/linux-deps && apt-ftparchive packages . > Packages )
+          for p in $REAL; do grep -qx "Package: $p" /tmp/linux-deps/Packages || { echo "ERROR: $p of the closure was not downloaded"; exit 1; }; done
+          # A root is a package of the repository or a name one of them provides (libgtk-3-0 is libgtk-3-0t64's on noble, as `apt-get install` resolved it)
+          for r in $ROOTS; do
+            e="$(printf '%s' "$r" | sed 's/[.+]/\\&/g')"
+            grep -qE "^(Package: $e|Provides: (.*, )?$e( \(.*\))?(,.*)?)$" /tmp/linux-deps/Packages || { echo "ERROR: the root $r is not in the repository"; exit 1; }
+          done
+          echo "$ROOTS" | tr ' ' '\n' | sed '/^$/d' > /tmp/linux-deps/roots.txt
+          cp "$RUNNER_TEMP/linux-deps-spec/spec.txt" /tmp/linux-deps/spec.txt
+          echo "$ImageOS $ImageVersion" > /tmp/linux-deps/image.txt
+          echo "$(wc -l < /tmp/linux-deps/roots.txt) roots, $(find /tmp/linux-deps -name '*.deb' | wc -l) packages in the closure, $(du -sh /tmp/linux-deps | cut -f1)"
+      - name: Keep the entry
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/linux-deps
+          key: ${{ steps.spec.outputs.key }}
+      - name: The repository for the jobs of this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-deps-${{ inputs.name }}
+          path: /tmp/linux-deps
+          retention-days: 1
+          if-no-files-found: error

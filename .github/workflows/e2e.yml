@@ -80,47 +80,93 @@ jobs:
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
-  e2e:
-    name: e2e (linux, xvfb)
+  # THE UBUNTU PACKAGES OF THE LINUX JOBS, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a job: a run lost a green leg to its time
+  # limit because a mirror served `playwright install-deps firefox` at 102 kB/s. One list for every Linux job of this file: xvfb (with xauth, its recommend, for
+  # xvfb-run), strace (the fontconfig suite, the host oracle and its recorder), gdb and elfutils (the cores of a browser that did not end with 0), and what
+  # Playwright's install-deps names for Firefox. The jobs install its roots by name from that repository, with --no-download.
+  linux-deps-e2e:
+    name: linux-deps-e2e
     needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: e2e
+      packages: xvfb strace gdb elfutils
+      playwright_wrapper_ref: ${{ github.sha }}
+
+  # THE e2e ON LINUX, IN THREE PARTS. One job ran the whole Linux e2e in 24.6 minutes on a normal runner and 35.7 on a slow one (the same tests, every
+  # one slower by the same 1.44x), close to the 40-minute ceiling. The files of each part are the rows `wrapper.e2e.suite.linux.1` to `.3` of
+  # ci/required-suites.json, the same partition the gate of the candidate runs on the engine under test (tests/test_the_e2e_suite_is_accounted_for.py
+  # holds it whole), read the way the Windows parts read theirs. The rows leave out by name the tests of `wrapper.e2e.udp.exit` (root) and
+  # `wrapper.e2e.udp.sandbox` (user namespaces): part 1, the lightest by the test time of the junit of run 45064266867, runs them in their own steps
+  # after its run, and no other part does. The job `e2e (linux, xvfb)` below waits for the three parts and is the one check the release and the
+  # branch protection read.
+  e2e-linux:
+    name: e2e (linux, part ${{ matrix.part }})
+    needs: [core-on-index, linux-deps-e2e]
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The A/A of the three A/B oracles (page, network, host) runs on the first seeds of the candidate set on a pull request, and on ALL of them when the pull request
+      # changes a file of that oracle (scripts/ci_ab_pr_seeds.py holds the lists). The checkout is shallow, so the script fetches the base commit and lists the files that
+      # differ from it (`git diff --name-only <base> HEAD`: HEAD is the merge commit, so this is the pull request's own change); the tests read the variables it prints.
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
       - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           # ⛔ The playwright package is NO LONGER a product dependency: the
           # client lives in invisible_playwright._pw and the driver in _driver. It
-          # is installed here for ONE thing only, the `playwright install-deps
-          # firefox` step below, which downloads the SYSTEM libraries Firefox
-          # needs on a bare runner. The fork does not expose that subcommand
-          # on purpose (it is meant to drive, not to be a toolchain).
+          # is installed here as a system tool, not as a product dependency (the
+          # SYSTEM libraries Firefox needs on a bare runner come from the run's
+          # linux-deps-e2e job, which reads the roots `install-deps firefox` installs from the
+          # table of the same pin, once per runner image and list).
           #
           # That the product does not IMPORT it is verified by tests/test_fork.py,
           # not from here: if someone one day reintroduced
           # `from playwright...` in src/, this line would mask it, and that is
           # exactly why that test exists.
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
           # the fontconfig e2e trace the opens of the browser: strace is not in the runner image (setsid is, util-linux)
-          sudo apt-get install -y strace
           # TEMPORARY (the -11 at the exit of the security state's generate): a core file of any crash where kernel.core_pattern says, and gdb to read it. tests/conftest.py
           # lifts the core limit of the pytest session (the runner's default soft limit is 0) and, after a test that fails, tests/_crash_cores.py saves gdb's text of every
           # core in INVPW_CORE_DIR under invpw-evidence/cores/<test>/ and deletes the core.
-          sudo apt-get install -y gdb
           mkdir -p "$RUNNER_TEMP/invpw-cores"
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/invpw-cores/core.%e.%p"
           echo "INVPW_CORE_DIR=$RUNNER_TEMP/invpw-cores" >> "$GITHUB_ENV"
-          sudo "$(which python)" -m playwright install-deps firefox
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with
       # STEALTHFOX_SECURITY_STATE set the core neither downloads nor generates one. BEFORE `fetch`, which makes the state present (it would download and generate it).
       - name: The security state (a fixed directory of the repository)
@@ -147,7 +193,13 @@ jobs:
 
       # test_release_e2e.py and test_upgrade_e2e.py (pip, uv, PyPI, the GitHub release) are NOT in this run or in the Windows legs below: tests/conftest.py leaves
       # them out of every run that does not name their file, and user-install.yml (the round after the publication) names it. tests/_post_publication.py.
-      - name: Run the full e2e suite under a virtual display, without the root ones
+      # The files of the part are the row `wrapper.e2e.suite.linux.N` of ci/required-suites.json (files, and node ids where a file has tests that skip on
+      # Linux or run in another suite). The rows hold no test of `wrapper.e2e.udp.exit` or `wrapper.e2e.udp.sandbox`: those run in the root and sandbox
+      # steps of part 1 below, and tests/test_the_root_e2e_run_in_the_root_step_and_nowhere_else.py and tests/test_the_sandbox_e2e_runs_where_user_namespaces_are_on.py
+      # hold both the exclusion and the steps.
+      - name: The files of this part (the row of the suite, in ci/required-suites.json)
+        run: python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.linux.${{ matrix.part }}" --os linux > "$RUNNER_TEMP/e2e_args.txt"
+      - name: Run this part of the e2e under a virtual display, without the root ones
         # PYTHONUNBUFFERED, and it is not a nicety. Without it Python block-buffers
         # stdout when it is a pipe, and this step printed NOTHING for 39 minutes
         # before the 40-minute timeout killed it on 2026-08-04: a run with no
@@ -163,29 +215,25 @@ jobs:
           # the descriptors at the system level: whatever is captured is lost
           # when the process is killed, which is exactly the case it exists for.
           INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog.log
-          ROOT_FILES: tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py
-          ROOT_NODES: tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick
-          SANDBOX_FILES: tests/test_the_socket_process_is_sandboxed_e2e.py
-        # The root ones are left out by name and run in the step below, as root: here, as the runner user, they errored. The sandbox one is left out
-        # by name too and runs in its own step after them: it is red on a runner whose AppArmor refuses user namespaces to a normal user.
+        # The root ones are in no row and run in the step below, as root: here, as the runner user, they errored. The sandbox ones are in no row either
+        # and run in their own step after them: the first is red on a runner whose AppArmor refuses user namespaces to a normal user.
         run: |
-          IGNORE=(); for f in $ROOT_FILES $SANDBOX_FILES; do IGNORE+=("--ignore=$f"); done
-          DESELECT=(); for n in $ROOT_NODES; do DESELECT+=("--deselect=$n"); done
-          xvfb-run -a python -u scripts/run_e2e.py "$FF" "${IGNORE[@]}" "${DESELECT[@]}"
+          mapfile -t ARGS < <(tr -d '\r' < "$RUNNER_TEMP/e2e_args.txt")
+          xvfb-run -a python -u scripts/run_e2e.py "$FF" "${ARGS[@]}"
 
       # THE ROOT SUITE, AS THE GATE RUNS IT (wrapper.e2e.udp.exit in ci/required-suites.json). Seven e2e need root: the exit of the lab is a documentation
       # address (198.51.100.9) added to `lo` with `ip addr add`. Collected here as the runner user they ERRORED (run 43262636367: "cannot hold 198.51.100.9
-      # on lo (needs root and iproute2 on Linux)"), so the run above leaves them out by name (ROOT_FILES / ROOT_NODES) and this step runs them, and only
-      # them, the way the gate does: the engine copied to /opt/ff (the socket process execs inside a new user namespace, where the runner's 750 home is not
+      # on lo (needs root and iproute2 on Linux)"), so no row of the parts holds them (ROOT_FILES / ROOT_NODES are the suite's list) and this step of part 1
+      # runs them, and only them, in that part only, the way the gate does: the engine copied to /opt/ff (the socket process execs inside a new user namespace, where the runner's 750 home is not
       # readable), `sudo -H -E env -u XDG_RUNTIME_DIR` (Firefox refuses to run as root in a regular user's session), no rerun plugin. Nothing is skipped
       # silently: the step reads its own junit and refuses anything but exactly that many tests, all passed.
       # AFTER the run of the runner user, never before it (run 43271443150 of PR 483: with this step first, every launch of the run that followed
       # waited for the browser's readiness line until its timeout, and the job was cancelled at 40 minutes; the same head without the step had 748
       # green). Whatever root leaves behind (files under the runner's home or /tmp, /etc/resolv.conf, an address on lo) cannot reach a launch of the
       # runner user any more; the step after this one prints what it left, and decides nothing.
-      # tests/test_the_root_e2e_run_in_the_root_step_and_nowhere_else.py holds the two lists, this step and the run above to the suite's list, and the order.
+      # tests/test_the_root_e2e_run_in_the_root_step_and_nowhere_else.py holds this step to the suite's list, the rows of the parts without it, the part and the order.
       - name: The root e2e (wrapper.e2e.udp.exit), as root, as the gate runs them
-        if: success() || failure()
+        if: matrix.part == 1 && (success() || failure())
         env:
           PYTHONUNBUFFERED: "1"
           ROOT_FILES: tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py
@@ -208,23 +256,25 @@ jobs:
           if counts["tests"] != int(os.environ["ROOT_TESTS"]) or counts["failures"] or counts["errors"] or counts["skipped"]:
               sys.exit("the root e2e must be exactly %s tests, all passed: %s" % (os.environ["ROOT_TESTS"], counts))
           PY
-      # THE SANDBOX E2E (wrapper.e2e.udp.sandbox), as the gate runs its first file: the browser WITH its sandbox, run by the runner user. On this runner AppArmor
+      # THE SANDBOX E2E (wrapper.e2e.udp.sandbox), as the gate runs it: the browser WITH its sandbox, run by the runner user. On this runner AppArmor
       # refuses user namespaces to a normal user (kernel.apparmor_restrict_unprivileged_userns=1), so the browser of every other step starts WITHOUT the sandbox
       # of its socket and content processes, and tests/test_the_socket_process_is_sandboxed_e2e.py (which fails unless both have a seccomp filter) can only
-      # be green after the restriction is turned off. It is left out of the run above by name (SANDBOX_FILES) so that it cannot fail on a runner without the
-      # sysctl, and it runs here, after the run and the root step (whatever the sysctl changes cannot reach a launch of the run), as the runner user. Nothing
+      # be green after the restriction is turned off. No row of the parts holds the tests of the suite (SANDBOX_FILES / SANDBOX_NODES are its list: the file
+      # and the three situations of the UDP line, which the rows leave to this suite), so the first cannot fail on a runner without the sysctl, and they run
+      # here, in part 1 only, after the run and the root step (whatever the sysctl changes cannot reach a launch of the run), as the runner user. Nothing
       # is skipped silently: the step reads its own junit and refuses anything but exactly that many tests, all passed.
-      # tests/test_the_sandbox_e2e_runs_where_user_namespaces_are_on.py holds this step, the exclusion above and the order.
+      # tests/test_the_sandbox_e2e_runs_where_user_namespaces_are_on.py holds this step to the suite's list, the rows of the parts without it, the part and the order.
       - name: The sandbox e2e (wrapper.e2e.udp.sandbox), with unprivileged user namespaces on
-        if: success() || failure()
+        if: matrix.part == 1 && (success() || failure())
         env:
           PYTHONUNBUFFERED: "1"
           SANDBOX_FILES: tests/test_the_socket_process_is_sandboxed_e2e.py
-          SANDBOX_TESTS: "1"
+          SANDBOX_NODES: tests/test_webrtc_realness.py::test_the_gather_is_real_without_a_proxy tests/test_webrtc_realness.py::test_a_gateway_with_coherent_udp_gives_the_page_a_srflx_born_through_its_relay tests/test_ice_names_by_the_context_proxy_e2e.py::test_a_gateway_without_udp_resolves_the_ice_name_then_ends_in_701
+          SANDBOX_TESTS: "13"
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           JUNIT="${RUNNER_TEMP}/sandbox-e2e.xml"
-          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -m pytest $SANDBOX_FILES -m e2e -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$JUNIT" || true
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -m pytest $SANDBOX_FILES $SANDBOX_NODES -m e2e -o addopts='' -o junit_family=xunit2 -q -p no:cacheprovider -p no:rerunfailures -rs --junitxml="$JUNIT" || true
           python - <<'PY'
           import os, sys, xml.etree.ElementTree as ET
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "sandbox-e2e.xml")).getroot()
@@ -235,7 +285,7 @@ jobs:
               sys.exit("the sandbox e2e must be exactly %s tests, all passed: %s" % (os.environ["SANDBOX_TESTS"], counts))
           PY
       - name: What the root step left behind (diagnostic, decides nothing)
-        if: always()
+        if: always() && matrix.part == 1
         run: |
           echo "-- files owned by root under the runner's home and /tmp"; sudo find /home/runner /tmp -maxdepth 3 -user root 2>/dev/null | head -40 || true
           echo "-- /etc/resolv.conf"; cat /etc/resolv.conf || true
@@ -283,18 +333,18 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-watchdog-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-watchdog-linux-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-watchdog.log
           if-no-files-found: warn
           retention-days: 14
 
       # The junit of every pass of the run (scripts/run_e2e.py writes one per pass, e2e-junit-*.xml, in the directory of the watchdog file) and of the two
-      # steps above that run alone (root, sandbox): what a red is read from, kept whether the run is green or red.
+      # steps above that run alone (root, sandbox; part 1 only, absent from the others): what a red is read from, kept whether the run is green or red.
       - name: Upload the junit of the run
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-junit-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-junit-linux-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/e2e-junit-*.xml
             ${{ runner.temp }}/root-e2e.xml
@@ -309,10 +359,34 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: invpw-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          name: invpw-evidence-linux-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/invpw-evidence
           if-no-files-found: ignore
           retention-days: 14
+
+  # THE CHECK OF THE LINUX e2e. `e2e (linux, xvfb)` is the name scripts/e2e_is_green.py, the branch protection and every reader before the split know:
+  # it is green only when every part is green. `needs.e2e-linux.result` is the result of the matrix as a whole (`success` only when every part succeeded;
+  # one failed, cancelled or skipped part makes it something else), and anything but `success` is red here: a cancelled part measured nothing, a skipped
+  # one ran nothing. `always()` so that a red or cancelled part still reaches this job and turns it red instead of skipping it, which reads as not red.
+  # The gate of the core on the index stays the same as for the parts: while the pinned core is not on the index the parts are skipped with the reason in
+  # the summary (core-on-index.yml), and so is this job, as the Linux job was before the split.
+  # tests/test_ci_runs_once_per_commit.py (5.) holds this job.
+  e2e:
+    name: e2e (linux, xvfb)
+    needs: [core-on-index, e2e-linux]
+    if: always() && needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every part of the Linux e2e is green
+        env:
+          PARTS: ${{ needs.e2e-linux.result }}
+        run: |
+          echo "the parts of the Linux e2e: $PARTS"
+          if [ "$PARTS" != "success" ]; then
+            echo "::error::the Linux e2e is not green: its parts ended in '$PARTS' (success is the only green)"
+            exit 1
+          fi
 
   # ``Control+A`` selects all in a field, on the PUBLISHED engine and the core this package pins, on Windows, where the keyboard of a real
   # user is: the shortcut letter used to reach the browser as Control+Shift+A (invisible-core 63.66.0 fixes it). The e2e is red on the
@@ -385,6 +459,15 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The A/A of the three A/B oracles (page, network, host) runs on the first seeds of the candidate set on a pull request, and on ALL of them when the pull request
+      # changes a file of that oracle (scripts/ci_ab_pr_seeds.py holds the lists). The checkout is shallow, so the script fetches the base commit and lists the files that
+      # differ from it (`git diff --name-only <base> HEAD`: HEAD is the merge commit, so this is the pull request's own change); the tests read the variables it prints.
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
       - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
         run: |
           python -m pip install --upgrade pip
@@ -445,5 +528,769 @@ jobs:
         with:
           name: invpw-evidence-windows-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/invpw-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ``The network oracle``: the A/A of tests/test_ab_network_e2e.py (the P4 journey and the lab, the published engine against itself) on its own job, Linux and Windows,
+  # as its gate leg runs it. On a pull request that changes the oracle it visits all five seeds of the candidate set (scripts/ci_ab_pr_seeds.py), 37 minutes at most
+  # for the run (the test's own guard, from the measured runs plus 25%; about 20 minutes on Linux and 22 on Windows measured in run 45153612447), which would not fit in
+  # the shared job's 40 minutes next to everything else. The shared jobs leave this file out (OWN_JOB_FILES
+  # above, `own_job` in the Windows parts). The same setup as the shared jobs: the security state, the engine, the GeoIP database made by the repository.
+  e2e-network:
+    name: e2e (network, linux)
+    needs: [core-on-index, linux-deps-e2e]
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
+      # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
+      # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
+      # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
+      # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
+      - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
+        run: |
+          mkdir -p "$RUNNER_TEMP/cores"
+          chmod 1777 "$RUNNER_TEMP/cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
+          echo "INVPW_CORE_DIR=$RUNNER_TEMP/cores" >> "$GITHUB_ENV"
+          cat /proc/sys/kernel/core_pattern
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        shell: bash
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the network oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_network_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/network-e2e.xml"
+          python - "$RUNNER_TEMP/network-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        shell: bash
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-network-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/network-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-network-windows:
+    name: e2e (network, windows)
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: windows-2022
+    # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the network oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_network_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/network-e2e.xml"
+          python - "$RUNNER_TEMP/network-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-network-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/network-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ``The host oracle``: the A/A of tests/test_ab_host_e2e.py (the trace of a closed run, a warm-up launch and the measured ones of each engine) on its own job, Linux
+  # and Windows. It measures what the engine does on the machine, so nothing else may run on it: in the shared job the other tests' browsers ran at the same time (the
+  # report of run 44982522362 counts 150 to 1000 paths per seed opened by firefox.exe processes outside the tree on Windows), and the engine's own timers (the
+  # telemetry notification flow that decides whether the pingsender is spawned at shutdown) raced with a loaded machine. One test, serial; 45 minutes for the job,
+  # 35 for the test.
+  e2e-host:
+    name: e2e (host, linux)
+    needs: [core-on-index, linux-deps-e2e]
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
+          # the host oracle traces the whole tree of the browser with strace
+      # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
+      # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
+      # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
+      # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
+      - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
+        run: |
+          mkdir -p "$RUNNER_TEMP/cores"
+          chmod 1777 "$RUNNER_TEMP/cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
+          echo "INVPW_CORE_DIR=$RUNNER_TEMP/cores" >> "$GITHUB_ENV"
+          cat /proc/sys/kernel/core_pattern
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        shell: bash
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the host oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_host_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/host-e2e.xml"
+          python - "$RUNNER_TEMP/host-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      # The recorder's own test (wrapper.e2e.ab_host_crash): the engine is launched once under the oracle's stand-in, its parent is sent SIGSEGV with os.kill, and the test passes when the
+      # oracle says RED and keeps the evidence (the code on the verdict line, strace's signal line, the core through gdb with its threads, the build ids). The red of the probe is the
+      # right answer: it does not make this job red; a probe that says green for a launch that died does. After the A/A, so that it cannot reach a measurement.
+      - name: The host oracle's recorder of a browser that dies (a parent sent SIGSEGV is red, with its gdb threads and its strace signal line)
+        if: success() || failure()
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_host_crash_linux_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/host-crash-e2e.xml"
+          python - "$RUNNER_TEMP/host-crash-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        shell: bash
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-host-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/host-e2e.xml
+            ${{ runner.temp }}/host-crash-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+
+  e2e-host-windows:
+    name: e2e (host, windows)
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      # The geolocation control of the host oracle runs on Playwright's own Firefox (`run_stock`, `ci_ab_host.py stock`) on every run: the binary is not in the image (run
+      # 45121964904: `Executable doesn't exist at ms-playwright/firefox-1532/firefox/firefox.exe`, and the oracle blamed the platform provider). The same python as the tests.
+      - name: Playwright's own Firefox (the control of the geolocation step)
+        run: python -m playwright install firefox
+      # The laboratory, before any launch (the published engine, the candidate and the stock control then run on the same machine in the same state): the runner image has
+      # the Windows location service off and denied for the machine (run 45153612447: `lfsvc` Disabled and Stopped, `HKLM\...\ConsentStore\location` = Deny), so stock
+      # Firefox cannot reach the platform provider and its request waits on the system. A runner that is thrown away after the job: the service is made startable and started,
+      # and the consent is Allow for the machine and for the user's non-packaged apps. A setting that does not hold is red here with its reason, never a silent go-on.
+      - name: Turn on the Windows location service of the runner (the laboratory of the geolocation step)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Windows' own answer for the user of the job: the question stock Firefox asks before it starts the Windows provider (AppCapability "location"
+          # CheckAccess, dom/geolocation/GeolocationSystemWin.cpp). Read, not presumed: printed before and after, and red unless it is Allowed after
+          # (run 45206303882: on windows-2025 the keys said Allow and stock Firefox did not start the provider). WinRT is read through Windows PowerShell.
+          $access = {
+            $answer = & powershell.exe -NoProfile -Command "`$null = [Windows.Security.Authorization.AppCapabilityAccess.AppCapability,Windows.Security.Authorization.AppCapabilityAccess,ContentType=WindowsRuntime]; [string][Windows.Security.Authorization.AppCapabilityAccess.AppCapability]::Create('location').CheckAccess()" 2>&1
+            ($answer | Out-String).Trim()
+          }
+          "CheckAccess(location) before: $(& $access)"
+          $machine = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+          $user = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+          foreach ($key in @($machine, $user, "$user\NonPackaged")) {
+            if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
+            Set-ItemProperty -Path $key -Name Value -Value 'Allow'
+          }
+          Set-Service -Name lfsvc -StartupType Manual
+          Start-Service -Name lfsvc
+          $service = Get-Service -Name lfsvc
+          $bad = @()
+          if ($service.Status -ne 'Running') { $bad += "lfsvc is $($service.Status), not Running" }
+          if ($service.StartType -eq 'Disabled') { $bad += 'lfsvc is still Disabled' }
+          foreach ($key in @($machine, $user, "$user\NonPackaged")) {
+            $value = (Get-ItemProperty -Path $key -Name Value).Value
+            if ($value -ne 'Allow') { $bad += "$key is $value, not Allow" }
+            "$key = $value"
+          }
+          "lfsvc: $($service.Status), $($service.StartType)"
+          $after = & $access
+          "CheckAccess(location) after: $after"
+          if ($after -ne 'Allowed') { $bad += "Windows answers CheckAccess(location) = $after, not Allowed" }
+          if ($bad) { throw ("the location service of the runner is not on: " + ($bad -join '; ')) }
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the host oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_host_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/host-e2e.xml"
+          python - "$RUNNER_TEMP/host-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      # What the Windows location provider needs, read only and printed when the control says the step does not reach it (the service, the consent of the location
+      # capability for the machine and for the user, its configuration): the runner's state, to be read next to the stock evidence of the oracle.
+      - name: The state of the Windows location service and of its consent (read only)
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "--- Get-Service lfsvc"
+          try { Get-Service lfsvc -ErrorAction Stop | Format-List * } catch { "lfsvc: not readable: $($_.Exception.Message)" }
+          foreach ($key in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+              'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration')) {
+            "--- $key"
+            if (-not (Test-Path -LiteralPath $key)) { "key absent: $key"; continue }
+            try { Get-ItemProperty -LiteralPath $key -ErrorAction Stop | Format-List * } catch { "not readable: $($_.Exception.Message)" }
+            foreach ($sub in @('NonPackaged')) {
+              $path = Join-Path $key $sub
+              if (Test-Path -LiteralPath $path) {
+                "--- $path"
+                try { Get-ItemProperty -LiteralPath $path -ErrorAction Stop | Format-List * } catch { "not readable: $($_.Exception.Message)" }
+              }
+            }
+          }
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-host-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/host-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ``The page oracle``: the A/A of tests/test_ab_oracle_e2e.py (the page of the host gate over the persona seeds, the published engine against itself; the poison probe, the H7 second
+  # launch of seed 0 and the ab. visits are part of its dumps) on its own job, Linux and Windows, as the network and host oracles have theirs. On a pull request that changes a
+  # file of the oracle it visits all five seeds of the candidate set (scripts/ci_ab_pr_seeds.py): the test's own guard for that run is 120 s to start and, for each of the
+  # two engine runs, 180 s for the first seed, 100 s for each next one and 200 s for the second launch of seed 0, 28 minutes (30 with the worker's margin), which took 38 minutes of
+  # the shared Linux job (run 45030727459, 40 minutes, every test passed) and does not fit next to everything else. The shared jobs leave this file out (OWN_JOB_FILES above,
+  # `own_job` in the Windows parts). 45 minutes for the job, as the host oracle's: the setup of the job plus the guard of the test with the margin of Windows. The same setup as the shared jobs.
+  e2e-page:
+    name: e2e (page oracle, linux)
+    needs: [core-on-index, linux-deps-e2e]
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
+      # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
+      # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
+      # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
+      # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
+      - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
+        run: |
+          mkdir -p "$RUNNER_TEMP/cores"
+          chmod 1777 "$RUNNER_TEMP/cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
+          echo "INVPW_CORE_DIR=$RUNNER_TEMP/cores" >> "$GITHUB_ENV"
+          cat /proc/sys/kernel/core_pattern
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        shell: bash
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-e2e.xml"
+          python - "$RUNNER_TEMP/page-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        shell: bash
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-page-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-page-windows:
+    name: e2e (page oracle, windows)
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle's A/A
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-e2e.xml"
+          python - "$RUNNER_TEMP/page-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-page-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ``The host oracle``: the A/A of tests/test_ab_host_e2e.py (the trace of a closed run, a warm-up launch and the measured ones of each engine) on its own job, Linux
+  # and Windows. It measures what the engine does on the machine, so nothing else may run on it: in the shared job the other tests' browsers ran at the same time (the
+  # report of run 44982522362 counts 150 to 1000 paths per seed opened by firefox.exe processes outside the tree on Windows), and the engine's own timers (the
+  # telemetry notification flow that decides whether the pingsender is spawned at shutdown) raced with a loaded machine. One test, serial; 45 minutes for the job,
+  # 35 for the test.
+
+  # ``The page oracle, final seeds``: the A/A of the 20 seeds of the `final` set of ci/persona-seeds.json (every value of every dimension the core declares), split in four
+  # shards of five seeds, on a pull request that changes a file of the page oracle (scripts/ci_ab_pr_seeds.py holds the list; `ci_ab_oracle.py touched` reads it). The
+  # shared jobs run the first seeds of the `candidate` set, or the five of it when the oracle is touched; they do not grow. This one is the control the final candidate's
+  # gate leg rests on: the published engine against itself on every seed, zero differences, before any A/B of the final set is accepted. Each shard is one test
+  # (tests/test_ab_oracle_e2e.py with AB_ORACLE_SEED_SET=final and AB_ORACLE_SHARD=i/4: its hang guard is sized from the shard's seeds) and the job refuses anything but that one test, passed.
+  # Seed 0 is in shard 1, and its second launch on a reused profile is part of that shard's A/A.
+  e2e-page-final-touched:
+    name: e2e (page oracle, is it touched)
+    needs: core-on-index
+    if: github.event_name == 'pull_request' && needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      touched: ${{ steps.touched.outputs.touched }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Does the pull request change a file of the page oracle
+        id: touched
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/ci_ab_oracle.py touched "$BASE_SHA" | tee -a "$GITHUB_OUTPUT"
+
+  e2e-page-final:
+    name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, linux)
+    needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]
+    if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The Linux packages (the run's linux-deps-e2e job, no mirror)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-e2e.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb, strace, gdb, elfutils + Firefox runtime libs; the repository of the linux-deps-e2e job)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
+      # What a browser that did not end with 0 leaves is kept by the oracle (scripts/ci_crash_evidence.py): the core goes through gdb (every thread's backtrace, the MOZ_CRASH reason, the
+      # libraries, with the build ids from elfutils). The kernel writes the core where its pattern says, so the pattern points at a folder of the job (INVPW_CORE_DIR); the launches
+      # allow cores themselves (`ulimit -c unlimited` in the host oracle's stand-in, the soft limit raised to the hard one in the page and network oracles). Nothing here reaches a
+      # launch that does not crash: no environment variable of the browser, no pref, no crash reporter option.
+      - name: Cores of a browser that did not end with 0 (gdb, elfutils, where the kernel writes them)
+        run: |
+          mkdir -p "$RUNNER_TEMP/cores"
+          chmod 1777 "$RUNNER_TEMP/cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p.%t"
+          echo "INVPW_CORE_DIR=$RUNNER_TEMP/cores" >> "$GITHUB_ENV"
+          cat /proc/sys/kernel/core_pattern
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        shell: bash
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle A/A on the final seeds of this shard
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_ORACLE_SEED_SET: final
+          AB_ORACLE_SHARD: ${{ matrix.shard }}/4
+        run: |
+          xvfb-run -a env -u PYTEST_ADDOPTS INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-final-e2e.xml"
+          python - "$RUNNER_TEMP/page-final-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        shell: bash
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-page-final-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-final-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-page-final-windows:
+    name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, windows)
+    needs: [core-on-index, e2e-page-final-touched]
+    if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+      - name: The security state (a fixed directory of the repository)
+        shell: bash
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the page oracle A/A on the final seeds of this shard
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_ORACLE_SEED_SET: final
+          AB_ORACLE_SHARD: ${{ matrix.shard }}/4
+        run: |
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u -m pytest tests/test_ab_oracle_e2e.py -m e2e -o addopts= -o junit_family=xunit2 -p no:cacheprovider -p no:rerunfailures -rs -v --junitxml="$RUNNER_TEMP/page-final-e2e.xml"
+          python - "$RUNNER_TEMP/page-final-e2e.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(0 if counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0} else 1)
+          PY
+      - name: The leg ran with the pinned GeoIP database
+        if: always()
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload what the test saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-page-final-windows-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/invpw-evidence
+            ${{ runner.temp }}/page-final-e2e.xml
           if-no-files-found: ignore
           retention-days: 14

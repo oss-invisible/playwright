@@ -59,8 +59,21 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
+  # The Ubuntu packages of the Linux hunt, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by the hunt. On Windows this job is
+  # skipped and the hunt runs on (the condition below accepts `skipped` and `success`, nothing else).
+  linux-deps-hunt:
+    name: linux-deps-hunt
+    if: startsWith(inputs.os, 'ubuntu')
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: hunt
+      packages: xvfb
+      playwright_wrapper_ref: ${{ github.sha }}
+
   hunt:
     name: hunt (${{ inputs.os }})
+    needs: linux-deps-hunt
+    if: ${{ !cancelled() && (needs.linux-deps-hunt.result == 'success' || needs.linux-deps-hunt.result == 'skipped') }}
     runs-on: ${{ inputs.os }}
     # 18 runs of ~6 minutes plus install time. Deliberately generous: the
     # ceiling here must NEVER be the thing that stops the hunt, or we're back
@@ -88,12 +101,26 @@ jobs:
       # Linux only: on Windows the browser launches on the runner's desktop,
       # and `firefox-launch-matrix.yml` has shown for months that it really
       # starts there.
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-hunt job, no mirror)
+        if: runner.os == 'Linux'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-hunt.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb + Firefox runtime libs; the repository of the linux-deps-hunt job)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
 

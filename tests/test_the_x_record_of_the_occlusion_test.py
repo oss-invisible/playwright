@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 
-from _x_visibility import VISIBILITY_NOTIFY, VisibilityRecord, XEvent, arrangement, outer, visibility_of
+from _x_visibility import (VISIBILITY_NOTIFY, VisibilityRecord, XEvent, XVisibility, arrangement, control_sees_hidden, outer, product_stays_visible,
+                           visibility_of)
 
 COVERED, COVER, OTHER = 0x400001, 0x600001, 0x200001
 SAME = {"x": 0, "y": 0, "width": 1280, "height": 720, "border": 0}
@@ -92,3 +93,62 @@ def test_a_record_without_fully_obscured_says_it_did_not_arrive():
     record.add(COVERED, "PartiallyObscured", 0.2)
     saved = record.as_dict()
     assert saved["fully obscured arrived"] is False and saved["fully obscured at"] is None
+
+
+# --- the verdicts of the two halves, on the sequences of changes a page can record -----------------------------------------------------------------
+
+# The control's criterion before: the state the page reads at the end of the run, which is the last of the changes it recorded.
+def the_old_control_passes(changes):
+    return changes[-1] == "hidden"
+
+
+# Firefox draws the covered window again after X's FullyObscured (``nsWindow::OnExposeEvent``: VISIBLE at every draw): hidden, then visible again.
+DRAWN_AFTER = ["visible", "hidden", "visible"]
+
+
+def test_a_covered_window_drawn_again_ends_visible_and_the_old_criterion_is_red_on_it_while_the_new_one_is_green():
+    assert the_old_control_passes(["visible", "hidden"]) is True
+    assert the_old_control_passes(DRAWN_AFTER) is False
+    assert control_sees_hidden(["visible", "hidden"]) is True
+    assert control_sees_hidden(DRAWN_AFTER) is True
+
+
+def test_the_control_is_red_when_the_page_never_recorded_hidden():
+    assert control_sees_hidden(["visible"]) is False
+    assert control_sees_hidden(["visible", "visible"]) is False
+    assert control_sees_hidden([]) is False
+
+
+def test_a_hidden_before_the_last_look_that_had_no_fully_obscured_is_not_its_effect():
+    # the page had recorded hidden when X had still said nothing (3 entries read before the event arrived): only what comes after counts
+    assert control_sees_hidden(["visible", "hidden", "visible"], not_before=3) is False
+    assert control_sees_hidden(["visible", "hidden", "visible", "hidden"], not_before=3) is True
+    assert control_sees_hidden(["visible", "hidden"], not_before=1) is True
+    assert control_sees_hidden(["visible", "hidden"], not_before=2) is False
+
+
+def test_the_product_half_is_red_as_soon_as_hidden_shows():
+    assert product_stays_visible(["visible"]) is True
+    assert product_stays_visible(["visible", "hidden"]) is False
+    assert product_stays_visible(DRAWN_AFTER) is False
+    assert product_stays_visible([]) is False
+
+
+class _Xlib:
+    def __init__(self):
+        self.resized = []
+
+    def XResizeWindow(self, connection, window, width, height):
+        self.resized.append((window, width, height))
+
+    def XSync(self, connection, discard):
+        pass
+
+
+def test_shrink_by_one_asks_x_for_one_pixel_less_in_width_and_keeps_the_height():
+    x = object.__new__(XVisibility)
+    x.x11, x.connection = _Xlib(), object()
+    sizes = iter([{"width": 1280, "height": 720}, {"width": 1279, "height": 720}])
+    x.geometry = lambda window: next(sizes)
+    assert x.shrink_by_one(COVERED) == {"before": {"width": 1280, "height": 720}, "after": {"width": 1279, "height": 720}}
+    assert x.x11.resized == [(COVERED, 1279, 720)]

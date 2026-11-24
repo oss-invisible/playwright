@@ -17,14 +17,22 @@ import pytest
 
 _SYSCALLS = ("execve,clone,clone3,fork,vfork,open,openat,stat,lstat,"
              "newfstatat,statx,access,faccessat,faccessat2,readlink")
+#: The network calls, traced only when a caller asks (``network=True``: scripts/ci_ab_host.py, NET_CALLS): the font tests do not.
+_NET_SYSCALLS = "socket,connect,bind,sendto,sendmsg,sendmmsg"
+#: The signals a trace with ``exit_status`` records (``-e signal=``): the ones that end a process or are sent to end it, with the sender (``si_pid``) and the faulting address
+#: (``si_addr``). The lines they make (``1234 --- SIGSEGV {si_signo=SIGSEGV, ...} ---``) are evidence of a crash and never data of the comparison (scripts/ci_ab_host.py drops
+#: them when it reads the log). strace stops the tracee at every signal whether it prints it or not, so printing changes nothing the browser does.
+RECORDED_SIGNALS = "SIGSEGV,SIGBUS,SIGABRT,SIGILL,SIGFPE,SIGSYS,SIGTRAP,SIGTERM,SIGINT,SIGQUIT,SIGHUP"
 
 
-def _strace_options() -> str:
+def _strace_options(fd_paths: bool = False, exit_status: bool = False) -> str:
     """strace's own flags: quiet, follow forks, and die with the traced process
-    when this build knows --kill-on-exit."""
+    when this build knows --kill-on-exit; ``fd_paths`` adds ``-y``, which prints the path of every file descriptor
+    (``3</usr/share/fonts>``), so that a path relative to a directory descriptor is known; ``exit_status`` keeps the lines that say how each process ended
+    (``+++ exited with 0 +++``, ``+++ killed by SIGKILL +++``: ``-q`` and not ``-qq``) and records the fatal signals (``RECORDED_SIGNALS``)."""
     help_text = subprocess.run([shutil.which("strace"), "-h"], capture_output=True,
                                text=True).stdout
-    return "-f -qq -s 4096" + (" --kill-on-exit" if "--kill-on-exit" in help_text else "")
+    return (("-f -q -e signal=%s -s 4096" % RECORDED_SIGNALS) if exit_status else "-f -qq -s 4096") + (" -y" if fd_paths else "") + (" --kill-on-exit" if "--kill-on-exit" in help_text else "")
 
 
 def _require_strace_can_trace(tmp: Path) -> None:
@@ -38,7 +46,8 @@ def _require_strace_can_trace(tmp: Path) -> None:
 
 
 def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str = _SYSCALLS,
-              timestamps: bool = False) -> str:
+              timestamps: bool = False, fd_paths: bool = False, network: bool = False, exit_status: bool = False,
+              cores: bool = False) -> str:
     """A copy of the engine's directory made of links, whose executable runs
     the real one under strace, in the engine's place.
 
@@ -53,18 +62,26 @@ def _stand_in(binary: str, tree: Path, log: Path, pidfile: Path, syscalls: str =
 
     ``syscalls`` is what strace traces; ``timestamps`` adds ``-ttt`` (the epoch
     seconds after each pid), which ``_LINE`` does not read: a caller that asks
-    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``)."""
+    for them strips them first (``test_the_parent_reads_the_bundle_from_fontconfig_s_cache_linux_e2e``);
+    ``fd_paths`` adds ``-y`` (scripts/ci_ab_host.py reads the paths the tree touched, and knows a socket by its inode);
+    ``network`` adds the network calls to ``syscalls`` (scripts/ci_ab_host.py reads the netlink sockets and the public destinations);
+    ``cores`` lets the tree dump core (``ulimit -c unlimited``) and changes nothing else: the working directory stays the launcher's, so the paths the trace reads
+    are the same, and where the kernel writes the core is the job's ``kernel.core_pattern`` (scripts/ci_ab_host.py)."""
+    if network:
+        syscalls = syscalls + "," + _NET_SYSCALLS
     real = Path(os.path.realpath(binary))
     tree.mkdir()
     for entry in real.parent.iterdir():
         if entry.name != real.name:
             (tree / entry.name).symlink_to(entry)
     script = tree / real.name
+    cores_script = "ulimit -c unlimited\n" if cores else ""
     script.write_text(
         "#!/bin/sh\n"
         "echo $$ > %s\n"
+        "%s"
         'exec %s %s -o %s -e trace=%s %s "$@"\n'
-        % (pidfile, shutil.which("strace"), _strace_options() + (" -ttt" if timestamps else ""), log, syscalls, real))
+        % (pidfile, cores_script, shutil.which("strace"), _strace_options(fd_paths, exit_status) + (" -ttt" if timestamps else ""), log, syscalls, real))
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 

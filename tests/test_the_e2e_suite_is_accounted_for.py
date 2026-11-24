@@ -47,6 +47,14 @@ _BOTH = ("linux", "windows")
 #: What no row of the suite runs, by file or by ``file::test`` (every parameter of the test), the systems it holds for, and why. The skip reasons are the ones the
 #: junit of run 44942540063 carries.
 EXCLUDED = {
+    "tests/test_ab_oracle_e2e.py":
+        (_BOTH, "wrapper.e2e.ab_oracle: the page oracle (A/B of the published engine against the one under test) has its own row and job"),
+    "tests/test_ab_network_e2e.py":
+        (_BOTH, "wrapper.e2e.ab_network: the network oracle has its own row and job (e2e-network-* in e2e.yml)"),
+    "tests/test_ab_host_e2e.py":
+        (_BOTH, "wrapper.e2e.ab_host: the host oracle has its own row and job (e2e-host-* in e2e.yml)"),
+    "tests/test_ab_host_crash_linux_e2e.py":
+        (_BOTH, "wrapper.e2e.ab_host_crash: the host oracle's recorder on a launch that dies on purpose has its own row (Linux only) and runs in the host oracle's job"),
     "tests/test_a_proxy_that_cannot_carry_udp_leaks_nothing_direct_e2e.py":
         (_BOTH, "wrapper.e2e.udp.exit: the lab's exit is an address held on lo as root (Linux only), run in the root step"),
     "tests/test_the_whole_udp_chain_by_name_e2e.py::test_a_turn_srflx_by_name_arrives_through_the_relay_before_the_tick":
@@ -83,7 +91,7 @@ EXCLUDED = {
         (("windows",), "skips on Windows: the Linux text path"),
 }
 #: Changed by hand, together with the list above: an exclusion is a test the candidate does not run, and it may not be added in silence.
-EXCLUDED_COUNT = 17
+EXCLUDED_COUNT = 21
 
 
 @functools.lru_cache(maxsize=None)

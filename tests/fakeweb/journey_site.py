@@ -6,7 +6,8 @@ host would be the same site, and with Fission an "other origin" frame of the sam
 with two sites the ad frames and the partner page are really out of process. Cookies and sign-in stay on A.
 Every page also runs a deterministic ad noise (DET_JS): every slow
 response is held by the server until an event releases it, never by a timer, and nothing is aborted or
-removed while a request is in flight, so stock Firefox gives the same outcome on every run. Two pages stay
+removed while a request is in flight, so stock Firefox gives the same outcome on every run. The noise runs on
+timers after `load`; a page declares when it is done (`window.__noiseDone`), and the walk leaves a page only then. Two pages stay
 "not idle" on purpose (PARK_PAGES, PARK_KEEPALIVE_PAGES). Add ?noise=0 to a URL to turn the noise off
 (every internal link and form keeps the switch).
 
@@ -17,10 +18,13 @@ Pages (A): /  /category/<name>[?sort=new|top]  /article/<id>  /search[?q=..]
 /signin (GET form, POST sets cookies, 303 to /account)  /account  /signout (POST)
 /download/<id>.txt (Content-Disposition: attachment).  O: /partner/<id>.
 Both origins also serve /r?kind=.. (finite resources), /hold, /release, /stream, /jf/<kind> and POST /beacon.
+/slowlink and /slowload are for a test of the walk's hang guard only: no page of the walk links to them (see page_slowload).
 User: alice / secret.
 """
+import bisect
 import html
 import json
+import re
 import secrets
 import select
 import socket
@@ -42,6 +46,11 @@ CATEGORIES = ["world", "tech", "sport", "travel", "science", "culture"]
 WORDS = ["Harbour", "Orchard", "Signal", "Lantern", "Meadow", "Circuit", "Glacier", "Market",
          "Village", "Satellite", "Garden", "Bridge", "Compass", "Library", "Station"]
 PRELUDE = sites.PRELUDE
+#: When the last stage of the noise starts, in ms after `load` (the late DOM resources, the stylesheet `ld3` among them). A lab can make it
+#: longer (`start(last_stage_ms=...)`): a page the walk passes through is then left before that stage unless the walk waits for it.
+LAST_STAGE_MS = 600
+#: The weights of the five @font-face rules of the noise (the font stylesheet), one woff2 request each.
+FONT_WEIGHTS = (400, 500, 600, 700, 800)
 
 CSS = """
 body{font:16px/1.5 sans-serif;margin:0 auto;max-width:900px;padding:0 16px}
@@ -80,6 +89,12 @@ def link(ctx, path, **params):
 DET_JS = r"""
 const tok = Math.random().toString(36).slice(2, 8);
 const rel = (id) => get(A + '/release?id=' + id);
+// 0. the end of the noise, declared: window.__noiseDone is true once the font stage is done (its stylesheet has loaded and
+// document.fonts.ready has resolved after it), the last stage has loaded its stylesheet ld3, the fetch chain has sent its release
+// (stage 5) and the three aborted streams have sent theirs (stage 9). The walk leaves the page only then. A request held until the
+// walk reaches a step (PARK_PAGES) is not part of it: it is the page that stays open on purpose.
+let fontsDone = false, lastDone = false, chainDone = false, streamsOpen = 3;
+const noiseDone = () => { if (fontsDone && lastDone && chainDone && streamsOpen === 0) window.__noiseDone = true; };
 // 1. beacons and keepalive fetches
 afterLoad(300, () => {
   navigator.sendBeacon(O + '/beacon?src=load&n=1', 'a=1');
@@ -94,6 +109,10 @@ for (let i = 0; i < 4; i++) { const im = new Image(); im.src = O + '/r?kind=png&
 afterLoad(250, () => {
   const l = document.createElement('link');
   l.rel = 'stylesheet'; l.href = O + '/r?kind=fontcss&id=fc';
+  // the @font-face rules are in: lay the spans out (their fonts start to load) and wait for the fonts of the document
+  const fonts = () => { void document.body.offsetWidth; document.fonts.ready.then(() => { fontsDone = true; noiseDone(); }); };
+  l.addEventListener('load', fonts);
+  l.addEventListener('error', fonts);
   document.head.appendChild(l);
   for (const w of [400, 500, 600, 700, 800]) {
     const sp = document.createElement('span');
@@ -111,7 +130,7 @@ get(O + '/r?kind=json&redirect=2&id=rc2');
 get(A + '/hold?id=lp' + tok);
 let late = 0;
 const nextLate = () => {
-  if (++late > 7) { rel('lp' + tok); return; }
+  if (++late > 7) { rel('lp' + tok).then(() => { chainDone = true; noiseDone(); }); return; }
   get(A + '/r?kind=json&id=late' + late).then(nextLate);
 };
 nextLate();
@@ -127,7 +146,7 @@ for (let i = 0; i < 3; i++) {
   document.body.appendChild(f);
 }
 // 8. late DOM resources
-afterLoad(600, () => {
+afterLoad(LAST_MS, () => {
   const im = document.createElement('img');
   im.src = O + '/r?kind=svg&id=ld1';
   document.body.appendChild(im);
@@ -139,12 +158,16 @@ afterLoad(600, () => {
   document.body.appendChild(svg);
   const l = document.createElement('link');
   l.rel = 'stylesheet'; l.href = A + '/r?kind=css&id=ld3';
+  const last = () => { lastDone = true; noiseDone(); };
+  l.addEventListener('load', last);
+  l.addEventListener('error', last);
   document.head.appendChild(l);
 });
 // 9. aborts that cannot race: the server sends headers and part of the body, the page aborts on the headers
 for (let i = 0; i < 3; i++) {
   const c = new AbortController();
-  fetch(A + '/stream?id=ab' + i, {signal: c.signal}).then(() => { c.abort(); rel('stream-ab' + i); }).catch(noop);
+  fetch(A + '/stream?id=ab' + i, {signal: c.signal}).then(() => { c.abort(); return rel('stream-ab' + i); }).catch(noop)
+    .then(() => { streamsOpen--; noiseDone(); });
 }
 // 10. leaving the page: one sendBeacon and one keepalive POST
 addEventListener('pagehide', () => {
@@ -165,7 +188,7 @@ PARK_KEEPALIVE_PAGES = {"search": 13}
 
 def noise_script(ctx, park_until=None, park_keepalive_until=None):
     if not ctx.noise:
-        return ""
+        return "<script>window.__noiseDone = true;</script>"      # no noise: nothing to wait for before the walk leaves the page
     js = DET_JS
     if park_until:
         js += "\nafterLoad(0, () => get(A + '/hold?id=park' + tok + '&until=%d'));\n" % park_until
@@ -173,8 +196,8 @@ def noise_script(ctx, park_until=None, park_keepalive_until=None):
         js += ("\nafterLoad(0, () => fetch(A + '/hold?id=kapark' + tok + '&until=%d', {keepalive: true}).catch(noop));\n"
                % park_keepalive_until)
     # Own <script> element: a failure in the noise cannot break the page's script.
-    return "<script>(function(){const A=%s,O=%s;\n%s\ntry{\n%s\n}catch(e){}\n})();</script>" % (
-        json.dumps(ctx.own), json.dumps(ctx.other), PRELUDE, js)
+    return "<script>(function(){const A=%s,O=%s,LAST_MS=%d;\n%s\ntry{\n%s\n}catch(e){}\n})();</script>" % (
+        json.dumps(ctx.own), json.dumps(ctx.other), ctx.last_ms, PRELUDE, js)
 
 
 JFRAME_JS = {
@@ -362,6 +385,20 @@ def page_partner(ctx, i):
     return layout(ctx, "partner-%d" % i, "Partner %d" % i, "Partner %d (other origin)" % i, body)
 
 
+def page_slowlink(ctx, ms, rid):
+    """A page with one link (#go) to a page that holds `load` (page_slowload). No page of the walk links to it."""
+    body = '<p><a id=go href="%s">Go</a></p>' % html.escape(link(ctx, "/slowload", ms=ms, id=rid))
+    return layout(ctx, "slowlink", "Slow link", "Slow link", body)
+
+
+def page_slowload(ctx, ms, rid):
+    """A page whose `load` is held by a parser-blocking script, which the server answers after `ms` milliseconds, or when /release?id=slow-<rid>
+    comes (a test that wants a page that never loads gives no `ms`, and releases it when it is done). For a test of the hang guard of the walk
+    (run 45176061220: a `load` that took 15.7 to 22.1 s on a slow runner ended steps with the 15 s deadline). Not part of the walk."""
+    body = '<p>Loading.</p><script src="%s"></script>' % html.escape(link(ctx, "/slowload.js", ms=ms, id=rid))
+    return layout(ctx, "slowload", "Slow load", "Slow load", body)
+
+
 class State:
     def __init__(self):
         self.origins = ["", ""]
@@ -373,10 +410,12 @@ class State:
         self.walk = 0
         self.cond = threading.Condition()
         self.released = set()
+        self.last_stage_ms = LAST_STAGE_MS
         #: What the server itself saw, in order, for a test that saves it when it fails (`start(...)[2].state.records`; nothing else reads
         #: it): one `accept` per TCP connection and one `request` per request, with `time.perf_counter()` of this process as `m_*` (the
         #: scale of the client's log) and `time.time()` as `t_*`; for a held request (`/hold`) also when the hold began and ended, why
-        #: it ended, and when the server first saw the browser's end of the connection closed.
+        #: it ended, and when the server first saw the browser's end of the connection closed. Each request also keeps its `referer` and the
+        #: `ctype` of its answer (what `pages_left_before_their_noise` reads).
         self.records = []
 
     def note(self, record):
@@ -482,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         rec = getattr(self, "_rec", None)
         if rec is not None:
             rec["status"] = code
+            rec["ctype"] = ctype
             rec["t_answer"] = round(time.time(), 4)
             rec["m_answer"] = round(time.perf_counter(), 6)
 
@@ -497,7 +537,7 @@ class Handler(BaseHTTPRequestHandler):
         rec = self._rec = state.note({
             "ev": "request", "t_arrive": round(time.time(), 4), "m_arrive": round(time.perf_counter(), 6), "site": self.server.idx,
             "peer": self.client_address[1], "method": self.command, "path": self.path, "walk": state.walk, "step": state.step,
-            "status": None, "t_answer": None, "m_answer": None, "t_done": None, "m_done": None, "error": None})
+            "referer": self.headers.get("Referer"), "ctype": None, "status": None, "t_answer": None, "m_answer": None, "t_done": None, "m_done": None, "error": None})
         try:
             fn()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
@@ -535,7 +575,8 @@ class Handler(BaseHTTPRequestHandler):
     def _ctx(self, q):
         st = self.server.state
         idx = self.server.idx
-        return SimpleNamespace(own=st.origins[idx], other=st.origins[1 - idx], noise=q.get("noise", ["1"])[0] != "0")
+        return SimpleNamespace(own=st.origins[idx], other=st.origins[1 - idx], noise=q.get("noise", ["1"])[0] != "0",
+                               last_ms=st.last_stage_ms)
 
     def _session_user(self):
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -600,6 +641,14 @@ class Handler(BaseHTTPRequestHandler):
             text = ("Summary of article %s.\nThe quick brown fox jumps over the lazy dog.\n" % num).encode()
             return self._send(200, "text/plain; charset=utf-8", text, [
                 ("Content-Disposition", 'attachment; filename="summary-%s.txt"' % num)])
+        if p in ("/slowlink", "/slowload"):
+            ms, rid = q.get("ms", [None])[0], q.get("id", ["0"])[0]
+            return self._html((page_slowlink if p == "/slowlink" else page_slowload)(ctx, ms, rid))
+        if p == "/slowload.js":
+            # held by the server until its time is up (`ms`; with none, 90 s at most) or until the test releases it
+            ms = q.get("ms", [None])[0]
+            self.server.state.hold("slow-" + q.get("id", ["0"])[0], 0, failsafe=int(ms) / 1000 if ms else 90.0)
+            return self._send(200, "application/javascript", b"/* released */\n", cache="no-store")
         if p == "/search":
             return self._html(page_search(ctx, q["q"][0] if "q" in q else None))
         if p == "/signin":
@@ -688,9 +737,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(400, "text/plain", b"bad kind")
 
 
-def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_host="localhost"):
-    """Start both origins on daemon threads. Returns (origin_a, origin_o, stop)."""
+def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_host="localhost", last_stage_ms=LAST_STAGE_MS):
+    """Start both origins on daemon threads. Returns (origin_a, origin_o, stop). `last_stage_ms`: when the last stage of the noise
+    starts after `load` (LAST_STAGE_MS; a lab that tests the walk makes it longer)."""
     state = State()
+    state.last_stage_ms = int(last_stage_ms)
     servers = [Site((bind, p), Handler, i, state) for i, p in enumerate(ports)]
     state.origins = ["http://%s:%d" % (host, s.server_address[1]) for host, s in zip((public_host, other_host), servers)]
     for s in servers:
@@ -705,3 +756,55 @@ def start(ports=(8321, 8322), bind="127.0.0.1", public_host="127.0.0.1", other_h
     global STATE
     STATE = state
     return state.origins[0], state.origins[1], stop
+
+
+# The server's record read back: did the walk leave a page before the noise of the page was done? ------------------------------------
+#: A navigation of a tab: a page, or a route that answers a form with a redirect. Not /download/ (the page stays where it is).
+NAVIGATION = re.compile(r"^/(?:$|\?|category/|article/|partner/|(?:search|signin|account|signout)(?:$|\?))")
+
+
+def _query(path):
+    return {k: v[0] for k, v in parse_qs(urlsplit(path).query).items()}
+
+
+def _name(page):
+    return "%s %s%s (step %s)" % (page["method"], "AO"[page["site"]], page["path"], page["step"])
+
+
+def pages_left_before_their_noise(records, origins):
+    """The pages of a walk whose noise had not reached the server when the walk left them, from the server's own record (`State.records`,
+    `origins` = `State.origins`). Returns one line per problem (none: every page was left after its noise).
+
+    A page is an HTML answer to a navigation. The walk leaves a page of the site's tab (origin A) at its next navigation request to A; the
+    one page of the other origin (the partner tab) is closed before the walk's next navigation of A; the last page is left when the walk
+    ends. Before that moment the last stage of the page must have arrived: its stylesheet `ld3` with the page as its referrer (a page asks
+    its own origin for it, A or O: a same-origin request, so the whole URL of the page), the `release?id=lp...` that ends its fetch chain
+    (the same referrer), and the woff2 of its five @font-face
+    rules. Those all have the font stylesheet as their referrer, so they are counted per stretch that ends where the walk leaves: every
+    page that starts in a stretch brings five."""
+    requests = sorted((r for r in records if r.get("ev") == "request"), key=lambda r: r["m_arrive"])
+    navigations = [r for r in requests if NAVIGATION.match(r["path"])]
+    pages = [r for r in navigations if r.get("status") == 200 and (r.get("ctype") or "").startswith("text/html")]
+    leaves = [r["m_arrive"] for r in navigations if r["site"] == 0]
+    resources = [(r, _query(r["path"])) for r in requests if r["path"].startswith("/r?")]
+    late_css = [r for r, q in resources if q.get("kind") == "css" and q.get("id") == "ld3"]
+    chain_ends = [r for r in requests if r["path"].startswith("/release?id=lp")]
+    fonts = [r["m_arrive"] for r, q in resources if q.get("kind") == "woff2"]
+    problems, stretches = [], {}
+    for page in pages:
+        i = bisect.bisect_right(leaves, page["m_arrive"])
+        left_at = leaves[i] if i < len(leaves) else float("inf")
+        referrer = origins[page["site"]] + page["path"]
+        if not any(r.get("referer") == referrer and page["m_arrive"] < r["m_arrive"] < left_at for r in late_css):
+            problems.append("%s: its stylesheet ld3 (referrer %s) had not arrived when the walk left the page" % (_name(page), referrer))
+        if not any(r.get("referer") == referrer and page["m_arrive"] < r["m_arrive"] < left_at for r in chain_ends):
+            problems.append("%s: the release that ends its fetch chain (referrer %s) had not arrived when the walk left the page" % (
+                _name(page), referrer))
+        stretches.setdefault(left_at, []).append(page)
+    for left_at, group in stretches.items():
+        expected = len(FONT_WEIGHTS) * len(group)
+        arrived = sum(1 for m in fonts if group[0]["m_arrive"] < m < left_at)
+        if arrived < expected:
+            problems.append("%s: %d woff2 had arrived when the walk left, %d expected (%d @font-face per page)" % (
+                ", ".join(_name(p) for p in group), arrived, expected, len(FONT_WEIGHTS)))
+    return problems

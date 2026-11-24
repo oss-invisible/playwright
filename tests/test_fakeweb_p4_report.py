@@ -231,12 +231,369 @@ def test_the_site_records_what_the_report_reads_and_the_tracer_keeps_what_the_cl
     assert profile_p4.Tracer(Context()).events is None      # without --trace nothing is kept
 
 
+# the pages the walk left before their noise was done (journey_site.pages_left_before_their_noise) --------------------------------------
+A, O = "http://127.0.0.1:1", "http://localhost:2"
+
+
+def _request(m, site, method, path, referer=None, status=200, ctype=None, step=1):
+    if ctype is None:
+        ctype = "text/html; charset=utf-8" if not path.startswith("/r?") else "text/css"
+    return {"ev": "request", "m_arrive": m, "site": site, "method": method, "path": path, "referer": referer, "status": status,
+            "ctype": ctype, "step": step}
+
+
+def _noise(m, site, path):
+    """The last stage of a page, its five woff2 and the release that ends its fetch chain, from moment `m` on."""
+    referrer = ([A, O][site]) + path      # a page asks its own origin for the stylesheet: same origin, the whole URL
+    return [_request(m, 0, "GET", "/r?kind=css&id=ld3", referrer)] + [
+        _request(m + 0.01 * (k + 1), 1, "GET", "/r?kind=woff2&id=font", O + "/r?kind=fontcss&id=fc", ctype="font/woff2") for k in range(5)] + [
+        _request(m + 0.07, site, "GET", "/release?id=lpq7x1z2", referrer, ctype="text/plain")]
+
+
+def test_a_walk_that_leaves_every_page_after_its_noise_has_no_problem():
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/")] + _noise(2, 0, "/") + [_request(3, 0, "GET", "/account", status=302, ctype=None)]
+               + [_request(4, 0, "GET", "/signin?x=1")] + _noise(5, 0, "/signin?x=1")
+               + [_request(6, 1, "GET", "/partner/1")] + _noise(7, 1, "/partner/1")
+               + [_request(7.5, 0, "GET", "/download/1.txt", ctype="text/plain; charset=utf-8")]
+               + [_request(8, 0, "POST", "/signin")] + _noise(9, 0, "/signin"))
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == []
+
+
+def test_a_page_left_before_its_late_stylesheet_and_its_fonts_is_found():
+    """Step 15 of the walk as the network oracle saw it: the home page is left (the request of /account) before its last stage."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/", step=15), _request(1.1, 0, "GET", "/account", step=15)] + _noise(1.2, 0, "/")
+               + _noise(2, 0, "/account"))
+    left = journey_site.pages_left_before_their_noise(records, [A, O])
+    assert len(left) == 3 and all("GET A/ (step 15)" in line for line in left)
+    assert "ld3" in left[0] and "release that ends its fetch chain" in left[1] and "0 woff2" in left[2]
+
+
+def test_a_late_stylesheet_of_another_page_does_not_count_for_the_page():
+    """The referrer tells the pages apart: the stylesheet of the page left behind arrives while the next page is open."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/article/2")] + _noise(2, 0, "/article/2")[1:] + [_request(3, 0, "GET", "/article/3")]
+               + _noise(4, 0, "/article/3") + [_request(4.5, 0, "GET", "/r?kind=css&id=ld3", A + "/article/2")])
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == [
+        "GET A/article/2 (step 1): its stylesheet ld3 (referrer %s/article/2) had not arrived when the walk left the page" % A]
+
+
+def test_a_page_left_before_the_release_that_ends_its_fetch_chain_is_found():
+    """The network oracle of the run 45088980743 (Windows, job 137413984973): the home page of step 15 had sent its last stage and its fonts, but
+    its chain of seven fetches had not yet sent `release?id=lp...` when /account was requested; the other run of the same engine had it."""
+    from fakeweb import journey_site
+
+    home = _noise(2, 0, "/")
+    records = ([_request(1, 0, "GET", "/")] + home[:-1] + [_request(3, 0, "GET", "/account")] + _noise(4, 0, "/account"))
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == [
+        "GET A/ (step 1): the release that ends its fetch chain (referrer %s/) had not arrived when the walk left the page" % A]
+    late = records + [_request(3.5, 0, "GET", "/release?id=lpq7x1z2", A + "/", ctype="text/plain")]      # after /account was asked for
+    assert len(journey_site.pages_left_before_their_noise(late, [A, O])) == 1
+
+
+def test_the_page_of_the_other_origin_counts_its_fonts_with_the_page_open_beside_it():
+    """The partner tab opens while the article is open: the stretch until the next navigation holds both pages, so ten woff2."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/article/2")] + _noise(2, 0, "/article/2") + [_request(3, 1, "GET", "/partner/2")]
+               + _noise(4, 1, "/partner/2")[:3] + _noise(4, 1, "/partner/2")[-1:] + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search"))
+    left = journey_site.pages_left_before_their_noise(records, [A, O])
+    assert left == ["GET A/article/2 (step 1), GET O/partner/2 (step 1): 7 woff2 had arrived when the walk left, 10 expected "
+                    "(5 @font-face per page)"]
+
+
+def test_the_page_of_the_other_origin_is_found_by_its_own_url_as_the_referrer_of_its_late_stylesheet():
+    """The partner page (origin O) loads its stylesheet ld3 from O itself: a same-origin request carries the whole URL of the page, as in
+    the run 45074928774 (job 137370233977: `GET /r?kind=css&id=ld3` with the referrer `O/partner/8`, 3 s after `load`). A partner tab
+    closed before that stage, and a stylesheet of another partner page, are not the page's."""
+    from fakeweb import journey_site
+
+    records = ([_request(1, 0, "GET", "/article/8")] + _noise(2, 0, "/article/8") + [_request(3, 1, "GET", "/partner/8")]
+               + _noise(4, 1, "/partner/8") + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search"))
+    assert journey_site.pages_left_before_their_noise(records, [A, O]) == []
+    closed_early = ([_request(1, 0, "GET", "/article/8")] + _noise(2, 0, "/article/8") + [_request(3, 1, "GET", "/partner/8")]
+                    + [_request(5, 0, "GET", "/search")] + _noise(6, 0, "/search") + _noise(7, 1, "/partner/9"))
+    left = journey_site.pages_left_before_their_noise(closed_early, [A, O])
+    assert left[0] == ("GET O/partner/8 (step 1): its stylesheet ld3 (referrer %s/partner/8) had not arrived when the walk left the "
+                       "page" % O)
+
+
+def test_the_site_keeps_the_referrer_and_the_type_of_every_answer_and_the_lab_can_make_the_last_stage_long():
+    import urllib.request
+
+    from fakeweb import journey_site
+
+    a, _o, stop = journey_site.start((0, 0), last_stage_ms=3000)
+    try:
+        page = urllib.request.urlopen(urllib.request.Request(a + "/", headers={"Referer": a + "/article/1"})).read().decode()
+        urllib.request.urlopen(a + "/r?kind=css&id=ld3").read()
+    finally:
+        stop()
+    home, css = [r for r in stop.state.records if r["ev"] == "request"]
+    assert (home["referer"], home["ctype"], css["referer"], css["ctype"]) == (a + "/article/1", "text/html; charset=utf-8", None, "text/css")
+    assert "LAST_MS=3000;" in page and "afterLoad(LAST_MS, () => {" in page and "/r?kind=css&id=ld3" in page
+    a, _o, stop = journey_site.start((0, 0))
+    try:
+        page = urllib.request.urlopen(a + "/").read().decode()
+    finally:
+        stop()
+    assert "LAST_MS=%d;" % journey_site.LAST_STAGE_MS in page and journey_site.LAST_STAGE_MS == 600
+
+
+# the walk leaves a page only once the page has declared its noise done (profile_p4.Journey.leave) -------------------------------------
+class _Page:
+    """A page of the walk without a browser: it logs what the walk does to it; `moves` maps an action to the URLs it lands on, in turn."""
+
+    def __init__(self, log, url, moves=None):
+        self.log, self.url, self.moves = log, url, {k: list(v) for k, v in (moves or {}).items()}
+        page = self
+
+        class Keyboard:
+            def press(self, key):
+                page.act("press " + key)
+
+            def type(self, text, delay=0):
+                page.log.append("type")
+
+        self.keyboard = Keyboard()
+
+    def act(self, what):
+        self.log.append(what)
+        if self.moves.get(what):
+            self.url = self.moves[what].pop(0)
+
+    def wait_for_function(self, expression, timeout=None):
+        self.log.append(("wait", expression, timeout))
+
+    def locator(self, selector):
+        page = self
+
+        class Locator:
+            first = property(lambda self: self)
+
+            def hover(self):
+                page.log.append("hover " + selector)
+
+            def click(self):
+                page.act("click " + selector)
+
+            def count(self):
+                return 3
+
+        return Locator()
+
+    def click(self, selector):
+        self.act("click " + selector)
+
+    def expect_navigation(self, **expect):
+        page = self
+
+        class Navigation:
+            def __enter__(self):
+                page.log.append("expect")
+
+            def __exit__(self, *exc):
+                page.log.append("navigated")
+                return False
+
+        return Navigation()
+
+    def go_back(self, wait_until=None, timeout=None):
+        self.act("back")
+
+    def go_forward(self, wait_until=None, timeout=None):
+        self.act("forward")
+
+    def wait_for_load_state(self, state, timeout=None):
+        self.log.append("load " + state)
+
+    def wait_for_selector(self, selector):
+        self.log.append("selector " + selector)
+
+    def inner_text(self, selector):
+        return "quiet morning" if selector == "#qshow" else "alice"
+
+    def evaluate(self, expression):
+        return 1        # window.__keep: the page did not navigate where the walk says it must not
+
+    def close(self):
+        self.log.append("close")
+
+
+def _waited_before(log, what):
+    """Every `what` of the log comes right after a wait for the page's declaration, with a deadline of at least 30 s."""
+    from fakeweb import profile_p4
+
+    at = [i for i, entry in enumerate(log) if entry == what]
+    assert at, "the walk did not %s" % what
+    return all(i > 0 and log[i - 1][:2] == ("wait", profile_p4.NOISE_DONE) and log[i - 1][2] >= 30000 for i in at)
+
+
+def test_step_15_leaves_the_home_page_only_once_its_noise_is_done():
+    """The case the network oracle saw: from the account page the logo opens the home page, and Account is clicked on it at once."""
+    from fakeweb import profile_p4
+
+    log = []
+    page = _Page(log, A + "/account", {"click #logo": [A + "/"], "click #nav-account": [A + "/account"]})
+    profile_p4.Journey(None, page, A, O).s15_logo_account()
+    assert [e if isinstance(e, str) else e[0] for e in log] == ["wait", "expect", "click #logo", "navigated",
+                                                               "wait", "expect", "click #nav-account", "navigated"]
+    assert _waited_before(log, "expect")
+
+
+def test_the_keys_that_send_a_form_leave_the_page_only_once_its_noise_is_done():
+    """Step 14: Sign in, then Enter twice (the wrong password, then the right one); step 12: Enter on the search page."""
+    from fakeweb import profile_p4
+
+    log = []
+    page = _Page(log, A + "/", {"click #nav-signin": [A + "/signin"], "press Enter": [A + "/signin", A + "/account"]})
+    profile_p4.Journey(None, page, A, O).s14_signin()
+    assert [e for e in log if e == "press Enter"] == ["press Enter"] * 2
+    assert _waited_before(log, "expect")
+    log = []
+    page = _Page(log, A + "/", {"click #nav-search": [A + "/search"], "press Enter": [A + "/search?q=quiet+morning"]})
+    profile_p4.Journey(None, page, A, O).s12_search()
+    assert log.count("press Enter") == 1 and _waited_before(log, "expect")
+
+
+def test_back_and_forward_leave_the_page_only_once_its_noise_is_done():
+    from fakeweb import profile_p4
+
+    log = []
+    page = _Page(log, A + "/article/3", {"back": [A + "/article/2"], "forward": [A + "/article/3"]})
+    journey = profile_p4.Journey(None, page, A, O)
+    journey.s4_back()
+    assert _waited_before(log, "back")
+    assert journey.history_step("forward") and _waited_before(log, "forward")
+
+
+def test_the_tab_and_the_last_page_are_left_only_once_their_noise_is_done(monkeypatch):
+    """Step 10 closes the partner tab; when the walk ends the context closes the page it is on."""
+    from fakeweb import journey_site, profile_p4
+
+    log = []
+    tab = _Page(log, O + "/partner/2")
+    journey = profile_p4.Journey(None, _Page([], A + "/article/2"), A, O)
+    journey.leave(tab.close, page=tab)
+    assert _waited_before(log, "close")
+
+    class Walk(profile_p4.Journey):
+        def s_only(self):
+            self.page.log.append("step")
+            return self.page, None
+
+    class Tracer:
+        events, step = None, 0
+
+        def snapshot(self):
+            return []
+
+    log = []
+    page = _Page(log, A + "/")
+    walk = Walk(None, page, A, O)
+    walk.ctx = type("Context", (), {"pages": [page]})()
+    monkeypatch.setattr(profile_p4, "STEPS", [("the only step", "s_only")])
+    monkeypatch.setattr(journey_site, "STATE", journey_site.State())
+    records = profile_p4.run_round(walk, Tracer(), 1, 30000)
+    assert records[0]["ok"] and log[0] == "step" and log[-1][:2] == ("wait", profile_p4.NOISE_DONE)
+
+
+def test_step_10_closes_the_partner_tab_only_once_its_noise_is_done():
+    """The cleanup step 10 returns closes the tab the click opened, and only after the wait for the tab's own declaration (the last stage of
+    the partner page comes seconds after `load`: a tab closed at once never sends its late stylesheet)."""
+    from fakeweb import profile_p4
+
+    log = []
+
+    class Tab(_Page):
+        def inner_text(self, selector):
+            return "Partner 8 (other origin)"
+
+        def wait_for_selector(self, selector):
+            self.log.append("selector " + selector)
+
+    tab = Tab(log, O + "/partner/8")
+
+    class Context:
+        pages = [object(), tab]
+
+        def expect_page(self):
+            class Opened:
+                value = tab
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return Opened()
+
+    journey = profile_p4.Journey(Context(), _Page([], A + "/article/8"), A, O)
+    seen, cleanup = journey.s10_blank_tab()
+    assert seen is tab and "close" not in log
+    cleanup()
+    assert log[-1] == "close" and _waited_before(log, "close")
+
+
+def test_every_navigation_back_forward_and_close_of_the_walk_goes_through_its_one_point_of_leaving():
+    """Read from the source: the walk waits for a navigation only in Journey.navigate, presses back or forward only in Journey._press
+    (and in the popstate step, which stays on its document), opens an address only to open the first page, never reloads, and closes
+    a page only through Journey.leave."""
+    import ast
+
+    from fakeweb import profile_p4
+
+    tree = ast.parse(Path(profile_p4.__file__).read_text(encoding="utf-8"))
+    journey = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Journey")
+    allowed = {"expect_navigation": {"navigate"}, "go_back": {"_press", "s8_filter_popstate"}, "go_forward": {"_press"},
+               "goto": {"s1_open_home"}, "reload": set()}      # goto: the first page, from a blank one
+    wrong = []
+    for method in (n for n in journey.body if isinstance(n, ast.FunctionDef)):
+        passed_to_leave = {id(a) for c in ast.walk(method) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                           and c.func.attr == "leave" for a in c.args}
+        for node in ast.walk(method):
+            if isinstance(node, ast.Attribute) and node.attr in allowed and method.name not in allowed[node.attr]:
+                wrong.append("%s: %s" % (method.name, node.attr))
+            if (isinstance(node, ast.Attribute) and node.attr == "close" and id(node) not in passed_to_leave
+                    and not (isinstance(node.value, ast.Name) and node.value.id == "os")):      # os.close: a file, not a page
+                wrong.append("%s: close not through leave" % method.name)
+    assert wrong == []
+
+
+def test_a_page_of_the_site_declares_when_its_noise_is_done():
+    """With the noise, once the font stage and the last stage have loaded and the fetch chain and the three streams have sent their release
+    (window.__noiseDone); without it, at once. A held request of a parked page is not part of it."""
+    import urllib.request
+
+    from fakeweb import journey_site
+
+    a, o, stop = journey_site.start((0, 0))
+    try:
+        noisy, partner = (urllib.request.urlopen(u).read().decode() for u in (a + "/", o + "/partner/2"))
+        quiet = urllib.request.urlopen(a + "/?noise=0").read().decode()
+    finally:
+        stop()
+    for page in (noisy, partner):
+        assert "const noiseDone = () => { if (fontsDone && lastDone && chainDone && streamsOpen === 0) window.__noiseDone = true; };" in page
+        assert "rel('lp' + tok).then(() => { chainDone = true; noiseDone(); })" in page
+        assert "return rel('stream-ab' + i); }).catch(noop)" in page and "streamsOpen--; noiseDone();" in page
+        assert page.count("l.addEventListener('load', ") == 2 and page.count("l.addEventListener('error', ") == 2
+        assert "document.fonts.ready.then(() => { fontsDone = true; noiseDone(); })" in page
+        assert "const last = () => { lastDone = true; noiseDone(); };" in page
+    assert "<script>window.__noiseDone = true;</script>" in quiet and "fontsDone" not in quiet
+
+
 # the workflow ------------------------------------------------------------------------------------------------------------
 WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb.yml").read_text(encoding="utf-8")
 
 
 def test_the_workflow_has_four_legs_and_one_verdict_job():
-    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses):", WORKFLOW, re.MULTILINE)) == 3     # core-on-index, walk, verdict
+    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses):", WORKFLOW, re.MULTILINE)) == 4     # core-on-index, linux-deps-fakeweb, walk, verdict
     assert WORKFLOW.count("{ profile: ") == 4
     for leg in ("p2, os: linux", "p2, os: windows", "p4, os: linux", "p4, os: windows"):
         assert "profile: " + leg in WORKFLOW

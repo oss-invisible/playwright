@@ -20,12 +20,13 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 GATE = "tests/gates/e2e_clock_exceptions.json"
+WIRE_GATE = "tests/gates/wire_method_debt.json"
 
 
-def _main_document():
+def _main_document(gate: str = GATE):
     """The list of main, or None when it has none; the reason of the miss otherwise."""
     for ref in ("origin/main", "main"):
-        shown = subprocess.run(["git", "show", "%s:%s" % (ref, GATE)], cwd=ROOT, capture_output=True, text=True)
+        shown = subprocess.run(["git", "show", "%s:%s" % (ref, gate)], cwd=ROOT, capture_output=True, text=True)
         if shown.returncode == 0:
             return json.loads(shown.stdout), ref
         if subprocess.run(["git", "cat-file", "-e", ref], cwd=ROOT, capture_output=True).returncode == 0:
@@ -50,3 +51,24 @@ def test_the_debt_does_not_grow_against_main():
     assert grown == [], (
         "the debt has occurrences that %s does not have: a test that was clean on main now waits on a clock, shares a port or reaches the world. Correct it; "
         "the debt only shrinks. %s" % (ref, grown))
+
+
+def test_the_wire_method_debt_does_not_grow_against_main():
+    """The budget of the wire methods that the client sends and the server neither serves nor refuses (``tests/gates/wire_method_debt.json``, compared with the
+    code by ``test_every_wire_method_is_served_or_refused.py``) may only shrink: it can be changed together with the test, so it is read from MAIN, and main is only
+    there when the checkout has it (a developer without it skips, a CI run without it is red: a comparison that compares nothing is not a green)."""
+    document, ref = _main_document(WIRE_GATE)
+    if document == "no ref":
+        if os.environ.get("GITHUB_ACTIONS"):
+            pytest.fail("origin/main is not in this checkout, so the wire-method debt cannot be compared with it: fetch it (git fetch origin main) before the tests")
+        pytest.skip("no origin/main in this checkout: the wire-method debt is not compared with main (CI does)")
+    if document is None:
+        return      # main has no budget: this is the change that brings it, there is nothing to grow from
+    mine = json.loads((ROOT / WIRE_GATE).read_text(encoding="utf-8"))
+    debt = lambda doc: {(i["channel"], i["method"]) for i in doc["debt"]}
+    partial = lambda doc: {(i["channel"], i["method"], i["detail"]) for i in doc["partial"]}
+    grown = sorted(debt(mine) - debt(document))
+    grown_partial = sorted(partial(mine) - partial(document))
+    assert grown == [] and grown_partial == [], (
+        "the wire-method budget has entries that %s does not have: a method the client sends is now neither served nor refused. Serve it or refuse it by name in "
+        "perimeter.py; the budget only shrinks. debt: %s; partial: %s" % (ref, grown, grown_partial))

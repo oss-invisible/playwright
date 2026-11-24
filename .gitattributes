@@ -13,3 +13,11 @@
 # Linux one. The gate folds CRLF vs LF deliberately, but there is no reason to
 # make it do that work.
 PUBLISHED.json text eol=lf
+
+# The persona seeds are compared byte for byte with their canonical rendering (tests/test_persona_cover.py): LF on every checkout.
+ci/persona-seeds.json text eol=lf
+
+# The wire-method budget is compared with what `dump()` writes, byte for byte
+# (tests/test_every_wire_method_is_served_or_refused.py): a Windows runner checks
+# out with autocrlf and would hand the test CRLF that nobody wrote.
+tests/gates/wire_method_debt.json text eol=lf

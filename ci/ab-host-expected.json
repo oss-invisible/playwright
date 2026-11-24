@@ -1,0 +1,14 @@
+{
+  "format": "ab-host-expected/1",
+  "differences": [
+    {
+      "id": "gfxtest-69",
+      "os": "linux",
+      "category": "proc",
+      "name": "gfxtest",
+      "published": "present",
+      "candidate": "absent",
+      "reason": "the 69 no longer spawns the graphics probe gfxtest (GFX_PROBE_BINARY, widget/gtk/GfxInfo.cpp:55; commit 0e896e4ee1, the probe never reads the host); the paths only that process touched go with it"
+    }
+  ]
+}

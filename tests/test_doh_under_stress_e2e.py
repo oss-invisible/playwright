@@ -112,6 +112,7 @@ def _only_the_doh_road_was_used(doh, gw, watcher):
         % (", ".join(DOH_ADDRESSES), watcher.describe()))
 
 
+@pytest.mark.wall_clock       # the DoH answers 2 s late and the product gives up a lookup on its own time budget: a verdict that reads the wall clock
 def test_a_slow_doh_still_resolves_the_name_of_a_proxied_context(firefox_binary, doh, pages, gateway, watcher,
                                                                  record_property):
     """`slow-a.test` is known only to the FakeDoh, which answers it 2 s after the query. The page of a context with a

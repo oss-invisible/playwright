@@ -23,6 +23,11 @@ THE RULES (a stable name each; ``CLASS`` is the letter of the audit of the e2e t
   time a healthy run is allowed, and a loaded runner takes longer than a developer's machine: 30 s is the one the whole suite uses (the unit is read from the callee:
   milliseconds for the Playwright API, seconds for the standard library and for the helpers of ``tests/``). A wait for something that must NOT happen is accepted by its shape
   (inside ``pytest.raises``, under a ``try`` that swallows the timeout, or a limit that is NAMED ``NEGATIVE_...``); any other is a reviewed ``entries`` item with its reason.
+* ``lab-delay`` (A): an e2e test that gives a lab gateway or lab server a delay (``Gateway(..., rtt_ms=N)``, ``Chain(rtt_ms=N)``, ``first_connection_delay=N``, ``doh.delay_names[...] = N``,
+  ``sites.route(..., delay=N)``, ``_serve(..., delay=N)``, a test parameter named ``rtt_ms``, or a fixture of the file that does) and is not marked ``wall_clock``. The delay is a sleep or a
+  timer of the lab's own threads, and what the test waits for is decided by the product with a time budget (the core's UDP measurement, a DoH timeout): on a runner with no CPU left the
+  threads are scheduled late and the answer comes after the budget (run 45058944650). The test belongs to the ``wall_clock`` lane (serial, the whole machine). A delay of a literal 0 is none;
+  a value the test computes counts until it is shown to be 0. One occurrence per test.
 * ``egress`` (D): the conftest has no autouse session fixture that declares the exit of the lab (tests/_lab_egress.py), so a launch asks three services of the internet.
 
 WHAT IS ACCEPTED WITHOUT A LIST, because it is recognised by its shape: a pause that is the step of a poll with a deadline (a ``while``/``for`` that compares with a clock
@@ -45,7 +50,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 TESTS = Path(__file__).resolve().parent
 
 #: The rule -> the class of the audit.
-CLASS = {"sleep": "A", "js-timer": "A", "bound": "B", "port": "C", "env": "C", "net": "D", "egress": "D", "count": "E", "timeout": "F"}
+CLASS = {"sleep": "A", "js-timer": "A", "lab-delay": "A", "bound": "B", "port": "C", "env": "C", "net": "D", "egress": "D", "count": "E", "timeout": "F"}
 RULES = tuple(CLASS)
 
 #: The files that say what is forbidden (their own patterns would be found) and the files of the round after a publication (``net`` is theirs by design).
@@ -608,6 +613,98 @@ def _is_e2e_file(tree: ast.Module) -> bool:
                for sub in ast.walk(tree))
 
 
+#: The delay knobs of the lab servers: the keyword of a call -> the callees it is a delay of (None: any). ``delay`` alone is too common a word (``keyboard.type(delay=120)``): it is a delay
+#: of the lab only on the two helpers that serve a late page.
+LAB_DELAY_KEYWORDS: Dict[str, Optional[Set[str]]] = {"rtt_ms": None, "first_connection_delay": None, "delay": {"route", "_serve"}}
+#: A test parameter that is one of those knobs: the distance a ``parametrize`` gives the gateway.
+LAB_DELAY_PARAMETERS = {"rtt_ms", "first_connection_delay"}
+#: The tables of the lab servers that a test fills with a delay by name (``doh.delay_names["slow.test"] = 2.0``).
+LAB_DELAY_TABLES = {"delay_names"}
+
+
+def _is_zero(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and (node.value is None or node.value is False or (isinstance(node.value, (int, float)) and node.value == 0))
+
+
+def _first_lab_delay(function: ast.AST) -> Optional[ast.AST]:
+    """The first node in the body of ``function`` that gives a lab server a delay (see :data:`LAB_DELAY_KEYWORDS`), or None."""
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call):
+            callee = _dotted(node.func).rsplit(".", 1)[-1]
+            for keyword in node.keywords:
+                where = LAB_DELAY_KEYWORDS.get(keyword.arg or "", False)
+                if where is not False and (where is None or callee in where) and not _is_zero(keyword.value):
+                    return node
+        elif isinstance(node, (ast.Assign, ast.AugAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                if isinstance(target, ast.Subscript) and _dotted(target.value).rsplit(".", 1)[-1] in LAB_DELAY_TABLES and not _is_zero(node.value):
+                    return node
+    return None
+
+
+def _lab_delays(tree: ast.Module) -> List[Tuple[str, int, str]]:
+    """``(scope, line, text)`` of each e2e test that gives a lab server a delay and does not carry ``wall_clock``: in its own body, through a parameter named like a knob, or through a
+    fixture of the same file (``usefixtures`` and the fixtures that fixture takes included)."""
+    module_marks: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
+            module_marks |= _marks(node.value)
+    functions: List[Tuple[str, ast.AST, Set[str]]] = []      # qualified name, node, the marks of its classes and module
+
+    def collect(body: List[ast.stmt], prefix: str, inherited: Set[str]) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append((prefix + node.name, node, inherited))
+            elif isinstance(node, ast.ClassDef):
+                marks = set(inherited)
+                for decorator in node.decorator_list:
+                    marks |= _marks(decorator)
+                for stmt in node.body:
+                    if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets):
+                        marks |= _marks(stmt.value)
+                collect(node.body, prefix + node.name + ".", marks)
+
+    collect(tree.body, "", module_marks)
+
+    def is_a_fixture(node: ast.AST) -> bool:
+        return any(_dotted(d.func if isinstance(d, ast.Call) else d).rsplit(".", 1)[-1] == "fixture" for d in node.decorator_list)  # type: ignore[attr-defined]
+
+    def parameters(node: ast.AST) -> List[str]:
+        arguments = node.args  # type: ignore[attr-defined]
+        return [a.arg for a in list(arguments.posonlyargs) + list(arguments.args) + list(arguments.kwonlyargs)]
+
+    delaying = {name.rsplit(".", 1)[-1] for name, node, _ in functions if is_a_fixture(node) and _first_lab_delay(node) is not None}
+    grew = True
+    while grew:                                                # a fixture that takes a delaying fixture delays too
+        grew = False
+        for name, node, _ in functions:
+            short = name.rsplit(".", 1)[-1]
+            if is_a_fixture(node) and short not in delaying and delaying & set(parameters(node)):
+                delaying.add(short)
+                grew = True
+    out: List[Tuple[str, int, str]] = []
+    for name, node, inherited in functions:
+        if not name.rsplit(".", 1)[-1].startswith("test_") or is_a_fixture(node):
+            continue
+        marks = set(inherited)
+        for decorator in node.decorator_list:  # type: ignore[attr-defined]
+            marks |= _marks(decorator)
+        if "e2e" not in marks or "wall_clock" in marks:
+            continue
+        used = set(parameters(node))
+        for decorator in node.decorator_list:  # type: ignore[attr-defined]
+            if isinstance(decorator, ast.Call) and _dotted(decorator.func).rsplit(".", 1)[-1] == "usefixtures":
+                used |= {a.value for a in decorator.args if isinstance(a, ast.Constant) and isinstance(a.value, str)}
+        own = _first_lab_delay(node)
+        if own is not None:
+            out.append((name, getattr(own, "lineno", node.lineno), ast.unparse(own).splitlines()[0][:80]))
+        elif used & LAB_DELAY_PARAMETERS:
+            out.append((name, node.lineno, "parameter " + sorted(used & LAB_DELAY_PARAMETERS)[0]))
+        elif used & delaying:
+            out.append((name, node.lineno, "fixture " + sorted(used & delaying)[0]))
+    return out
+
+
 def analyze(source: str, file: str, *, force: bool = False) -> List[Violation]:
     """The occurrences of ``source`` (the content of ``tests/<file>``). A test file with no ``e2e`` marker is not read, unless ``force`` (the helpers always are)."""
     tree = ast.parse(source)
@@ -615,6 +712,8 @@ def analyze(source: str, file: str, *, force: bool = False) -> List[Violation]:
     if not e2e or file in SELF:
         return []
     reader = _Reader(file, tree, e2e)
+    if file.startswith("test_"):
+        reader.found.extend((scope, "lab-delay", line, text) for scope, line, text in _lab_delays(tree))
     reader.found.sort(key=lambda item: item[2])
     counts: Dict[Tuple[str, str], int] = {}
     out: List[Violation] = []
@@ -684,6 +783,7 @@ DEBT_REASON = {
     "net": "A real host in a gate is a third party: serve the page and the answer from the test's own server.",
     "count": "The number of processes is not something the product promises: count by site name or against the pool the product keeps (tests/_processes.py, tests/_waits.py).",
     "timeout": "A deadline under 30 s on a wait for something that must happen is a verdict on the machine: a loaded runner is slower than the one it was written on. Give it 30 s (or the deadline the product itself has), and read the result after it.",
+    "lab-delay": "A delay given to a lab gateway or server, and a wait for what the product decides with a time budget, read the wall clock: mark the test wall_clock (the serial lane, the whole machine), or take the delay out of the verdict.",
     "egress": "The launch asks three services of the internet where it leaves from: declare the exit (tests/_lab_egress.py).",
 }
 

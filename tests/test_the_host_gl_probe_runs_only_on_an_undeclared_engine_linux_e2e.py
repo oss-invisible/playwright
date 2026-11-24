@@ -21,6 +21,12 @@ of the tree to the log, because the process is stopped AT the call. Every exec o
 sampler must cover the window from the launch to the page's WebGL context, and the log must hold the browser's own exec; otherwise the test is red with
 the problem (``reconcile``), never green on a miss. The failure message lists every process seen (times from the launch, names, pid, ppid, command line)
 and every exec strace wrote.
+
+When it is born (with the engine off). Mozilla fires the probe at startup, so that it has all of the startup before the first ``GfxInfo::GetData`` waits for
+it (4 s: a probe that was not done failed WebGL for the session). From firefox-69 the engine fires it right after the profile's preferences are read
+(``StealthFireHostGLProbeIfStock``, the hook in nsAppRunner), because the early fire in ``XRE_mainStartup`` is before them and refuses. So the probe's
+first sample must come BEFORE the page's first goto (``Seen.first`` is the clock of the first sample that held the process, never earlier than its birth,
+so first < the clock just before the goto proves the birth was before it); a probe started only by the page's own request (GetData, at WebGL) is red.
 """
 from __future__ import annotations
 
@@ -49,7 +55,7 @@ HAS_WEBGL = "() => document.createElement('canvas').getContext('webgl') !== null
 
 def _launch(firefox_binary, work, extra_prefs):
     """One launch under the strace stand-in, sampled from before it to after the browser has closed. Returns
-    ``(glx_probes, problems, webgl, report, parents)``."""
+    ``(glx_probes, problems, webgl, report, parents, goto_at)``; ``goto_at`` is the sampler's clock just before the page's first goto."""
     from invisible_playwright import InvisiblePlaywright
 
     work.mkdir(parents=True)
@@ -58,10 +64,11 @@ def _launch(firefox_binary, work, extra_prefs):
     stand_in = _stand_in(firefox_binary, work / "engine", log, pidfile, syscalls=TRACE)
     sampler = TreeSampler(os.getpid()).start()
     launched_at = time.monotonic()
-    ready_at, webgl = None, None
+    ready_at, goto_at, webgl = None, None, None
     try:
         with InvisiblePlaywright(seed=SEED, binary_path=stand_in, headless=True, extra_prefs=extra_prefs) as browser:
             page = browser.new_page()
+            goto_at = time.monotonic()
             page.goto("about:blank")
             webgl = page.evaluate(HAS_WEBGL)
             ready_at = time.monotonic()
@@ -73,20 +80,23 @@ def _launch(firefox_binary, work, extra_prefs):
     probes, problems = reconcile(seen, first, last, error, execs, real, launched_at, ready_at)
     report = "%d samples\n%s" % (sampler.samples, describe(seen, execs, launched_at))
     glx = [(e, seen[e.pid]) for e in probes if is_glx_probe(e) and e.pid in seen]
-    return glx, problems, webgl, report, browser_parents(execs, real)
+    return glx, problems, webgl, report, browser_parents(execs, real), goto_at
 
 
 def _check(firefox_binary, tmp_path, extra_prefs, want_probe):
     if shutil.which("strace") is None:
         pytest.fail("needs strace (apt install strace): without it no absence can be proved", pytrace=False)
     _require_strace_can_trace(tmp_path)
-    glx, problems, webgl, report, parents = _launch(firefox_binary, tmp_path / "launch", extra_prefs)
+    glx, problems, webgl, report, parents, goto_at = _launch(firefox_binary, tmp_path / "launch", extra_prefs)
     assert problems == [], "the observation cannot be trusted:\n%s\n%s" % ("\n".join(problems), report)
     assert webgl is True, "getContext('webgl') is null\n" + report
     if want_probe:
         assert glx, "no GLX probe (gfxtest glx) below the browser's parent %s\n%s" % (parents, report)
         strays = [(e.pid, s.ppid) for e, s in glx if s.ppid not in parents]
         assert not strays, "a GLX probe that is not a child of the browser's parent %s: %s\n%s" % (parents, strays, report)
+        late = [(e.pid, round(s.first - goto_at, 3)) for e, s in glx if not s.first < goto_at]
+        assert not late, ("a GLX probe born after the page's first goto (pid, seconds after it): %s: it started with the page's request for GfxInfo, not "
+                          "at startup\n%s" % (late, report))
     else:
         assert not glx, "the GLX probe ran on a declared engine: %s\n%s" % ([e.pid for e, _s in glx], report)
 

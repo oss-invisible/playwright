@@ -53,9 +53,20 @@ jobs:
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
+  # The Ubuntu packages of the Linux legs, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a leg.
+  linux-deps-fakeweb:
+    name: linux-deps-fakeweb
+    needs: core-on-index
+    if: needs.core-on-index.outputs.available == 'true'
+    uses: ./.github/workflows/linux-deps.yml
+    with:
+      name: fakeweb
+      packages: xvfb
+      playwright_wrapper_ref: ${{ github.sha }}
+
   walk:
     name: fakeweb ${{ matrix.profile }} (${{ matrix.os }})
-    needs: core-on-index
+    needs: [core-on-index, linux-deps-fakeweb]
     if: needs.core-on-index.outputs.available == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -80,12 +91,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
-      - name: System deps (xvfb + Firefox runtime libs)
+      - name: The Linux packages (the run's linux-deps-fakeweb job, no mirror)
+        if: matrix.os == 'linux'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.linux-deps-fakeweb.outputs.artifact }}
+          path: /tmp/linux-deps
+      - name: System deps (xvfb + Firefox runtime libs; the repository of the linux-deps-fakeweb job)
         if: matrix.os == 'linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo "$(which python)" -m playwright install-deps firefox
+          set -euo pipefail
+          # The run's linux-deps repository and nothing else: apt reads only its sources list and lists folder, the files are already in apt's archives,
+          # and the roots are installed by name with --no-download: a package the repository does not hold is named here and red, never fetched.
+          read -r OS VER < /tmp/linux-deps/image.txt
+          echo "the repository was read on $OS $VER; this runner is $ImageOS $ImageVersion"
+          sudo mkdir -p /tmp/linux-deps-apt/lists/partial /tmp/linux-deps-apt/parts
+          echo "deb [trusted=yes] file:/tmp/linux-deps ./" | sudo tee /tmp/linux-deps-apt/sources.list >/dev/null
+          APT="-o Dir::Etc::SourceList=/tmp/linux-deps-apt/sources.list -o Dir::Etc::SourceParts=/tmp/linux-deps-apt/parts -o Dir::State::Lists=/tmp/linux-deps-apt/lists -o Acquire::Languages=none"
+          sudo apt-get $APT update
+          sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
+          sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
       - name: Playwright's own Firefox (the control)
         run: python -m playwright install firefox
       # The security state is a ready directory of the repository (ci/security-state/, a result with no data, the sha256 in ci/security-state.pin.json): with

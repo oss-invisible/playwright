@@ -53,6 +53,10 @@ import pytest
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(sys.platform != "win32", reason="the launcher process exists only on Windows"),
+    # In the serial lane: copying the engine tree between two volumes and launching from it starves the browsers of the
+    # parallel pass. In run 45033639069 the whole runner went 3 to 9 times slower while it ran (51.5 s against a median of
+    # 6.3 s), and a neighbour's Runtime.evaluate got no response in 30 s. Its own verdict reads no duration.
+    pytest.mark.wall_clock,
 ]
 
 LAUNCHER_KEY = r"Software\Mozilla\Firefox\Launcher"

@@ -1,10 +1,11 @@
 """The workflows that run the wrapper's tests launch with the GeoIP database of ci/geoip.json; the release alone looks at the real one.
 
-Without STEALTHFOX_GEOIP_MMDB the core asks GitHub which database is the latest on every call (run 43211837926). tests.yml and e2e.yml (its Linux run and its Windows parts) make
+Without STEALTHFOX_GEOIP_MMDB the core asks GitHub which database is the latest on every call (run 43211837926). tests.yml and e2e.yml (its Linux parts and its Windows parts) make
 the database (scripts/ci_lab_geoip.py: the same bytes every run, no download) BEFORE the step that runs pytest. user-install.yml proves the installation a user
 gets and is left as it is. publish.yml is the release: it runs the three checks on the REAL database (scripts/ci_real_geoip_check.py) before it uploads, and
 nothing else touches it.
 """
+import re
 from pathlib import Path
 
 import pytest
@@ -16,22 +17,31 @@ BUILD = "scripts/ci_lab_geoip.py build"
 REAL = "scripts/ci_real_geoip_check.py"
 RUNS_PYTEST = {
     "tests.yml": "      - name: Run pytest\n",
-    "e2e.yml": "      - name: Run the full e2e suite under a virtual display, without the root ones\n",
+    "e2e.yml": "      - name: Run this part of the e2e under a virtual display, without the root ones\n",
     "e2e.yml#windows": "      - name: Run this part of the e2e\n",
+    "e2e.yml#network": "      - name: Run the network oracle's A/A\n",
+    "e2e.yml#network-windows": "      - name: Run the network oracle's A/A\n",
+    "e2e.yml#host": "      - name: Run the host oracle's A/A\n",
+    "e2e.yml#host-windows": "      - name: Run the host oracle's A/A\n",
+    "e2e.yml#page": "      - name: Run the page oracle's A/A\n",
+    "e2e.yml#page-windows": "      - name: Run the page oracle's A/A\n",
 }
 
 
+JOBS = {"e2e.yml": "e2e-linux", "e2e.yml#windows": "e2e-windows", "e2e.yml#control-a": "e2e-windows-control-a", "e2e.yml#network": "e2e-network",
+        "e2e.yml#network-windows": "e2e-network-windows", "e2e.yml#host": "e2e-host", "e2e.yml#host-windows": "e2e-host-windows",
+        "e2e.yml#page": "e2e-page", "e2e.yml#page-windows": "e2e-page-windows"}
+
+
 def _scope(name):
-    """The text of one workflow, or of one leg of it: `e2e.yml` is its Linux job, `e2e.yml#windows` its Windows parts."""
+    """The text of one workflow, or of one leg of it: `e2e.yml` is its Linux parts and their check, `e2e.yml#windows` its Windows parts."""
     file, _, leg = name.partition("#")
     text = (WORKFLOWS / file).read_text(encoding="utf-8")
     if file != "e2e.yml":
         return text
-    windows = text.index("\n  e2e-windows:\n")
-    if leg == "windows":
-        return text[windows:]
-    ends = [i for i in (text.find("\n  e2e-windows-control-a:\n"), windows) if i >= 0]
-    return text[:min(ends)]
+    start = text.index("\n  %s:\n" % JOBS[name])
+    following = re.search(r"\n  [A-Za-z0-9_-]+:[ ]*\n", text[start + 1:])
+    return text[start:start + 1 + following.start()] if following else text[start:]
 
 
 @pytest.mark.parametrize("name, pytest_step", sorted(RUNS_PYTEST.items()))
