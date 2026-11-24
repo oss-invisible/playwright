@@ -976,23 +976,40 @@ def test_how_many_pingsenders_a_launch_has_is_not_judged_it_is_listed():
     a = six_launches("A", {i: {ping: 3} for i in range(6)})
     for n, where in ((0, {}), (1, {1: {ping: 1}}), (2, {1: {ping: 2}, 4: {ping: 2}}), (4, {0: {ping: 4}, 5: {ping: 4}})):
         report = host.judge(a, six_launches("B", where), a_a=True, floors=SMALL)
-        assert report["verdict"] == ("red" if n == 0 else "green"), (n, report["problems"][:2])
-        if n:
-            (entry,) = report["not_judged"]["kinds"]
-            assert entry["kind"] == ping and entry["A"]["measured"] == [6, 6] and entry["B"]["measured"][1] == 6 and 0 < entry["B"]["measured"][0] < 6, n
+        assert report["verdict"] == "green", (n, report["problems"][:2])
+        (entry,) = report["not_judged"]["kinds"]
+        assert entry["kind"] == ping and entry["A"]["measured"] == [6, 6] and entry["B"]["measured"][1] == 6 and entry["B"]["measured"][0] < 6, n
     pings = with_pingsenders(footprint(), 3)
     assert judge(with_pingsenders(footprint(), 3), with_pingsenders(footprint("again"), 3), a_a=True)["verdict"] == "green"
     report = judge(pings, footprint("again"), a_a=True)
-    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc." + ping}, "in every launch of one engine and in none of the other's: the rule of every kind"
+    assert report["verdict"] == "green" and report["differences"] == [], "in every launch of one engine and in none of the other's: listed, never red (listed_not_judged_kind)"
+    assert [e["kind"] for e in report["not_judged"]["kinds"]] == [ping]
 
 
-def test_a_pingsender_kind_in_six_launches_of_six_of_one_engine_and_in_none_of_the_other_is_red_and_one_in_some_launches_is_listed():
+def test_a_pingsender_kind_in_six_launches_of_six_of_one_engine_and_in_none_of_the_other_is_listed_not_red_like_one_in_some_launches():
     ping, child = host.PINGSENDER_KIND, "socket<-pingsender"
     both = {i: {ping: 3, child: 3} for i in range(6)}
     report = host.judge(six_launches("A", both), six_launches("B"), a_a=True, floors=SMALL)
-    assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc." + ping, "proc." + child}
+    assert report["verdict"] == "green" and report["differences"] == [], report["problems"]
+    assert {e["kind"] for e in report["not_judged"]["kinds"]} == {ping, child}
     some = host.judge(six_launches("A", both), six_launches("B", {0: {child: 1}, 3: {ping: 2, child: 2}}), a_a=True, floors=SMALL)
     assert some["verdict"] == "green" and {e["kind"] for e in some["not_judged"]["kinds"]} == {ping, child}
+
+
+def test_the_socket_of_a_pingsender_in_every_launch_of_one_run_and_in_none_of_the_other_does_not_break_the_control():
+    """Run 45364818483 (A/A of the 68, Windows, main 5a68489d): the pingsenders were in one launch of A and in both of B, the socket one of them starts in no launch of A and in both of B:
+    `proc.socket<-pingsender` was red and the control broken. Whether a launch starts Mozilla's pingsender is `canUpload()`'s, not the engine's: the kind is listed, never red."""
+    ping, child = host.PINGSENDER_KIND, "socket<-pingsender"
+    a = footprint(kinds=dict(KINDS))
+    a["seeds"][1]["kinds"] = dict(KINDS, **{ping: 3})
+    b = footprint("firefox-68 again", kinds=dict(KINDS, **{ping: 3, child: 1}))
+    report = judge(a, b, a_a=True)
+    assert report["verdict"] == "green" and report["differences"] == [], report["problems"]
+    assert {e["kind"] for e in report["not_judged"]["kinds"]} == {ping, child}
+    assert host.listed_not_judged_kind(ping) and host.listed_not_judged_kind(child) and host.listed_not_judged_kind("gpu<-pingsender")
+    assert not any(host.listed_not_judged_kind(k) for k in ("socket", "gpu", "pingsender.exe", "pingsender", "rdd"))
+    lost = footprint("firefox-68 again", kinds={k: n for k, n in KINDS.items() if k != "rdd"} if "rdd" in KINDS else dict(KINDS, rdd=1))
+    assert judge(footprint(kinds=dict(KINDS)), lost, a_a=True)["verdict"] == "red", "any other kind is still red by the rule of every kind"
 
 
 def test_the_types_and_the_parents_of_the_pingsenders_are_not_judged_only_the_separate_executable_is():
@@ -1021,7 +1038,7 @@ def test_what_only_the_pingsender_touches_is_a_path_like_any_other_and_its_desti
         return fp
 
     one_side = judge(with_surface(footprint(), 3), footprint("again"), a_a=True)
-    assert {d["leaf"] for d in one_side["differences"]} == {"file." + imagehlp, "proc." + host.PINGSENDER_KIND}, "its paths and its kind are like any other: in every launch of one side and in none of the other"
+    assert {d["leaf"] for d in one_side["differences"]} == {"file." + imagehlp}, "its paths are like any other: in every launch of one side and in none of the other; its kind is listed"
     assert not any(d["category"] == "net" for d in one_side["differences"]), "its destinations on one side only are left out"
     same = judge(with_surface(footprint(), 3), with_surface(footprint("again"), 3), a_a=True)
     assert same["verdict"] == "green", same["problems"]
@@ -2043,10 +2060,10 @@ def test_what_a_pingsender_spawns_is_named_after_it_and_comes_and_goes_with_the_
     got = host.derive_labels(labels, parents)
     assert got == {1: "parent", 2: "socket", 3: host.PINGSENDER_KIND, 4: "socket<-pingsender", 5: host.PINGSENDER_KIND, 6: "socket<-pingsender", 7: "tab/isForBrowser"}
     kinds = {"parent": 1, "socket": 1, "socket<-pingsender": 2, host.PINGSENDER_KIND: 2, "gpu": 1, "glxtest": 1, "tab/isForBrowser": 2}
-    # the pingsenders (and so what they spawn) in every launch of one side and none of the other: red like any kind; the parent's own socket is a kind of its own
+    # the pingsenders (and so what they spawn) in every launch of one side and none of the other: listed, never red; the parent's own socket is a kind of its own
     a = with_pingsenders(footprint(kinds=kinds), 3)
     report = judge(a, footprint("again", kinds={k: n for k, n in kinds.items() if "pingsender" not in k}), a_a=True)
-    assert {d["leaf"] for d in report["differences"]} == {"proc." + host.PINGSENDER_KIND, "proc.socket<-pingsender"}
+    assert report["differences"] == [] and {e["kind"] for e in report["not_judged"]["kinds"]} == {host.PINGSENDER_KIND, "socket<-pingsender"}
     # on both sides, what they spawn is listed by the launches that have it, and its count is not compared
     b = with_pingsenders(footprint("again", kinds=dict(kinds, **{"socket<-pingsender": 3})), 3)
     report = judge(a, b, a_a=True)
