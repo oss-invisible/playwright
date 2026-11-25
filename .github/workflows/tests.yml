@@ -164,7 +164,7 @@ jobs:
   # email (author, committer, tagger). The judge lives in oss-invisible/core and
   # is read from its main, never from this branch.
   noreply-identity:
-    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@6d048ac02fc886a50791a4ae0423cbca2a547d72 # core main, the last change of noreply-identity.yml
+    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@db3b67efd8d52924ecfe4c69e6daa33cdac58e8c # core main, the last change of noreply-identity.yml
 
   unit:
     name: pytest (${{ matrix.os }}, py${{ matrix.python }})
