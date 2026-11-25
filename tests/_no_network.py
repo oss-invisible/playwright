@@ -38,6 +38,15 @@ FIX = ("declare the value the code would ask the network for (timezone=, locale=
        "on loopback (tests/_servers.py, the local_egress_echo fixture), or mark the test e2e if it is one")
 
 
+#: The ONE file whose job is to ask a third party, and the hosts it may ask. Nothing else is declared, and a new entry is a decision, not a fix.
+#: ``tests/test_version_is_not_taken.py`` is the version gate of a pull request: it asks the index whether the version the change proposes
+#: is already published, which only the index can answer. It is skipped unless ``IPW_CHECK_VERSION`` is set, which only the ``version`` job
+#: of tests.yml does. Its host is allowed for its name lookup and for the addresses that lookup answered, nothing else.
+DECLARED_THIRD_PARTIES = {
+    "tests/test_version_is_not_taken.py": ("pypi.org",),
+}
+
+
 class LeftTheMachine(ConnectionRefusedError):
     """A destination outside this host, refused by the guard of the tests."""
 
@@ -112,34 +121,43 @@ class Guard:
 def install(monkeypatch: Any, test: str) -> Guard:
     """Patch the four doors for the duration of ``monkeypatch``; return the record of ``test``."""
     guard = Guard(test)
-    own = own_addresses()
+    declared_hosts = DECLARED_THIRD_PARTIES.get(test.split("::", 1)[0].replace("\\", "/"), ())
+    answered = set()  # the addresses a lookup of a declared host answered: a connection to them is that host
+    own = tuple(own_addresses())
+
+    def mine():
+        return own + tuple(answered)
     connect, connect_ex, sendto, getaddrinfo = (socket.socket.connect, socket.socket.connect_ex, socket.socket.sendto,
                                                 socket.getaddrinfo)
 
     def guarded_connect(self, address):
-        where = _destination(address, own)
+        where = _destination(address, mine())
         if where is not None:
             raise guard.refuse("connect to", where)
         return connect(self, address)
 
     def guarded_connect_ex(self, address):
-        where = _destination(address, own)
+        where = _destination(address, mine())
         if where is not None:
             raise guard.refuse("connect to", where)
         return connect_ex(self, address)
 
     def guarded_sendto(self, data, *rest):
-        where = _destination(rest[-1] if rest else None, own)
+        where = _destination(rest[-1] if rest else None, mine())
         if where is not None:
             raise guard.refuse("datagram to", where)
         return sendto(self, data, *rest)
 
     def guarded_getaddrinfo(host, *args, **kwargs):
-        if not is_on_this_host(host, own):
+        if isinstance(host, str) and host.lower() in declared_hosts:
+            found = getaddrinfo(host, *args, **kwargs)
+            answered.update(info[4][0] for info in found)
+            return found
+        if not is_on_this_host(host, mine()):
             raise guard.refuse("name lookup of", str(host))
         return getaddrinfo(host, *args, **kwargs)
 
-    _install_asyncio(monkeypatch, guard, own)
+    _install_asyncio(monkeypatch, guard, mine)
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
     monkeypatch.setattr(socket.socket, "sendto", guarded_sendto)
@@ -147,7 +165,7 @@ def install(monkeypatch: Any, test: str) -> Guard:
     return guard
 
 
-def _install_asyncio(monkeypatch: Any, guard: Guard, own: Sequence[str]) -> None:
+def _install_asyncio(monkeypatch: Any, guard: Guard, mine: Any) -> None:
     """The asyncio doors (module docstring), for the selector loop and, where it exists, the Proactor loop."""
     import asyncio.base_events as base_events
     import asyncio.selector_events as selector_events
@@ -165,12 +183,12 @@ def _install_asyncio(monkeypatch: Any, guard: Guard, own: Sequence[str]) -> None
     create_datagram_endpoint = base_events.BaseEventLoop.create_datagram_endpoint
 
     async def guarded_create_connection(self, protocol_factory, host=None, port=None, *args, **kwargs):
-        if host is not None and kwargs.get("sock") is None and not is_on_this_host(host, own):
+        if host is not None and kwargs.get("sock") is None and not is_on_this_host(host, mine()):
             raise guard.refuse("asyncio connect to", "%s:%s" % (host, port))
         return await create_connection(self, protocol_factory, host, port, *args, **kwargs)
 
     async def guarded_create_datagram_endpoint(self, protocol_factory, local_addr=None, remote_addr=None, **kwargs):
-        where = _destination(remote_addr, own)
+        where = _destination(remote_addr, mine())
         if where is not None:
             raise guard.refuse("asyncio datagram endpoint to", where)
         return await create_datagram_endpoint(self, protocol_factory, local_addr=local_addr, remote_addr=remote_addr, **kwargs)
@@ -183,13 +201,13 @@ def _install_asyncio(monkeypatch: Any, guard: Guard, own: Sequence[str]) -> None
 
         def make(sock_connect=sock_connect, sock_sendto=sock_sendto):
             async def guarded_sock_connect(self, sock, address):
-                where = _destination(address, own)
+                where = _destination(address, mine())
                 if where is not None:
                     raise guard.refuse("asyncio connect to", where)
                 return await sock_connect(self, sock, address)
 
             async def guarded_sock_sendto(self, sock, data, address):
-                where = _destination(address, own)
+                where = _destination(address, mine())
                 if where is not None:
                     raise guard.refuse("asyncio datagram to", where)
                 return await sock_sendto(self, sock, data, address)
@@ -202,7 +220,7 @@ def _install_asyncio(monkeypatch: Any, guard: Guard, own: Sequence[str]) -> None
     for transport in datagram_transports:
         def make_sendto(sendto=transport.sendto):
             def guarded_sendto(self, data, addr=None):
-                where = _destination(addr, own)
+                where = _destination(addr, mine())
                 if where is not None:
                     raise guard.refuse("asyncio datagram to", where)
                 return sendto(self, data, addr)

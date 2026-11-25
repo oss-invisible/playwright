@@ -191,3 +191,44 @@ def test_asyncio_on_this_host_passes(monkeypatch, kind):
 
     _run(kind, go)
     assert guard.verdict() is None
+
+
+# The one declared third party: the version gate asks the index. Faked below the guard, so nothing leaves the machine here either.
+INDEX_ADDRESS = "8.8.4.4"  # stands for the index: faked, never contacted
+
+
+def _fake_index(monkeypatch):
+    """The system lookup answers the index's address for pypi.org, and the system connect records instead of connecting."""
+    reached = []
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (INDEX_ADDRESS, port))])
+    monkeypatch.setattr(socket.socket, "connect", lambda self, address: reached.append(address))
+    return reached
+
+
+def test_the_version_gate_may_ask_the_index_and_only_the_index(monkeypatch):
+    reached = _fake_index(monkeypatch)
+    guard = _no_network.install(monkeypatch, "tests/test_version_is_not_taken.py::test_the_declared_version_is_not_already_published")
+    (family, kind, proto, _name, address), = socket.getaddrinfo("pypi.org", 443)
+    with socket.socket(family, kind) as s:
+        s.connect(address)
+    assert [a for a in reached if a[1] == 443] == [(INDEX_ADDRESS, 443)]  # (the guard's own probe of this host's address is recorded too)
+    with pytest.raises(ConnectionRefusedError):
+        socket.getaddrinfo("files.example.net", 443)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, pytest.raises(ConnectionRefusedError):
+        s.connect(OUTSIDE)
+    assert guard.attempts == ["name lookup of files.example.net", "connect to 1.1.1.1:443"]
+
+
+def test_no_other_file_may_ask_the_index(monkeypatch):
+    reached = _fake_index(monkeypatch)
+    guard = _no_network.install(monkeypatch, "tests/test_x.py::test_y")
+    with pytest.raises(ConnectionRefusedError):
+        socket.getaddrinfo("pypi.org", 443)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, pytest.raises(ConnectionRefusedError):
+        s.connect((INDEX_ADDRESS, 443))
+    assert [a for a in reached if a[1] == 443] == [] and guard.attempts == ["name lookup of pypi.org", "connect to %s:443" % INDEX_ADDRESS]
+
+
+def test_the_declared_third_parties_are_the_version_gate_alone():
+    """A new entry is a decision: this test changes with it, in the same diff, where a reviewer sees it."""
+    assert _no_network.DECLARED_THIRD_PARTIES == {"tests/test_version_is_not_taken.py": ("pypi.org",)}
