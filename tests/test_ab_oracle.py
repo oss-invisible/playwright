@@ -629,7 +629,7 @@ def _job(text, name):
 def _needs_core_on_index(body, linux):
     """A Linux job of e2e.yml waits for the core on the index and for the run's linux-deps-e2e job (its Ubuntu packages, from the archive once, never by the job);
     a Windows job waits for the core only."""
-    return ("needs: [core-on-index, linux-deps-e2e]" in body) if linux else ("needs: core-on-index\n" in body)
+    return ("needs: [changes, core-on-index, linux-deps-e2e]" in body) if linux else ("needs: [changes, core-on-index]\n" in body)
 
 
 def _linux_deps_e2e_packages(text):
@@ -1089,7 +1089,7 @@ def test_the_final_set_has_jobs_of_its_own_in_four_shards_on_each_system_and_the
     for body in (linux, windows):
         assert "shard: [1, 2, 3, 4]" in body and "AB_ORACLE_SEED_SET: final" in body and "AB_ORACLE_SHARD: ${{ matrix.shard }}/4" in body
         assert body.count(page) == 1 and "scripts/run_e2e.py" not in body and "timeout-minutes: 40" in body and "fail-fast: false" in body
-        assert ("needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]" if body is linux else "needs: [core-on-index, e2e-page-final-touched]") in body and "needs.e2e-page-final-touched.outputs.touched == 'true'" in body
+        assert ("needs: [changes, core-on-index, e2e-page-final-touched, linux-deps-e2e]" if body is linux else "needs: [changes, core-on-index, e2e-page-final-touched]") in body and "needs.e2e-page-final-touched.outputs.touched == 'true'" in body
         assert "skipped\": 0" in body and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in body, "one test, passed: a skipped one is red"
         assert "matrix.shard" in body.split("name: invpw-evidence-page-final", 1)[1].split("path:", 1)[0], "four shards, four artifact names"
     assert "scripts/ci_ab_oracle.py touched" in touched and "github.event_name == 'merge_group'" in touched and "github.event.merge_group.base_sha" in touched and "outputs:" in touched

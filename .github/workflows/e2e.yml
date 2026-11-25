@@ -66,12 +66,46 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
+  # THE FIRST JOB: does this change have anything for the workflow to test? GitHub applies no `paths` filter to a merge queue run, so a docs-only change would
+  # run everything here. In a queue run scripts/ci_changes.py lists the files of the entry (base_sha..head_sha) and applies the path rules of the `push` trigger
+  # above; on any other event it says run=true. `run=false` is an explicit "nothing to test", not a skip: every other job needs this one and runs only on
+  # run == 'true', and `e2e verdict` (scripts/ci_gate.py, CHANGES_RUN) expects them all skipped then, and red otherwise. The script is read from main, never
+  # from the branch it judges (a branch must not decide that it needs no test); while it is not on main yet the copy of this branch is used, and the log says so.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changes.outputs.run }}
+      files: ${{ steps.changes.outputs.files }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - name: does the change touch anything this workflow tests
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if git cat-file -e origin/main:scripts/ci_changes.py 2>/dev/null; then
+            git show origin/main:scripts/ci_changes.py > "$RUNNER_TEMP/ci_changes.py"
+          else
+            echo "ci_changes.py is not on origin/main yet: falling back to the copy of this branch"
+            cp scripts/ci_changes.py "$RUNNER_TEMP/ci_changes.py"
+          fi
+          python3 "$RUNNER_TEMP/ci_changes.py" e2e "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA" | tee -a "$GITHUB_OUTPUT"
+
   # The install below resolves `invisible-core==N.M.0` from the package index,
   # and the core is published BEFORE this package. This gate answers whether it
   # is on the index yet; during that window this job FAILS (rule ci-13: a core
   # that is not on the index is red, never a skip) and the e2e jobs, which
   # need it, do not run; once the core is up it runs unchanged. See .github/workflows/core-on-index.yml.
   core-on-index:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     uses: ./.github/workflows/core-on-index.yml
 
   # THE UBUNTU PACKAGES OF THE LINUX JOBS, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a job: a run lost a green leg to its time
@@ -80,8 +114,8 @@ jobs:
   # Playwright's install-deps names for Firefox. The jobs install its roots by name from that repository, with --no-download.
   linux-deps-e2e:
     name: linux-deps-e2e
-    needs: core-on-index
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     uses: ./.github/workflows/linux-deps.yml
     with:
       name: e2e
@@ -97,8 +131,8 @@ jobs:
   # branch protection read.
   e2e-linux:
     name: e2e (linux, part ${{ matrix.part }})
-    needs: [core-on-index, linux-deps-e2e]
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index, linux-deps-e2e]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -366,8 +400,8 @@ jobs:
   # tests/test_ci_runs_once_per_commit.py (5.) holds this job.
   e2e:
     name: e2e (linux, xvfb)
-    needs: [core-on-index, e2e-linux]
-    if: always() && inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index, e2e-linux]
+    if: always() && needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -387,7 +421,8 @@ jobs:
   # <textarea>, in-process and served to the stock Playwright client). Same gate as the Linux job: it needs core-on-index, which fails until the core is on the index, and it runs unchanged after; `workflow_dispatch` with `only: windows-control-a` runs it alone.
   e2e-windows-control-a:
     name: e2e (windows, Control+A)
-    needs: core-on-index
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
@@ -429,8 +464,8 @@ jobs:
   # partition whole and tests/test_every_suite_runs_on_linux_and_windows.py holds both systems together.
   e2e-windows:
     name: e2e (windows, part ${{ matrix.part }})
-    needs: core-on-index
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 40
     # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
@@ -529,8 +564,8 @@ jobs:
   # above, `own_job` in the Windows parts). The same setup as the shared jobs: the security state, the engine, the GeoIP database made by the repository.
   e2e-network:
     name: e2e (network, linux)
-    needs: [core-on-index, linux-deps-e2e]
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index, linux-deps-e2e]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
     timeout-minutes: 50
@@ -620,8 +655,8 @@ jobs:
 
   e2e-network-windows:
     name: e2e (network, windows)
-    needs: core-on-index
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
     timeout-minutes: 50
@@ -693,8 +728,8 @@ jobs:
   # 35 for the test.
   e2e-host:
     name: e2e (host, linux)
-    needs: [core-on-index, linux-deps-e2e]
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index, linux-deps-e2e]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 65
     steps:
@@ -803,8 +838,8 @@ jobs:
 
   e2e-host-windows:
     name: e2e (host, windows)
-    needs: core-on-index
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -942,8 +977,8 @@ jobs:
   # `own_job` in the Windows parts). 45 minutes for the job, as the host oracle's: the setup of the job plus the guard of the test with the margin of Windows. The same setup as the shared jobs.
   e2e-page:
     name: e2e (page oracle, linux)
-    needs: [core-on-index, linux-deps-e2e]
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index, linux-deps-e2e]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -1032,8 +1067,8 @@ jobs:
 
   e2e-page-windows:
     name: e2e (page oracle, windows)
-    needs: core-on-index
-    if: inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -1111,8 +1146,8 @@ jobs:
   # Seed 0 is in shard 1, and its second launch on a reused profile is part of that shard's A/A.
   e2e-page-final-touched:
     name: e2e (page oracle, is it touched)
-    needs: core-on-index
-    if: github.event_name == 'merge_group' && inputs.only != 'windows-control-a'
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true' && github.event_name == 'merge_group' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -1131,8 +1166,8 @@ jobs:
 
   e2e-page-final:
     name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, linux)
-    needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]
-    if: needs.e2e-page-final-touched.outputs.touched == 'true'
+    needs: [changes, core-on-index, e2e-page-final-touched, linux-deps-e2e]
+    if: needs.changes.outputs.run == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -1221,8 +1256,8 @@ jobs:
 
   e2e-page-final-windows:
     name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, windows)
-    needs: [core-on-index, e2e-page-final-touched]
-    if: needs.e2e-page-final-touched.outputs.touched == 'true'
+    needs: [changes, core-on-index, e2e-page-final-touched]
+    if: needs.changes.outputs.run == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: windows-2022
     timeout-minutes: 40
     strategy:
@@ -1293,7 +1328,7 @@ jobs:
   # used, and the log says so. `e2e (linux, xvfb)` above stays the Linux check the release reads (scripts/e2e_is_green.py).
   verdict:
     name: e2e verdict
-    needs: [core-on-index, linux-deps-e2e, e2e-linux, e2e, e2e-windows-control-a, e2e-windows, e2e-network, e2e-network-windows, e2e-host, e2e-host-windows, e2e-page, e2e-page-windows, e2e-page-final-touched, e2e-page-final, e2e-page-final-windows]
+    needs: [changes, core-on-index, linux-deps-e2e, e2e-linux, e2e, e2e-windows-control-a, e2e-windows, e2e-network, e2e-network-windows, e2e-host, e2e-host-windows, e2e-page, e2e-page-windows, e2e-page-final-touched, e2e-page-final, e2e-page-final-windows]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1305,6 +1340,7 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW: e2e
+          CHANGES_RUN: ${{ needs.changes.outputs.run }}
           INPUT_ONLY: ${{ inputs.only }}
         run: |
           git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main

@@ -46,13 +46,48 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
+  # THE FIRST JOB: does this change have anything for the workflow to test? GitHub applies no `paths` filter to a merge queue run, so a docs-only change would
+  # run everything here. In a queue run scripts/ci_changes.py lists the files of the entry (base_sha..head_sha) and applies the path rules of the `push` trigger
+  # above; on any other event it says run=true. `run=false` is an explicit "nothing to test", not a skip: every other job needs this one and runs only on
+  # run == 'true', and `fakeweb verdict` (scripts/ci_gate.py, CHANGES_RUN) expects them all skipped then, and red otherwise. The script is read from main, never
+  # from the branch it judges (a branch must not decide that it needs no test); while it is not on main yet the copy of this branch is used, and the log says so.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changes.outputs.run }}
+      files: ${{ steps.changes.outputs.files }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - name: does the change touch anything this workflow tests
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if git cat-file -e origin/main:scripts/ci_changes.py 2>/dev/null; then
+            git show origin/main:scripts/ci_changes.py > "$RUNNER_TEMP/ci_changes.py"
+          else
+            echo "ci_changes.py is not on origin/main yet: falling back to the copy of this branch"
+            cp scripts/ci_changes.py "$RUNNER_TEMP/ci_changes.py"
+          fi
+          python3 "$RUNNER_TEMP/ci_changes.py" fakeweb "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA" | tee -a "$GITHUB_OUTPUT"
+
   core-on-index:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     uses: ./.github/workflows/core-on-index.yml
 
   # The Ubuntu packages of the Linux legs, from Ubuntu's archive once per runner image and list (linux-deps.yml), never by a leg.
   linux-deps-fakeweb:
     name: linux-deps-fakeweb
-    needs: core-on-index
+    needs: [changes, core-on-index]
+    if: needs.changes.outputs.run == 'true'
     uses: ./.github/workflows/linux-deps.yml
     with:
       name: fakeweb
@@ -61,7 +96,8 @@ jobs:
 
   walk:
     name: fakeweb ${{ matrix.profile }} (${{ matrix.os }})
-    needs: [core-on-index, linux-deps-fakeweb]
+    needs: [changes, core-on-index, linux-deps-fakeweb]
+    if: needs.changes.outputs.run == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -174,7 +210,7 @@ jobs:
   # the branch it judges; while the file is not on main yet (the change that adds it) the copy of this branch is used, and the log says so.
   verdict:
     name: fakeweb verdict
-    needs: [core-on-index, linux-deps-fakeweb, walk]
+    needs: [changes, core-on-index, linux-deps-fakeweb, walk]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -185,6 +221,7 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW: fakeweb
+          CHANGES_RUN: ${{ needs.changes.outputs.run }}
         run: |
           git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
           if git cat-file -e origin/main:scripts/ci_gate.py 2>/dev/null; then

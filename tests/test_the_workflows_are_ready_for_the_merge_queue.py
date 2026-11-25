@@ -145,8 +145,8 @@ def test_every_step_that_reads_the_base_reads_the_one_of_the_queue_entry():
         text = _code(_text(name))
         assert text.count("BASE_SHA: ${{ github.event.merge_group.base_sha }}") == text.count("BASE_SHA:"), name
     e2e = _code(_text("e2e.yml"))
-    assert e2e.count("BASE_SHA:") == 9 and len(re.findall(r"^\s+if: github\.event_name == 'merge_group'\s*$", e2e, re.M)) == 8
-    assert "if: github.event_name == 'merge_group' && inputs.only != 'windows-control-a'" in e2e
+    assert e2e.count("BASE_SHA:") == 10 and len(re.findall(r"^\s+if: github\.event_name == 'merge_group'\s*$", e2e, re.M)) == 8
+    assert "if: needs.changes.outputs.run == 'true' && github.event_name == 'merge_group' && inputs.only != 'windows-control-a'" in e2e
 
 
 def test_the_version_check_runs_in_the_merge_queue_run_too():
@@ -235,7 +235,7 @@ def test_each_verdict_job_waits_for_every_job_and_reads_the_judge_from_main(name
 def test_a_verdict_that_forgets_a_job_or_is_not_always_or_reads_the_branch_is_refused():
     text = _text("e2e.yml")
     assert any("not every other job" in p for p in problems_verdict("e2e.yml", text.replace("e2e-page-windows, ", "", 1)))
-    assert any("no `if: always()`" in p for p in problems_verdict("fakeweb.yml", _text("fakeweb.yml").replace("    name: fakeweb verdict\n    needs: [core-on-index, linux-deps-fakeweb, walk]\n    if: always()\n", "    name: fakeweb verdict\n    needs: [core-on-index, linux-deps-fakeweb, walk]\n", 1)))
+    assert any("no `if: always()`" in p for p in problems_verdict("fakeweb.yml", _text("fakeweb.yml").replace("    name: fakeweb verdict\n    needs: [changes, core-on-index, linux-deps-fakeweb, walk]\n    if: always()\n", "    name: fakeweb verdict\n    needs: [changes, core-on-index, linux-deps-fakeweb, walk]\n", 1)))
     assert any("origin/main" in p for p in problems_verdict("e2e.yml", text.replace('git show origin/main:scripts/ci_gate.py > "$RUNNER_TEMP/ci_gate.py"', "true", 1)))
     assert any("WORKFLOW" in p for p in problems_verdict("e2e.yml", text.replace("WORKFLOW: e2e\n", "", 1)))
     assert any("not named exactly" in p for p in problems_verdict("fakeweb.yml", _text("fakeweb.yml").replace("name: fakeweb verdict", "name: verdict", 1)))
@@ -265,8 +265,8 @@ def _all_green(workflow: str, touched: str = "true") -> dict:
     return needs
 
 
-def _lines(workflow: str, needs: dict, event: str, only: str = "") -> list:
-    return ci_gate.verdict(needs, event, workflow, only)
+def _lines(workflow: str, needs: dict, event: str, only: str = "", changes_run: str = "true") -> list:
+    return ci_gate.verdict(needs, event, workflow, only, changes_run)
 
 
 def _event_for(workflow: str) -> str:
@@ -345,7 +345,7 @@ def test_the_final_seed_shards_run_exactly_when_the_page_oracle_is_touched():
 
 def test_the_dispatch_of_the_windows_job_alone_skips_what_it_leaves_out_and_nothing_else():
     needs = {name: {"result": "skipped", "outputs": {}} for name in ci_gate.E2E_FIX}
-    for name in ("core-on-index", "e2e-windows-control-a"):
+    for name in ("changes", "core-on-index", "e2e-windows-control-a"):
         needs[name]["result"] = "success"
     assert _lines("e2e", needs, "workflow_dispatch", "windows-control-a") == []
     assert any("job e2e-windows is skipped" in line for line in _lines("e2e", needs, "workflow_dispatch", "")), "a full run does not forgive a skipped job"
@@ -357,7 +357,7 @@ def test_the_jobs_that_may_be_skipped_are_the_ones_the_workflow_says_it_skips():
     text = _text("e2e.yml")
     jobs = _jobs(text)
     only = {j for j, body in jobs.items() if re.search(r"^    if: .*inputs\.only != 'windows-control-a'", body, re.M)}
-    by_output = {j for j, body in jobs.items() if re.search(r"^    if: needs\.[A-Za-z0-9_-]+\.outputs\.[a-z]+ == 'true'\s*$", body, re.M)}
+    by_output = {j for j, body in jobs.items() if re.search(r"^    if: needs\.changes\.outputs\.run == 'true' && needs\.[A-Za-z0-9_-]+\.outputs\.[a-z]+ == 'true'\s*$", body, re.M)}
     assert by_output == set(ci_gate.E2E_BY_OUTPUT), by_output
     assert set(ci_gate.E2E_NARROWED) - set(ci_gate.E2E_BY_OUTPUT) == only, (sorted(only), ci_gate.E2E_NARROWED)
     for job, (decider, output, value) in ci_gate.E2E_BY_OUTPUT.items():
@@ -367,7 +367,7 @@ def test_the_jobs_that_may_be_skipped_are_the_ones_the_workflow_says_it_skips():
     assert conditional == set(ci_gate.E2E_CONDITIONAL), conditional
     assert set(_triggers(text)) >= {"merge_group"} and all("merge_group" in ci_gate.E2E_CONDITIONAL[j] for j in conditional)
     fake = _jobs(_text("fakeweb.yml"))
-    assert not [j for j, body in fake.items() if j != "verdict" and re.search(r"^    if:", body, re.M)], "no job of fakeweb.yml is conditional"
+    assert all(re.search(r"^    if: needs\.changes\.outputs\.run == 'true'\s*$", body, re.M) for j, body in fake.items() if j not in ("verdict", "changes")), "a job of fakeweb.yml runs on `changes` and on nothing else"
 
 
 def test_the_conditional_jobs_of_tests_yml_are_the_ones_whose_if_reads_the_event():
@@ -377,8 +377,8 @@ def test_the_conditional_jobs_of_tests_yml_are_the_ones_whose_if_reads_the_event
 
 
 def _run(workflow: str, needs: dict, event: str, only: str = "") -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if k not in ("NEEDS", "EVENT_NAME", "WORKFLOW", "INPUT_ONLY")}
-    env.update(NEEDS=json.dumps(needs), EVENT_NAME=event, INPUT_ONLY=only)
+    env = {k: v for k, v in os.environ.items() if k not in ("NEEDS", "EVENT_NAME", "WORKFLOW", "INPUT_ONLY", "CHANGES_RUN")}
+    env.update(NEEDS=json.dumps(needs), EVENT_NAME=event, INPUT_ONLY=only, CHANGES_RUN="true")
     if workflow:
         env["WORKFLOW"] = workflow
     return subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)

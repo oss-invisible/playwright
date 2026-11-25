@@ -1,6 +1,6 @@
 """The verdict job of a workflow that gates a merge: every job it waits for must have ended in `success`.
 
-    NEEDS='<toJSON(needs)>' EVENT_NAME=<github.event_name> WORKFLOW=<tests|e2e|fakeweb> python scripts/ci_gate.py
+    NEEDS='<toJSON(needs)>' EVENT_NAME=<github.event_name> WORKFLOW=<tests|e2e|fakeweb> [CHANGES_RUN=<needs.changes.outputs.run>] python scripts/ci_gate.py
 
 Three workflows have one: the job `gate` of tests.yml, `e2e verdict` of e2e.yml and `fakeweb verdict` of fakeweb.yml. WORKFLOW (default `tests`) picks
 the tables that belong to the workflow. A pull request runs the fast set (tests.yml); e2e.yml and fakeweb.yml run in the merge queue run
@@ -14,6 +14,11 @@ The only jobs that may end in something else than `success` are the ones that ar
 * CONDITIONAL: the events on which the job runs; on any other event it is expected to be `skipped`, and on those events it must be `success`;
 * E2E_BY_OUTPUT: a job that runs only when another job of the workflow says so by an output (the final-seed shards, when the page oracle is touched);
 * E2E_NARROWED: what `workflow_dispatch` with `only: windows-control-a` leaves out on purpose (that run is the Windows job of one shortcut alone).
+
+* NOTHING TO TEST: e2e.yml and fakeweb.yml start with the job `changes` (scripts/ci_changes.py: in a merge queue run, do the files of the entry fall under the
+  paths of the workflow?). Its output `run` comes in as CHANGES_RUN. `run=false` is an explicit answer: `changes` must be `success` and every other job
+  `skipped` (a job that ran anyway is red, so is one that is `success` here), and the verdict ends with `ok: nothing to test (<n> files changed, none under the
+  paths of <workflow>)`. `run=true`: every job as above. A `run` that is missing or is not `true` or `false` is red: nothing is judged on a guess.
 
 Nothing else is forgiven, and a job the workflow waits for that the table does not know is red as well (the table and the `needs:` of the verdict job
 cannot drift apart without tests/test_the_gate_is_red_when_a_needed_job_is_skipped.py and tests/test_the_workflows_are_ready_for_the_merge_queue.py
@@ -30,6 +35,7 @@ import sys
 
 RULE = "ci-13 nothing counts as passed that did not pass"
 
+_CHANGES = "open the job `changes` and fix scripts/ci_changes.py (or the diff it lists): it must succeed and print run=true|false"
 _CORE = "wait for the publish of the pinned invisible-core to finish, or pin a published core, then re-run"
 
 # tests.yml: the jobs `gate` waits for, each with what to do when it is not green.
@@ -55,6 +61,7 @@ CONDITIONAL = {
 
 # e2e.yml: the jobs `e2e verdict` waits for.
 E2E_FIX = {
+    "changes": _CHANGES,
     "core-on-index": _CORE,
     "linux-deps-e2e": "open the job linux-deps-e2e and fix the package list of the Linux jobs; when it is skipped, fix core-on-index first",
     "e2e-linux": "open the failing part of `e2e (linux, part N)` and fix its test; when it is skipped, fix core-on-index or linux-deps-e2e first",
@@ -81,14 +88,19 @@ E2E_BY_OUTPUT = {
     "e2e-page-final-windows": ("e2e-page-final-touched", "touched", "true"),
 }
 # What `workflow_dispatch` with `only: windows-control-a` skips on purpose: every job but the two that run it.
-E2E_NARROWED = tuple(sorted(set(E2E_FIX) - {"core-on-index", "e2e-windows-control-a"}))
+E2E_NARROWED = tuple(sorted(set(E2E_FIX) - {"changes", "core-on-index", "e2e-windows-control-a"}))
 
 # fakeweb.yml: every job runs on every event the workflow listens to.
 FAKEWEB_FIX = {
+    "changes": _CHANGES,
     "core-on-index": _CORE,
     "linux-deps-fakeweb": "open the job linux-deps-fakeweb and fix the package list; when it is skipped, fix core-on-index first",
     "walk": "open the failing leg (`fakeweb p2` or `p4`, on linux or windows) and fix what differs from stock; when it is skipped, fix core-on-index first",
 }
+
+# The workflows that start with the job `changes`, and the name of that job.
+CHANGES_JOB = "changes"
+HAS_CHANGES = ("e2e", "fakeweb")
 
 # WORKFLOW -> (the name of the verdict job, its FIX table, its CONDITIONAL table).
 TABLES = {
@@ -98,9 +110,12 @@ TABLES = {
 }
 
 
-def expected_result(name: str, needs: dict, event: str, workflow: str = "tests", only: str = "") -> str:
-    """`success`, or `skipped` for a job that is conditional by design on this event (or on this input, or on the output of another job)."""
+def expected_result(name: str, needs: dict, event: str, workflow: str = "tests", only: str = "", changes_run: str = "true") -> str:
+    """`success`, or `skipped` for a job that is conditional by design on this event (or on this input, or on the output of another job, or because
+    `changes` said there is nothing to test)."""
     conditional = TABLES[workflow][2]
+    if workflow in HAS_CHANGES and name != CHANGES_JOB and changes_run == "false":
+        return "skipped"
     if workflow == "e2e":
         if only == "windows-control-a" and name in E2E_NARROWED:
             return "skipped"
@@ -115,10 +130,26 @@ def expected_result(name: str, needs: dict, event: str, workflow: str = "tests",
     return "success"
 
 
-def verdict(needs: dict, event: str, workflow: str = "tests", only: str = "") -> list[str]:
-    """The FAIL lines for the results of `needs` (the object `toJSON(needs)` gives) of `workflow` on `event`; empty when every job is as expected."""
+def nothing_to_test(needs: dict, workflow: str) -> str:
+    """The last line of a verdict whose `changes` job said there is nothing to test."""
+    entry = needs.get(CHANGES_JOB)
+    outputs = entry.get("outputs") if isinstance(entry, dict) else None
+    files = outputs.get("files") if isinstance(outputs, dict) else None
+    count = files if isinstance(files, str) and files.isdigit() else "?"
+    return "ok: nothing to test (%s files changed, none under the paths of %s)" % (count, workflow)
+
+
+def verdict(needs: dict, event: str, workflow: str = "tests", only: str = "", changes_run: "str | None" = None) -> list[str]:
+    """The FAIL lines for the results of `needs` (the object `toJSON(needs)` gives) of `workflow` on `event`; empty when every job is as expected.
+    `changes_run` is the output `run` of the job `changes` (workflows that have one): `true` or `false`, anything else is red."""
     label, fix, _conditional = TABLES[workflow]
     out = []
+    if workflow in HAS_CHANGES:
+        if changes_run not in ("true", "false"):
+            return ["FAIL %s: the output run of the job changes is %r, not true or false. Fix: pass CHANGES_RUN=${{ needs.changes.outputs.run }} and make the job changes print "
+                    "run=true|false. Rule: %s" % (label, "missing" if changes_run in (None, "") else changes_run, RULE)]
+    else:
+        changes_run = "true"
     for name in sorted(set(fix) | set(needs)):
         entry = needs.get(name)
         result = entry.get("result") if isinstance(entry, dict) else None
@@ -126,7 +157,7 @@ def verdict(needs: dict, event: str, workflow: str = "tests", only: str = "") ->
             out.append(
                 "FAIL %s: job %s is %s. Fix: add it to the table of %s in scripts/ci_gate.py, or take it out of `needs:` of the job %s. Rule: %s"
                 % (label, name, result, workflow, label, RULE))
-        elif result != expected_result(name, needs, event, workflow, only):
+        elif result != expected_result(name, needs, event, workflow, only, changes_run):
             out.append("FAIL %s: job %s is %s. Fix: %s. Rule: %s" % (label, name, result or "missing", fix[name], RULE))
     return out
 
@@ -148,12 +179,13 @@ def main() -> int:
     for name in sorted(needs):
         entry = needs[name]
         print("%-24s %s" % (name + ":", entry.get("result") if isinstance(entry, dict) else entry))
-    lines = verdict(needs, event, workflow, os.environ.get("INPUT_ONLY", ""))
+    changes_run = os.environ.get("CHANGES_RUN")
+    lines = verdict(needs, event, workflow, os.environ.get("INPUT_ONLY", ""), changes_run)
     for line in lines:
         print(line)
     if lines:
         return 1
-    print("ok")
+    print(nothing_to_test(needs, workflow) if workflow in HAS_CHANGES and changes_run == "false" else "ok")
     return 0
 
 

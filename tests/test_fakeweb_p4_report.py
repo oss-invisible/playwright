@@ -593,13 +593,13 @@ WORKFLOW = (ROOT / ".github" / "workflows" / "fakeweb.yml").read_text(encoding="
 
 
 def test_the_workflow_has_four_legs_and_one_verdict_job():
-    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses):", WORKFLOW, re.MULTILINE)) == 4     # core-on-index, linux-deps-fakeweb, walk, verdict
+    assert len(re.findall(r"^  [a-z0-9_-]+:\n    (?:name|uses|needs):", WORKFLOW, re.MULTILINE)) == 5     # changes, core-on-index, linux-deps-fakeweb, walk, verdict
     assert WORKFLOW.count("{ profile: ") == 4
     for leg in ("p2, os: linux", "p2, os: windows", "p4, os: linux", "p4, os: windows"):
         assert "profile: " + leg in WORKFLOW
     assert "name: fakeweb verdict" in WORKFLOW and "if: always()" in WORKFLOW.split("name: fakeweb verdict", 1)[1]
     verdict = WORKFLOW.split("name: fakeweb verdict", 1)[1]
-    assert "needs: [core-on-index, linux-deps-fakeweb, walk]" in verdict and "WORKFLOW: fakeweb" in verdict and "NEEDS: ${{ toJSON(needs) }}" in verdict
+    assert "needs: [changes, core-on-index, linux-deps-fakeweb, walk]" in verdict and "WORKFLOW: fakeweb" in verdict and "NEEDS: ${{ toJSON(needs) }}" in verdict
     # a leg that did not run is not green: scripts/ci_gate.py (read from main) expects `success` of `walk`, see tests/test_the_workflows_are_ready_for_the_merge_queue.py
 
 

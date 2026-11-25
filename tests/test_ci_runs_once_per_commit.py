@@ -444,7 +444,7 @@ def test_a_linux_check_that_accepts_skipped_is_refused():
 
 
 def test_a_linux_check_that_does_not_need_the_parts_is_refused():
-    body = _check_body().replace("needs: [core-on-index, e2e-linux]", "needs: [core-on-index]", 1)
+    body = _check_body().replace("needs: [changes, core-on-index, e2e-linux]", "needs: [changes, core-on-index]", 1)
     assert body != _check_body()
     assert any("does not need the parts" in p for p in problems_linux_check(_e2e_with_check(body)))
 
