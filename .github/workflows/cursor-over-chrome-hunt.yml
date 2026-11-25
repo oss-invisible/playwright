@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cursor-over-chrome-hunt.yml - does a native move of the OS cursor over the browser's chrome reach the content page?
+#
+# The question. The real OS cursor over a headed window gives the page a native mousemove (buttons=0) at the cursor's place: the first native move of a
+# process passes Gecko's first-move filter. On the Windows runner the screen is 1024x768 and the window of the declared identity covers all of it, so no point
+# outside the window exists to park the cursor on. The design to prove: the native move goes to the top-level widget, and over the CHROME strip (tab strip and
+# toolbar above the content) it reaches the chrome document, never the content page; so the precondition is "the cursor is outside the CONTENT area", and the
+# cursor is parked inside the chrome strip.
+#
+# What it does. Windows, the published engine, 4 jobs. Each runs 25 iterations of its cells, a fresh headed browser each (seed 42), with the page recording
+# every mouse/pointer/drag event, the geometry the page reads and the window rectangles the system gives, and a helper thread that moves the real cursor
+# with SetCursorPos while a Juggler-driven gesture runs: over the chrome strip (chrome-*), over the content (content-*, the control), nowhere
+# (edge-*: parked in the top rows before the launch; baseline-drag: not parked at all), or across the content's top edge (boundary-hover).
+# One JSON line per iteration and a summary table. The job is green whatever it finds; only a scenario that errors is an error.
+#
+# Starts on a push to its own branch; not a gate, no pull request. The evidence is the artifact.
+# ─────────────────────────────────────────────────────────────────────────────
+name: cursor over chrome hunt
+
+on:
+  push:
+    branches: [hunt/cursor-over-chrome]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cursor-over-chrome-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: hunt (${{ matrix.name }})
+    runs-on: windows-2022
+    timeout-minutes: 60
+    # TEMP and TMP on D:\a\_temp, as the Windows e2e jobs of e2e.yml have them.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - name: chrome
+            cells: chrome-drag,chrome-hover
+          - name: content
+            cells: content-drag,content-hover
+          - name: edge
+            cells: edge-drag,edge-hover
+          - name: baseline-boundary
+            cells: baseline-drag,boundary-hover
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install the wrapper + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "playwright==$(cat scripts/playwright_pin.txt)"
+          python -c "import invisible_playwright, sys; print(invisible_playwright.__file__)"
+          python -m pip show invisible-playwright invisible-core | grep -E "^(Name|Version)"
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the cells (25 iterations each)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mkdir -p evidence
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u scripts/hunt_cursor_over_chrome.py run \
+            --cells "${{ matrix.cells }}" --iterations 25 --out evidence
+      - name: The summary of this job
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.name }} (${{ matrix.cells }})"
+            echo
+            python scripts/hunt_cursor_over_chrome.py summary evidence
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cursor-over-chrome-${{ matrix.name }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 14
