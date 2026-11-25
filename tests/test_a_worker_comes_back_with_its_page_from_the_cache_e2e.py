@@ -168,37 +168,6 @@ def _ask(page, where):
 BFCACHE_LOG = "timestamp,SHIPBFCache:5,nsSHistory:5,SessionHistory:4,BCWebProgress:4,DocumentChannel:4,BrowsingContext:4"
 
 
-class _Reads:
-    """What the page says right after a go_back that raised, and once more later (``FailureEvidence.note_records`` shape)."""
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.records = []
-
-    def read(self, page, when):
-        record = {"when": when, "t": time.time(), "client_url": page.url}
-        try:
-            record.update(page.evaluate(
-                "() => ({url: location.href, shown: window.__shown || null, history: history.length,"
-                " type: (performance.getEntriesByType('navigation')[0] || {}).type || null, state: document.readyState})"))
-        except Exception as problem:       # the page may be gone or changing: that is what is being recorded
-            record["read_error"] = "%s: %s" % (type(problem).__name__, problem)
-        with self.lock:
-            self.records.append(record)
-
-
-def _go_back_and_record(page, reads):
-    """``page.go_back(wait_until="load")``; when it raises, what the page says then and after a short pause is recorded first (the error is raised
-    unchanged: the pause only dates a restore that lands after the wait, it decides nothing)."""
-    try:
-        page.go_back(wait_until="load")
-    except Exception:
-        reads.read(page, "right after the go_back raised")
-        page.wait_for_timeout(2000)
-        reads.read(page, "2 s later")
-        raise
-
-
 @pytest.mark.e2e
 @pytest.mark.parametrize("how", ["goto", "location"])
 @pytest.mark.parametrize("away", ["same-site", "other-site"])
@@ -325,3 +294,34 @@ def _assert_a_new_page_with_a_new_worker(page, events, where, old, back):
         elif m == "Page.workerDestroyed":
             live.pop(p["workerId"], None)
     assert list(live) == [new[0]], "live workers after the page was built again: %r" % list(live.values())
+
+
+class _Reads:
+    """What the page says right after a go_back that raised, and once more later (``FailureEvidence.note_records`` shape)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.records = []
+
+    def read(self, page, when):
+        record = {"when": when, "t": time.time(), "client_url": page.url}
+        try:
+            record.update(page.evaluate(
+                "() => ({url: location.href, shown: window.__shown || null, history: history.length,"
+                " type: (performance.getEntriesByType('navigation')[0] || {}).type || null, state: document.readyState})"))
+        except Exception as problem:       # the page may be gone or changing: that is what is being recorded
+            record["read_error"] = "%s: %s" % (type(problem).__name__, problem)
+        with self.lock:
+            self.records.append(record)
+
+
+def _go_back_and_record(page, reads):
+    """``page.go_back(wait_until="load")``; when it raises, what the page says then and after a short pause is recorded first (the error is raised
+    unchanged: the pause only dates a restore that lands after the wait, it decides nothing)."""
+    try:
+        page.go_back(wait_until="load")
+    except Exception:
+        reads.read(page, "right after the go_back raised")
+        page.wait_for_timeout(2000)
+        reads.read(page, "2 s later")
+        raise
