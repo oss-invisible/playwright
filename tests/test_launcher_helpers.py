@@ -186,14 +186,14 @@ def test_default_context_with_no_language_asked_is_en_us():
 
 
 @pytest.mark.unit
-def test_build_env_carries_the_declared_network():
+def test_build_env_carries_the_declared_network(declared_engine):
     from invisible_core import network_to_declare
     env = InvisiblePlaywright(seed=42)._build_env({})
     assert env["STEALTHFOX_WEBRTC_NETWORK"] == network_to_declare(42)
 
 
 @pytest.mark.unit
-def test_build_env_caller_env_override_wins(monkeypatch):
+def test_build_env_caller_env_override_wins(monkeypatch, declared_engine):
     monkeypatch.setenv("STEALTHFOX_WEBRTC_NETWORK", "v4=198.51.100.5;v6=1")
     env = InvisiblePlaywright(seed=42)._build_env({})
     assert env["STEALTHFOX_WEBRTC_NETWORK"] == "v4=198.51.100.5;v6=1"  # caller wins
@@ -223,7 +223,7 @@ def test_build_env_drops_the_variables_the_display_names_absent():
 
 
 @pytest.mark.unit
-def test_build_env_never_injects_font_env():
+def test_build_env_never_injects_font_env(declared_engine):
     # The patched binary is self-contained for fonts (always bundle-only; the
     # exposed set IS the bundle, system-ui + generics baked in C++). The wrapper
     # must NOT inject any STEALTHFOX_FONTLIST/SYSTEMUI env - even if legacy font
@@ -238,7 +238,7 @@ def test_build_env_never_injects_font_env():
 
 
 @pytest.mark.unit
-def test_build_env_no_font_keys_when_absent():
+def test_build_env_no_font_keys_when_absent(declared_engine):
     ip = InvisiblePlaywright(seed=42)
     env = ip._build_env({})
     assert "STEALTHFOX_FONTLIST" not in env

@@ -283,6 +283,24 @@ def lab_exit(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def declared_engine(monkeypatch, tmp_path):
+    """An engine executable declared for one test that is not e2e, instead of the one the core resolves.
+
+    Without ``binary_path=`` the launch resolves the engine through ``ensure_binary`` (``_engine.resolve_executable``): with an engine in
+    the cache of the machine it answers at once, and with none it asks GitHub's release index and downloads the archive. So a unit test that
+    composes a launch passed on a machine that had run ``fetch`` and went to the internet on a fresh runner, and a test that is not e2e
+    never leaves the machine (``tests/_no_network.py``). The file is never run: the tests that take this fixture stop at the environment,
+    the arguments or a fake ``launch``. Returns its path."""
+    from invisible_playwright import _engine
+
+    executable = tmp_path / "declared-engine" / ("firefox.exe" if sys.platform == "win32" else "firefox")
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"")
+    monkeypatch.setattr(_engine, "ensure_binary", lambda *a, **k: executable)
+    return executable
+
+
+@pytest.fixture
 def local_egress_echo(monkeypatch):
     """The REAL discovery of the exit, for the test that must prove it, against an echo service of its own on loopback: the three services of the
     product are replaced by one that answers :data:`_lab_egress.LAB_EGRESS_IP` and counts its questions. Nothing goes to the internet."""
