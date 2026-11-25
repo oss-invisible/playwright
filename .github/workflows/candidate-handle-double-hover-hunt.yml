@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# candidate-handle-double-hover-hunt.yml - a MEASUREMENT, not a gate: on Windows, on the binary of an ENGINE CANDIDATE, is the double `mouseover` that
+# `tests/test_element_handle_actions.py::test_the_nine_actions_reach_the_page_through_a_handle` saw once (page record ['hover', 'hover', 'click'])
+# an EXIT AND RE-ENTRY of the pointer (a mouseout between the two) or a SPURIOUS second mouseover (none between)?
+#
+# The scenario is the first `query_selector("#bottone").click()` of that test, repeated with a fresh browser each time (tests/hunt_handle_double_hover_e2e.py):
+# the page listens to mouseover, mouseout, mouseenter, mouseleave, every mousemove and the button's rect, and the core's retry loop is hooked (it logs nothing
+# of its turns). 60 runs one after the other, then 60 four at a time (xdist -n 4, as the suite runs). One line of JSON per run, a verdict
+# (single | exit-reentry | spurious | other | error), a table in the log.
+#
+# The candidate is named by two files of this branch (ci/candidate-run.txt, ci/candidate-core-ref.txt): the artifact asset-win-x86_64 of that run of `release`
+# in oss-invisible/firefox_antidetect_patch, sealed as the gate of the candidate seals it (scripts/hunt_candidate_binary.py). The wrapper is this branch's code,
+# installed with that core ref, as the gate installs it.
+#
+# ONE job, on a push to its own branch only. Green whatever it finds; red only when the scenario itself errored (a launch, a goto or a click that raised).
+# ─────────────────────────────────────────────────────────────────────────────
+name: candidate-handle-double-hover-hunt
+
+on:
+  push:
+    branches: [hunt/handle-double-hover]
+
+permissions:
+  contents: read
+  actions: read
+
+# A hunt has a group of its own, unique to the run: a newer push never cancels a measurement that is half done (tests/test_ci_runs_once_per_commit.py).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  # reads the artifacts and the log of the candidate's run (the engine repository is public)
+  GH_TOKEN: ${{ github.token }}
+  GITHUB_TOKEN: ${{ github.token }}
+  # the core of the candidate, not the one the wrapper pins: the pair is mismatched on purpose, as the gate of the candidate runs it
+  INVISIBLE_CORE_PIN: allow
+  INVISIBLE_CORE_AUTOFIX: "off"
+
+jobs:
+  handle-double-hover:
+    name: candidate-handle-double-hover (windows)
+    runs-on: windows-2022      # the image of wrapper.e2e.suite.windows.1 in the gate of the candidate
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      HUNT_OUT: ${{ github.workspace }}/hunt-out
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: The candidate is named (ci/candidate-run.txt, ci/candidate-core-ref.txt)
+        run: python scripts/hunt_candidate_binary.py check
+      - name: Install the core of the candidate, the wrapper and the test deps
+        run: |
+          set -e
+          CORE_GIT="git+https://github.com/oss-invisible/core@$(python scripts/hunt_candidate_binary.py core-ref)"
+          python -m pip install --upgrade pip
+          python -m pip install --quiet "$CORE_GIT"
+          python -m pip install --quiet ".[dev]"
+          python -m pip install --quiet --force-reinstall "$CORE_GIT"
+          python -m pip install --quiet "playwright==$(cat scripts/playwright_pin.txt)"
+          python scripts/hunt_candidate_binary.py verify-core
+      - name: The binary of the candidate (asset-win-x86_64), sealed
+        run: python scripts/hunt_candidate_binary.py fetch --leg win-x86_64 --dest "$RUNNER_TEMP/candidate"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build --pin ci/geoip.json
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Which candidate this hunt ran on
+        run: |
+          mkdir -p "$HUNT_OUT"
+          cp "$RUNNER_TEMP/candidate/candidate.json" "$HUNT_OUT/"
+          cat "$HUNT_OUT/candidate.json"
+      # no PYTEST_ADDOPTS, no rerun plugin, no suite's options: the file is named by its path and is in no row of ci/required-suites.json
+      - name: 60 runs one after the other (a fresh browser each)
+        run: |
+          HUNT_MODE=sequential HUNT_RUNS=60 python -m pytest tests/hunt_handle_double_hover_e2e.py -o addopts="" -p no:cacheprovider -p no:rerunfailures \
+            -m e2e -q -rf --timeout 420 --timeout-method thread
+      - name: 60 runs four at a time (xdist -n 4, as the suite runs)
+        if: always()
+        run: |
+          HUNT_MODE=parallel HUNT_RUNS=60 python -m pytest tests/hunt_handle_double_hover_e2e.py -o addopts="" -p no:cacheprovider -p no:rerunfailures \
+            -m e2e -q -rf --timeout 420 --timeout-method thread -n 4 --dist load
+      - name: Close every Firefox left
+        if: always()
+        run: |
+          taskkill //F //IM firefox.exe //T 2>/dev/null || true
+          echo "left: $(tasklist //FI 'IMAGENAME eq firefox.exe' 2>/dev/null | grep -ci firefox || true)"
+      - name: The summary (the verdicts, the retry turns, the sequence of every run that is not single)
+        if: always()
+        run: python scripts/hunt_handle_double_hover_summary.py "$HUNT_OUT"
+      - name: Upload the runs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: handle-double-hover-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/hunt-out
+          if-no-files-found: warn
+          retention-days: 14
