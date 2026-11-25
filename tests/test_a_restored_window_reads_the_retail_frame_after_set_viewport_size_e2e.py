@@ -27,13 +27,29 @@ window at that scale (or that goes back to maximized when the page asks for the 
 run the same assertions: the declaration, not the host, is what is read.
 
 The page is a local one (``Sites``); the mouse is the client's own (``page.mouse.move``), so the events are trusted ones.
+
+The restored state survives the replacement of the top browsing context
+(``test_the_restored_state_survives_a_browsing_context_replacement``, 1920x1080 at scale 1.0): after ``set_viewport_size(390, 844)`` the same tab
+navigates to a page served with ``Cross-Origin-Opener-Policy: same-origin`` (and ``Cross-Origin-Embedder-Policy: require-corp``) from another site of
+the local server, while the first page has none. The opener policy differs, so the parent does not keep the top browsing context: it REPLACES it
+(``CanonicalBrowsingContext::ReplacedBy``) with one of a new browsing context group. The window is the same window, so the page must read the same
+restored window (inner 390x844, outer 516x945, screen 4,4, mozInnerScreen 12,89, and the events' offset 12,89). Without the engine line that carries the
+restored state across the replacement, the new browsing context starts from the maximized window and the page reads the maximized numbers instead
+(outer 1936x1048, screen -8,-8, mozInnerScreen 0,85).
+
+The replacement is proved twice, so the test cannot pass by accident: the page reads ``crossOriginIsolated`` False before and True after (the opener
+policy took effect: a new browsing context group), and the engine's own Juggler trace holds the ``onNavigationMoved`` line of that navigation, naming the
+browsing context the load left (``tests/_navigation_moved_trace.py``): a load that left its browsing context is a load that replaced it.
 """
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
+from _evidence_on_failure import FailureEvidence
 from _fission_frames import Sites
+from _navigation_moved_trace import moved_origin, read_trace
 from _waits import wait_until
 
 pytestmark = pytest.mark.e2e
@@ -180,3 +196,52 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
                 reading = _stable(page, (width, height))
                 event = _event_offset(page, POINTS[number])
                 _check_reading("set_viewport_size(%d, %d), call %d (%s)" % (width, height, number, case), reading, event, call, dpr)
+
+
+#: The headers that give the second page its own browsing context group (and make it cross-origin isolated).
+ISOLATING = [("Cross-Origin-Opener-Policy", "same-origin"), ("Cross-Origin-Embedder-Policy", "require-corp")]
+
+#: The restored window of call 1 at scale 1.0 (the first case above), and the maximized one the new browsing context falls back to without the line.
+RESTORED_390x844 = CASES["1920x1080-dpr1.0"]["calls"][0]
+
+
+def test_the_restored_state_survives_a_browsing_context_replacement(firefox_binary):
+    from invisible_playwright import InvisiblePlaywright
+
+    pin = {"screen.width": PANEL[0], "screen.height": PANEL[1], "screen.dpr": 1.0}
+    width, height = RESTORED_390x844["size"]
+    held = FailureEvidence("a-restored-window-survives-a-browsing-context-replacement")
+    held.arm()      # the engine's trace, before the browser is launched (it reads the variable at launch)
+    try:
+        with Sites() as s:
+            s.route("A", "/first", PAGE)
+            s.route("B", "/second", PAGE, headers=ISOLATING)
+            first, second = s.url("A", "/first"), s.url("B", "/second")
+            with InvisiblePlaywright(seed=42, pin=pin, binary_path=firefox_binary, headless=True, humanize=False) as browser:
+                page = browser.new_page()
+                page.goto(first, wait_until="load", timeout=30000)
+                assert page.evaluate("self.crossOriginIsolated") is False, "the first page has no opener policy and reads isolated"
+
+                # 1. the restored window of call 1
+                page.set_viewport_size({"width": width, "height": height})
+                reading = _stable(page, (width, height))
+                event = _event_offset(page, POINTS[0])
+                _check_reading("set_viewport_size(%d, %d) on the first page" % (width, height), reading, event, RESTORED_390x844, 1.0)
+
+                # 2. the same tab goes to a page of another site with an opener policy: the top browsing context is replaced
+                page.goto(second, wait_until="load", timeout=30000)
+                # 3. the proof that it was: the page is isolated (a new browsing context group), and the engine told that the load left its browsing context
+                assert wait_until(lambda: page.evaluate("self.crossOriginIsolated") is True, DEADLINE_S, lambda: page.wait_for_timeout(100)), (
+                    "the second page is not cross-origin isolated (%r): its opener policy did not take effect, so this run replaced nothing"
+                    % page.evaluate("self.crossOriginIsolated"))
+                left_bc, left_child = moved_origin(read_trace(held.trace_dir), second)
+                assert left_bc > 0 and left_child > 0, "the engine told no browsing context left for %s" % second
+
+                # 4. the window the second page reads is still the restored one
+                after = _stable(page, (width, height))
+                after_event = _event_offset(page, POINTS[1])
+                _check_reading("the second page after the replacement", after, after_event, RESTORED_390x844, 1.0)
+                assert (after["ow"], after["oh"], after["sx"], after["sy"], after["mx"], after["my"]) != (1936, 1048, -8, -8, 0, 85), (
+                    "the second page reads the maximized window again: %r" % after)
+    finally:
+        held.__exit__(*sys.exc_info())      # the evidence is saved when the body raised, and the engine's trace variable is put back
