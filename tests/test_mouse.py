@@ -20,6 +20,7 @@ import urllib.parse
 
 import pytest
 
+import _os_cursor
 from invisible_playwright import InvisiblePlaywright
 
 
@@ -140,6 +141,8 @@ def _humanize_move_count(firefox_binary, humanize):
             "<div id=d style='width:600px;height:400px' "
             "onmousemove=\"window.__n=(window.__n||0)+1\">x</div>"
         ))
+        # A native move of the OS cursor would count among the page's mousemoves (`off <= 2` below); it is parked outside the window (tests/_os_cursor.py).
+        _os_cursor.require_outside()
         page.mouse.move(10, 10)
         page.evaluate("window.__n = 0")
         page.mouse.move(500, 300)
