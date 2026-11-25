@@ -152,11 +152,11 @@ jobs:
   # package index. The core is published BEFORE this package, so between the
   # first push of this repo and that upload there is a window in which no
   # install here can succeed. This gate answers "is it on the index?" and the
-  # unit job depends on the answer: during the window that job is SKIPPED (grey
-  # in the checks list, with the reason written into the run summary), never
-  # faked green; once the core is published it runs exactly as before. Full
-  # reasoning, including why `|| true`, `--no-deps` and a git fallback were all
-  # rejected, is in .github/workflows/core-on-index.yml.
+  # unit job depends on the answer: during the window this job FAILS with the
+  # reason (rule ci-13: a core that is not on the index is red, never a skip),
+  # and `gate` is red with it; once the core is published it runs exactly as
+  # before. Full reasoning, including why `|| true`, `--no-deps` and a git
+  # fallback were all rejected, is in .github/workflows/core-on-index.yml.
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
@@ -169,7 +169,6 @@ jobs:
   unit:
     name: pytest (${{ matrix.os }}, py${{ matrix.python }})
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -347,13 +346,12 @@ jobs:
   # exactly how it got here. This job depends on the whole matrix and its
   # name never changes.
   #
-  # SKIPPED IS NOT FAILED, and that is the part specific to this repo. `unit`
-  # is skipped on purpose when `core-on-index` says the pin is not yet on the
-  # index: during that window no install can succeed, and the workflow chose
-  # to SKIP instead of faking green. A gate that required `success` would
-  # turn that choice into a red and push toward dropping the protection on
-  # release day of all days. So it refuses on `failure` and `cancelled`,
-  # never on `skipped`.
+  # SKIPPED IS RED (rule ci-13: nothing counts as passed that did not pass).
+  # A job that was skipped ran nothing. `unit` used to be skipped when
+  # `core-on-index` said the pin was not on the index yet, and this gate
+  # treated that skip as a pass: a pull request merged with no test run. Now
+  # `core-on-index` fails in that case, and the gate refuses every needed job
+  # whose result is not `success`.
   # The guides are the surface a stranger copies first, and until 2026-09-08
   # nothing read them: one page published `page.accessibility.snapshot()`, which
   # this fork does not have, so anybody who ran that block got an AttributeError.
@@ -361,13 +359,11 @@ jobs:
   # by a reader who then leaves.
   #
   # It needs the package importable, because it asks the REAL classes what they
-  # have rather than carrying a list that would drift from them - so it takes
-  # core-on-index's answer exactly as `unit` does, and is SKIPPED during the
-  # window rather than faked green.
+  # have rather than carrying a list that would drift from them - so it needs
+  # core-on-index exactly as `unit` does.
   docs-api:
     name: the guides name an API that exists
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
@@ -396,59 +392,35 @@ jobs:
   # the decorative protection this project has already met once, on the branch
   # rules that required job names no job produced any more.
   #
-  # `skipped` is not a failure and must not be treated as one: `version` runs on
-  # pull requests only and is skipped on every push to main, and `unit` and
-  # `docs-api` are skipped during the window when the pinned core is not on the
-  # index yet. The case arms name failure and cancelled, so a skip passes on
-  # purpose. That is also why each arm carries its own sentence: a gate that
-  # exits 1 without saying which of five inputs went red is a gate somebody has
-  # to open five tabs to read.
+  # Every needed job must end in `success`; `skipped`, `cancelled` and
+  # `failure` are red, one FAIL line each (scripts/ci_gate.py). The single job
+  # that is conditional by design is `version`: it runs on pull requests only,
+  # so a push to main skips it on purpose, and the script expects `skipped`
+  # there and `success` on a pull request. Nothing else is forgiven. The
+  # script is read from origin/main, not from the branch being judged. Its table and the `needs:` below are held together by
+  # tests/test_the_gate_is_red_when_a_needed_job_is_skipped.py.
   gate:
     needs: [core-on-index, unit, docs-api, english, claims, version, way-in, install-job, noreply-identity]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: refuse unless nothing failed
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+      - name: refuse unless every needed job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        # The judge is read from main, never from the branch it judges. Only
+        # while the file is not on main yet (the change that adds it) the
+        # copy of this branch is used, and the log says so.
         run: |
-          echo "core-on-index: ${{ needs.core-on-index.result }}"
-          echo "unit:          ${{ needs.unit.result }}"
-          echo "docs-api:      ${{ needs.docs-api.result }}"
-          echo "english:       ${{ needs.english.result }}"
-          echo "claims:        ${{ needs.claims.result }}"
-          echo "way-in:        ${{ needs.way-in.result }}"
-          echo "version:       ${{ needs.version.result }}"
-          echo "install-job:   ${{ needs.install-job.result }}"
-          echo "noreply-identity: ${{ needs.noreply-identity.result }}"
-          case "${{ needs.unit.result }}" in
-            failure|cancelled) echo "the suite did not pass"; exit 1 ;;
-          esac
-          case "${{ needs.core-on-index.result }}" in
-            failure|cancelled) echo "the index check did not run"; exit 1 ;;
-          esac
-          case "${{ needs.docs-api.result }}" in
-            failure|cancelled) echo "the guides name something that does not exist"; exit 1 ;;
-          esac
-          case "${{ needs.english.result }}" in
-            failure|cancelled) echo "the repository is not English"; exit 1 ;;
-          esac
-          case "${{ needs.claims.result }}" in
-            failure|cancelled) echo "the README promises what no measurement supports"; exit 1 ;;
-          esac
-          case "${{ needs.way-in.result }}" in
-            failure|cancelled) echo "an install instruction is not uv"; exit 1 ;;
-          esac
-          case "${{ needs.version.result }}" in
-            failure|cancelled) echo "the version this change proposes is already taken"; exit 1 ;;
-          esac
-          case "${{ needs.install-job.result }}" in
-            failure|cancelled) echo "the user-install job would not run on a release, or leaks"; exit 1 ;;
-          esac
-          # Unlike the checks above this one must be `success`: it runs on every
-          # event this workflow has, so a skip would mean the check never ran.
-          if [ "${{ needs.noreply-identity.result }}" != "success" ]; then
-            echo "a commit or tag of this change has an email that is not a GitHub noreply address"; exit 1
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if git cat-file -e origin/main:scripts/ci_gate.py 2>/dev/null; then
+            git show origin/main:scripts/ci_gate.py > "$RUNNER_TEMP/ci_gate.py"
+          else
+            echo "ci_gate.py is not on origin/main yet: falling back to the copy of this branch"
+            cp scripts/ci_gate.py "$RUNNER_TEMP/ci_gate.py"
           fi
-          echo "ok"
+          python3 "$RUNNER_TEMP/ci_gate.py"
 
   # Measured 2026-09-04: 0.10.0 was on the index while main sat on 0.10.0 with
   # FIFTEEN commits of different content on top of the tag - 39 files, 841

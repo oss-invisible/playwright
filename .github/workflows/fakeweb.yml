@@ -57,7 +57,6 @@ jobs:
   linux-deps-fakeweb:
     name: linux-deps-fakeweb
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true'
     uses: ./.github/workflows/linux-deps.yml
     with:
       name: fakeweb
@@ -67,7 +66,6 @@ jobs:
   walk:
     name: fakeweb ${{ matrix.profile }} (${{ matrix.os }})
     needs: [core-on-index, linux-deps-fakeweb]
-    if: needs.core-on-index.outputs.available == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:

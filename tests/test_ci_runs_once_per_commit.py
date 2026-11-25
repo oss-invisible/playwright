@@ -25,17 +25,19 @@ the files themselves:
      a job of its own that waits for them. A job that `needs` another is
      SKIPPED when that one fails unless its `if:` says `always()`, and a
      skipped check is not red. So: the job `e2e` needs the parts and
-     `core-on-index`; its `if:` is `always()` and the gate of the parts (the
-     core on the index, not the Windows-only dispatch) joined by `&&`, so that
-     it is skipped exactly when the parts are skipped for the core, as the
-     Linux job was before the split, and runs in every other case; its one
+     `core-on-index`; its `if:` is `always()` and the gate of the parts (not the
+     Windows-only dispatch) joined by `&&`, so that it is skipped exactly when
+     the parts are skipped by that dispatch, and runs in every other case (a
+     core that is not on the index fails `core-on-index`, the parts are then
+     skipped and this job runs and is red: no output of `core-on-index` is
+     read by any `if:`, ci-13); its one
      step binds `needs.e2e-linux.result` (`success` only when every part
      succeeded) and fails unless it is `success`, in exactly the form
      `if [ "$PARTS" != "success" ]; then ... exit 1 ... fi`, with no other
      result named in its code (a cancelled part measured nothing, a skipped
      one ran nothing); no `continue-on-error`; no other job has its name.
      Known-bad: without `always()`, accepting `skipped`, not needing the
-     parts, exiting 0, reading another job, dropping the gate of the core,
+     parts, exiting 0, reading another job, dropping the gate of the dispatch,
      `success() || failure()`, the single job before the split.
 
 The checkers are tested on known-bad inputs first, because a check that has
@@ -387,7 +389,7 @@ def problems_linux_check(text: str) -> list:
     if PARTS_JOB not in needs:
         out.append("the check does not need the parts (%s): it would not wait for them, nor read their result" % PARTS_JOB)
     if INDEX_GATE not in needs:
-        out.append("the check does not need %s: its `if:` cannot read whether the core is on the index" % INDEX_GATE)
+        out.append("the check does not need %s: it would run before the index was asked" % INDEX_GATE)
     if "||" in str(check.get("if", "")):
         out.append("the `if:` of the check has a `||`: it must be `always()` and the gate of the parts")
     cond = _conjuncts(check.get("if"))
@@ -457,8 +459,8 @@ def test_a_linux_check_that_reads_another_job_is_refused():
     assert any("does not bind PARTS" in p for p in problems_linux_check(_e2e_with_check(body)))
 
 
-def test_a_linux_check_that_drops_the_gate_of_the_core_is_refused():
-    body = _check_body().replace(" && needs.core-on-index.outputs.available == 'true'", "", 1)
+def test_a_linux_check_that_drops_the_gate_of_the_dispatch_is_refused():
+    body = _check_body().replace(" && inputs.only != 'windows-control-a'", "", 1)
     assert body != _check_body()
     assert any("not `always()` and the gate of the parts" in p for p in problems_linux_check(_e2e_with_check(body)))
 

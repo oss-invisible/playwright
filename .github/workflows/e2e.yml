@@ -74,9 +74,9 @@ env:
 jobs:
   # The install below resolves `invisible-core==N.M.0` from the package index,
   # and the core is published BEFORE this package. This gate answers whether it
-  # is on the index yet; during that window the e2e job is SKIPPED with the
-  # reason in the run summary rather than faked green, and once the core is up
-  # it runs unchanged. See .github/workflows/core-on-index.yml.
+  # is on the index yet; during that window this job FAILS (rule ci-13: a core
+  # that is not on the index is red, never a skip) and the e2e jobs, which
+  # need it, do not run; once the core is up it runs unchanged. See .github/workflows/core-on-index.yml.
   core-on-index:
     uses: ./.github/workflows/core-on-index.yml
 
@@ -87,7 +87,7 @@ jobs:
   linux-deps-e2e:
     name: linux-deps-e2e
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     uses: ./.github/workflows/linux-deps.yml
     with:
       name: e2e
@@ -104,7 +104,7 @@ jobs:
   e2e-linux:
     name: e2e (linux, part ${{ matrix.part }})
     needs: [core-on-index, linux-deps-e2e]
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -368,13 +368,12 @@ jobs:
   # it is green only when every part is green. `needs.e2e-linux.result` is the result of the matrix as a whole (`success` only when every part succeeded;
   # one failed, cancelled or skipped part makes it something else), and anything but `success` is red here: a cancelled part measured nothing, a skipped
   # one ran nothing. `always()` so that a red or cancelled part still reaches this job and turns it red instead of skipping it, which reads as not red.
-  # The gate of the core on the index stays the same as for the parts: while the pinned core is not on the index the parts are skipped with the reason in
-  # the summary (core-on-index.yml), and so is this job, as the Linux job was before the split.
+  # The gate of the core on the index stays the same as for the parts: while the pinned core is not on the index core-on-index is red and the parts are skipped, so this job (always()) sees their result `skipped` and fails (rule ci-13).
   # tests/test_ci_runs_once_per_commit.py (5.) holds this job.
   e2e:
     name: e2e (linux, xvfb)
     needs: [core-on-index, e2e-linux]
-    if: always() && needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: always() && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -391,12 +390,10 @@ jobs:
   # ``Control+A`` selects all in a field, on the PUBLISHED engine and the core this package pins, on Windows, where the keyboard of a real
   # user is: the shortcut letter used to reach the browser as Control+Shift+A (invisible-core 63.66.0 fixes it). The e2e is red on the
   # keyboard that held Shift for the capital A (tests/test_control_a_selects_all_in_a_field_e2e.py: 5 ways to press it x an <input> and a
-  # <textarea>, in-process and served to the stock Playwright client). Same gate as the Linux job: it is SKIPPED, with the reason in the
-  # summary, until the core is on the index, and it runs unchanged after; `workflow_dispatch` with `only: windows-control-a` runs it alone.
+  # <textarea>, in-process and served to the stock Playwright client). Same gate as the Linux job: it needs core-on-index, which fails until the core is on the index, and it runs unchanged after; `workflow_dispatch` with `only: windows-control-a` runs it alone.
   e2e-windows-control-a:
     name: e2e (windows, Control+A)
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
@@ -439,7 +436,7 @@ jobs:
   e2e-windows:
     name: e2e (windows, part ${{ matrix.part }})
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 40
     # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
@@ -539,7 +536,7 @@ jobs:
   e2e-network:
     name: e2e (network, linux)
     needs: [core-on-index, linux-deps-e2e]
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
     timeout-minutes: 50
@@ -630,7 +627,7 @@ jobs:
   e2e-network-windows:
     name: e2e (network, windows)
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: windows-2022
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
     timeout-minutes: 50
@@ -703,7 +700,7 @@ jobs:
   e2e-host:
     name: e2e (host, linux)
     needs: [core-on-index, linux-deps-e2e]
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 65
     steps:
@@ -813,7 +810,7 @@ jobs:
   e2e-host-windows:
     name: e2e (host, windows)
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -952,7 +949,7 @@ jobs:
   e2e-page:
     name: e2e (page oracle, linux)
     needs: [core-on-index, linux-deps-e2e]
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -1042,7 +1039,7 @@ jobs:
   e2e-page-windows:
     name: e2e (page oracle, windows)
     needs: core-on-index
-    if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -1121,7 +1118,7 @@ jobs:
   e2e-page-final-touched:
     name: e2e (page oracle, is it touched)
     needs: core-on-index
-    if: github.event_name == 'pull_request' && needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
+    if: github.event_name == 'pull_request' && inputs.only != 'windows-control-a'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -1141,7 +1138,7 @@ jobs:
   e2e-page-final:
     name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, linux)
     needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]
-    if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
+    if: needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -1231,7 +1228,7 @@ jobs:
   e2e-page-final-windows:
     name: e2e (page oracle, final seeds ${{ matrix.shard }}/4, windows)
     needs: [core-on-index, e2e-page-final-touched]
-    if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
+    if: needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: windows-2022
     timeout-minutes: 40
     strategy:

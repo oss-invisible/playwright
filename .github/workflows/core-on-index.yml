@@ -28,28 +28,27 @@
 # version with content nobody compared, which is the exact failure mode the
 # `==` specifier was adopted to expose.
 #
-# So this workflow asks the index and reports a verdict, and the callers make
-# their real jobs depend on it. Three outcomes, all of them visible:
+# So this workflow asks the index and reports a verdict: the job is green only
+# when the pinned core is on the index, and RED in every other case. There is no
+# "skip" outcome and no output a caller can read to skip itself (rule ci-13:
+# nothing counts as passed that did not pass). Outcomes:
 #
 #   the project is not on the index at all
-#       -> the publish window. This job passes, emits a ::warning:: annotation
-#          on the run page, writes the reason into the run summary, and returns
-#          available=false. Every caller job is then SKIPPED - grey in the
-#          checks list, not green - and the summary says in words that no tests
-#          ran. Nobody can mistake it for a passing build.
+#       -> red. During the publish window (the core is uploaded first, this
+#          package after it) no install here can succeed, so the run says so and
+#          fails; re-run it once the core's publish has finished. The callers
+#          `need` this job, so they do not run, and the `gate` of tests.yml
+#          refuses a skipped job.
 #
 #   the project is on the index and carries the pinned version
-#       -> available=true. Every caller job runs exactly as it did before this
-#          file existed. Nothing is weakened, ever.
+#       -> green. Every caller job runs exactly as it did before this file
+#          existed. Nothing is weakened, ever.
 #
 #   the project is on the index but NOT at the pinned version
-#       -> this is not the window. The core has been published, so the pin
-#          names a version that was never uploaded. Hard failure, red.
+#       -> red: the pin names a version that was never uploaded.
 #
 # Anything ambiguous (index unreachable, malformed answer, no `==` pin in
-# pyproject.toml, two of them) is also a hard failure. A gate that answers
-# "skip" when it does not know would silently disable this repo's whole CI the
-# first time PyPI has a bad minute.
+# pyproject.toml, two of them) is also a hard failure.
 #
 # This does NOT stop being useful once the core is published: it is the check
 # that catches a pin pointing at a version that does not exist, about 20s
@@ -60,12 +59,6 @@ name: core-on-index
 on:
   workflow_call:
     outputs:
-      available:
-        description: >-
-          "true" when the invisible-core version pinned in pyproject.toml can
-          be resolved from the package index. Any other value means the caller
-          must not attempt an install.
-        value: ${{ jobs.probe.outputs.available }}
       pin:
         description: The invisible-core version this repo pins.
         value: ${{ jobs.probe.outputs.pin }}
@@ -79,7 +72,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      available: ${{ steps.probe.outputs.available }}
       pin: ${{ steps.probe.outputs.pin }}
     steps:
       # SHA-pinned like e2e.yml: this job decides whether the rest of the repo's
@@ -167,29 +159,20 @@ jobs:
                   f"verdict, so this job fails instead of guessing. Re-run it.")
 
           if unpublished:
-              msg = (f"{DIST} has never been published to the index. This is the "
-                     f"expected publish window: the core is uploaded first, this "
-                     f"repo's package after it.")
-              print(f"::warning title={DIST} is not on the index yet::{msg} "
-                    f"NOTHING WAS INSTALLED AND NO TEST RAN in this workflow run.")
-              write("GITHUB_STEP_SUMMARY",
-                    f"### NO TESTS RAN\n\n{msg}\n\n"
-                    f"Every job in this workflow was **skipped**, not passed. "
-                    f"`pyproject.toml` pins `{DIST}=={pin}`; until that version is on "
-                    f"the index no `pip install` in this repository can resolve, so "
-                    f"there is nothing to run. Publish `{DIST}=={pin}`, then re-run "
-                    f"this workflow - the jobs come back on their own, with no edit "
-                    f"to any file here.\n")
-              write("GITHUB_OUTPUT", "available=false")
-              sys.exit(0)
+              die(f"FAIL core-on-index: the pinned {DIST} {pin} is not on the index. "
+                  f"Fix: wait for its publish to finish, or pin a published core. "
+                  f"Rule: ci-13 nothing counts as passed that did not pass")
 
           versions = data.get("versions")
           if not versions:
               die(f"{url} answered but listed no versions. The index API changed shape "
-                  f"or served something unexpected; refusing to turn that into a skip.")
+                  f"or served something unexpected; refusing to guess.")
           if pin not in versions:
               shown = sorted(versions)[-10:]   # diagnostics only, so a plain sort
-              die(f"pyproject.toml pins {DIST}=={pin}, but the index publishes "
+              die(f"FAIL core-on-index: the pinned {DIST} {pin} is not on the index. "
+                  f"Fix: wait for its publish to finish, or pin a published core. "
+                  f"Rule: ci-13 nothing counts as passed that did not pass. "
+                  f"Detail: pyproject.toml pins {DIST}=={pin}, but the index publishes "
                   f"{len(versions)} version(s) ({', '.join(shown)}) and not {pin}. "
                   f"{DIST} exists, so this is NOT the "
                   f"publish window - the pin names a version that was never uploaded. "
@@ -197,11 +180,9 @@ jobs:
                   f"the core first.")
 
           print(f"{DIST}=={pin} is on the index - the workflow runs normally.")
-          write("GITHUB_OUTPUT", "available=true")
           PY
 
       - name: Say so in the run summary
-        if: steps.probe.outputs.available == 'true'
         run: |
           echo "invisible-core==${{ steps.probe.outputs.pin }} is on the index; jobs run normally." \
             >> "$GITHUB_STEP_SUMMARY"
