@@ -9,21 +9,32 @@ The hook: ``nsWindow::OnVisibilityNotifyEvent`` in ``widget/gtk/nsWindow.cpp`` o
 ternary that decides ``OCCLUDED`` or ``UNKNOWN`` reads the pref (``StealthOcclusionTracked``). On Windows the same declaration is Mozilla's own pref, so the same
 page reading is the proof that the two builds do not disagree.
 
-The control, in the same test: the two prefs true. The same two sessions, the same covering, and the covered page turns ``hidden``. Without it the first half
+The control, in the same test: the two prefs true. The same covering, and the covered page turns ``hidden``. Without it the first half
 proves nothing (a window that was never covered is visible too); it runs first, so a runner on which two windows do not cover each other is red here and not a
 green that means nothing.
 
-Two sessions are launched on one display and both are headed. Linux: the display is a private Xvfb started for this test and shared only by its two sessions
-(``_os_focus.a_display_of_its_own``, ``DISPLAY`` set with ``monkeypatch`` before either session starts), so no other worker's headed window can sit above or
-inside the pair. No window manager runs there. The engine turns a window ``OCCLUDED`` only on a ``VisibilityNotify`` with ``FullyObscured`` of its toplevel,
-so the test asks X itself, through a connection of its own (``_x_visibility.XVisibility``, libX11 as the focus test): it selects ``VisibilityChangeMask``
-on the covered toplevel before the cover is mapped; once the covering toplevel is up it raises it (``XRaiseWindow``) and reads back ONCE, asserted, the
-stacking (``XQueryTree``: the cover above the covered window) and the geometries (the covered window inside the cover); then it waits for X's
-``VisibilityNotify FullyObscured`` of the covered toplevel, in both halves. A red there says "arrangement" (X never told the window it is covered, so the page
-proves nothing). With tracking enabled, X's ``FullyObscured`` arrived and a page that never turns ``hidden`` is red with a message that starts with "ENGINE".
-Without tracking, the same ``FullyObscured`` arrived and the page must stay ``visible``. The X record (the two window ids, the stacking and geometries read
-back, every visibility event with its time since the watch began, and whether ``FullyObscured`` arrived) is saved on every run, green or red, with the
-Windows record below. Windows: opening the second window is not enough, and neither is putting it above the first one. ``WinWindowOcclusionTracker`` marks a root window
+The covering window. Linux: the display is a private Xvfb started for this test (``_os_focus.a_display_of_its_own``, ``DISPLAY`` set with ``monkeypatch`` before
+the session starts), so no other worker's headed window can sit above or inside the pair. No window manager runs there. The cover is NOT a second Firefox
+session: it is a window of the test's own (``_x_visibility.XVisibility.cover_window``), an override-redirect ``InputOutput`` window, larger than the covered
+toplevel by 32 px on every side (inside the screen where it fits), mapped and raised, and never given the focus. Why not a second session: its window took the
+X focus when it mapped, the covered toplevel got ``FocusOut``, and GTK draws a window that loses the focus (``nsWindow::OnExposeEvent``,
+``NotifyOcclusionState(VISIBLE)``). When X delivered ``PartiallyObscured``, ``FocusOut`` and ``FullyObscured`` in one batch, that draw ran 0.4 to 15 ms after the
+``FullyObscured`` and turned the window ``VISIBLE`` again before the posted visibility update ran: the page never recorded ``hidden`` (hunt run 45603211231, 58
+reds of 1294; shard 1 it-0014: ``VisibilityNotify state 1`` at 54.355670, ``OnContainerFocusOutEvent`` at 54.355752, ``state 2`` at 54.356290,
+``OnExposeEvent`` with ``mIsFullyOccluded 0`` at 54.359166). Mozilla's own behaviour, in retail too; the engine is not changed, the arrangement must not move the
+focus. Windows: the second session stays (the tracker needs its window, below).
+
+The engine turns a window ``OCCLUDED`` only on a ``VisibilityNotify`` with ``FullyObscured`` of its toplevel, so the test asks X itself, through a connection of
+its own (``_x_visibility.XVisibility``, libX11 as the focus test): it selects ``VisibilityChangeMask`` together with ``FocusChangeMask`` on the covered toplevel
+before the cover is created; it creates and raises the cover and reads back ONCE, asserted, the stacking (``XQueryTree``: the cover above the covered window) and
+the geometries (the covered window inside the cover); then it waits for X's ``VisibilityNotify FullyObscured`` of the covered toplevel, in both halves. A red
+there says "arrangement" (X never told the window it is covered, so the page proves nothing). The precondition, asserted in both halves before the page is
+judged: no ``FocusOut`` reached the covered toplevel between the start of the watch and the verdict ("arrangement: the covering moved the focus", with the X
+record; red on the second-session arrangement, which always produced one, green runs included). With tracking enabled, X's ``FullyObscured`` arrived and a page
+that never turns ``hidden`` is red with a message that starts with "ENGINE". Without tracking, the same ``FullyObscured`` arrived and the page must stay
+``visible``: the product half's meaning is unchanged. The X record (the two window ids, the stacking and geometries read back, every visibility and focus event
+with its time since the watch began, and whether ``FullyObscured`` arrived) is saved on every run, green or red, with the Windows record below.
+Windows: opening the second window is not enough, and neither is putting it above the first one. ``WinWindowOcclusionTracker`` marks a root window
 ``OCCLUDED`` only when the windows ABOVE it in the Z-order already cover its rectangle (``widget/windows/WinWindowOcclusionTracker.cpp``,
 ``ProcessComputeNativeWindowOcclusionStatusCallback``: ``it->second = (mUnoccludedDesktopRegion == currUnoccludedDestkop) ? OCCLUDED : VISIBLE``), and it
 computes that only when an event it hooks tells it to (``RegisterEventHooks``): a change of the foreground window, a move or resize, a minimize or restore, a
@@ -63,7 +74,7 @@ again and leaves it covered (``XVisibility.shrink_by_one``: one pixel narrower t
 with the changes ``visible, hidden, visible``: the state at the end, which was the criterion of the control before, is ``visible`` here, so it would be red.
 
 The engine's own log of its window system (``MOZ_LOG=Widget:4``, the level of nsWindow's LOG; the core passes it, ``environment.MOZ_DIAGNOSTICS``) is written into the evidence
-folder with the rest.
+folder with the rest, one file per process (``MOZ_LOG_FILE`` with ``%PID``, ``FailureEvidence.arm``).
 """
 from __future__ import annotations
 
@@ -77,7 +88,7 @@ from _evidence_on_failure import FailureEvidence
 from _os_focus import a_display_of_its_own
 from _waits import watch
 from _window_sessions import DEADLINE_S, in_a_thread_of_its_own, launch, wait_for_condition
-from _x_visibility import XVisibility, control_sees_hidden, product_stays_visible
+from _x_visibility import XVisibility, control_sees_hidden, focus_moved, product_stays_visible
 
 pytestmark = pytest.mark.e2e
 
@@ -431,7 +442,8 @@ class CoveringOnWindows:
 
 
 class CoveringOnX:
-    """Linux only: what X says about the two toplevels, through the test's own connection ``x`` to the private display (see the module docstring)."""
+    """Linux only: what X says about the covered toplevel and the test's own cover window, through the test's own connection ``x`` to the private display (see
+    the module docstring)."""
 
     def __init__(self, x) -> None:
         self.x = x
@@ -448,10 +460,10 @@ class CoveringOnX:
                                         "arrangement: no single viewable toplevel is titled %r" % COVERED_TITLE).history[-1][1]
         self.visibility = self.x.watch(self.first)
 
-    def raise_the_cover_and_read_back(self, covered):
-        """Raises the covering toplevel, reads the stacking and the geometries back once, and asserts them."""
-        self.cover = wait_for_condition(covered, lambda: self.x.window_titled(COVER_TITLE), lambda window: window is not None,
-                                        "arrangement: no single viewable toplevel is titled %r" % COVER_TITLE).history[-1][1]
+    def cover_the_window_and_read_back(self):
+        """Creates the cover (an override-redirect window of the test's own, no focus asked), raises it, reads the stacking and the geometries back once, and
+        asserts them."""
+        self.cover = self.x.cover_window(self.first)
         self.after_raise = self.x.raise_and_read(self.first, self.cover)
         assert self.after_raise["ok"], "arrangement: after XRaiseWindow the cover is not above the covered toplevel with the covered one inside it: %r" % (
             self.evidence(),)
@@ -469,6 +481,16 @@ class CoveringOnX:
         seen = watch(look, lambda first: first is not None, DEADLINE_S, lambda: covered.wait_for_timeout(100))
         assert seen.ok, "arrangement: X never sent the covered toplevel VisibilityNotify FullyObscured (%s), so the page proves nothing: %r" % (
             self.line(), self.evidence())
+
+    def assert_the_focus_did_not_move(self):
+        """The precondition, before the page is judged: no ``FocusOut`` reached the covered toplevel since the watch began (``focus_moved``)."""
+        self.x.drain()
+        problem = focus_moved(self.visibility)
+        assert not problem, "%s; X: %r" % (problem, self.evidence())
+
+    def remove_the_cover(self):
+        if self.cover is not None:
+            self.x.destroy_window(self.cover)
 
     def engine_message(self, seen, changes):
         return ("ENGINE: X sent the covered toplevel VisibilityNotify FullyObscured (%s) and with occlusion tracking enabled its page never recorded hidden "
@@ -517,16 +539,17 @@ class Record:
 
 
 def second_window_over_the_first(firefox_binary, tracking, record, x):
-    """A dict of what the first session's page recorded after a second session's window is up over it: ``state`` and ``changes`` at the end, ``verdict_changes``
+    """A dict of what the first session's page recorded after a window is up over it (on Windows the second session's, on Linux the test's own): ``state`` and ``changes`` at the end, ``verdict_changes``
     and ``not_before`` (the list of changes when the wait for ``hidden`` ended, and the index it counts from), ``windows`` (the evidence of the covering: on
     Windows the tracker's view, on Linux X's, also added to ``record`` for the evidence file) and, in the control half on Linux, ``drawn`` (the covered window
     drawn again while it stays covered).
 
     ``tracking`` is None for the product as it launches, or the value both tracking prefs are given; ``x`` is the test's own connection to the private
-    display on Linux, None on Windows."""
+    display on Linux (the cover is its own window, no second session), None on Windows (the second session's window covers)."""
     half = "control (tracking enabled)" if tracking else "product"
     extra = None if tracking is None else {name: tracking for name in TRACKING_PREFS}
-    with launch(firefox_binary, extra_prefs=extra) as first, in_a_thread_of_its_own(firefox_binary) as second:
+    second_session = contextlib.nullcontext() if x is not None else in_a_thread_of_its_own(firefox_binary)
+    with launch(firefox_binary, extra_prefs=extra) as first, second_session as second:
         covered = first.new_page()
         covered.goto("about:blank")
         covered.evaluate(NAME, COVERED_TITLE)
@@ -540,16 +563,18 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
             assert covered.evaluate(WATCH) == "visible", "the page was not visible before anything covered it"
             if on_x:
                 on_x.watch_the_covered_window(covered)
-            second.run(opens_the_covering_window)
             if covering:
+                second.run(opens_the_covering_window)
                 covering.find_the_cover(covered)
                 covering.arrange(covered)
             if on_x:
-                on_x.raise_the_cover_and_read_back(covered)
+                on_x.cover_the_window_and_read_back()
                 on_x.wait_until_x_says_fully_obscured(covered)
             not_before = on_x.not_before if on_x else 1
             if tracking:
                 seen = covering.wait_for_hidden(covered) if covering else watch_hidden_change(covered, not_before)
+                if on_x:
+                    on_x.assert_the_focus_did_not_move()
                 verdict_changes = covered.evaluate(CHANGES)
                 assert seen.ok and control_sees_hidden(verdict_changes, not_before), on_x.engine_message(seen, verdict_changes) if on_x else (
                     "a window that another one covers never turned hidden with occlusion tracking enabled; the changes the page recorded: %r; seen: %s; "
@@ -558,6 +583,8 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
                     drawn = on_x.draw_while_covered(covered)
             else:
                 covered.evaluate(TWO_FRAMES)
+                if on_x:
+                    on_x.assert_the_focus_did_not_move()
             windows = covering.evidence() if covering else on_x.evidence() if on_x else None
             return {"state": covered.evaluate(STATE), "changes": covered.evaluate(CHANGES), "verdict_changes": verdict_changes, "not_before": not_before,
                     "windows": windows, "drawn": drawn}
@@ -566,6 +593,7 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
                 record.add({"half": half, **covering.evidence()})
             if on_x:
                 record.add({"half": half, **on_x.evidence()})
+                on_x.remove_the_cover()
 
 
 def watch_hidden_change(covered, not_before):
@@ -583,7 +611,7 @@ def lines(record):
 
 @contextlib.contextmanager
 def the_display(monkeypatch):
-    """Linux: a private Xvfb for the two sessions of this test and the test's own X connection to it. Windows: the runner's desktop, None."""
+    """Linux: a private Xvfb for this test and the test's own X connection to it. Windows: the runner's desktop, None."""
     if sys.platform == "win32":
         yield None
         return
