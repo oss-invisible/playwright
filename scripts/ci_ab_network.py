@@ -49,6 +49,11 @@ under ``exits``, outside the leaves that are compared, and a parent that did not
 the side, the seed, the launch and the code. What a launch that died left is kept beside the transcript (``transcript-68.json`` -> ``transcript-68.crash/``): the core through gdb with
 the build ids, the ``.extra`` and the minidump names, ``said.txt`` for what the collectors did not find. This oracle runs no strace (a trace would change the outcome it observes).
 
+THE WEBRTC EVIDENCE AND THE HUNT. The WebRTC walk keeps, under ``transcript["evidence"]["seeds"][<seed>]["webrtc"]`` (never compared: the comparison reads ``seeds`` and nothing else), every datagram the gateway
+routed in it (when, target, message, STUN transaction id), the moments of its stages and of the page's call, and the page's own ``performance.now()`` at each step of the gather. With
+``AB_NETWORK_HUNT=webrtc:<seed>:<n>`` the command ``ab`` runs ONLY that walk of that seed, ``n`` times for each engine of the A/A, and writes ``<out>/hunt/<engine>-<i>.json`` and ``<out>/hunt/summary.json``;
+it decides nothing and exits 0 (e2e-hunt.yml: the input ``ab_network_webrtc_seed``).
+
 Exit codes: 0 green, 1 red (a finding), 2 broken control (the A/A is red) or a run that could not run.
 """
 from __future__ import annotations
@@ -79,6 +84,10 @@ import ci_crash_evidence as crash  # noqa: E402  (how each launch's parent ended
 FORMAT = "ab-network/1"
 DIFF_FORMAT = "ab-network-diff/1"
 EVIDENCE_FORMAT = "ab-network-evidence/1"
+HUNT_FORMAT = "ab-network-hunt/1"
+HUNT_SUMMARY_FORMAT = "ab-network-hunt-summary/1"
+#: The environment variable that makes ``ab`` repeat one walk of one seed and nothing else (``cmd_hunt``): ``webrtc:<seed>:<n>``.
+HUNT_ENV = "AB_NETWORK_HUNT"
 VOLATILE_FORMAT = "ab-network-volatile/1"
 VOLATILE_FILE = ROOT / "ci" / "ab-network-volatile.json"
 SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
@@ -544,6 +553,14 @@ def message_kind(payload: bytes) -> str:
     return "other"
 
 
+def stun_tid(payload: bytes) -> Optional[str]:
+    """The transaction id of a STUN message (bytes 8 to 20 of the datagram) in hex: what ties a retransmission to the request it repeats. None when the datagram is not STUN
+    (the same test as :func:`message_kind`: the magic cookie at bytes 4 to 8). Written in the evidence of the WebRTC walk, never compared."""
+    if len(payload) >= 20 and payload[4:8] == b"\x21\x12\xa4\x42":
+        return payload[8:20].hex()
+    return None
+
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 #  The seeds, the transcript and its files
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -591,6 +608,12 @@ class Recorder:
         self._t0 = time.monotonic()
         self._sources: Dict[str, list] = {}
         self._marks: List[Tuple[str, Dict[str, int]]] = []
+        #: The moment (``t``, as an event's) at which each stage began: the evidence of the WebRTC walk says where its stages sit among the datagrams.
+        self.phase_t: Dict[str, float] = {}
+
+    def now(self) -> float:
+        """The recorder's clock, the ``t`` of an event: seconds since the recorder started."""
+        return round(time.monotonic() - self._t0, 3)
 
     def attach(self, name: str, items: list) -> None:
         self._sources[name] = items
@@ -600,6 +623,7 @@ class Recorder:
         with self._lock:
             self._marks.append((name, {k: len(v) for k, v in self._sources.items()}))
             self.phase = name
+            self.phase_t[name] = self.now()
 
     def event(self, kind: str, **fields: Any) -> None:
         with self._lock:
@@ -782,7 +806,8 @@ def make_lab_classes() -> Tuple[type, type, type]:
 
         def _route(self, host: str, dport: int, atyp: int, payload: bytes, out_port: int, answer: Any) -> Any:
             association = getattr(self._dgram, "index", None)
-            self.rec.event("udp", target="%s:%d" % (host, dport), message=message_kind(payload), opener=self._association_openers.get(association) if association is not None else None)
+            self.rec.event("udp", target="%s:%d" % (host, dport), message=message_kind(payload), tid=stun_tid(payload),
+                           opener=self._association_openers.get(association) if association is not None else None)
             if atyp == 1 and (host, dport) == (TURN_IP, TURN_PORT):
                 return self.turn.address, (host, dport)
             if (host, dport) in ((STUN_NAME, STUN_PORT), (STUN_NUMBER, STUN_PORT), (MEASURE_NUMBER, STUN_PORT)):
@@ -852,25 +877,39 @@ JOURNEY_A, JOURNEY_O = "journey-a.test", "journey-o.test"
 PAGE_NAME, H1_NAME, H2_NAME, H3_NAME = "page.lab.test", "h1.lab.test", "h2.lab.test", "h3.lab.test"
 STUN_URL = "stun:198.51.100.5:19302"
 TURN_URL = "turn:198.51.100.7:3478?transport=udp"
+#: The TURN server of ``TURN_URL`` as the gateway names the target of a datagram (a test holds it equal to ``tests/_turn_chain.py``).
+TURN_TARGET = "198.51.100.7:3478"
 #: The probe of the WebRTC page: one STUN and one TURN server by address (the relay answers both), a data channel, and the page waits for the end of the gather (the
 #: timer is the safety net of a gather that never ends, not a measure of it).
 RTC_JS = r"""async (urls) => {
+  const T = {start: performance.now(), offer: null, local: null, candidates: [], errors: [], gathered: null, closing: null, closed: null};
   const pc = new RTCPeerConnection({iceServers: [{urls: [urls[0]]}, {urls: [urls[1]], username: 'lab', credential: 'lab'}]});
   pc.createDataChannel('');
   const cands = [], errors = [];
-  pc.addEventListener('icecandidate', e => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); });
-  pc.addEventListener('icecandidateerror', e => { errors.push({code: e.errorCode, url: e.url}); });
-  await pc.setLocalDescription(await pc.createOffer());
+  pc.addEventListener('icecandidate', e => {
+    if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate);
+    T.candidates.push({t: performance.now(), type: e.candidate ? (e.candidate.type || null) : 'end'});
+  });
+  pc.addEventListener('icecandidateerror', e => {
+    errors.push({code: e.errorCode, url: e.url});
+    T.errors.push({t: performance.now(), code: e.errorCode, url: e.url});
+  });
+  const offer = await pc.createOffer();
+  T.offer = performance.now();
+  await pc.setLocalDescription(offer);
+  T.local = performance.now();
   await new Promise(resolve => {
     const timer = setTimeout(resolve, 30000);
-    const done = () => { clearTimeout(timer); resolve(); };
+    const done = () => { clearTimeout(timer); if (T.gathered === null) T.gathered = performance.now(); resolve(); };
     if (pc.iceGatheringState === 'complete') done();
     pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') done(); });
   });
   const sdp = (pc.localDescription && pc.localDescription.sdp) || '';
   const gathering = pc.iceGatheringState;
+  T.closing = performance.now();
   try { pc.close(); } catch (e) {}
-  return {candidates: cands, errors, sdp, gathering};
+  T.closed = performance.now();
+  return {candidates: cands, errors, sdp, gathering, times: T};
 }"""
 FETCH_JS = r"""async () => {
   await (await fetch('/api?x=1', {cache: 'no-store'})).text();
@@ -975,6 +1014,8 @@ class Lab:
         self.roles: Dict[int, str] = {}
         self.collisions: List[Tuple[int, str, str]] = []
         self.norm = Normalizer(self.roles)
+        #: What the WebRTC walk measured about itself (``walk_webrtc``), for ``webrtc_evidence``: never a leaf.
+        self.webrtc: Dict[str, Any] = {}
         self._closers: List[Callable[[], None]] = []
         self.h1 = self.h2 = self.h3 = None
         self.origin_a = self.origin_o = ""
@@ -1408,15 +1449,33 @@ def walk_webrtc(browser: Any, lab: Lab) -> Dict[str, Any]:
     try:
         page = context.new_page()
         page.goto("http://%s:%d/rtc" % (PAGE_NAME, lab.site.port), wait_until="load", timeout=60000)
+        lab.webrtc["evaluate"] = {"called": lab.rec.now()}
         result = page.evaluate(RTC_JS, [STUN_URL, TURN_URL])
+        lab.webrtc["evaluate"]["returned"] = lab.rec.now()
     finally:
         context.close()
     lab.rec.set_phase("webrtc.end")
+    # What the page measured of itself goes to the evidence and to nothing that is compared: ``webrtc_summary`` reads the fields it always read.
+    lab.webrtc["page"] = result.pop("times", None)
     data = phase_data(lab, "webrtc")
+    lab.webrtc["counted"] = len(lab.rec.of("webrtc", "udp"))
     out = webrtc_summary(result, lab.exit_ip)
     out.update(connects=data["connects"], dns=data["dns"], udp=data["udp"],
                turn={"messages": sorted({"0x%04x" % t for _ip, _port, t in lab.turn.seen}), "allocated": bool(lab.turn.allocations)})
     return lab.norm.walk(out)
+
+
+def webrtc_evidence(lab: Lab) -> Dict[str, Any]:
+    """The WebRTC walk of a seed as it happened, outside the leaves that are compared: every datagram the gateway routed in its stages (when, to whom, the message, the STUN transaction id,
+    its stage, and whether it was already there when the summary of the walk was taken: ``counted``), the moments of the stages and of the page's call on the recorder's clock, and the
+    page's own ``performance.now()`` at each step of the gather (``page``: the offer, each candidate with its type, each error with its code and url, the end of the gather, the close).
+    It exists to tell two readings of a run that differs from itself apart: a close that cuts the retransmissions of the TURN server short at a variable point, and a retransmission of the
+    first request whose answer came late."""
+    info = getattr(lab, "webrtc", None) or {}
+    counted = info.get("counted")
+    datagrams = [{"t": e["t"], "phase": e["phase"], "target": e["target"], "message": e["message"], "tid": e.get("tid"), "counted": counted is None or i < counted}
+                 for i, e in enumerate(lab.rec.of("webrtc", "udp"))]
+    return {"phase_t": {name: lab.rec.phase_t.get(name) for name in ("webrtc", "webrtc.end")}, "evaluate": info.get("evaluate"), "page": info.get("page"), "datagrams": datagrams}
 
 
 def direct_report(lab: Lab, watcher: Any, trap: Any) -> Dict[str, Any]:
@@ -1515,7 +1574,7 @@ def wire_evidence(lab: Lab) -> Dict[str, Any]:
         for q in lab.h3.snapshot()["quic"]:
             h3.append({"phase": q["phase"], "requests": [{"t": r.get("t"), "written": r.get("written_t"),
                                                          "request": "%s %s" % (dict(r["headers"]).get(":method"), lab.norm.text(dict(r["headers"]).get(":path", "")))} for r in q["requests"]]})
-    return {"journey": journey, "https": https, "h3": h3}
+    return {"journey": journey, "https": https, "h3": h3, "webrtc": webrtc_evidence(lab)}
 
 
 def sentinel_signature(lab: Lab) -> Dict[str, Any]:
@@ -1726,13 +1785,19 @@ def judge(report: Dict[str, Any], control: bool) -> int:
     return 2 if control else 1
 
 
-def run_engine(binary: str, seal: Optional[str], label: str, seeds: Tuple[int, ...], out: Path) -> int:
-    """``run`` in a process of its own: the seal a process runs under is read at import, so each engine gets its own."""
+def engine_env(seal: Optional[str]) -> Dict[str, str]:
+    """The environment of a process that runs one engine: its seal, no autofix, no pin check, no browser logging."""
     env = dict(os.environ, INVISIBLE_CORE_AUTOFIX="off", INVISIBLE_CORE_PIN="allow")
     if seal:
         env["INVISIBLE_SEAL_FILE"] = str(seal)
     for name in ("MOZ_LOG", "MOZ_LOG_FILE"):
         env.pop(name, None)
+    return env
+
+
+def run_engine(binary: str, seal: Optional[str], label: str, seeds: Tuple[int, ...], out: Path) -> int:
+    """``run`` in a process of its own: the seal a process runs under is read at import, so each engine gets its own."""
+    env = engine_env(seal)
     env[crash.CRASH_DIR_ENV] = str(Path(out).parent / (Path(out).stem + ".crash"))  # footprint-68.json -> transcript-68.crash/: what a launch that did not end with 0 left
     command = [sys.executable, "-u", str(Path(__file__).resolve()), "run", "--binary", binary, "--label", label, "--seeds", ",".join(map(str, seeds)), "--out", str(out)]
     print("=== run %s: %s (seal %s)" % (label, binary, seal or "the one this process has"))
@@ -1746,6 +1811,158 @@ def run_engine(binary: str, seal: Optional[str], label: str, seeds: Tuple[int, .
         return 124
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------
+#  The hunt: one walk of one seed, repeated, and the evidence of each repetition (never a verdict)
+# ---------------------------------------------------------------------------------------------------------------------------------
+def parse_hunt(text: str) -> Tuple[str, int, int]:
+    """``webrtc:<seed>:<n>`` -> ``("webrtc", seed, n)``. Anything else is a usage error: the walk is named, the seed and the count are whole numbers, and n is at least 1."""
+    parts = (text or "").strip().split(":")
+    if len(parts) != 3 or parts[0] != "webrtc":
+        raise ValueError("%s is %r: expected webrtc:<seed>:<n>" % (HUNT_ENV, text))
+    try:
+        seed, n = int(parts[1]), int(parts[2])
+    except ValueError:
+        raise ValueError("%s is %r: the seed and n are whole numbers" % (HUNT_ENV, text)) from None
+    if n < 1:
+        raise ValueError("%s is %r: n is at least 1" % (HUNT_ENV, text))
+    return parts[0], seed, n
+
+
+def hunt_counts(evidence: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """Datagrams to the TURN server in a repetition: ``counted`` as the summary of the walk (what the A/A compares) took them, ``all`` with the ones that came after."""
+    turn = [d for d in (evidence or {}).get("datagrams") or [] if d.get("target") == TURN_TARGET]
+    return {"counted": sum(1 for d in turn if d.get("counted")), "all": len(turn)}
+
+
+def hunt_repetition(binary: str, label: str, i: int, seed: int, patch: Any) -> Dict[str, Any]:
+    """One repetition: a launch behind a lab as the main launch has it, the WebRTC walk only, the close, and what the lab saw of it. A failure is the ``error`` of the record."""
+    record: Dict[str, Any] = {"format": HUNT_FORMAT, "engine": label, "i": i, "seed": seed, "error": None, "evidence": None}
+    try:
+        with open_lab(journey=True, wire=True) as lab:
+            begin_launch(seed, "hunt")
+            session = launch(binary, seed, lab, patch)
+            with session as browser:
+                browser.new_context(ignore_https_errors=True).new_page()     # Glean is born when a window opens (``glean_ready``); the walk opens its own context
+                record.update(glean_ready(session, seed, "hunt"))
+                record["walk"] = guarded(lambda: walk_webrtc(browser, lab))
+            record["evidence"] = webrtc_evidence(lab)                        # after the close: the datagrams the close leaves in flight are in it
+    except Exception as exc:  # noqa: BLE001 - evidence, never a verdict
+        record["error"] = _first_line(exc)
+    record["counts"] = hunt_counts(record["evidence"])
+    return record
+
+
+def hunt_run(binary: str, label: str, seed: int, n: int, out_dir: Path) -> int:
+    """``n`` repetitions of the WebRTC walk of ``seed`` with one engine, each written to ``<out_dir>/<label>-<i>.json``. Exits 0: it decides nothing."""
+    import pytest
+
+    patch = pytest.MonkeyPatch()
+    work = Path(tempfile.mkdtemp(prefix="ab-network-hunt-"))
+    try:
+        import _lab_egress
+
+        _lab_egress.install(patch, work)
+        global RUN_LABEL
+        RUN_LABEL = label
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(1, n + 1):
+            record = hunt_repetition(binary, label, i, seed, patch)
+            write_json(out_dir / ("%s-%d.json" % (label, i)), record)
+            print("hunt %s %d/%d: %d datagrams to the TURN server (%d with the late ones)%s" % (
+                label, i, n, record["counts"]["counted"], record["counts"]["all"], "" if record["error"] is None else ", ERROR " + record["error"]))
+            sys.stdout.flush()
+        return 0
+    finally:
+        patch.undo()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def hunt_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The summary of the repetition files: per repetition the count of datagrams to the TURN server (``count_3478``: as the A/A counts them; ``count_3478_all``: with the late ones) and, per
+    target, the transaction ids in the order they first appeared with the number of datagrams each carried (``[tid, n]``: a retransmission repeats its request's id); per engine, how often
+    each count came."""
+    repetitions = []
+    distribution: Dict[str, collections.Counter] = {}
+    for record in records:
+        counts = hunt_counts(record.get("evidence"))
+        groups: Dict[str, Dict[Any, int]] = {}
+        for d in (record.get("evidence") or {}).get("datagrams") or []:
+            tids = groups.setdefault(d["target"], {})
+            tids[d.get("tid")] = tids.get(d.get("tid"), 0) + 1
+        repetitions.append({"engine": record["engine"], "i": record["i"], "count_3478": counts["counted"], "count_3478_all": counts["all"],
+                            "targets": {t: [[tid, n] for tid, n in groups[t].items()] for t in sorted(groups)}, "error": record.get("error")})
+        distribution.setdefault(record["engine"], collections.Counter())[counts["counted"]] += 1
+    return {"format": HUNT_SUMMARY_FORMAT, "target": TURN_TARGET, "repetitions": repetitions,
+            "count_3478_by_engine": {engine: {str(k): v for k, v in sorted(c.items())} for engine, c in sorted(distribution.items())}}
+
+
+def read_hunt_records(folder: Path) -> List[Dict[str, Any]]:
+    """The repetition files of a folder, by engine and repetition."""
+    records = []
+    for path in sorted(Path(folder).glob("*.json")):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if document.get("format") == HUNT_FORMAT:
+            records.append(document)
+    return sorted(records, key=lambda r: (r["engine"], r["i"]))
+
+
+#: The safety net of a hunt's engine run, in seconds: a base and a share per repetition (a launch, Glean, the gather's own 30 s). Never a verdict.
+HUNT_BASE_S = 600
+HUNT_PER_REPETITION_S = 120
+
+
+def hunt_engine(binary: str, seal: Optional[str], label: str, seed: int, n: int, out_dir: Path) -> int:
+    """``hunt_run`` in a process of its own, as ``run_engine`` runs ``run``: each engine its own seal and its own cache."""
+    env = engine_env(seal)
+    command = [sys.executable, "-u", str(Path(__file__).resolve()), "hunt-run", "--binary", binary, "--label", label, "--seed", str(seed), "--n", str(n), "--out", str(out_dir)]
+    print("=== hunt %s: %s (seal %s), %d repetitions of the WebRTC walk of seed %d" % (label, binary, seal or "the one this process has", n, seed))
+    sys.stdout.flush()
+    from ci_ab_oracle import own_cache_env
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="ab-network-cache-") as cache:
+            return subprocess.run(command, env=own_cache_env(env, cache), timeout=HUNT_BASE_S + n * HUNT_PER_REPETITION_S).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+def published_engine(args: argparse.Namespace, work: Path) -> Tuple[str, Optional[str]]:
+    """The published engine of an ``ab``: the binary the caller gave, or the one the release holds, with its seal."""
+    if args.published_binary:
+        return str(args.published_binary), (str(args.published_seal) if args.published_seal else None)
+    import ci_ab_oracle as oracle
+
+    binary, seal = oracle.fetch_published(args.engine_tag, work)
+    return binary, str(seal)
+
+
+def cmd_hunt(args: argparse.Namespace, spec: str) -> int:
+    """``ab`` with ``AB_NETWORK_HUNT=webrtc:<seed>:<n>``: the WebRTC walk of that seed, ``n`` times, for each engine of the A/A (the published engine twice), written to ``<out>/hunt``:
+    ``<engine>-<i>.json`` per repetition and ``summary.json``. It decides nothing and exits 0 (2 only for a spec that does not read)."""
+    try:
+        _walk, seed, n = parse_hunt(spec)
+    except ValueError as exc:
+        print("FAIL " + str(exc))
+        return 2
+    out = Path(args.out) / "hunt"
+    out.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="ab-network-"))
+    try:
+        binary, seal = published_engine(args, work)
+        for label in (args.engine_tag, args.engine_tag + "-again"):
+            code = hunt_engine(binary, seal, label, seed, n, out)
+            if code != 0:
+                print("hunt %s ended with %s" % (label, code))
+        summary = hunt_summary(read_hunt_records(out))
+        write_json(out / "summary.json", summary)
+        for r in summary["repetitions"]:
+            print("hunt %s %d: %d to the TURN server (%d with the late ones); %s" % (r["engine"], r["i"], r["count_3478"], r["count_3478_all"], r["targets"].get(TURN_TARGET)))
+        print("hunt summary written: %s" % (out / "summary.json"))
+        return 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def compare_files(a: Path, b: Path, out: Optional[Path], floor: int, volatile_path: Path, control: bool) -> Dict[str, Any]:
     ta, tb = read_transcript(a), read_transcript(b)
     report = compare_transcripts(ta, tb, load_volatile(volatile_path), floor, ta.get("label", "A"), tb.get("label", "B"))
@@ -1757,6 +1974,9 @@ def compare_files(a: Path, b: Path, out: Optional[Path], floor: int, volatile_pa
 
 
 def cmd_ab(args: argparse.Namespace) -> int:
+    spec = os.environ.get(HUNT_ENV)
+    if spec:
+        return cmd_hunt(args, spec)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     seeds = parse_seeds(args.seeds)
@@ -1768,13 +1988,7 @@ def cmd_ab(args: argparse.Namespace) -> int:
         return 2
     work = Path(tempfile.mkdtemp(prefix="ab-network-"))
     try:
-        if args.published_binary:
-            binary, seal = str(args.published_binary), (str(args.published_seal) if args.published_seal else None)
-        else:
-            import ci_ab_oracle as oracle
-
-            binary, seal = oracle.fetch_published(args.engine_tag, work)
-            seal = str(seal)
+        binary, seal = published_engine(args, work)
         tag = args.engine_tag.rsplit("-", 1)[-1]
         first, again = out / ("transcript-%s.json" % tag), out / ("transcript-%s-again.json" % tag)
         problems = []
@@ -1810,6 +2024,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     r.add_argument("--label", default="engine")
     r.add_argument("--seeds", default=None)
     r.add_argument("--out", type=Path, required=True)
+    h = sub.add_parser("hunt-run", help="one engine: the WebRTC walk of one seed, n times (what AB_NETWORK_HUNT makes `ab` run)")
+    h.add_argument("--binary", required=True)
+    h.add_argument("--label", required=True)
+    h.add_argument("--seed", type=int, required=True)
+    h.add_argument("--n", type=int, required=True)
+    h.add_argument("--out", type=Path, required=True)
     c = sub.add_parser("compare", help="two transcripts: the diff and the leaf count")
     c.add_argument("a", type=Path)
     c.add_argument("b", type=Path)
@@ -1835,6 +2055,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "run":
         return run(args.binary, args.label, parse_seeds(args.seeds), args.out)
+    if args.cmd == "hunt-run":
+        return hunt_run(args.binary, args.label, args.seed, args.n, args.out)
     if args.cmd == "compare":
         return judge(compare_files(args.a, args.b, args.out, args.floor, args.volatile, args.a_a), args.a_a)
     if args.cmd == "judge":
