@@ -16,24 +16,31 @@ green that means nothing.
 The covering window. Linux: the display is a private Xvfb started for this test (``_os_focus.a_display_of_its_own``, ``DISPLAY`` set with ``monkeypatch`` before
 the session starts), so no other worker's headed window can sit above or inside the pair. No window manager runs there. The cover is NOT a second Firefox
 session: it is a window of the test's own (``_x_visibility.XVisibility.cover_window``), an override-redirect ``InputOutput`` window, larger than the covered
-toplevel by 32 px on every side (inside the screen where it fits), mapped and raised, and never given the focus. Why not a second session: its window took the
-X focus when it mapped, the covered toplevel got ``FocusOut``, and GTK draws a window that loses the focus (``nsWindow::OnExposeEvent``,
-``NotifyOcclusionState(VISIBLE)``). When X delivered ``PartiallyObscured``, ``FocusOut`` and ``FullyObscured`` in one batch, that draw ran 0.4 to 15 ms after the
+toplevel by 32 px on every side (inside the screen where it fits, and never over the pointer), mapped and raised, and never given the focus.
+
+Why the pointer: with no window manager the focus is ``PointerRoot`` and GDK treats the toplevel under the pointer as the focused one, and the pointer sits at the
+screen centre, inside the covered window. Any window mapped over it makes the pointer leave the covered toplevel; GDK turns that crossing into a GTK focus-out
+(``OnContainerFocusOutEvent``, then a ``leave notify``) and GTK draws a window that loses the focus (``nsWindow::OnExposeEvent``,
+``NotifyOcclusionState(VISIBLE)``). When X delivered ``PartiallyObscured`` and ``FullyObscured`` close to that, the draw ran 0.4 to 15 ms after the
 ``FullyObscured`` and turned the window ``VISIBLE`` again before the posted visibility update ran: the page never recorded ``hidden`` (hunt run 45603211231, 58
 reds of 1294; shard 1 it-0014: ``VisibilityNotify state 1`` at 54.355670, ``OnContainerFocusOutEvent`` at 54.355752, ``state 2`` at 54.356290,
-``OnExposeEvent`` with ``mIsFullyOccluded 0`` at 54.359166). Mozilla's own behaviour, in retail too; the engine is not changed, the arrangement must not move the
-focus. Windows: the second session stays (the tracker needs its window, below).
+``OnExposeEvent`` with ``mIsFullyOccluded 0`` at 54.359166). Mozilla's own behaviour, in retail too; the engine is not changed. The first reading, that the focus
+moved to a second session's window (an X ``FocusOut``), was refuted by run 45620136865: 458 reds of 463 with an X cover over the pointer, FocusOut 0 in 40
+iterations of the old arrangement. So on Linux, before any session starts, the test warps the pointer through its own connection to the bottom-right pixel of the
+root (``XVisibility.warp_pointer_to_the_corner``, computed from the root's geometry), and the cover leaves the pointer outside it. Windows: the second session
+stays (the tracker needs its window, below).
 
 The engine turns a window ``OCCLUDED`` only on a ``VisibilityNotify`` with ``FullyObscured`` of its toplevel, so the test asks X itself, through a connection of
-its own (``_x_visibility.XVisibility``, libX11 as the focus test): it selects ``VisibilityChangeMask`` together with ``FocusChangeMask`` on the covered toplevel
-before the cover is created; it creates and raises the cover and reads back ONCE, asserted, the stacking (``XQueryTree``: the cover above the covered window) and
-the geometries (the covered window inside the cover); then it waits for X's ``VisibilityNotify FullyObscured`` of the covered toplevel, in both halves. A red
-there says "arrangement" (X never told the window it is covered, so the page proves nothing). The precondition, asserted in both halves before the page is
-judged: no ``FocusOut`` reached the covered toplevel between the start of the watch and the verdict ("arrangement: the covering moved the focus", with the X
-record; red on the second-session arrangement, which always produced one, green runs included). With tracking enabled, X's ``FullyObscured`` arrived and a page
-that never turns ``hidden`` is red with a message that starts with "ENGINE". Without tracking, the same ``FullyObscured`` arrived and the page must stay
-``visible``: the product half's meaning is unchanged. The X record (the two window ids, the stacking and geometries read back, every visibility and focus event
-with its time since the watch began, and whether ``FullyObscured`` arrived) is saved on every run, green or red, with the Windows record below.
+its own (``_x_visibility.XVisibility``, libX11 as the focus test): it selects ``VisibilityChangeMask``, ``FocusChangeMask``, ``EnterWindowMask`` and
+``LeaveWindowMask`` on the covered toplevel before the cover is created; it creates and raises the cover and reads back ONCE, asserted, the stacking
+(``XQueryTree``: the cover above the covered window), the geometries (the covered window inside the cover) and the pointer (``XQueryPointer``: outside both
+rectangles); then it waits for X's ``VisibilityNotify FullyObscured`` of the covered toplevel, in both halves. A red there says "arrangement" (X never told the
+window it is covered, so the page proves nothing). The precondition, asserted in both halves before the page is judged: no ``EnterNotify``, ``LeaveNotify``,
+``FocusIn`` or ``FocusOut`` reached the covered toplevel between the start of the watch and the verdict, and the pointer read back is outside both rectangles
+("arrangement: the covering moved the pointer or the focus", with the X record). With tracking enabled, X's ``FullyObscured`` arrived and a page that never turns
+``hidden`` is red with a message that starts with "ENGINE". Without tracking, the same ``FullyObscured`` arrived and the page must stay ``visible``: the product
+half's meaning is unchanged. The X record (the two window ids, the stacking and geometries read back, the pointer, every visibility, crossing and focus event with
+its time since the watch began, and whether ``FullyObscured`` arrived) is saved on every run, green or red, with the Windows record below.
 Windows: opening the second window is not enough, and neither is putting it above the first one. ``WinWindowOcclusionTracker`` marks a root window
 ``OCCLUDED`` only when the windows ABOVE it in the Z-order already cover its rectangle (``widget/windows/WinWindowOcclusionTracker.cpp``,
 ``ProcessComputeNativeWindowOcclusionStatusCallback``: ``it->second = (mUnoccludedDesktopRegion == currUnoccludedDestkop) ? OCCLUDED : VISIBLE``), and it
@@ -88,7 +95,7 @@ from _evidence_on_failure import FailureEvidence
 from _os_focus import a_display_of_its_own
 from _waits import watch
 from _window_sessions import DEADLINE_S, in_a_thread_of_its_own, launch, wait_for_condition
-from _x_visibility import XVisibility, control_sees_hidden, focus_moved, product_stays_visible
+from _x_visibility import XVisibility, control_sees_hidden, pointer_or_focus_moved, product_stays_visible
 
 pytestmark = pytest.mark.e2e
 
@@ -450,6 +457,7 @@ class CoveringOnX:
         self.first = self.cover = None
         self.visibility = None
         self.after_raise = None
+        self.pointer = None
         #: The length of the page's list of changes at the last look made before X's ``FullyObscured`` showed up (1: the start).
         self.not_before = 1
         self.drawn = None
@@ -461,10 +469,11 @@ class CoveringOnX:
         self.visibility = self.x.watch(self.first)
 
     def cover_the_window_and_read_back(self):
-        """Creates the cover (an override-redirect window of the test's own, no focus asked), raises it, reads the stacking and the geometries back once, and
-        asserts them."""
+        """Creates the cover (an override-redirect window of the test's own, the pointer outside it, no focus asked), raises it, reads the stacking, the
+        geometries and the pointer back once, and asserts them."""
         self.cover = self.x.cover_window(self.first)
         self.after_raise = self.x.raise_and_read(self.first, self.cover)
+        self.pointer = self.x.read_pointer_back(self.first, self.cover)
         assert self.after_raise["ok"], "arrangement: after XRaiseWindow the cover is not above the covered toplevel with the covered one inside it: %r" % (
             self.evidence(),)
 
@@ -482,10 +491,12 @@ class CoveringOnX:
         assert seen.ok, "arrangement: X never sent the covered toplevel VisibilityNotify FullyObscured (%s), so the page proves nothing: %r" % (
             self.line(), self.evidence())
 
-    def assert_the_focus_did_not_move(self):
-        """The precondition, before the page is judged: no ``FocusOut`` reached the covered toplevel since the watch began (``focus_moved``)."""
+    def assert_the_pointer_and_the_focus_did_not_move(self):
+        """The precondition, before the page is judged: no crossing and no focus event reached the covered toplevel since the watch began, and the pointer read
+        back after the cover was up is outside both rectangles (``pointer_or_focus_moved``)."""
         self.x.drain()
-        problem = focus_moved(self.visibility)
+        problem = pointer_or_focus_moved(self.visibility) or ("" if self.pointer is not None else "arrangement: the covering moved the pointer or the focus: "
+                                                                "the pointer was never read back after the cover was up")
         assert not problem, "%s; X: %r" % (problem, self.evidence())
 
     def remove_the_cover(self):
@@ -522,7 +533,7 @@ class CoveringOnX:
     def evidence(self):
         """The window ids, the read-back after the raise, and every visibility event of the covered toplevel with its time."""
         line = self.line()
-        return {"line": line, "covered": None if self.first is None else "0x%x" % self.first, "cover": None if self.cover is None else "0x%x" % self.cover,
+        return {"line": line, "covered": None if self.first is None else "0x%x" % self.first, "cover": None if self.cover is None else "0x%x" % self.cover, "pointer warped": self.x.warped, "pointer read back": self.pointer,
                 "after the raise": self.after_raise, "forced draw": self.drawn, "not before": self.not_before, "visibility": self.visibility.as_dict() if self.visibility else None}
 
 
@@ -574,7 +585,7 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
             if tracking:
                 seen = covering.wait_for_hidden(covered) if covering else watch_hidden_change(covered, not_before)
                 if on_x:
-                    on_x.assert_the_focus_did_not_move()
+                    on_x.assert_the_pointer_and_the_focus_did_not_move()
                 verdict_changes = covered.evaluate(CHANGES)
                 assert seen.ok and control_sees_hidden(verdict_changes, not_before), on_x.engine_message(seen, verdict_changes) if on_x else (
                     "a window that another one covers never turned hidden with occlusion tracking enabled; the changes the page recorded: %r; seen: %s; "
@@ -584,7 +595,7 @@ def second_window_over_the_first(firefox_binary, tracking, record, x):
             else:
                 covered.evaluate(TWO_FRAMES)
                 if on_x:
-                    on_x.assert_the_focus_did_not_move()
+                    on_x.assert_the_pointer_and_the_focus_did_not_move()
             windows = covering.evidence() if covering else on_x.evidence() if on_x else None
             return {"state": covered.evaluate(STATE), "changes": covered.evaluate(CHANGES), "verdict_changes": verdict_changes, "not_before": not_before,
                     "windows": windows, "drawn": drawn}
@@ -618,6 +629,7 @@ def the_display(monkeypatch):
     with a_display_of_its_own(monkeypatch) as display:
         x = XVisibility(display)
         try:
+            x.warp_pointer_to_the_corner()      # before any session starts: no toplevel is under the pointer, none gets a crossing from it
             yield x
         finally:
             x.close()
