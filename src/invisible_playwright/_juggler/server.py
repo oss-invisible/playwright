@@ -1123,17 +1123,24 @@ class ElementHandleDispatcher(Dispatcher):
     # `page.query_selector(...).click()` is ordinary code - and the rest keep
     # reporting themselves as missing rather than being filled in for symmetry.
     #
-    # ⛔ THEY GO THROUGH THE SAME `actions` AS THE SELECTOR VERSIONS, and that is
-    # the whole design. `click` here is the humanised pointer: approach, hover,
-    # press, release, with the hit-target check and the actionability retry. A
-    # second, simpler path would be quicker to write and would give this package
-    # two click behaviours with two fingerprints, which is the one thing it
-    # exists not to have.
+    # ⛔ THEY GO THROUGH THE SAME `actions` AND THE SAME HAND AS THE SELECTOR
+    # VERSIONS, and that is the whole design. The pointer actions (click,
+    # dblclick, hover, tap, check, uncheck) are drawn by `FrameDispatcher._by_hand`
+    # (`Pointer.act`): a path onto the element, a landing point of the session's
+    # own, and then the core's action with the hit-target check and the
+    # actionability retry. They used to call `actions` directly, and the core's
+    # approach with no client cursor is ONE `mousemove` onto the exact centre of the
+    # element's box and a press there: a handle click was a jump to the centre where
+    # the selector's was a walk, two click behaviours with two fingerprints, which
+    # is the one thing this package exists not to have.
     #
     # What differs from a selector click is exactly what SHOULD differ: the node
     # is not looked up again, because a handle names one node and re-querying
-    # would find a different element with the same description; and the node is
-    # not disposed afterwards, because the caller still holds it.
+    # would find a different element with the same description (the hand aims at
+    # the handle's own object, `element=`); and the node is not disposed
+    # afterwards, because the caller still holds it. The keyboard and text
+    # actions (fill, type, press, focus, selectText, setInputFiles) have no hand to
+    # draw: their rhythm lives in the core's action, which both doors call.
     #
     # The parameter helpers are the frame's. `self.frame._timeout` rather than a
     # copy: the rules for reading a timeout, a position and the pointer flags out
@@ -1151,29 +1158,37 @@ class ElementHandleDispatcher(Dispatcher):
                 "element_id": self.object_id,
                 **self.frame._act_opts(params)}
 
+    def _by_hand(self, params: Dict, run: Callable[[Any, Any], Any]) -> Any:
+        """A pointer action of THIS node with the session's hand in front of it: the Frame's own (`FrameDispatcher._by_hand`, the one
+        walk), aimed at the handle's object and not at a selector. `run(position, timeout)` is the plain action; it takes the position
+        and the timeout the hand chose, and everything else from `_act_args`."""
+        return self.frame._by_hand(params, self.frame.frame_id, _HANDLE, run, element=self.object_id)
+
     def op_click(self, params: Dict) -> Any:
-        self.frame._waiting_after(params, lambda: self.frame.actions.click(
-            _HANDLE, position=self.frame._position(params),
-            **self.frame._pointer(params), **self._act_args(params)))
+        pointer = self.frame._pointer(params)
+        self.frame._waiting_after(params, lambda: self._by_hand(
+            params, lambda position, timeout: self.frame.actions.click(
+                _HANDLE, **{**self._act_args(params), "timeout": timeout},
+                position=position, **pointer)))
         return None
 
     def op_hover(self, params: Dict) -> Any:
-        self.frame.actions.hover(_HANDLE, position=self.frame._position(params),
-                                 **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.hover(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_dblclick(self, params: Dict) -> Any:
         pointer = self.frame._pointer(params)
         # dblclick sets its own clickCount; the caller's is not a second one.
         pointer.pop("clicks", None)
-        self.frame.actions.dblclick(
-            _HANDLE, position=self.frame._position(params), **pointer,
-            **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.dblclick(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout},
+            position=position, **pointer))
         return None
 
     def op_tap(self, params: Dict) -> Any:
-        self.frame.actions.tap(_HANDLE, position=self.frame._position(params),
-                               **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.tap(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_select_text(self, params: Dict) -> Any:
@@ -1187,13 +1202,13 @@ class ElementHandleDispatcher(Dispatcher):
         return None
 
     def op_check(self, params: Dict) -> Any:
-        self.frame.actions.check(_HANDLE, position=self.frame._position(params),
-                                 **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.check(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_uncheck(self, params: Dict) -> Any:
-        self.frame.actions.uncheck(_HANDLE, position=self.frame._position(params),
-                                   **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.uncheck(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_fill(self, params: Dict) -> Any:
@@ -1807,7 +1822,7 @@ class FrameDispatcher(Dispatcher):
         return result
 
     def _by_hand(self, params: Dict, frame_id: str, selector: str,
-                 run: Callable[[Any, Any], Any]) -> Any:
+                 run: Callable[[Any, Any], Any], *, element: Optional[str] = None) -> Any:
         """Run a pointer action with the hand of the session in front of it.
 
         ⛔ THE WALK ONTO THE ELEMENT IS DRAWN HERE, once, for every client: it
@@ -1816,13 +1831,17 @@ class FrameDispatcher(Dispatcher):
         `run(position, timeout)` is the plain action; with no hand (humanising
         off, the engine's own expansion) it is all that happens, with the
         caller's own arguments.
+
+        ⛔ ONE WALK FOR EVERY DOOR. An ElementHandle's pointer actions come through
+        here too, with `element` the object id of the node they name: the hand then
+        aims at THAT node (`selector` is not looked up) and leaves it undisposed.
         """
         hand = self.page.pointer
         if hand is None or not hand.active:
             return run(self._position(params), self._timeout(params))
         return hand.act(frame_id, selector, self._position(params),
                         self._timeout(params), run,
-                        trial=self._act_opts(params)["trial"])
+                        trial=self._act_opts(params)["trial"], element=element)
 
     def op_click(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
