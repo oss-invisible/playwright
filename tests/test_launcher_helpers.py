@@ -108,7 +108,7 @@ def test_default_context_viewport_follows_a_pinned_taskbar():
 
 
 @pytest.mark.unit
-def test_default_context_screen_matches_profile():
+def test_default_context_screen_matches_profile(lab_exit):
     ip = InvisiblePlaywright(seed=42)
     kw = ip._default_context_kwargs()
     p = ip._profile
@@ -125,7 +125,7 @@ def test_default_context_screen_matches_profile():
 
 
 @pytest.mark.unit
-def test_default_context_color_scheme_follows_dark_theme():
+def test_default_context_color_scheme_follows_dark_theme(lab_exit):
     """The theme follows ``dark_theme``, but through the DECLARATION.
 
     Previously the wrapper passed ``color_scheme`` to Playwright, which translated it
