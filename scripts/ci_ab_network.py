@@ -89,7 +89,8 @@ HUNT_SUMMARY_FORMAT = "ab-network-hunt-summary/1"
 #: The environment variable that makes ``ab`` repeat one walk of one seed and nothing else (``cmd_hunt``): ``webrtc:<seed>:<n>``.
 HUNT_ENV = "AB_NETWORK_HUNT"
 #: The engine's own log in a hunt (the launch's environment, in hunt mode only): nICEr's reasons for accepting or rejecting an answer or ending a transaction, and the signaling.
-HUNT_MOZ_LOG = "nicer:5,signaling:5,timestamp"
+#: ``sync`` makes each line reach the file as it is written, so a process that ends (or is killed) loses none.
+HUNT_MOZ_LOG = "sync,timestamp,nicer:5,signaling:5"
 VOLATILE_FORMAT = "ab-network-volatile/1"
 VOLATILE_FILE = ROOT / "ci" / "ab-network-volatile.json"
 SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
@@ -97,6 +98,11 @@ SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
 FALLBACK_SEEDS = (11, 12, 13)
 ENGINE_TAG = "firefox-68"
 CANDIDATE = "candidate"
+#: The most times the engine sends one STUN request (a transmit and its retransmissions) before it gives the transaction up: the pref
+#: ``media.peerconnection.ice.stun_client_maximum_transmits`` (modules/libpref/init/all.js), 7. The first RTO is 100 ms and doubles, so how
+#: MANY transactions a walk has is the engine's and is compared, and how many datagrams each took is the network's timing and is not: a
+#: transaction over this number is a problem of the run (``udp_summary``'s ``over_limit``, ``_udp_overruns``), never a compared leaf.
+STUN_MAX_TRANSMITS = 7
 #: What a leaf that one side does not have reads as.
 MISSING = "<missing>"
 #: A value longer than this in diff.json is replaced by its length and its sha256.
@@ -278,6 +284,25 @@ def _udp_attribution(la: Dict[str, Any], lb: Dict[str, Any]) -> Tuple[set, List[
     return paths, differences, unattributed
 
 
+_UDP_OVER_LIMIT = re.compile(r"^(?P<where>.*/udp)/over_limit/(?P<target>[^/]+)/\d+$")
+
+
+def _udp_overruns(la: Dict[str, Any], lb: Dict[str, Any], label_a: str, label_b: str) -> Tuple[set, List[str]]:
+    """The STUN transactions that were sent more times than the engine's maximum (``udp_summary``'s ``over_limit``: per destination, the number of transmits of each such
+    transaction). They are not compared leaf by leaf: how many datagrams a transaction took is the network's timing, but more than the engine's own maximum is not
+    timing, it is a client that does not stop. Returns the paths that take part and one problem line for each."""
+    paths: set = set()
+    problems: List[str] = []
+    for label, leaves in ((label_a, la), (label_b, lb)):
+        for path, value in sorted(leaves.items()):
+            m = _UDP_OVER_LIMIT.match(path)
+            if m:
+                paths.add(path)
+                problems.append("%s: a STUN transaction to %s was sent %s times, more than the engine's maximum of %d transmits (%s)"
+                                % (label, m.group("target"), value, STUN_MAX_TRANSMITS, m.group("where")))
+    return paths, problems
+
+
 def exit_lines(transcript: Dict[str, Any], label: str, side: str) -> List[str]:
     """The red lines of the launches of one side that did not end with 0 (``exits``, which ``run`` writes: scripts/ci_crash_evidence.py). A transcript that has no ``exits``
     was not made by ``run`` and says nothing about it; one that has it and no launch in it is a run whose probe saw no browser, which is red."""
@@ -297,7 +322,8 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     run the same seeds, when fewer than ``floor`` leaves were compared, or when an entry of the volatile list matches no leaf of either transcript (``stale``)."""
     la, lb = flatten(a.get("seeds") or {}), flatten(b.get("seeds") or {})
     attribution, attribution_differences, unattributed = _udp_attribution(la, lb)
-    paths = sorted((set(la) | set(lb)) - attribution)
+    overrun_paths, overruns = _udp_overruns(la, lb, label_a, label_b)
+    paths = sorted((set(la) | set(lb)) - attribution - overrun_paths)
     problems: List[str] = []
     if set(a.get("seeds") or {}) != set(b.get("seeds") or {}):
         problems.append("the sides ran different seeds: %s and %s" % (sorted(a.get("seeds") or {}), sorted(b.get("seeds") or {})))
@@ -335,6 +361,7 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     problems += ["a direct connection: " + d for d in direct]
     problems += exit_lines(a, label_a, "A") + exit_lines(b, label_b, "B")
     problems += invariants
+    problems += overruns
     problems += ["the volatile entry %r matches no leaf of either transcript: it is stale, drop it" % p for p in stale]
     problems += ["%s: %s %s | %s %s" % (d["path"], label_a, json.dumps(d["a"], sort_keys=True)[:160], label_b, json.dumps(d["b"], sort_keys=True)[:160])
                  for d in differences]
@@ -479,17 +506,31 @@ def dns_summary(queries: List[Tuple[str, int, str]], openers: Optional[List[Opti
 
 
 def udp_summary(events: List[Dict[str, Any]], norm: Normalizer) -> Dict[str, Any]:
-    """The datagrams the relay carried in one phase: per destination, the kinds of message and how many."""
+    """The datagrams the relay carried in one phase: per destination, the kinds of message and how many.
+
+    ``counts`` is the number of STUN TRANSACTIONS (distinct transaction ids) per destination, plus one for each datagram that is not STUN: a retransmission carries the
+    transaction id of the request it repeats, and how many times a request is repeated is the timing of the network (the first RTO is 100 ms and doubles; a late answer
+    on a loaded host adds one), so it is not what the engine decides. ``over_limit`` (only when there is one) lists, per destination, the transmits of each transaction
+    that has more than ``STUN_MAX_TRANSMITS``: ``compare_transcripts`` reports it as a problem and never compares it."""
     kinds: Dict[str, set] = collections.defaultdict(set)
-    counts: collections.Counter = collections.Counter()
+    transmits: Dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    plain: collections.Counter = collections.Counter()
     order: List[str] = []
     for e in events:
         target = norm.text(e["target"])
         if target not in kinds:
             order.append(target)
         kinds[target].add(e["message"])
-        counts[target] += 1
-    out: Dict[str, Any] = {"order": order, "messages": {t: sorted(kinds[t]) for t in sorted(kinds)}, "counts": dict(sorted(counts.items()))}
+        if e.get("tid") is None:
+            plain[target] += 1
+        else:
+            transmits[target][e["tid"]] += 1
+    counts = {t: plain[t] + len(transmits[t]) for t in sorted(kinds)}
+    out: Dict[str, Any] = {"order": order, "messages": {t: sorted(kinds[t]) for t in sorted(kinds)}, "counts": counts}
+    over = {t: sorted((n for n in transmits[t].values() if n > STUN_MAX_TRANSMITS), reverse=True) for t in sorted(kinds)}
+    over = {t: v for t, v in over.items() if v}
+    if over:
+        out["over_limit"] = over
     who = _openers([norm.text(e["target"]) for e in events], [e.get("opener") for e in events])
     if who:
         out["openers"] = who
@@ -923,6 +964,7 @@ def make_lab_classes() -> Tuple[type, type, type]:
             self.seen: list = []
             self.allocations: list = []
             self.requests: list = []
+            self.refused: list = []
             self._closed = False
             threading.Thread(target=self._serve, daemon=True).start()
 
@@ -975,11 +1017,14 @@ STUN_URL = "stun:198.51.100.5:19302"
 TURN_URL = "turn:198.51.100.7:3478?transport=udp"
 #: The TURN server of ``TURN_URL`` as the gateway names the target of a datagram (a test holds it equal to ``tests/_turn_chain.py``).
 TURN_TARGET = "198.51.100.7:3478"
-#: The probe of the WebRTC page: one STUN and one TURN server by address (the relay answers both), a data channel, and the page waits for the end of the gather (the
+#: The user name the probe gives the TURN server (the lab's server takes any: the key is made from it and the password of ``tests/_turn_chain.py``, which the walk passes as the credential).
+TURN_USERNAME = "lab"
+#: The probe of the WebRTC page: one STUN and one TURN server by address (the relay answers both; the TURN's user name and credential are its arguments, never written here), a data channel, and the page waits for the end of the gather (the
 #: timer is the safety net of a gather that never ends, not a measure of it).
-RTC_JS = r"""async (urls) => {
+RTC_JS = r"""async (args) => {
+  const [stunUrl, turnUrl, username, credential] = args;
   const T = {start: performance.now(), offer: null, local: null, candidates: [], errors: [], gathered: null, closing: null, closed: null};
-  const pc = new RTCPeerConnection({iceServers: [{urls: [urls[0]]}, {urls: [urls[1]], username: 'lab', credential: 'lab'}]});
+  const pc = new RTCPeerConnection({iceServers: [{urls: [stunUrl]}, {urls: [turnUrl], username, credential}]});
   pc.createDataChannel('');
   const cands = [], errors = [];
   pc.addEventListener('icecandidate', e => {
@@ -1541,13 +1586,15 @@ def walk_h3(browser: Any, lab: Lab, guard_ms: int = LEAVE_GUARD_MS) -> Dict[str,
 
 
 def walk_webrtc(browser: Any, lab: Lab) -> Dict[str, Any]:
+    from _turn_chain import PASSWORD as TURN_PASSWORD      # the one the lab's TURN server signs its answers with: a browser with another finds every success invalid and makes no relay
+
     lab.rec.set_phase("webrtc")
     context = browser.new_context(ignore_https_errors=True)
     try:
         page = context.new_page()
         page.goto("http://%s:%d/rtc" % (PAGE_NAME, lab.site.port), wait_until="load", timeout=60000)
         lab.webrtc["evaluate"] = {"called": lab.rec.now()}
-        result = page.evaluate(RTC_JS, [STUN_URL, TURN_URL])
+        result = page.evaluate(RTC_JS, [STUN_URL, TURN_URL, TURN_USERNAME, TURN_PASSWORD])
         lab.webrtc["evaluate"]["returned"] = lab.rec.now()
     finally:
         context.close()

@@ -111,11 +111,36 @@ def _message(mtype: int, tid: bytes, attrs: bytes, key: Optional[bytes] = None) 
     return head + attrs + _attr(0x0008, mac)
 
 
+def long_term_key(user: str) -> bytes:
+    """The long-term credential key of RFC 5389 section 15.4: md5(username:realm:password)."""
+    return hashlib.md5(("%s:%s:%s" % (user, REALM, PASSWORD)).encode(), usedforsecurity=False).digest()
+
+
+def integrity_valid(data: bytes, user: str) -> bool:
+    """Whether the MESSAGE-INTEGRITY of a request is the HMAC-SHA1 under the long-term key of ``user`` (RFC 5389 section 15.4): over the message up to the
+    attribute, with the length field of the header set as if the message ended with that attribute (24 bytes more than what came before it). A request
+    with no MESSAGE-INTEGRITY, or a truncated one, is not valid."""
+    i = 20
+    while i + 4 <= len(data):
+        t, n = struct.unpack("!HH", data[i:i + 4])
+        if t == 0x0008:
+            if n != 20 or i + 24 > len(data):
+                return False
+            head = data[:2] + struct.pack("!H", i + 24 - 20) + data[4:20]
+            return hmac.compare_digest(hmac.new(long_term_key(user), head + data[20:i], hashlib.sha1).digest(), data[i + 4:i + 24])
+        i += 4 + ((n + 3) & ~3)
+    return False
+
+
 class TurnServer:
     """UDP TURN server on 127.0.0.1. ``seen`` is every datagram as (source ip, source port, STUN type), in order;
     ``requests`` the same datagrams as (monotonic time, transaction id, STUN type, carries credentials): a retransmission has the
     transaction id of the request it repeats, so the TRANSACTIONS of a road are the distinct ids (:meth:`transactions`);
-    ``allocations`` the successful Allocates as (source ip, source port, username, time)."""
+    ``allocations`` the successful Allocates as (source ip, source port, username, time).
+
+    A request that carries USERNAME is checked: its MESSAGE-INTEGRITY must be the HMAC under the long-term key of that user (``PASSWORD``).
+    A missing or wrong one is answered 401 with the realm and the nonce, makes no allocation, and is written in ``refused`` as
+    (source ip, source port, username, transaction id, time): a client with the wrong password never gets a relay here, as on a real server."""
 
     def __init__(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -124,6 +149,7 @@ class TurnServer:
         self.seen: List[Tuple[str, int, int]] = []
         self.allocations: List[Tuple[str, int, str, float]] = []
         self.requests: List[Tuple[float, bytes, int, bool]] = []
+        self.refused: List[Tuple[str, int, str, bytes, float]] = []
         self._closed = False
         threading.Thread(target=self._serve, daemon=True).start()
 
@@ -151,22 +177,33 @@ class TurnServer:
             self.seen.append((src[0], src[1], mtype))
             attrs = _attrs(data)
             self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
+            user_raw = attrs.get(0x0006)
+            if mtype in (0x0003, 0x0004, 0x0008, 0x0009) and user_raw is not None:
+                user = user_raw.decode(errors="replace")
+                if not integrity_valid(data, user):               # the wrong password, or no MESSAGE-INTEGRITY: 401, no allocation
+                    self.refused.append((src[0], src[1], user, tid, time.monotonic()))
+                    self.sock.sendto(_message(mtype | 0x0110, tid, self._unauthorized()), src)
+                    continue
             if mtype == 0x0003:                                   # Allocate
                 if 0x0008 not in attrs or 0x0006 not in attrs:   # no credentials: 401 with a realm and a nonce
-                    err = _attr(0x0009, b"\x00\x00\x04\x01Unauthorized") + _attr(0x0014, REALM.encode()) + _attr(0x0015, NONCE.encode())
-                    self.sock.sendto(_message(0x0113, tid, err), src)
+                    self.sock.sendto(_message(0x0113, tid, self._unauthorized()), src)
                     continue
                 user = attrs[0x0006].decode(errors="replace")
-                key = hashlib.md5(("%s:%s:%s" % (user, REALM, PASSWORD)).encode(), usedforsecurity=False).digest()
+                key = long_term_key(user)
                 body = (_attr(0x0016, _xor_addr(*RELAYED)) + _attr(0x0020, _xor_addr(src[0], src[1])) +
                         _attr(0x000D, struct.pack("!I", 600)))
                 self.allocations.append((src[0], src[1], user, time.monotonic()))
                 self.sock.sendto(_message(0x0103, tid, body, key), src)
             elif mtype in (0x0004, 0x0008, 0x0009):                # Refresh, CreatePermission, ChannelBind
                 user = attrs.get(0x0006, b"").decode(errors="replace")
-                key = hashlib.md5(("%s:%s:%s" % (user, REALM, PASSWORD)).encode(), usedforsecurity=False).digest()
+                key = long_term_key(user)
                 body = _attr(0x000D, struct.pack("!I", 600)) if mtype == 0x0004 else b""
                 self.sock.sendto(_message(mtype | 0x0100, tid, body, key), src)
+
+    @staticmethod
+    def _unauthorized() -> bytes:
+        """The attributes of a 401: ERROR-CODE, the realm and the nonce of the long-term credential."""
+        return _attr(0x0009, b"\x00\x00\x04\x01Unauthorized") + _attr(0x0014, REALM.encode()) + _attr(0x0015, NONCE.encode())
 
 
 # ── the gateway ────────────────────────────────────────────────────────────────

@@ -20,6 +20,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import ci_ab_network as ab  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _turn_chain  # noqa: E402
+
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,9 +75,10 @@ def test_the_gateway_writes_the_transaction_id_of_each_datagram_and_the_summary_
     assert [(e["target"], e["message"], e["tid"]) for e in events] == [
         (ab.TURN_TARGET, "stun-0x0003", TID.hex()), (ab.TURN_TARGET, "stun-0x0003", TID.hex()), (ab.TURN_TARGET, "stun-0x0003", "09" * 12), ("127.0.0.1:5555", "quic-long", None)]
     norm = ab.Normalizer({})
+    # the count is of TRANSACTIONS: the first Allocate was sent twice (one transaction), the second once, and the QUIC datagram has no transaction id (one)
+    assert ab.udp_summary(events, norm)["counts"] == {ab.TURN_TARGET: 2, "127.0.0.1:5555": 1}
     without = [{k: v for k, v in e.items() if k != "tid"} for e in events]
-    assert ab.udp_summary(events, norm) == ab.udp_summary(without, norm), "the datagram's transaction id is not in what the A/A compares"
-    assert ab.udp_summary(events, norm)["counts"] == {ab.TURN_TARGET: 3, "127.0.0.1:5555": 1}
+    assert ab.udp_summary(without, norm)["counts"] == {ab.TURN_TARGET: 3, "127.0.0.1:5555": 1}, "with no transaction id every datagram counts one"
 
 
 # ----------------------------------------------------------------------------------------------------------------- the evidence key
@@ -187,7 +191,7 @@ def test_what_the_page_measures_of_itself_is_in_the_evidence_and_the_summary_of_
             pass
 
         def evaluate(self, js, arg):
-            assert js == ab.RTC_JS and arg == [ab.STUN_URL, ab.TURN_URL]
+            assert js == ab.RTC_JS and arg == [ab.STUN_URL, ab.TURN_URL, ab.TURN_USERNAME, _turn_chain.PASSWORD]
             return json.loads(json.dumps(self.result))
 
     class Browser:
@@ -212,10 +216,10 @@ def test_what_the_page_measures_of_itself_is_in_the_evidence_and_the_summary_of_
 
 # ----------------------------------------------------------------------------------------------------------------- the TURN server's answers and the relay's return path
 def signed_allocate(tid, user=b"lab"):
-    """An Allocate with USERNAME and a MESSAGE-INTEGRITY attribute (the server of the lab checks that they are there)."""
-    from _turn_chain import _attr, _message
+    """An Allocate with USERNAME and the MESSAGE-INTEGRITY of the long-term key (the server of the lab checks it)."""
+    from _turn_chain import _attr, _message, long_term_key
 
-    return _message(0x0003, tid, _attr(0x0006, user) + _attr(0x0008, b"\x00" * 20))
+    return _message(0x0003, tid, _attr(0x0006, user), long_term_key(user.decode()))
 
 
 def test_the_turn_server_of_the_lab_writes_every_request_with_what_it_carried_and_every_answer_with_where_it_went_and_answers_as_it_always_did():
@@ -382,7 +386,7 @@ def test_a_hunt_repetition_launches_the_engine_with_its_own_log_and_the_variable
         without = ab.hunt_repetition("/e/firefox", "firefox-68", 1, 4, patch)
     finally:
         patch.undo()
-    assert seen == [("nicer:5,signaling:5,timestamp", str(tmp_path / "firefox-68-again-7-mozlog")), (None, None)] and ab.HUNT_MOZ_LOG == "nicer:5,signaling:5,timestamp"
+    assert seen == [("sync,timestamp,nicer:5,signaling:5", str(tmp_path / "firefox-68-again-7-mozlog")), (None, None)] and ab.HUNT_MOZ_LOG == "sync,timestamp,nicer:5,signaling:5"
     assert record["mozlog"] == "firefox-68-again-7-mozlog" and "mozlog" not in without
 
 
