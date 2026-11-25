@@ -74,6 +74,15 @@ def _calls(page):
 
 WAYS = ("page", "locator", "handle")
 
+# The first line of stock Playwright's error for `omitBackground` with png on Firefox, read from Playwright 1.61.1's own code: the server's
+# `FFPage.setBackgroundColor` throws `new Error("Not implemented")` (driver `coreBundle.js`, called when `options.omitBackground && format === "png"`),
+# and the Python client prefixes the API name (`playwright/_impl/_connection.py`: `rewrite_error(error, f"{apiName}: {error}")`).
+NOT_IMPLEMENTED = {
+    "page": "Page.screenshot: Not implemented",
+    "locator": "Locator.screenshot: Not implemented",
+    "handle": "ElementHandle.screenshot: Not implemented",
+}
+
 
 @pytest.mark.parametrize("way", WAYS)
 def test_a_mask_is_refused_by_name_and_the_page_is_untouched(page, way):
@@ -119,11 +128,12 @@ def test_a_caret_that_is_asked_to_be_drawn_is_refused_by_name(page, way):
 def test_omit_background_with_png_is_firefoxs_not_implemented(page, way):
     from invisible_playwright.sync_api import Error
 
-    with pytest.raises(Error, match=r"^Not implemented") as refused:
+    with pytest.raises(Error) as refused:
         _calls(page)[way](omit_background=True)
-    assert str(refused.value).split("\n")[0] == "Not implemented"
-    with pytest.raises(Error, match=r"^Not implemented"):
+    assert str(refused.value).split("\n")[0] == NOT_IMPLEMENTED[way]
+    with pytest.raises(Error) as refused:
         _calls(page)[way](omit_background=True, type="png")
+    assert str(refused.value).split("\n")[0] == NOT_IMPLEMENTED[way]
 
 
 @pytest.mark.parametrize("way", WAYS)
@@ -188,7 +198,7 @@ REFUSALS = [
     ("style", r"screenshot\(style=", lambda p: {"style": "p { visibility: hidden }"}),
     ("animations", r'screenshot\(animations="disabled"\)', lambda p: {"animations": "disabled"}),
     ("caret", r'screenshot\(caret="initial"\)', lambda p: {"caret": "initial"}),
-    ("omit_background", r"^Not implemented", lambda p: {"omit_background": True}),
+    ("omit_background", None, lambda p: {"omit_background": True}),
 ]
 
 
@@ -201,8 +211,10 @@ def test_a_refused_element_screenshot_does_not_scroll_the_page(scrolled, way, na
         "locator": lambda **k: scrolled.locator("#below").screenshot(**k),
         "handle": lambda **k: scrolled.query_selector("#below").screenshot(**k),
     }[way]
-    with pytest.raises(Error, match=pattern):
+    with pytest.raises(Error, match=pattern) as refused:
         shoot(**kwargs(scrolled))
+    if pattern is None:
+        assert str(refused.value).split("\n")[0] == NOT_IMPLEMENTED[way]
     assert scrolled.evaluate("window.scrollY") == SCROLLED_TO
     # the control: the same call without the refused parameter DOES scroll the element in, so the unchanged scroll above is a measurement
     assert shoot()[:4] == PNG
