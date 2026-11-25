@@ -1,5 +1,5 @@
 {
- "comment": "The outcome of Playwright's own Firefox (stock.lock) on each page: 'idle' means page.wait_for_load_state('networkidle') arrives. A page enters this list after 20 green runs of stock in a row; if stock deviates, the suite is red as a broken control. newsfront is not listed: stock Firefox stalls on it 1 or 2 times in 10 (a pending list that is empty), so it cannot be a gate until a minimal pattern replaces it.",
+ "comment": "The outcome of Playwright's own Firefox (stock.lock) on each page: 'idle' means page.wait_for_load_state('networkidle') arrives. A page enters this list after 20 green runs of stock in a row; if stock deviates, the suite is red as a broken control. newsfront is not listed: stock Firefox stalls on it 1 or 2 times in 10 (a pending list that is empty), so it cannot be a gate until a minimal pattern replaces it. stock_firefox_may_lose names, per page, a request stock may never report the end of when the page itself aborts it while the route holds it: a stock round that did not idle only because of such a request is \"stock unsettled\" (not a broken control), and our engine is judged there against the outcome stock_firefox declares.",
  "stock_firefox": {
   "quiet": "idle",
   "beacon_pair": "idle",
@@ -18,6 +18,13 @@
   "leaving_beacons": "idle",
   "leaving_beacons_subframe": "idle",
   "cancel_among_beacons": "idle"
+ },
+ "stock_firefox_may_lose": {
+  "cancel_among_beacons": {
+   "url": "[?&]id=cab\\d+(&|$)",
+   "what": "a fetch the page aborts while the route holds it may never end on stock Firefox",
+   "measured": "Windows 2 of 460 rounds (runs 45206310347 round 9 and 45621332479 round 6, always id=cab6), Linux 0 of 480 (94 runs, 25/11)"
+  }
  },
  "journey_p4": {
   "comment": "Profile P4 (tests/fakeweb/profile_p4.py): the steps on which stock Firefox does NOT reach networkidle within the timeout, because the page holds a request open on purpose: 7 and 8 (a fetch held until step 9, on the category page), 12 (a keepalive fetch held until step 13, on the search results). Stock Firefox idles on every other step, and every step is ok.",
