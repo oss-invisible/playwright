@@ -413,6 +413,26 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker (python.exe, "Windows fatal exception: access violation" in a thread Python has no state for): Windows Error Reporting writes a
+      # full dump of any python.exe that dies from an unhandled exception, into a folder the job uploads. faulthandler (pytest enables it) is a vectored handler that prints
+      # the Python stacks and returns EXCEPTION_CONTINUE_SEARCH, so the exception goes on to the unhandled-exception path and WER still sees it. BEFORE the first pytest step.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: Install wrapper + test deps (the stock client is in the dev extra)
         run: |
           python -m pip install --upgrade pip
@@ -428,6 +448,14 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: INVPW_BINARY_PATH="$FF" python -u -m pytest -m e2e -p no:cacheprovider -v tests/test_control_a_selects_all_in_a_field_e2e.py
+      - name: Upload the crash dumps of python.exe
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crash-dumps-windows-control-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-dumps
+          if-no-files-found: ignore
+          retention-days: 14
 
   # THE SAME e2e ON WINDOWS (Federico, 12/11: every test of the product runs on Linux AND Windows; where Windows behaves
   # differently the test adapts to the system). Before this, 562 of the 808 e2e had never run on Windows in any round. The census
@@ -459,6 +487,26 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker (python.exe, "Windows fatal exception: access violation" in a thread Python has no state for): Windows Error Reporting writes a
+      # full dump of any python.exe that dies from an unhandled exception, into a folder the job uploads. faulthandler (pytest enables it) is a vectored handler that prints
+      # the Python stacks and returns EXCEPTION_CONTINUE_SEARCH, so the exception goes on to the unhandled-exception path and WER still sees it. BEFORE the first pytest step.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       # The A/A of the three A/B oracles (page, network, host) runs on the first seeds of the candidate set on a pull request, and on ALL of them when the pull request
       # changes a file of that oracle (scripts/ci_ab_pr_seeds.py holds the lists). The checkout is shallow, so the script fetches the base commit and lists the files that
       # differ from it (`git diff --name-only <base> HEAD`: HEAD is the merge commit, so this is the pull request's own change); the tests read the variables it prints.
@@ -528,6 +576,14 @@ jobs:
         with:
           name: invpw-evidence-windows-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/invpw-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload the crash dumps of python.exe
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crash-dumps-windows-${{ matrix.part }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-dumps
           if-no-files-found: ignore
           retention-days: 14
 
@@ -642,6 +698,26 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker (python.exe, "Windows fatal exception: access violation" in a thread Python has no state for): Windows Error Reporting writes a
+      # full dump of any python.exe that dies from an unhandled exception, into a folder the job uploads. faulthandler (pytest enables it) is a vectored handler that prints
+      # the Python stacks and returns EXCEPTION_CONTINUE_SEARCH, so the exception goes on to the unhandled-exception path and WER still sees it. BEFORE the first pytest step.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
         if: github.event_name == 'pull_request'
         shell: bash
@@ -692,6 +768,14 @@ jobs:
           path: |
             ${{ runner.temp }}/invpw-evidence
             ${{ runner.temp }}/network-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload the crash dumps of python.exe
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crash-dumps-network-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-dumps
           if-no-files-found: ignore
           retention-days: 14
 
@@ -824,6 +908,26 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker (python.exe, "Windows fatal exception: access violation" in a thread Python has no state for): Windows Error Reporting writes a
+      # full dump of any python.exe that dies from an unhandled exception, into a folder the job uploads. faulthandler (pytest enables it) is a vectored handler that prints
+      # the Python stacks and returns EXCEPTION_CONTINUE_SEARCH, so the exception goes on to the unhandled-exception path and WER still sees it. BEFORE the first pytest step.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
         if: github.event_name == 'pull_request'
         shell: bash
@@ -942,6 +1046,14 @@ jobs:
             ${{ runner.temp }}/host-e2e.xml
           if-no-files-found: ignore
           retention-days: 14
+      - name: Upload the crash dumps of python.exe
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crash-dumps-host-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-dumps
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ``The page oracle``: the A/A of tests/test_ab_oracle_e2e.py (the page of the host gate over the persona seeds, the published engine against itself; the poison probe, the H7 second
   # launch of seed 0 and the ab. visits are part of its dumps) on its own job, Linux and Windows, as the network and host oracles have theirs. On a pull request that changes a
@@ -1053,6 +1165,26 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker (python.exe, "Windows fatal exception: access violation" in a thread Python has no state for): Windows Error Reporting writes a
+      # full dump of any python.exe that dies from an unhandled exception, into a folder the job uploads. faulthandler (pytest enables it) is a vectored handler that prints
+      # the Python stacks and returns EXCEPTION_CONTINUE_SEARCH, so the exception goes on to the unhandled-exception path and WER still sees it. BEFORE the first pytest step.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
         if: github.event_name == 'pull_request'
         shell: bash
@@ -1103,6 +1235,14 @@ jobs:
           path: |
             ${{ runner.temp }}/invpw-evidence
             ${{ runner.temp }}/page-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload the crash dumps of python.exe
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crash-dumps-page-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-dumps
           if-no-files-found: ignore
           retention-days: 14
 
@@ -1246,6 +1386,26 @@ jobs:
         with: { fetch-depth: 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker (python.exe, "Windows fatal exception: access violation" in a thread Python has no state for): Windows Error Reporting writes a
+      # full dump of any python.exe that dies from an unhandled exception, into a folder the job uploads. faulthandler (pytest enables it) is a vectored handler that prints
+      # the Python stacks and returns EXCEPTION_CONTINUE_SEARCH, so the exception goes on to the unhandled-exception path and WER still sees it. BEFORE the first pytest step.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
         run: |
           python -m pip install --upgrade pip
@@ -1292,5 +1452,13 @@ jobs:
           path: |
             ${{ runner.temp }}/invpw-evidence
             ${{ runner.temp }}/page-final-e2e.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload the crash dumps of python.exe
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crash-dumps-page-final-windows-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-dumps
           if-no-files-found: ignore
           retention-days: 14
