@@ -1,0 +1,112 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# drag-stray-move-hunt.yml - one e2e test, many times, the wrapper before and after #606.
+#
+# The question. tests/test_drag_motion.py::test_a_real_page_sees_a_drag_that_travelled was red once on the published
+# engine with the wrapper of main (#606 merged): after the press the page saw mousemove 101,81 / 103,82 / 106,85 with
+# buttons=1 and then `mousemove 512,299 buttons=0`. It passed in the 60 runs before and in the pull request's own run.
+# Code reading says #606 cannot be involved (drag_and_drop does not go through `_by_hand`/Pointer), and the hypothesis
+# is that the engine, during the native drag on Windows (OLE DoDragDrop), synthesizes a mousemove at the OS cursor
+# position with no button.
+#
+# What it does. Windows, the published engine, wrapper ref x shard = 8 jobs. Each job installs the wrapper AT THE
+# MATRIX REF and runs, 25 times in sequence: the scenario of the test with every mouse/pointer/drag event recorded
+# (clientX/Y, screenX/Y, buttons, isTrusted, timeStamp), the window geometry, and the real OS cursor position read on
+# the runner outside the browser; then the original test from that ref's own tests/ folder. One JSON line per
+# iteration. The job is green whatever it finds; only a scenario that errors is an error.
+#
+# Starts on a push to its own branch; not a gate, no pull request. The evidence is the artifact.
+# ─────────────────────────────────────────────────────────────────────────────
+name: drag stray move hunt
+
+on:
+  push:
+    branches: [hunt/drag-stray-move]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drag-stray-move-hunt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  hunt:
+    name: hunt (${{ matrix.label }}, shard ${{ matrix.shard }})
+    runs-on: windows-2022
+    timeout-minutes: 60
+    # TEMP and TMP on D:\a\_temp, as the Windows e2e jobs of e2e.yml have them.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        # 2f5216b47bd2: main just before #606. 46054486: the merge of #606.
+        ref: [2f5216b4c084b4ec01c81c2510b5e629f96de0ac, 46054486c9ce8a969fc21167e2a9eb5eff78e364]
+        shard: [1, 2, 3, 4]
+        include:
+          - ref: 2f5216b4c084b4ec01c81c2510b5e629f96de0ac
+            label: before-606
+          - ref: 46054486c9ce8a969fc21167e2a9eb5eff78e364
+            label: after-606
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The hunt files, the security state and the GeoIP builder: the hunt branch.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      # The code under test: the matrix ref, in its own folder, with its own tests/ folder.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: ref
+          fetch-depth: 1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.11' }
+      - name: Install the wrapper AT THE MATRIX REF + test deps (+ Playwright ONLY as a system tool)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "./ref[dev]"
+          python -m pip install "playwright==$(cat ref/scripts/playwright_pin.txt)"
+          python -c "import invisible_playwright, sys; print(invisible_playwright.__file__)"
+          python -m pip show invisible-playwright invisible-core | grep -E "^(Name|Version)"
+      - name: The security state (a fixed directory of the repository)
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
+      - name: Fetch the published firefox binary
+        run: echo "FF=$(cd "$RUNNER_TEMP" && python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        run: python scripts/ci_lab_geoip.py build
+      - name: Run the drag 25 times (the scenario with evidence, then the original test)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mkdir -p evidence
+          INVPW_BINARY_PATH="$FF" STEALTHFOX_E2E_BINARY="$FF" python -u scripts/hunt_drag_stray_move.py run \
+            --ref-dir ref --label "${{ matrix.label }}" --shard "${{ matrix.shard }}" --iterations 25 --out evidence
+      - name: The summary of this job
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.label }} (${{ matrix.ref }}), shard ${{ matrix.shard }}"
+            echo
+            python scripts/hunt_drag_stray_move.py summary evidence
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Close every Firefox left
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: drag-stray-move-${{ matrix.label }}-${{ matrix.shard }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 14
