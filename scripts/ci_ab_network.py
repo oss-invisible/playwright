@@ -88,6 +88,8 @@ HUNT_FORMAT = "ab-network-hunt/1"
 HUNT_SUMMARY_FORMAT = "ab-network-hunt-summary/1"
 #: The environment variable that makes ``ab`` repeat one walk of one seed and nothing else (``cmd_hunt``): ``webrtc:<seed>:<n>``.
 HUNT_ENV = "AB_NETWORK_HUNT"
+#: The engine's own log in a hunt (the launch's environment, in hunt mode only): nICEr's reasons for accepting or rejecting an answer or ending a transaction, and the signaling.
+HUNT_MOZ_LOG = "nicer:5,signaling:5,timestamp"
 VOLATILE_FORMAT = "ab-network-volatile/1"
 VOLATILE_FILE = ROOT / "ci" / "ab-network-volatile.json"
 SEEDS_FILE = ROOT / "ci" / "persona-seeds.json"
@@ -561,6 +563,85 @@ def stun_tid(payload: bytes) -> Optional[str]:
     return None
 
 
+def stun_attributes(data: bytes) -> Dict[int, bytes]:
+    """The attributes of a STUN message by type (RFC 8489: type, length, value padded to 4 bytes); what a truncated tail says is left out."""
+    out: Dict[int, bytes] = {}
+    i = 20
+    while i + 4 <= len(data):
+        kind, length = int.from_bytes(data[i:i + 2], "big"), int.from_bytes(data[i + 2:i + 4], "big")
+        if i + 4 + length > len(data):
+            break
+        out[kind] = data[i + 4:i + 4 + length]
+        i += 4 + ((length + 3) & ~3)
+    return out
+
+
+def xor_address(value: Optional[bytes]) -> Optional[str]:
+    """An XOR-MAPPED-ADDRESS or XOR-RELAYED-ADDRESS value (IPv4) as ``ip:port``; None for a missing value or another family."""
+    if value is None or len(value) < 8 or value[1] != 1:
+        return None
+    cookie = b"\x21\x12\xa4\x42"
+    port = int.from_bytes(value[2:4], "big") ^ int.from_bytes(cookie[:2], "big")
+    return "%s:%d" % (socket.inet_ntoa(bytes(a ^ b for a, b in zip(value[4:8], cookie))), port)
+
+
+def turn_request_record(data: bytes, source: Tuple[str, int], t: float) -> Optional[Dict[str, Any]]:
+    """What the lab's TURN server writes down of a datagram it receives (None when it is not STUN): when, from where, the transaction id, the message type, whether it carried
+    USERNAME and MESSAGE-INTEGRITY, and (``responses``, filled by :func:`turn_response_record`) what the server answered."""
+    if stun_tid(data) is None:
+        return None
+    attrs = stun_attributes(data)
+    return {"t": t, "src": "%s:%d" % (source[0], source[1]), "tid": stun_tid(data), "type": "0x%04x" % int.from_bytes(data[:2], "big"),
+            "username": 0x0006 in attrs, "integrity": 0x0008 in attrs, "responses": []}
+
+
+def turn_response_record(data: bytes, destination: Tuple[str, int], t: float) -> Optional[Dict[str, Any]]:
+    """What the lab's TURN server sends: when, the type (0x0113 an Allocate error, 0x0103 its success), the address it is sent to and, of a success, the XOR-RELAYED-ADDRESS and the
+    XOR-MAPPED-ADDRESS it carries (of an error, its code)."""
+    if stun_tid(data) is None:
+        return None
+    attrs = stun_attributes(data)
+    error = attrs.get(0x0009)
+    return {"t": t, "tid": stun_tid(data), "type": "0x%04x" % int.from_bytes(data[:2], "big"), "to": "%s:%d" % (destination[0], destination[1]),
+            "relayed": xor_address(attrs.get(0x0016)), "mapped": xor_address(attrs.get(0x0020)),
+            "error": (error[2] * 100 + error[3]) if error is not None and len(error) >= 4 else None}
+
+
+class ExchangeSocket:
+    """The UDP socket of the lab's TURN server with a record of what it receives and sends (``owner.exchanges``): the server's own code runs on it unchanged, and a failure of the record
+    is never a failure of the server. ``owner.clock`` is the moment (the recorder's)."""
+
+    def __init__(self, sock: socket.socket, owner: Any) -> None:
+        self._sock, self._owner = sock, owner
+
+    def recvfrom(self, size: int) -> Tuple[bytes, Any]:
+        data, source = self._sock.recvfrom(size)
+        try:
+            record = turn_request_record(data, source, self._owner.clock())
+            if record is not None:
+                self._owner.exchanges.append(record)
+        except Exception:  # noqa: BLE001 - evidence, never the road
+            pass
+        return data, source
+
+    def sendto(self, data: bytes, address: Any) -> int:
+        try:
+            record = turn_response_record(data, address, self._owner.clock())
+            if record is not None:
+                for exchange in reversed(self._owner.exchanges):
+                    if exchange.get("tid") == record["tid"]:
+                        exchange["responses"].append(record)
+                        break
+                else:
+                    self._owner.exchanges.append({"t": record["t"], "src": None, "tid": record["tid"], "type": None, "username": None, "integrity": None, "responses": [record]})
+        except Exception:  # noqa: BLE001 - evidence, never the road
+            pass
+        return self._sock.sendto(data, address)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
+
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 #  The seeds, the transcript and its files
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -751,6 +832,17 @@ def make_lab_classes() -> Tuple[type, type, type]:
             self.opener_lookup: Callable[..., str] = self._look_up_opener
             super().__init__("lab", doh, udp="relay", tcp_exit=exit_ip, udp_exit=exit_ip, relay_host=host, exit_host=host)
 
+        def _deliver(self, relay: socket.socket, to: Any, host: str, port: int, payload: bytes) -> None:
+            """Every datagram the relay sends BACK to the browser is written down (``udp_back``: the address it claims in the SOCKS UDP header, where it is sent, from which relay
+            socket, the STUN type and transaction id), then sent as it always was."""
+            try:
+                local = relay.getsockname()
+                self.rec.event("udp_back", claimed="%s:%d" % (host, port), to="%s:%d" % (to[0], to[1]), relay="%s:%d" % (local[0], local[1]),
+                               message=message_kind(payload), tid=stun_tid(payload))
+            except Exception:  # noqa: BLE001 - evidence, never the road
+                pass
+            super()._deliver(relay, to, host, port, payload)
+
         def _attributing(self) -> bool:
             phase = self.rec.phase
             return any(phase == p or phase.startswith(p + ".") for p in self.attribute_in)
@@ -821,9 +913,13 @@ def make_lab_classes() -> Tuple[type, type, type]:
         from an address of the host to loopback."""
 
         def __init__(self, address: str) -> None:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.bind((address, 0))
-            self.address = self.sock.getsockname()
+            raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            raw.bind((address, 0))
+            self.address = raw.getsockname()
+            #: Every STUN datagram it received with the answers it sent (``turn_request_record``), by the clock the lab sets (``Lab``): evidence of the WebRTC walk, never compared.
+            self.exchanges: list = []
+            self.clock: Callable[[], float] = time.monotonic
+            self.sock = ExchangeSocket(raw, self)
             self.seen: list = []
             self.allocations: list = []
             self.requests: list = []
@@ -1032,6 +1128,7 @@ class Lab:
         self._closers.append(self.witness.close)
         self._claim(self.witness.port, "witness")
         self.turn = turn_class(self.host)
+        self.turn.clock = self.rec.now
         self._closers.append(self.turn.close)
         self.gateway = gateway_class(self.rec, self.doh, self.turn, self.host, self.exit_ip)
         self.gateway.attribute_in = attribute_in
@@ -1472,10 +1569,15 @@ def webrtc_evidence(lab: Lab) -> Dict[str, Any]:
     It exists to tell two readings of a run that differs from itself apart: a close that cuts the retransmissions of the TURN server short at a variable point, and a retransmission of the
     first request whose answer came late."""
     info = getattr(lab, "webrtc", None) or {}
+    began = lab.rec.phase_t.get("webrtc")
     counted = info.get("counted")
     datagrams = [{"t": e["t"], "phase": e["phase"], "target": e["target"], "message": e["message"], "tid": e.get("tid"), "counted": counted is None or i < counted}
                  for i, e in enumerate(lab.rec.of("webrtc", "udp"))]
-    return {"phase_t": {name: lab.rec.phase_t.get(name) for name in ("webrtc", "webrtc.end")}, "evaluate": info.get("evaluate"), "page": info.get("page"), "datagrams": datagrams}
+    # The lab's TURN server: each request with what it carried and what it answered; the relay's datagrams back to the browser: the address each claims and the 5-tuple it goes to.
+    exchanges = [e for e in getattr(getattr(lab, "turn", None), "exchanges", None) or [] if began is None or e["t"] >= began]
+    returned = [{"t": e["t"], "phase": e["phase"], "claimed": e["claimed"], "to": e["to"], "relay": e["relay"], "message": e["message"], "tid": e.get("tid")} for e in lab.rec.of("webrtc", "udp_back")]
+    return {"phase_t": {name: lab.rec.phase_t.get(name) for name in ("webrtc", "webrtc.end")}, "evaluate": info.get("evaluate"), "page": info.get("page"), "datagrams": datagrams,
+            "turn": exchanges, "returned": returned, "send_errors": list(getattr(getattr(lab, "gateway", None), "send_errors", None) or [])}
 
 
 def direct_report(lab: Lab, watcher: Any, trap: Any) -> Dict[str, Any]:
@@ -1834,9 +1936,14 @@ def hunt_counts(evidence: Optional[Dict[str, Any]]) -> Dict[str, int]:
     return {"counted": sum(1 for d in turn if d.get("counted")), "all": len(turn)}
 
 
-def hunt_repetition(binary: str, label: str, i: int, seed: int, patch: Any) -> Dict[str, Any]:
+def hunt_repetition(binary: str, label: str, i: int, seed: int, patch: Any, out_dir: Optional[Path] = None) -> Dict[str, Any]:
     """One repetition: a launch behind a lab as the main launch has it, the WebRTC walk only, the close, and what the lab saw of it. A failure is the ``error`` of the record."""
     record: Dict[str, Any] = {"format": HUNT_FORMAT, "engine": label, "i": i, "seed": seed, "error": None, "evidence": None}
+    if out_dir is not None:
+        # The engine logs to ``<out_dir>/<engine>-<i>-mozlog`` (its child processes to the same name with ``.child-N``): the launch inherits this process's environment.
+        record["mozlog"] = "%s-%d-mozlog" % (label, i)
+        patch.setenv("MOZ_LOG", HUNT_MOZ_LOG)
+        patch.setenv("MOZ_LOG_FILE", str(Path(out_dir) / record["mozlog"]))
     try:
         with open_lab(journey=True, wire=True) as lab:
             begin_launch(seed, "hunt")
@@ -1848,6 +1955,10 @@ def hunt_repetition(binary: str, label: str, i: int, seed: int, patch: Any) -> D
             record["evidence"] = webrtc_evidence(lab)                        # after the close: the datagrams the close leaves in flight are in it
     except Exception as exc:  # noqa: BLE001 - evidence, never a verdict
         record["error"] = _first_line(exc)
+    finally:
+        if out_dir is not None:
+            patch.delenv("MOZ_LOG", raising=False)
+            patch.delenv("MOZ_LOG_FILE", raising=False)
     record["counts"] = hunt_counts(record["evidence"])
     return record
 
@@ -1866,7 +1977,7 @@ def hunt_run(binary: str, label: str, seed: int, n: int, out_dir: Path) -> int:
         RUN_LABEL = label
         out_dir.mkdir(parents=True, exist_ok=True)
         for i in range(1, n + 1):
-            record = hunt_repetition(binary, label, i, seed, patch)
+            record = hunt_repetition(binary, label, i, seed, patch, out_dir)
             write_json(out_dir / ("%s-%d.json" % (label, i)), record)
             print("hunt %s %d/%d: %d datagrams to the TURN server (%d with the late ones)%s" % (
                 label, i, n, record["counts"]["counted"], record["counts"]["all"], "" if record["error"] is None else ", ERROR " + record["error"]))

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -99,7 +100,7 @@ def test_the_evidence_of_the_walk_lists_every_datagram_with_its_time_target_mess
     page = {"start": 1.0, "offer": 2.0, "candidates": [{"t": 3.0, "type": "host"}], "errors": [{"t": 4.0, "code": 701, "url": "turn:x"}], "gathered": 5.0, "closing": 6.0, "closed": 6.5}
     evidence = ab.webrtc_evidence(lab_with(rec, counted=counted, evaluate={"called": 0.5, "returned": 7.0}, page=page))
     json.dumps(evidence)
-    assert set(evidence) == {"phase_t", "evaluate", "page", "datagrams"}
+    assert set(evidence) == {"phase_t", "evaluate", "page", "datagrams", "turn", "returned", "send_errors"}
     assert evidence["page"] == page and evidence["evaluate"] == {"called": 0.5, "returned": 7.0}
     assert set(evidence["phase_t"]) == {"webrtc", "webrtc.end"} and evidence["phase_t"]["webrtc"] <= evidence["phase_t"]["webrtc.end"]
     datagrams = evidence["datagrams"]
@@ -115,7 +116,7 @@ def test_the_evidence_of_the_walk_leaves_out_the_datagrams_of_other_stages_and_s
     rec.set_phase("h3")
     rec.event("udp", target="127.0.0.1:1", message="quic-long", tid=None, opener=None)
     empty = ab.webrtc_evidence(lab_with(rec))
-    assert empty == {"phase_t": {"webrtc": None, "webrtc.end": None}, "evaluate": None, "page": None, "datagrams": []}
+    assert empty == {"phase_t": {"webrtc": None, "webrtc.end": None}, "evaluate": None, "page": None, "datagrams": [], "turn": [], "returned": [], "send_errors": []}
 
 
 def evidence_transcript(label, datagrams):
@@ -207,6 +208,190 @@ def test_what_the_page_measures_of_itself_is_in_the_evidence_and_the_summary_of_
     assert '"times"' not in outs[0] and "gathered" not in outs[0]
     assert [x["page"] for x in labs] == [{"start": 1.0, "gathered": 2.0}, {"start": 5.5, "gathered": 9.25, "closed": 11.0}, None]
     assert all(x["evaluate"]["called"] <= x["evaluate"]["returned"] for x in labs) and all(isinstance(x["counted"], int) for x in labs)
+
+
+# ----------------------------------------------------------------------------------------------------------------- the TURN server's answers and the relay's return path
+def signed_allocate(tid, user=b"lab"):
+    """An Allocate with USERNAME and a MESSAGE-INTEGRITY attribute (the server of the lab checks that they are there)."""
+    from _turn_chain import _attr, _message
+
+    return _message(0x0003, tid, _attr(0x0006, user) + _attr(0x0008, b"\x00" * 20))
+
+
+def test_the_turn_server_of_the_lab_writes_every_request_with_what_it_carried_and_every_answer_with_where_it_went_and_answers_as_it_always_did():
+    import socket
+
+    from _turn_chain import RELAYED, TurnServer
+
+    _gateway, turn_class, _page = ab.make_lab_classes()
+    turn = turn_class("127.0.0.1")
+    assert isinstance(turn, TurnServer) and isinstance(turn.sock, ab.ExchangeSocket)
+    ticks = iter(x / 10 for x in range(1, 100))
+    turn.clock = lambda: next(ticks)
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(5)
+    client.bind(("127.0.0.1", 0))
+    first, second = b"\x01" * 12, b"\x02" * 12
+    try:
+        client.sendto(stun(0x0003, first), turn.address)
+        unauthorized, _ = client.recvfrom(2048)
+        client.sendto(signed_allocate(second), turn.address)
+        success, _ = client.recvfrom(2048)
+        client.sendto(b"not stun at all, twenty-odd bytes", turn.address)
+        client.sendto(stun(0x0001, b"\x03" * 12), turn.address)         # a Binding request: the server of the lab does not answer it
+        port = client.getsockname()[1]
+        for _ in range(100):
+            if len(turn.exchanges) == 3:
+                break
+            time.sleep(0.05)
+    finally:
+        client.close()
+        turn.close()
+    assert int.from_bytes(unauthorized[:2], "big") == 0x0113 and int.from_bytes(success[:2], "big") == 0x0103, "what the server answers is what it answered"
+    assert len(turn.seen) == 3 and [a[2] for a in turn.allocations] == ["lab"] and turn.allocations[0][:2] == ("127.0.0.1", port)
+    one, two, three = turn.exchanges
+    json.dumps(turn.exchanges)
+    assert (one["t"], one["src"], one["tid"], one["type"], one["username"], one["integrity"]) == (0.1, "127.0.0.1:%d" % port, first.hex(), "0x0003", False, False)
+    assert one["responses"] == [{"t": 0.2, "tid": first.hex(), "type": "0x0113", "to": "127.0.0.1:%d" % port, "relayed": None, "mapped": None, "error": 401}]
+    assert (two["tid"], two["type"], two["username"], two["integrity"]) == (second.hex(), "0x0003", True, True)
+    (answer,) = two["responses"]
+    assert answer["type"] == "0x0103" and answer["to"] == "127.0.0.1:%d" % port and answer["error"] is None
+    assert answer["relayed"] == "%s:%d" % RELAYED and answer["mapped"] == "127.0.0.1:%d" % port, "the XOR-RELAYED-ADDRESS and XOR-MAPPED-ADDRESS the server put in, decoded"
+    assert (three["type"], three["responses"]) == ("0x0001", []), "a request the server does not answer has no answer in its record"
+
+
+def test_a_failure_of_the_record_never_reaches_the_server():
+    class Owner:
+        exchanges = None            # append on None: the record fails
+
+        def clock(self):
+            raise RuntimeError("no clock")
+
+    class Raw:
+        def __init__(self):
+            self.sent = []
+
+        def recvfrom(self, size):
+            return stun(0x0003), ("127.0.0.1", 9)
+
+        def sendto(self, data, address):
+            self.sent.append((data, address))
+            return len(data)
+
+        def close(self):
+            self.closed = True
+
+    raw = Raw()
+    sock = ab.ExchangeSocket(raw, Owner())
+    assert sock.recvfrom(10) == (stun(0x0003), ("127.0.0.1", 9))
+    assert sock.sendto(stun(0x0113), ("127.0.0.1", 9)) == 20 and raw.sent == [(stun(0x0113), ("127.0.0.1", 9))]
+    sock.close()
+    assert raw.closed is True
+
+
+def test_an_xor_address_is_decoded_and_an_answer_with_no_request_has_a_record_of_its_own():
+    from _turn_chain import _attr, _xor_addr
+
+    assert ab.xor_address(_xor_addr("198.51.100.7", 50000)) == "198.51.100.7:50000"
+    assert ab.xor_address(None) is None and ab.xor_address(b"\x00\x02" + b"\x00" * 18) is None
+    assert ab.stun_attributes(stun(0x0003) + _attr(0x0006, b"lab") + _attr(0x0008, b"\x00" * 20)) == {0x0006: b"lab", 0x0008: b"\x00" * 20}
+    assert ab.stun_attributes(stun(0x0003) + b"\x00\x06\x00\x40ab") == {}, "a truncated attribute says nothing"
+    owner = types.SimpleNamespace(exchanges=[], clock=lambda: 1.5)
+    ab.ExchangeSocket(types.SimpleNamespace(sendto=lambda data, address: 0), owner).sendto(stun(0x0113, b"\x07" * 12), ("127.0.0.1", 5))
+    assert owner.exchanges == [{"t": 1.5, "src": None, "tid": "07" * 12, "type": None, "username": None, "integrity": None,
+                                "responses": [{"t": 1.5, "tid": "07" * 12, "type": "0x0113", "to": "127.0.0.1:5", "relayed": None, "mapped": None, "error": None}]}]
+
+
+def test_the_relay_writes_each_datagram_it_sends_back_with_the_address_it_claims_and_the_five_tuple_it_goes_to_and_still_sends_it():
+    import socket
+    import struct
+
+    from _doh_servers import FakeDoh
+
+    gateway_class, turn_class, _page = ab.make_lab_classes()
+    rec = ab.Recorder()
+    doh = FakeDoh({})
+    turn = turn_class("127.0.0.1")
+    gateway = gateway_class(rec, doh, turn, "127.0.0.1", "198.51.100.9")
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.settimeout(5)
+    receiver.bind(("127.0.0.1", 0))
+    relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    relay.bind(("127.0.0.1", 0))
+    try:
+        rec.set_phase("webrtc")
+        gateway._deliver(relay, receiver.getsockname(), "198.51.100.7", 3478, stun(0x0103, b"\x05" * 12))
+        gateway._deliver(relay, receiver.getsockname(), "198.51.100.5", 19302, b"\xc3" + b"\x00" * 5)
+        first, _ = receiver.recvfrom(2048)
+        second, _ = receiver.recvfrom(2048)
+        relay_address = relay.getsockname()
+        client_address = receiver.getsockname()
+    finally:
+        receiver.close()
+        relay.close()
+        gateway.close()
+        turn.close()
+        doh.close()
+    assert first == b"\x00\x00\x00\x01" + socket.inet_aton("198.51.100.7") + struct.pack("!H", 3478) + stun(0x0103, b"\x05" * 12), "the datagram is sent as it always was"
+    assert second.endswith(b"\xc3" + b"\x00" * 5)
+    back = rec.of("webrtc", "udp_back")
+    assert [(e["claimed"], e["to"], e["relay"], e["message"], e["tid"]) for e in back] == [
+        ("198.51.100.7:3478", "%s:%d" % client_address, "%s:%d" % relay_address, "stun-0x0103", "05" * 12),
+        ("198.51.100.5:19302", "%s:%d" % client_address, "%s:%d" % relay_address, "quic-long", None)]
+    assert rec.of("webrtc", "udp") == [], "a datagram back is not a datagram of the browser: the compared UDP summary does not see it"
+
+
+def test_the_evidence_keeps_the_turn_exchanges_of_the_walk_and_the_return_datagrams_and_the_gateways_send_errors():
+    rec = ab.Recorder()
+    rec.set_phase("webrtc")
+    rec.event("udp_back", claimed="198.51.100.7:3478", to="127.0.0.1:40000", relay="127.0.0.1:41000", message="stun-0x0103", tid="aa" * 12)
+    rec.set_phase("webrtc.end")
+    rec.phase_t["webrtc"] = 5.0                       # the stage began at 5 s on the recorder's clock
+    before = {"t": 1.0, "src": "x:1", "tid": "00" * 12, "type": "0x0003", "username": False, "integrity": False, "responses": []}
+    inside = {"t": 5.5, "src": "127.0.0.1:40000", "tid": "aa" * 12, "type": "0x0003", "username": True, "integrity": True, "responses": []}
+    lab = types.SimpleNamespace(rec=rec, webrtc={}, turn=types.SimpleNamespace(exchanges=[before, inside]), gateway=types.SimpleNamespace(send_errors=["the answer to the client: OSError x"]))
+    evidence = ab.webrtc_evidence(lab)
+    json.dumps(evidence)
+    assert evidence["turn"] == [inside], "the exchanges of the walk, not what the server heard before its stage"
+    assert [(e["claimed"], e["to"], e["relay"], e["tid"], e["phase"]) for e in evidence["returned"]] == [("198.51.100.7:3478", "127.0.0.1:40000", "127.0.0.1:41000", "aa" * 12, "webrtc")]
+    assert evidence["send_errors"] == ["the answer to the client: OSError x"]
+
+
+def test_a_lab_gives_its_turn_server_the_clock_of_its_recorder():
+    with ab.Lab(host="127.0.0.1") as lab:
+        assert lab.turn.clock == lab.rec.now and lab.turn.exchanges == []
+
+
+def test_a_hunt_repetition_launches_the_engine_with_its_own_log_and_the_variables_are_gone_after(tmp_path, monkeypatch):
+    import os
+
+    seen = []
+
+    def launch(binary, seed, lab, patch):
+        seen.append((os.environ.get("MOZ_LOG"), os.environ.get("MOZ_LOG_FILE")))
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(ab, "launch", launch)
+    monkeypatch.setattr(ab, "begin_launch", lambda seed, name: None)
+    monkeypatch.delenv("MOZ_LOG", raising=False)
+    monkeypatch.delenv("MOZ_LOG_FILE", raising=False)
+    patch = pytest.MonkeyPatch()
+    try:
+        record = ab.hunt_repetition("/e/firefox", "firefox-68-again", 7, 4, patch, tmp_path)
+        assert "MOZ_LOG" not in os.environ and "MOZ_LOG_FILE" not in os.environ, "the variables are the launch's: a repetition leaves none"
+        without = ab.hunt_repetition("/e/firefox", "firefox-68", 1, 4, patch)
+    finally:
+        patch.undo()
+    assert seen == [("nicer:5,signaling:5,timestamp", str(tmp_path / "firefox-68-again-7-mozlog")), (None, None)] and ab.HUNT_MOZ_LOG == "nicer:5,signaling:5,timestamp"
+    assert record["mozlog"] == "firefox-68-again-7-mozlog" and "mozlog" not in without
+
+
+def test_the_run_of_a_normal_a_a_does_not_log_the_engine():
+    import inspect
+
+    for function in (ab.run_main, ab.run, ab.run_engine, ab.launch, ab.engine_env):
+        assert "HUNT_MOZ_LOG" not in inspect.getsource(function) and "setenv" not in inspect.getsource(function), function.__name__
+    assert "MOZ_LOG" in inspect.getsource(ab.engine_env), "an engine's own environment still has the log variables taken out: only the hunt's repetition sets them"
 
 
 # ----------------------------------------------------------------------------------------------------------------- the hunt
