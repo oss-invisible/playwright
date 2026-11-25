@@ -235,7 +235,7 @@ def original(ref_dir, binary, out_dir, label, shard, n):
     """The original test, pytest from the ref's own tests/ folder, as the e2e jobs run it."""
     env = dict(os.environ, INVPW_BINARY_PATH=binary, STEALTHFOX_E2E_BINARY=binary, PYTHONUNBUFFERED="1")
     env.pop("PYTEST_ADDOPTS", None)
-    log = Path(out_dir) / "original-%s-%s-%02d.log" % (label, shard, n)
+    log = Path(out_dir) / ("original-%s-%s-%02d.log" % (label, shard, n))
     t0 = time.time()
     try:
         proc = subprocess.run(
@@ -261,7 +261,11 @@ def cmd_run(args):
         with tempfile.TemporaryDirectory() as tmp:
             line = {"ref": args.label, "shard": args.shard, "iteration": n, "seed": 42}
             line["instrumented"] = instrumented(binary, journey_check, tmp)
-        line["original"] = original(args.ref_dir, binary, out, args.label, args.shard, n)
+        try:
+            line["original"] = original(args.ref_dir, binary, out, args.label, args.shard, n)
+        except Exception as exc:  # the harness around the test broke: recorded, the loop goes on
+            line["original"] = {"rc": None, "outcome": "harness-error", "seconds": 0,
+                                "tail": "%s: %s" % (type(exc).__name__, str(exc)[:500])}
         with open(jsonl, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
         ins = line["instrumented"]
