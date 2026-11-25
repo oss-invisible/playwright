@@ -207,8 +207,8 @@ def problems_concurrency(name: str, spec: dict) -> list[str]:
     if "github.run_id" not in group:
         out.append(f"{name}: outside a pull request the group is not unique to the run, "
                    f"so a newer pending run of main replaces an older one")
-    if "github.ref" in group or "head_ref" in group:
-        out.append(f"{name}: the group is keyed on the ref, which is main for every push to main")
+    if ("github.ref" in group and "merge_group" not in group) or "head_ref" in group:
+        out.append(f"{name}: the group is keyed on the ref, which is main for every push to main (only a merge queue run may key on it: its ref is its own)")
     return out
 
 
@@ -319,9 +319,9 @@ def test_the_push_triggers_the_release_reads_are_still_there():
     e2e = triggers(_load(WORKFLOWS / "e2e.yml"))
     assert e2e["push"]["branches"] == ["main"], \
         "scripts/e2e_is_green.py needs the e2e of the push to main on the tagged commit"
-    assert "pull_request" in e2e
+    assert "merge_group" in e2e and "pull_request" not in e2e, "e2e runs in the merge queue run, not on the pull request"
     tests = triggers(_load(WORKFLOWS / "tests.yml"))
-    assert tests["push"]["branches"] == ["main"] and "pull_request" in tests
+    assert tests["push"]["branches"] == ["main"] and "pull_request" in tests and "merge_group" in tests
     publish = triggers(_load(WORKFLOWS / "publish.yml"))
     assert publish["push"]["tags"] == ["v*"], "publish must start on a release tag"
 

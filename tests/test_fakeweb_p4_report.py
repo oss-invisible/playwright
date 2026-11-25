@@ -598,7 +598,9 @@ def test_the_workflow_has_four_legs_and_one_verdict_job():
     for leg in ("p2, os: linux", "p2, os: windows", "p4, os: linux", "p4, os: windows"):
         assert "profile: " + leg in WORKFLOW
     assert "name: fakeweb verdict" in WORKFLOW and "if: always()" in WORKFLOW.split("name: fakeweb verdict", 1)[1]
-    assert '"${{ needs.walk.result }}" != "success"' in WORKFLOW        # a leg that did not run is not green
+    verdict = WORKFLOW.split("name: fakeweb verdict", 1)[1]
+    assert "needs: [core-on-index, linux-deps-fakeweb, walk]" in verdict and "WORKFLOW: fakeweb" in verdict and "NEEDS: ${{ toJSON(needs) }}" in verdict
+    # a leg that did not run is not green: scripts/ci_gate.py (read from main) expects `success` of `walk`, see tests/test_the_workflows_are_ready_for_the_merge_queue.py
 
 
 def test_every_action_is_pinned_to_a_commit():
@@ -616,7 +618,8 @@ def test_the_workflow_runs_stock_and_ours_and_never_reruns_or_forgives():
     assert WORKFLOW.index("scripts/ci_lab_geoip.py build") < first_run and WORKFLOW.index("scripts/ci_lab_security_state.py set") < WORKFLOW.index("fetch | tail -1")
 
 
-def test_the_workflow_starts_on_the_fake_web_files_of_a_pull_request_and_of_main_and_by_hand():
+def test_the_workflow_starts_in_the_merge_queue_run_and_on_the_fake_web_files_of_main_and_by_hand():
     on = WORKFLOW.split("\npermissions:", 1)[0]
-    assert "  push:\n    branches: [main]\n    paths:" in on and "  pull_request:\n    paths:" in on and "  workflow_dispatch:" in on
-    assert on.count("'tests/fakeweb/**'") == 2 and on.count("'.github/workflows/fakeweb.yml'") == 2
+    assert "  push:\n    branches: [main]\n    paths:" in on and "  merge_group:\n    types: [checks_requested]\n" in on and "  workflow_dispatch:" in on
+    assert "pull_request" not in on.split("\non:\n", 1)[1], "a pull request runs the fast set; this workflow runs in the queue run"
+    assert on.count("'tests/fakeweb/**'") == 1 and on.count("'.github/workflows/fakeweb.yml'") == 1

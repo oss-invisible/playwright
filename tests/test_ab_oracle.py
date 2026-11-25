@@ -638,12 +638,12 @@ def _linux_deps_e2e_packages(text):
     return job[job.index("packages:"):].split("\n", 1)[0]
 
 
-def test_the_e2e_workflow_runs_the_step_on_a_pull_request_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
+def test_the_e2e_workflow_runs_the_step_in_the_merge_queue_run_in_the_jobs_that_run_the_oracles_and_the_e2e_tests_read_its_variables():
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
     legs = {name: _job(text, name) for name in ("e2e-linux", "e2e-windows-control-a", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows")}
     step = ('      - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)\n'
-            "        if: github.event_name == 'pull_request'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
+            "        if: github.event_name == 'merge_group'\n        shell: bash\n        env:\n          BASE_SHA: ${{ github.event.merge_group.base_sha }}\n"
             '        run: python scripts/ci_ab_pr_seeds.py "$BASE_SHA" >> "$GITHUB_ENV"\n')
     assert [name for name, body in legs.items() if step in body] == ["e2e-linux", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"], "the jobs that run the oracles' tests, and only those"
     for name in ("e2e-linux", "e2e-windows", "e2e-network", "e2e-network-windows", "e2e-host", "e2e-host-windows", "e2e-page", "e2e-page-windows"):
@@ -1092,7 +1092,7 @@ def test_the_final_set_has_jobs_of_its_own_in_four_shards_on_each_system_and_the
         assert ("needs: [core-on-index, e2e-page-final-touched, linux-deps-e2e]" if body is linux else "needs: [core-on-index, e2e-page-final-touched]") in body and "needs.e2e-page-final-touched.outputs.touched == 'true'" in body
         assert "skipped\": 0" in body and '{"tests": 1, "failures": 0, "errors": 0, "skipped": 0}' in body, "one test, passed: a skipped one is red"
         assert "matrix.shard" in body.split("name: invpw-evidence-page-final", 1)[1].split("path:", 1)[0], "four shards, four artifact names"
-    assert "scripts/ci_ab_oracle.py touched" in touched and "pull_request" in touched and "outputs:" in touched
+    assert "scripts/ci_ab_oracle.py touched" in touched and "github.event_name == 'merge_group'" in touched and "github.event.merge_group.base_sha" in touched and "outputs:" in touched
     shared_linux, shared_windows = _job(text, "e2e-linux"), _job(text, "e2e-windows")
     assert "AB_ORACLE_SEED_SET" not in shared_linux + shared_windows + _job(text, "e2e-windows-control-a"), "the shared jobs run the candidate set and do not grow"
 

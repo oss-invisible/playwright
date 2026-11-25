@@ -11,9 +11,10 @@
 # WHICH ENGINE. The published one (`python -m invisible_playwright fetch`), as e2e.yml. The candidate of the engine repository runs the same entry on its own
 # binary (scripts/run_fakeweb.py --binary), and judges the four e2e tests of this fake web as the suite `wrapper.e2e.fakeweb` of ci/required-suites.json.
 #
-# WHEN. A pull request or a push to main that touches the fake web or this file (the journey and the hard pages are not a round for every change); again by hand
-# with `workflow_dispatch`. Four legs, a profile on a system each (Linux under Xvfb, Windows); no leg is repeated or forgiven, and the ONE verdict of the workflow is the
-# job `fakeweb verdict`: red unless all four legs are green (a skipped leg, for a core that is not on the index yet, is not green: nothing was measured).
+# WHEN. The merge queue run of every change to main (`merge_group`: GitHub applies no `paths` filter to it, so every queue entry runs it, and that run decides), and a
+# push to main that touches the fake web or this file; again by hand with `workflow_dispatch`. A pull request does not run it: a pull request runs the fast set
+# (tests.yml). Four legs, a profile on a system each (Linux under Xvfb, Windows); no leg is repeated or forgiven, and the ONE verdict of the workflow is the
+# job `fakeweb verdict`: red unless every job of the workflow is green (a skipped leg, for a core that is not on the index yet, is not green: nothing was measured).
 
 name: fakeweb
 
@@ -27,23 +28,18 @@ on:
       - 'scripts/fakeweb_p4_report.py'
       - 'scripts/playwright_pin.txt'
       - '.github/workflows/fakeweb.yml'
-  pull_request:
-    paths:
-      - 'tests/fakeweb/**'
-      - 'tests/test_fakeweb_*.py'
-      - 'scripts/run_fakeweb.py'
-      - 'scripts/fakeweb_p4_report.py'
-      - 'scripts/playwright_pin.txt'
-      - '.github/workflows/fakeweb.yml'
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push to a pull request cancels the older run of THIS workflow on that pull request, and nothing else cancels (the same group as e2e.yml).
+# Nothing cancels this workflow (the same group as e2e.yml): a merge queue run is keyed by its own ref (one per queue entry) and never cancelled in progress,
+# and the run of a push is unique to the run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.ref || github.run_id }}
+  cancel-in-progress: false
 
 # The engine download goes through the release API with the token of the job (anonymous requests are the ones GitHub drops first).
 env:
@@ -173,19 +169,28 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # THE VERDICT of the workflow, the only one: green only when all four legs ran and passed.
+  # THE VERDICT of the workflow, the only one that decides (rule ci-13): it waits for EVERY job of this file, `if: always()` so that a failed, cancelled or skipped
+  # one still reaches it, and each must end in `success` (a leg that did not run measured nothing). scripts/ci_gate.py judges it, read from main and never from
+  # the branch it judges; while the file is not on main yet (the change that adds it) the copy of this branch is used, and the log says so.
   verdict:
     name: fakeweb verdict
-    needs: [core-on-index, walk]
+    needs: [core-on-index, linux-deps-fakeweb, walk]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: red unless every leg is green
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 1 }
+      - name: refuse unless every needed job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW: fakeweb
         run: |
-          echo "core-on-index: ${{ needs.core-on-index.result }}"
-          echo "walk (p2 and p4, linux and windows): ${{ needs.walk.result }}"
-          if [ "${{ needs.walk.result }}" != "success" ]; then
-            echo "RED: the four legs did not all pass (a leg that did not run measured nothing)"
-            exit 1
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if git cat-file -e origin/main:scripts/ci_gate.py 2>/dev/null; then
+            git show origin/main:scripts/ci_gate.py > "$RUNNER_TEMP/ci_gate.py"
+          else
+            echo "ci_gate.py is not on origin/main yet: falling back to the copy of this branch"
+            cp scripts/ci_gate.py "$RUNNER_TEMP/ci_gate.py"
           fi
-          echo "green: ours equals stock on the fake web, on both systems"
+          python3 "$RUNNER_TEMP/ci_gate.py"

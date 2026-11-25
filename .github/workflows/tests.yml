@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The merge queue run: a pull request is judged by this fast set; e2e.yml and fakeweb.yml run in the queue run and that run decides.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
@@ -17,9 +20,10 @@ permissions:
 # each other; only an older run of THIS workflow on the same branch is replaced.
 # A newer push to a pull request cancels the run it supersedes. Never on main:
 # outside a pull request the group is unique to the run (`github.run_id`), so
-# every commit of main keeps its own finished run (see e2e.yml for why).
+# every commit of main keeps its own finished run (see e2e.yml for why). A merge queue run is keyed by its own ref (one per queue entry) and is never
+# cancelled: `cancel-in-progress` is true on a pull request only.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.ref || github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Engine and GeoIP downloads go through the release API with this token.
@@ -394,9 +398,10 @@ jobs:
   #
   # Every needed job must end in `success`; `skipped`, `cancelled` and
   # `failure` are red, one FAIL line each (scripts/ci_gate.py). The single job
-  # that is conditional by design is `version`: it runs on pull requests only,
-  # so a push to main skips it on purpose, and the script expects `skipped`
-  # there and `success` on a pull request. Nothing else is forgiven. The
+  # that is conditional by design is `version`: it runs on pull requests and in
+  # the merge queue run, so a push to main skips it on purpose, and the script
+  # expects `skipped` there and `success` on a pull request and in the queue.
+  # Nothing else is forgiven. The
   # script is read from origin/main, not from the branch being judged. Its table and the `needs:` below are held together by
   # tests/test_the_gate_is_red_when_a_needed_job_is_skipped.py.
   gate:
@@ -409,6 +414,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW: tests
         # The judge is read from main, never from the branch it judges. Only
         # while the file is not on main yet (the change that adds it) the
         # copy of this branch is used, and the log says so.
@@ -430,13 +436,14 @@ jobs:
   # indistinguishable from somebody forgetting to bump. The fix could not have
   # reached anybody, and nothing would have said so.
   #
-  # Pull requests only: on main straight after a release the version IS the
-  # published one until somebody bumps, and a gate that is red at rest is one
-  # people learn to skip. Bumping publishes nothing - publishing happens on a
+  # Where a change is proposed (a pull request, and the merge queue run, which
+  # compares the version the entry proposes with the published one): on main
+  # straight after a release the version IS the published one until somebody
+  # bumps, and a gate that is red at rest is one people learn to skip. Bumping publishes nothing - publishing happens on a
   # tag push - so main on an unreleased version is the normal state between
   # releases and the rule costs one line.
   version:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
