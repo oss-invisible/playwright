@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 - ElementHandle pointer actions (`click`, `dblclick`, `hover`, `tap`, `check`, `uncheck`, `set_checked`) now use the same humanised pointer walk as selector actions (they used to jump to the exact centre of the element in one move).
+- Screenshot parameters that Playwright honours by modifying the page (`mask`/`maskColor`, `style`, `animations="disabled"`,
+  `caret="initial"`) are now refused by name with a clear error instead of being silently ignored; `omitBackground` with PNG answers
+  Firefox's own `Not implemented`, as stock Playwright does. A refused screenshot of an element or a locator is refused before the page is
+  scrolled or measured.
 
 ## [0.59.0] - 2026-11-24
 
