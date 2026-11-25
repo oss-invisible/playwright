@@ -255,6 +255,41 @@ def test_a_datagram_that_reaches_the_h3_port_is_an_attempt_even_when_no_handshak
         assert server.quic_peers == []
 
 
+# What the e2e says of an h2-only road is the judge of the visits plus the attempt read at the port: nothing of it is a duration.
+def _what_the_e2e_says_of_an_h2_only_road(road, protocols, server):
+    return line.judge_visits(road, protocols) + line.h3_attempts(server)
+
+
+@pytest.mark.parametrize("road", H2_ROADS)
+def test_a_loaded_runner_is_not_an_attempt_at_h3(road):
+    """Five visits that all read h2 and not one datagram at the h3 port, one of them loaded in 2500 ms against 719 ms of the first (a runner
+    under load, seen in a run): nothing tried h3, so nothing is wrong. A judge that read the load times (a margin of 1500 ms on the first)
+    called this a failure; the time a visit takes is no input of the verdict any more, so it is not even a parameter."""
+    visits_ms = [719, 2500, 702, 711, 705]        # the evidence the e2e keeps for the failure message, not an input of the verdict
+    assert max(visits_ms) > visits_ms[0] + 1500
+    with H3Server("127.0.0.1") as server:
+        assert _what_the_e2e_says_of_an_h2_only_road(road, H2, server) == []
+
+
+@pytest.mark.parametrize("road", H2_ROADS)
+def test_a_datagram_at_the_h3_port_of_an_h2_only_road_is_an_attempt_even_when_every_visit_is_fast(road):
+    """The converse: every visit reads h2 and loads in a flash (the fallback was quick), but a datagram reached the h3 port: the engine tried
+    h3 where UDP is dropped, and that is read where the attempt is born."""
+    visits_ms = [719, 702, 698, 711, 705]
+    assert max(visits_ms) < visits_ms[0] + 1500
+    with H3Server("127.0.0.1") as server:
+        assert _what_the_e2e_says_of_an_h2_only_road(road, H2, server) == []
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sender.sendto(b"the QUIC Initial of an engine that tries", (server.address, server.port))
+            from _waits import wait_until
+            wait_until(lambda: server.udp_datagrams, 30, lambda: time.sleep(0.05))
+        finally:
+            sender.close()
+        problems = _what_the_e2e_says_of_an_h2_only_road(road, H2, server)
+        assert len(problems) == 1 and "tried HTTP/3" in problems[0], problems
+
+
 def test_a_series_of_the_wrong_length_is_an_error():
     assert line.judge_visits("direct", ["h2", "h3"])
     assert line.judge_visits("socks5_coherent", ["h2", "h2", "h3"])
