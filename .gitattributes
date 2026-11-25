@@ -21,3 +21,6 @@ ci/persona-seeds.json text eol=lf
 # (tests/test_every_wire_method_is_served_or_refused.py): a Windows runner checks
 # out with autocrlf and would hand the test CRLF that nobody wrote.
 tests/gates/wire_method_debt.json text eol=lf
+
+# The lock of the gate is hashed byte for byte: its header names the sha256 of gate.in, so neither file may be rewritten with CRLF on a Windows checkout.
+ci/py-lock/** text eol=lf

@@ -1,0 +1,34 @@
+{
+  "playwright": "1.61.0",
+  "platforms": {
+    "ubuntu24.04-x64": [
+      {
+        "path": "builds/firefox/1532/firefox-ubuntu-24.04.zip",
+        "sha256": "8f3c97b95caf84cec1e83acdbee5079156cce338fc21bf2f4bc6afe3eec616c0",
+        "size": 110001368
+      },
+      {
+        "path": "builds/ffmpeg/1011/ffmpeg-linux.zip",
+        "sha256": "ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc",
+        "size": 2376500
+      }
+    ],
+    "win64": [
+      {
+        "path": "builds/firefox/1532/firefox-win64.zip",
+        "sha256": "c02daa45e8af1164cba27301f076a877d9419f0d40b51b9fab4fe415daf6f77f",
+        "size": 122449192
+      },
+      {
+        "path": "builds/ffmpeg/1011/ffmpeg-win64.zip",
+        "sha256": "8d08827c019ad36e7b9d49d3648447d884534cb2acf200e71c715f6dd834cc50",
+        "size": 1411741
+      },
+      {
+        "path": "builds/winldd/1007/winldd-win64.zip",
+        "sha256": "0069f0d11d4ad6df068a068c003d22fe7dbec192a47bba64b2e115e9c8ce41d8",
+        "size": 128684
+      }
+    ]
+  }
+}
