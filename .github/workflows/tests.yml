@@ -53,8 +53,8 @@ jobs:
     needs: core-on-index
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: "3.12"
       - name: install the pinned core, which carries the gate
@@ -82,8 +82,8 @@ jobs:
     needs: core-on-index
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: "3.12"
       - name: install the pinned core, which carries the gate
@@ -108,8 +108,8 @@ jobs:
     needs: core-on-index
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: "3.12"
       - name: install the pinned core, which carries the gate
@@ -135,8 +135,8 @@ jobs:
     needs: core-on-index
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: "3.12"
       - name: install the pinned core, which carries the gate
@@ -164,7 +164,7 @@ jobs:
   # email (author, committer, tagger). The judge lives in oss-invisible/core and
   # is read from its main, never from this branch.
   noreply-identity:
-    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@main
+    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@6d048ac02fc886a50791a4ae0423cbca2a547d72 # core main, the last change of noreply-identity.yml
 
   unit:
     name: pytest (${{ matrix.os }}, py${{ matrix.python }})
@@ -190,7 +190,7 @@ jobs:
           - { os: windows-latest, python: "3.13" }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
 
       # main, for the tests that compare a list of this change with the list of main (tests/test_the_e2e_tests_do_not_wait_on_clocks.py: the debt of
       # the e2e tests only shrinks). The checkout is one commit deep; without this the comparison has nothing to read and the test says so.
@@ -199,7 +199,7 @@ jobs:
         run: git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
 
       - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -370,8 +370,8 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: "3.12"
           cache: pip
@@ -467,12 +467,12 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
         with:
           # The gate diffs the tree against the tag of the published
           # version; a shallow clone has no tags and cannot tell.
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with:
           python-version: "3.12"
       - name: the version this change proposes is still free
