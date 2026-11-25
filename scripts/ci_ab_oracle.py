@@ -16,7 +16,7 @@ seed runs at its OWN DPR (nothing is pinned):
   2. with the candidate binary the gate already holds, under its own seal.
 
 The dump also reads what the host gate's retail comparison leaves alone, the ab. leaves (ci_host_gate.is_ab): ab.poison on every seed (zone, language, colour scheme, a
-canary font and the audio context, which scripts/ci_poison_host.py holds to the declared identity on a poisoned host) and, on seeds 0 and 63, the extra visit of every realm and
+canary font and the audio context, which scripts/ci_poison_host.py holds to the declared identity on a poisoned host) and, on seeds 0 and 5469, the extra visit of every realm and
 window a page can make (--ab; ci_host_gate.ab_visit). They are compared like every other leaf; the diag. ones are not.
 
 Then every leaf of every visit is compared. Everything must be equal. The only
@@ -163,6 +163,24 @@ def select_visits(seed_set: str = SEED_SET, shard: str | None = None, path: Path
 def relaunch_visits(visits) -> tuple:
     """The visits (dpr, seed) that are launched twice on one profile folder: the ones of RELAUNCH_SEED."""
     return tuple(key for key in visits if key[1] == RELAUNCH_SEED)
+
+
+#: How many shards e2e.yml splits the final set into (the e2e-page-final job: AB_ORACLE_SHARD=i/FINAL_SHARDS; tests/test_ab_oracle.py holds the two together).
+FINAL_SHARDS = 4
+
+
+def control_seed_problems(seeds, path: Path = personas.DEFAULT_PATH, shards: int = FINAL_SHARDS) -> list:
+    """What keeps the control seeds of the A/B (ci_host_gate.AB_SEEDS) from running in the final set's shards: [problem], empty when they run.
+    A seed that is not in the final set, or that no shard visits, is never read; and the control compares the seeds of ONE run (ci_host_gate.ab_control), so
+    they must be visited by the same shard (the plan e2e uses: select_visits("final", "i/n"))."""
+    final = {seed for _dpr, seed in select_visits("final", None, path)}
+    plan = {i: {seed for _dpr, seed in select_visits("final", "%d/%d" % (i, shards), path)} for i in range(1, shards + 1)}
+    problems = ["control seed %d is not in the final seed set" % s for s in seeds if s not in final]
+    problems += ["control seed %d is in no shard 1/%d..%d/%d of the final set" % (s, shards, shards, shards) for s in seeds if s in final and not any(s in v for v in plan.values())]
+    if not problems and not any(set(seeds) <= visited for visited in plan.values()):
+        problems.append("control seeds %s are not all in one shard of the final set (%s): the control compares them in one run"
+                        % (list(seeds), "; ".join("%d/%d: %s" % (i, shards, sorted(set(seeds) & v)) for i, v in plan.items())))
+    return problems
 
 
 def _bare(leaf: str) -> str:

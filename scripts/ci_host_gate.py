@@ -42,7 +42,7 @@ compare() skips them by name; dump() prints them into the job log, so a run
 tells why without its artifacts being downloaded.
 
 Values under the ab. prefix are read for the A/B oracle: what a page reads of values a host may hold and the engine must never read
-(ab.poison, with scripts/ci_poison_host.py) and, on the oracle's visits of seeds 0 and 63, the surfaces of every realm and window a page
+(ab.poison, with scripts/ci_poison_host.py) and, on the oracle's visits of seeds 0 and 5469, the surfaces of every realm and window a page
 can make (ab_visit). compare() skips them by name, as it skips diag.: the A/B compares them between the two engines.
 
 Values under the state. prefix are the window in the states a page can drive
@@ -591,21 +591,24 @@ def dump(firefox: str, leg: str, out: Path, reference: Path, timeout_ms: int = 1
 
 # -
 # The A/B oracle's extra visit: every realm and every kind of window a page can make, in a launch of another locale and in a context of yet
-# another, on seeds 0 and 63. Its leaves are under ab. (see is_ab): scripts/ci_ab_oracle.py compares them between the two engines. It is a
+# another, on seeds 0 and 5469. Its leaves are under ab. (see is_ab): scripts/ci_ab_oracle.py compares them between the two engines. It is a
 # separate launch per seed, with its own server and its own functions: nothing here changes how the visits above are made.
 #
-# Seed 63 is the CONTROL of seed 0: an identity that is not seed 0's must read other values, so the same block on both must differ on at least
+# Seed 5469 is the CONTROL of seed 0: an identity that is not seed 0's must read other values, so the same block on both must differ on at least
 # AB_CONTROL_MIN ab. leaves (ab_control). A block that answered the same for two identities would pass an engine that ignores the identity.
+# Both seeds are in the page oracle's FINAL seed set (ci/persona-seeds.json) and in the SAME shard of it (shard 1 of the 4 of e2e.yml's e2e-page-final job):
+# ab_control compares the two seeds of one run, so a control seed that another shard visits, or that no shard visits (seed 63 is only in the candidate
+# set), would never be compared. ci_ab_oracle.control_seed_problems holds this and tests/test_ci_host_gate_ab.py runs it on AB_SEEDS.
 
 AB_DIR = HERE / "ab"
-AB_SEEDS = (0, 63)
+AB_SEEDS = (0, 5469)
 AB_LAUNCH_LOCALE = "ja-JP"
 #: (name of the context, what the context is made with). The first is the launch's own default context (locale ja-JP); the second overrides
 #: both the language and the zone.
 AB_CONTEXTS = (("launch", {}), ("context", {"locale": "de-DE", "timezone_id": "America/Lima"}))
 AB_BUDGET_MS = 240_000
-#: How many ab. leaves seed 63 must differ from seed 0 on. PROVISIONAL, from the core's prefs and not from a run: the two personas differ in their core
-#: count (12 and 32), their GPU, their screen and their DPR, so hardwareConcurrency alone differs in every realm that must have read (top, cross-site
+#: How many ab. leaves seed 5469 must differ from seed 0 on. PROVISIONAL, from the core's prefs and not from a run: the two personas differ in their core
+#: count (12 and 8), their GPU, their screen and their DPR, so hardwareConcurrency alone differs in every realm that must have read (top, cross-site
 #: iframe, srcdoc iframe, worker, in each of the 2 contexts: 8 leaves) and the page-read GPU, the screen and the canvas leaves come on top of them.
 #: The first run on GitHub prints the measured count (ab_control's line in the oracle's log, and ab-control.json): this number then moves to a safe
 #: fraction of it, written here with the run it came from.

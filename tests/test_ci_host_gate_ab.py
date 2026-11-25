@@ -1,4 +1,4 @@
-"""The ab. leaves of the host gate (scripts/ci_host_gate.py): the poison probe of the page and the A/B oracle's extra visit of seeds 0 and 63.
+"""The ab. leaves of the host gate (scripts/ci_host_gate.py): the poison probe of the page and the A/B oracle's extra visit of seeds 0 and 5469.
 
 No browser. The site of the visit is served by a real loopback server and asked with plain HTTP requests, the way the browser asks it; the page's
 JavaScript is held by what it must contain and by the files it names. What the comparison does with the leaves is shown on synthetic dumps.
@@ -71,13 +71,13 @@ def test_the_dump_adds_the_ab_visit_to_the_seeds_that_have_one(monkeypatch):
 def test_the_ab_visit_launches_in_japanese_and_pins_a_dpr_only_when_asked():
     options = gate.ab_options("ff", 0, None, "Asia/Bangkok")
     assert options["locale"] == "ja-JP" and options["seed"] == 0 and options["timezone"] == "Asia/Bangkok" and "pin" not in options
-    assert gate.ab_options("ff", 63, 1.5, "Asia/Bangkok")["pin"] == {"screen.dpr": 1.5}
+    assert gate.ab_options("ff", 5469, 1.5, "Asia/Bangkok")["pin"] == {"screen.dpr": 1.5}
 
 
 def test_the_second_context_of_the_visit_overrides_language_and_zone():
     assert dict(gate.AB_CONTEXTS)["launch"] == {}
     assert dict(gate.AB_CONTEXTS)["context"] == {"locale": "de-DE", "timezone_id": "America/Lima"}
-    assert gate.AB_SEEDS == (0, 63)
+    assert gate.AB_SEEDS == (0, 5469)
 
 
 def test_a_visit_keeps_what_the_back_navigation_read_and_puts_whether_it_was_cached_in_diag():
@@ -200,15 +200,15 @@ def visit(**steps):
             "ab.context": {"top": {"hardwareConcurrency": 16, "language": "de-DE"}}}
 
 
-def test_the_control_counts_the_leaves_seed_63_reads_differently_from_seed_0():
+def test_the_control_counts_the_leaves_seed_5469_reads_differently_from_seed_0():
     other = {"ab.launch": {"top": {"hardwareConcurrency": 8, "language": "ja-JP"}}, "ab.context": {"top": {"hardwareConcurrency": 8, "language": "de-DE"}}}
-    result = gate.ab_control({0: visit(), 63: other}, minimum=2)
+    result = gate.ab_control({0: visit(), 5469: other}, minimum=2)
     assert result["status"] == "ok" and result["differing"] == 2 and result["compared"] == 4
-    assert result["line"].startswith("ab control: seed 63 differs from seed 0 on 2 of 4 ab. leaves (at least 2 are required)")
+    assert result["line"].startswith("ab control: seed 5469 differs from seed 0 on 2 of 4 ab. leaves (at least 2 are required)")
 
 
 def test_two_identities_that_read_the_same_fail_the_control():
-    result = gate.ab_control({0: visit(), 63: visit()}, minimum=1)
+    result = gate.ab_control({0: visit(), 5469: visit()}, minimum=1)
     assert result["status"] == "too_few" and result["differing"] == 0
     assert "an identity that is not seed 0's read the same" in result["line"]
 
@@ -216,13 +216,13 @@ def test_two_identities_that_read_the_same_fail_the_control():
 def test_the_control_counts_neither_the_poison_probe_nor_diag():
     a = dict(visit(), **{"ab.poison": {"offsets": [1]}, "diag.ab.launch": {"bfcache_persisted": True}})
     b = dict(visit(), **{"ab.poison": {"offsets": [2]}, "diag.ab.launch": {"bfcache_persisted": False}})
-    assert gate.ab_control({0: a, 63: b}, minimum=1)["differing"] == 0
+    assert gate.ab_control({0: a, 5469: b}, minimum=1)["differing"] == 0
 
 
 def test_a_run_that_did_not_visit_both_seeds_says_so():
     result = gate.ab_control({0: visit()})
-    assert result["status"] == "not_visited" and "seed 63 has no ab. leaves" in result["line"]
-    assert gate.ab_control({0: {"surface.x": 1}, 63: visit()})["status"] == "not_visited"
+    assert result["status"] == "not_visited" and "seed 5469 has no ab. leaves" in result["line"]
+    assert gate.ab_control({0: {"surface.x": 1}, 5469: visit()})["status"] == "not_visited"
 
 
 def test_the_minimum_is_written_and_provisional_until_a_run_measures_it():
@@ -241,7 +241,7 @@ def full(ctx_steps=None):
 
 
 def test_a_visit_that_read_every_required_step_in_every_context_is_whole():
-    assert gate.ab_coverage({0: full(), 63: full(), 2: {"surface.x": 1}}) == []
+    assert gate.ab_coverage({0: full(), 5469: full(), 2: {"surface.x": 1}}) == []
 
 
 def test_a_seed_of_the_ab_visit_without_its_leaves_is_a_problem_and_a_seed_not_visited_is_not():
@@ -252,7 +252,7 @@ def test_a_seed_of_the_ab_visit_without_its_leaves_is_a_problem_and_a_seed_not_v
 
 @pytest.mark.parametrize("step", gate.AB_REQUIRED_STEPS)
 def test_a_required_step_that_timed_out_is_a_problem(step):
-    problems = gate.ab_coverage({63: full({step: "timeout: " + step})})
+    problems = gate.ab_coverage({5469: full({step: "timeout: " + step})})
     assert len(problems) == len(gate.AB_CONTEXTS) and all(step in p and "timeout" in p for p in problems)
 
 
@@ -349,13 +349,56 @@ def test_the_ab_visit_reads_each_context_then_goes_away_and_back_and_closes_it(f
     assert waits == ["document.title === 'ab-done'", "window.__abBf && window.__abBf.n >= 2"] * 2
 
 
-def test_the_dump_adds_the_ab_leaves_to_seeds_0_and_63_only_and_only_when_asked(fake_browser, monkeypatch, tmp_path):
+def test_the_dump_adds_the_ab_leaves_to_seeds_0_and_5469_only_and_only_when_asked(fake_browser, monkeypatch, tmp_path):
     monkeypatch.setattr(gate, "ab_visit", lambda firefox, seed, zone, dpr=None: {"ab.launch": {"seed": seed}})
-    for ab, expected in ((True, {0: True, 2: False, 63: True}), (False, {0: False, 2: False, 63: False})):
+    for ab, expected in ((True, {0: True, 2: False, 5469: True}), (False, {0: False, 2: False, 5469: False})):
         out = tmp_path / str(ab)
-        assert gate.dump("ff", "linux-x86_64", out, gate.REFERENCE, visits=[(1.0, 0), (1.0, 2), (1.0, 63)], ab=ab) == 0
+        assert gate.dump("ff", "linux-x86_64", out, gate.REFERENCE, visits=[(1.0, 0), (1.0, 2), (1.5, 5469)], ab=ab) == 0
         for seed, has in expected.items():
-            items = json.loads((out / ("linux-x86_64_dpr1.0_seed%d.json" % seed)).read_text(encoding="utf-8"))["result"]["items"]
+            items = json.loads((out / ("linux-x86_64_dpr%s_seed%d.json" % (1.5 if seed == 5469 else 1.0, seed))).read_text(encoding="utf-8"))["result"]["items"]
             assert ("ab.launch" in items) is has, (ab, seed)
             if has:
                 assert items["ab.launch"] == {"seed": seed}
+
+
+# -
+# The control seeds are the ones the page oracle's final set visits: seed 63 was in the candidate set only, so no shard of e2e-page-final ever ran its control.
+
+def _shard_plan(shard):
+    return {seed for _dpr, seed in oracle.select_visits("final", "%d/%d" % (shard, oracle.FINAL_SHARDS))}
+
+
+def test_every_control_seed_is_in_the_final_seed_set():
+    final = {seed for _dpr, seed in oracle.select_visits("final")}
+    assert len(final) == 20 and gate.AB_SEEDS[0] == 0 and 0 in final
+    assert len(set(gate.AB_SEEDS)) == len(gate.AB_SEEDS) == 2 and set(gate.AB_SEEDS) <= final
+
+
+def test_every_control_seed_is_in_the_plan_of_a_shard_of_e2e_and_one_shard_holds_them_all():
+    shards = range(1, oracle.FINAL_SHARDS + 1)
+    for seed in gate.AB_SEEDS:
+        assert any(seed in _shard_plan(i) for i in shards), "no shard visits control seed %d" % seed
+    assert [i for i in shards if set(gate.AB_SEEDS) <= _shard_plan(i)] == [1], "the control compares its two seeds in one run: shard 1 holds both"
+    assert oracle.control_seed_problems(gate.AB_SEEDS) == []
+    workflow = (ROOT / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    assert "AB_ORACLE_SHARD: ${{ matrix.shard }}/%d" % oracle.FINAL_SHARDS in workflow and "AB_ORACLE_SEED_SET: final" in workflow
+
+
+def test_the_control_that_was_seeds_0_and_63_is_refused():
+    problems = oracle.control_seed_problems((0, 63))
+    assert problems == ["control seed 63 is not in the final seed set"]
+    final = [seed for _dpr, seed in oracle.select_visits("final")]
+    assert 63 not in final
+
+
+def test_control_seeds_of_the_final_set_in_two_shards_are_refused():
+    problems = oracle.control_seed_problems((0, 7))
+    assert len(problems) == 1 and "not all in one shard" in problems[0] and "1/4: [0]" in problems[0] and "2/4: [7]" in problems[0]
+    assert oracle.control_seed_problems((0, 50, 107)) == [] and oracle.control_seed_problems((0, 5469)) == []
+
+
+def test_a_control_whose_seeds_are_not_in_the_shard_that_visits_seed_0_does_not_run_its_control():
+    # what the check prevents: a shard that visits one control seed only has nothing to compare, and the oracle takes that for "not visited"
+    other = {seed: visit() for seed in _shard_plan(2)}
+    assert gate.ab_control(other)["status"] == "not_visited"
+    assert gate.ab_control({seed: visit() for seed in _shard_plan(1) if seed in gate.AB_SEEDS}, minimum=0)["status"] != "not_visited"
