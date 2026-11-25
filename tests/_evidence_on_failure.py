@@ -9,7 +9,7 @@ test: it only listens.
 
 A test that passed slowly may keep the evidence too: ``evidence.keep(why)`` saves what the helper holds at that moment (the same folder, a
 ``meta.json`` whose ``kept`` says why, judged after the fact and never a verdict). ``arm(moz_log=...)`` also starts the engine's own log
-(``MOZ_LOG``, its file in the evidence), and ``note_records(name, state)`` adds a record the test keeps itself (``state.lock``,
+(``MOZ_LOG``, one file per process in the evidence: ``MOZ_LOG_FILE`` carries ``%PID``), and ``note_records(name, state)`` adds a record the test keeps itself (``state.lock``,
 ``state.records``) as ``<name>.jsonl``.
 
 The times written: ``t``, wall-clock seconds since the epoch (``time.time()``; the engine's own trace writes milliseconds in ``t``, its
@@ -36,8 +36,11 @@ EVIDENCE_FOLDER = "invpw-evidence"
 WIRE_LIMIT = 4000
 #: The engine's trace: the variable `Trace.js` of the engine reads in the parent process (off without it).
 TRACE_ENV = "INVISIBLE_JUGGLER_TRACE_DIR"
-#: The base name of the engine's log file in the evidence (``MOZ_LOG_FILE``; the engine adds a suffix per process).
+#: The base name of the engine's log files in the evidence, and the name given to ``MOZ_LOG_FILE``: Firefox expands ``%PID`` into ``-main.<pid>`` or
+#: ``-child.<pid>`` (and adds ``.moz_log``, ``ExpandLogFileName`` in ``xpcom/base/Logging.cpp``), so that every process of every session of a test writes a
+#: file of its own. Without it two sessions of one test wrote the same file and the parent's one was 0 bytes.
 MOZ_LOG_BASE = "engine"
+MOZ_LOG_FILE_NAME = MOZ_LOG_BASE + "%PID"
 
 
 class FailureEvidence:
@@ -81,7 +84,7 @@ class FailureEvidence:
         if moz_log:
             self.moz_log_dir.mkdir(parents=True, exist_ok=True)
             self._patch.setenv("MOZ_LOG", moz_log)
-            self._patch.setenv("MOZ_LOG_FILE", str(self.moz_log_dir / MOZ_LOG_BASE))
+            self._patch.setenv("MOZ_LOG_FILE", str(self.moz_log_dir / MOZ_LOG_FILE_NAME))
         self._wire = open(self.wire_path, "w", encoding="utf-8")
         try:
             from invisible_core.juggler import connection
