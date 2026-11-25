@@ -44,6 +44,23 @@ The list is validated by all three commands (a malformed one is exit 2, with the
 row `os` a non-empty subset of {linux, windows}, `tests` a non-empty list of unique strings, `min_tests` an integer > 0,
 `exact` a bool, `marker` a string, `needs_root` a bool or a list of the row's OSes.
 
+Optional fields of a row, read by the gate to build the leg of the row (absent = the plain behaviour; a field that is
+present with a wrong type or value is a malformed list, exit 2, naming the row and the field; a name that is not listed
+here is ignored as it always was):
+    runner_image     object OS -> runner image name, only OSes of the row, e.g. {"windows": "windows-2022"}
+                     (default: ubuntu-24.04 on Linux, windows-latest on Windows)
+    timeout_minutes  integer 1..360, the timeout of the job (default 25)
+    needs_userns     bool or list of the row's OSes: user namespaces for a normal user (the sandbox suite)
+    core_dumps       false, "cores" or "invpw-cores" (Linux only): where the kernel writes the cores of a crashed
+                     browser, $RUNNER_TEMP/cores or $RUNNER_TEMP/invpw-cores
+    stock_firefox    bool or list of the row's OSes: Playwright's own Firefox is installed for the leg
+    location_service bool or list of the row's OSes: the Windows location service is turned on
+    run              "pytest" (default) or "suite_run" (scripts/ci_suite_run.py, two passes)
+    extra_steps      list of names from the closed set {fakeweb_profiles, keep_oracle_files}
+    moz_log          string of MOZ_LOG modules appended to the suite's MOZ_LOG, no space
+    juggler_trace    bool: the Juggler's own trace is kept with the result
+    artifact         name of the artifact that keeps the oracle files (default: the suite id)
+
 A required entry of "tests" is a file (at least one test of it must exist and EVERY one collected must pass) or a node
 id `tests/x.py::name` (that test must pass; a parametrized test is matched on the name before `[`, and every one of its
 parameters must pass).
@@ -69,6 +86,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 OSES = ("linux", "windows")
+#: The optional row fields of the form "bool or a list of the row's OSes" (besides needs_root).
+OS_FLAGS = ("needs_userns", "stock_firefox", "location_service")
+CORE_DUMPS = ("cores", "invpw-cores")
+RUN_MODES = ("pytest", "suite_run")
+#: The closed set of the extra steps a row may ask of the gate (a name here is a step the gate knows how to run).
+EXTRA_STEPS = ("fakeweb_profiles", "keep_oracle_files")
 
 
 class Usage(Exception):
@@ -122,12 +145,68 @@ def validate_list(data):
             problems.append("%s: exact must be true or false, not %r" % (where, row.get("exact")))
         if not isinstance(row.get("marker"), str) or not row.get("marker").strip():
             problems.append("%s: marker must be a non-empty string, not %r" % (where, row.get("marker")))
-        root = row.get("needs_root", False)
-        if not isinstance(root, bool):
-            if not (isinstance(root, list) and all(isinstance(o, str) for o in root) and set(root) <= set(OSES)
-                    and (not oses_ok or set(root) <= set(oses))):
-                problems.append("%s: needs_root must be a bool or a list of the OSes of the row, not %r" % (where, root))
+        for name in ("needs_root",) + OS_FLAGS:
+            if name in row or name == "needs_root":
+                value = row.get(name, False)
+                if not _is_os_flag(value, oses, oses_ok):
+                    problems.append("%s: %s must be a bool or a list of the OSes of the row, not %r" % (where, name, value))
+        problems.extend(_row_field_problems(row, where, oses, oses_ok))
     return problems
+
+
+def _is_os_flag(value, oses, oses_ok):
+    """A bool, or a list of OSes that are all OSes of the row."""
+    if isinstance(value, bool):
+        return True
+    return (isinstance(value, list) and all(isinstance(o, str) for o in value) and set(value) <= set(OSES)
+            and (not oses_ok or set(value) <= set(oses)))
+
+
+def _row_field_problems(row, where, oses, oses_ok):
+    """The optional fields of a row that tell the gate how to build the leg (see the docstring): absent is the plain
+    behaviour; a field that is present with a value outside its type or its closed set is a problem, named."""
+    out = []
+    if "runner_image" in row:
+        image = row["runner_image"]
+        if not (isinstance(image, dict) and image and all(isinstance(k, str) and isinstance(v, str) and v.strip()
+                                                          for k, v in image.items())):
+            out.append("%s: runner_image must be a non-empty object of OS -> image name, not %r" % (where, image))
+        else:
+            wrong = sorted(k for k in image if k not in OSES or (oses_ok and k not in oses))
+            if wrong:
+                out.append("%s: runner_image names an OS the row does not have: %s" % (where, ", ".join(wrong)))
+    if "timeout_minutes" in row:
+        minutes = row["timeout_minutes"]
+        if not _is_int(minutes) or not 0 < minutes <= 360:
+            out.append("%s: timeout_minutes must be an integer between 1 and 360, not %r" % (where, minutes))
+    if "core_dumps" in row:
+        dumps = row["core_dumps"]
+        if dumps is not False and dumps not in CORE_DUMPS:
+            out.append("%s: core_dumps must be false or one of %s, not %r" % (where, "/".join(CORE_DUMPS), dumps))
+        elif dumps is not False and oses_ok and "linux" not in oses:
+            out.append("%s: core_dumps is a Linux setting and the row has no linux leg" % where)
+    if "run" in row and (row["run"] not in RUN_MODES):
+        out.append("%s: run must be one of %s, not %r" % (where, "/".join(RUN_MODES), row["run"]))
+    if "extra_steps" in row:
+        steps = row["extra_steps"]
+        if not (isinstance(steps, list) and all(isinstance(x, str) for x in steps) and len(set(steps)) == len(steps)):
+            out.append("%s: extra_steps must be a list of distinct names, not %r" % (where, steps))
+        else:
+            unknown = sorted(set(steps) - set(EXTRA_STEPS))
+            if unknown:
+                out.append("%s: extra_steps names %s, outside the closed set %s"
+                           % (where, ", ".join(unknown), ", ".join(EXTRA_STEPS)))
+    if "moz_log" in row:
+        modules = row["moz_log"]
+        if not (isinstance(modules, str) and modules and not any(c.isspace() for c in modules)):
+            out.append("%s: moz_log must be a non-empty string of MOZ_LOG modules with no space, not %r" % (where, modules))
+    if "juggler_trace" in row and not isinstance(row["juggler_trace"], bool):
+        out.append("%s: juggler_trace must be true or false, not %r" % (where, row["juggler_trace"]))
+    if "artifact" in row:
+        name = row["artifact"]
+        if not (isinstance(name, str) and name and all(c.isalnum() or c in "._-" for c in name)):
+            out.append("%s: artifact must be a non-empty name of letters, digits, '.', '_' and '-', not %r" % (where, name))
+    return out
 
 
 def _read_json_list(path):
