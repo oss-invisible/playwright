@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
 
 import pytest
 
+from _content_processes import ContentProcessWatch, engine_snapshot
+from _evidence_on_failure import FailureEvidence
 from _servers import LocalServer
 from _waits import awatch
 
@@ -124,14 +127,25 @@ async def _pump():
     await asyncio.sleep(0.05)
 
 
-def _run(firefox_binary, scenario):
+def _watch_of_the_content_processes():
+    """What a red run says about the engine's processes: which content processes it had, and which ended, when, with what exit code
+    (a process that exited tells a crash from a message lost on the way). It only listens."""
+    return ContentProcessWatch(lambda: engine_snapshot(os.getpid()))
+
+
+def _run(firefox_binary, scenario, watch):
     from invisible_playwright.async_api import InvisiblePlaywright
 
     async def go():
         async with InvisiblePlaywright(seed=42, binary_path=firefox_binary, humanize=False, headless=True,
                                        extra_prefs=FISSION_ON) as browser:
             page = await browser.new_page()
-            return await scenario(page)
+            watch.sample("before the first goto")
+            watch.start()
+            try:
+                return await scenario(page)
+            finally:
+                watch.stop("end of the scenario (or the failure that ended it)")
 
     return asyncio.run(go())
 
@@ -142,8 +156,11 @@ def test_a_goto_to_the_address_the_page_is_at_ends_every_time(firefox_binary, si
     url = "http://a.test:%d/%s" % (port, kind)
     _, frames = _body(kind, port)
 
+    watch = _watch_of_the_content_processes()
+
     async def scenario(page):
         await page.goto(url, timeout=30000)
+        watch.sample("after the goto before the loop")
         seen = []
         for i in range(GOTOS):
             began = time.monotonic()
@@ -154,18 +171,22 @@ def test_a_goto_to_the_address_the_page_is_at_ends_every_time(firefox_binary, si
             # in a third process, and its announcement may reach the client after the top document's load (measured: 2 of 3 after 0.22 s, run
             # 44888497316). A frame that never comes is still red below.
             frames_seen = await awatch(lambda: len(page.frames), lambda n: n >= frames, 30, _pump)
+            watch.sample("after goto %d" % i)
             seen.append((i, response.status if response else None, page.url, title, frames_seen.history[-1][1], round(took, 2)))
         return seen
 
-    seen = _run(firefox_binary, scenario)
-    assert len(seen) == GOTOS
-    answers = (200, 304) if kind.endswith("etag") else (200,)   # a revalidated page is answered 304, and says so
-    for i, status, address, title, count, took in seen:
-        assert status in answers, seen[i]
-        assert address == url, seen[i]
-        assert title == kind, seen[i]
-        assert count == frames, seen[i]
-        # No bound on `took` here: a goto that did not end is the one that raised at its own timeout (30 s), above.
+    with FailureEvidence("goto-to-the-same-url-" + kind) as evidence:
+        evidence.note_records("content-processes", watch)
+        evidence.arm()                      # before the browser is launched: the engine's trace and the Juggler wire
+        seen = _run(firefox_binary, scenario, watch)
+        assert len(seen) == GOTOS
+        answers = (200, 304) if kind.endswith("etag") else (200,)   # a revalidated page is answered 304, and says so
+        for i, status, address, title, count, took in seen:
+            assert status in answers, seen[i]
+            assert address == url, seen[i]
+            assert title == kind, seen[i]
+            assert count == frames, "%r | %s" % (seen[i], watch.summary())
+            # No bound on `took` here: a goto that did not end is the one that raised at its own timeout (30 s), above.
 
 
 def test_a_goto_to_the_same_address_with_a_query_ends_the_second_time_too(firefox_binary, site):
@@ -173,13 +194,19 @@ def test_a_goto_to_the_same_address_with_a_query_ends_the_second_time_too(firefo
     port = site
     url = "http://a.test:%d/other-site-frame?x=1" % port
 
+    watch = _watch_of_the_content_processes()
+
     async def scenario(page):
         await page.goto("http://a.test:%d/other-site-frame" % port, timeout=30000)
         out = []
-        for _ in range(3):
+        for i in range(3):
             response = await page.goto(url, timeout=30000)
             out.append((response.status if response else None, page.url, len(page.frames)))
+            watch.sample("after goto %d" % i)
         return out
 
-    out = _run(firefox_binary, scenario)
-    assert out == [(200, url, 2)] * 3, out
+    with FailureEvidence("goto-to-the-same-url-with-a-query") as evidence:
+        evidence.note_records("content-processes", watch)
+        evidence.arm()
+        out = _run(firefox_binary, scenario, watch)
+        assert out == [(200, url, 2)] * 3, "%r | %s" % (out, watch.summary())
