@@ -174,7 +174,7 @@ def no_geo_lookup(monkeypatch):
 
 
 @pytest.mark.unit
-def test_enter_with_profile_dir_calls_launch_persistent_context(tmp_path, monkeypatch, no_geo_lookup):
+def test_enter_with_profile_dir_calls_launch_persistent_context(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """When profile_dir is set, __enter__ must call
     `firefox.launch_persistent_context(user_data_dir=...)` and NOT
     `firefox.launch(...)`. This is the structural test that the persistent
@@ -217,7 +217,7 @@ def test_enter_with_profile_dir_calls_launch_persistent_context(tmp_path, monkey
 
 
 @pytest.mark.unit
-def test_enter_without_profile_dir_calls_launch_not_persistent(tmp_path, monkeypatch, no_geo_lookup):
+def test_enter_without_profile_dir_calls_launch_not_persistent(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """Default path: profile_dir=None → firefox.launch, not
     launch_persistent_context. Sentinel that the non-persistent flow
     isn't accidentally rerouted."""
@@ -246,7 +246,7 @@ def test_enter_without_profile_dir_calls_launch_not_persistent(tmp_path, monkeyp
 
 
 @pytest.mark.unit
-def test_persistent_context_user_data_dir_is_created_if_missing(tmp_path, monkeypatch, no_geo_lookup):
+def test_persistent_context_user_data_dir_is_created_if_missing(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """First-run scenario: the directory the user names doesn't exist yet.
     __enter__ must mkdir -p it (Playwright won't, and would crash with
     'user_data_dir does not exist')."""
@@ -269,7 +269,7 @@ def test_persistent_context_user_data_dir_is_created_if_missing(tmp_path, monkey
 
 
 @pytest.mark.unit
-def test_teardown_closes_persistent_context(tmp_path, monkeypatch, no_geo_lookup):
+def test_teardown_closes_persistent_context(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """The teardown must close the persistent context. Forgetting this
     leaves Firefox + Playwright running until the parent process exits,
     which on long-running tools (job orchestrators, MCP servers) leaks

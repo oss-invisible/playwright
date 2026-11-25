@@ -178,6 +178,22 @@ def _offline_session_geo(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _a_test_that_is_not_e2e_never_leaves_the_machine(request, monkeypatch):
+    """Outside the e2e, every connection, datagram and name lookup goes to this host or is refused, and the test fails naming each
+    destination it tried (tests/_no_network.py), even when the code under test swallowed the refusal."""
+    if request.node.get_closest_marker("e2e") is not None:
+        yield
+        return
+    import _no_network
+
+    guard = _no_network.install(monkeypatch, request.node.nodeid)
+    yield
+    failure = guard.verdict()
+    if failure:
+        pytest.fail(failure, pytrace=False)
+
+
+@pytest.fixture(autouse=True)
 def _what_the_core_declares_for_a_proxy_is_recorded(monkeypatch):
     """The core keeps no UDP verdict in memory, so a test that wants to know what the launch declared reads it where it is
     written: `_udp_line.record_declared` spies the one function that renders the engine's proxy command (unit and e2e)."""
@@ -252,6 +268,36 @@ def _no_test_asks_the_world_where_it_leaves_from():
     asked = _socks_servers.nobody_asked_the_world()
     if asked:
         pytest.fail("the question of the exit went toward the internet: " + "; ".join(asked), pytrace=False)
+
+
+@pytest.fixture
+def lab_exit(monkeypatch, tmp_path):
+    """The exit of the lab and its GeoIP database, declared for one test that is not e2e (``tests/_lab_egress.py``, as the e2e have it).
+
+    With no proxy the core asks where this machine leaves from once per composition (``prepare_session_geo``: zone, language and position
+    come from the exit, even when the zone is given), and a test that is not e2e never leaves the machine (``tests/_no_network.py``). A test
+    that composes prefs or a session through the core takes this fixture."""
+    import _lab_egress
+
+    return _lab_egress.install(monkeypatch, tmp_path / "lab-geoip")
+
+
+@pytest.fixture
+def declared_engine(monkeypatch, tmp_path):
+    """An engine executable declared for one test that is not e2e, instead of the one the core resolves.
+
+    Without ``binary_path=`` the launch resolves the engine through ``ensure_binary`` (``_engine.resolve_executable``): with an engine in
+    the cache of the machine it answers at once, and with none it asks GitHub's release index and downloads the archive. So a unit test that
+    composes a launch passed on a machine that had run ``fetch`` and went to the internet on a fresh runner, and a test that is not e2e
+    never leaves the machine (``tests/_no_network.py``). The file is never run: the tests that take this fixture stop at the environment,
+    the arguments or a fake ``launch``. Returns its path."""
+    from invisible_playwright import _engine
+
+    executable = tmp_path / "declared-engine" / ("firefox.exe" if sys.platform == "win32" else "firefox")
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"")
+    monkeypatch.setattr(_engine, "ensure_binary", lambda *a, **k: executable)
+    return executable
 
 
 @pytest.fixture
