@@ -9,6 +9,7 @@ from invisible_core import generate_profile
 # turned unused in there and were removed. An import is not unused merely
 # because the file holding it does not use it - another module can be reaching
 # a name THROUGH it, and no single-file analysis can see that.
+from invisible_core import constants as _constants
 from invisible_core.constants import (TASKBAR_PX as _TASKBAR_H,
                                       WINDOW_FRAME_BY_DPR as _FRAMES)
 from invisible_playwright.launcher import InvisiblePlaywright
@@ -31,7 +32,10 @@ def test_chrome_offsets_are_positive_ints():
     """
     assert _TASKBAR_H > 0
     for frame in _FRAMES.values():
-        assert frame.border >= 0 and frame.maximized_ui > 0 and frame.popup_ui > 0
+        # the bar: from the panel via declared_maximized_ui (core with ui_normal/ui_compact), the frame's field on the older pinned core
+        bar = (_constants.declared_maximized_ui(frame, 1000) if hasattr(_constants, "declared_maximized_ui")
+               else frame.maximized_ui)
+        assert frame.border >= 0 and bar > 0 and frame.popup_ui > 0
 
     for seed in range(40):
         p = generate_profile(seed)
