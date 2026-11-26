@@ -422,6 +422,7 @@ def test_a_real_page_sees_a_drag_that_travelled(firefox_binary):
     """
     import urllib.parse
 
+    import _os_cursor
     from invisible_playwright import InvisiblePlaywright
 
     html = (
@@ -445,6 +446,11 @@ def test_a_real_page_sees_a_drag_that_travelled(firefox_binary):
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary) as browser:
         page = browser.new_page()
         page.goto("data:text/html," + urllib.parse.quote(html))
+        # ⛔ THE OS CURSOR IS NOT IN THE WINDOW. A window under the real cursor gets a native move for it, the first native move of a process passes Gecko's
+        # filter, and the page saw `mousemove 512,299 buttons=0` after the press (the runner's cursor is at 512,384, the window covers it). The cursor is
+        # parked before the browser starts (`tests/_os_cursor.py`, the autouse fixture of conftest); here the test says it is still outside, so a gesture
+        # judged by the events it records is never judged with the system's own move among them.
+        _os_cursor.require_outside()
         page.mouse.move(300, 300)
         page.evaluate("() => { window.__e = []; }")
         page.drag_and_drop("#a", "#b")

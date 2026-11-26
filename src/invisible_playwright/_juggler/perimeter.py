@@ -215,3 +215,45 @@ def refusal(operation):
             "invisible_playwright does not implement: the package covers the "
             "automation core, and " + feature + " is outside it by decision, "
             "not by omission. See 32-stacco-da-playwright.md section 5.4.")
+
+
+#: ⛔ A PARAMETER OF A SERVED OPERATION THAT IS REFUSED, keyed by (operation, parameter), and the sentence a caller reads.
+#: The operations above are refused whole; these are refused one parameter (or one value of it) at a time, and the call
+#: without them is served. They are raised in `server.py` by `_refuse_parameter(operation, parameter)`, the one function
+#: that reads this table, and `tests/test_every_refusal_is_declared.py` holds the two sides to each other.
+#:
+#: ⛔ WHY THESE FIVE. Stock Playwright honours `mask`, `style` and `animations="disabled"` by MODIFYING THE PAGE (an overlay,
+#: an injected `<style>`, animations finished or cancelled) before the picture and putting it back after. This package does
+#: not touch a page to photograph it, and until now it did not read them either: the call succeeded and the picture was as
+#: if they had not been written, which a caller cannot see. `caret="initial"` asks for the text caret to be drawn, and the
+#: engine never draws it (the capture does not set the flag that draws it), so the picture it takes is the one `"hide"`
+#: asks for, which is also Playwright's default: `"hide"` and an absent `caret` are served. `omitBackground` with png is
+#: Firefox's own `Not implemented` in stock (`FFPage.setBackgroundColor`), word for word; with jpeg stock does nothing and
+#: neither do we.
+REFUSED_PARAMETERS = {
+    ("screenshot", "mask"):
+        "screenshot(mask=...) is not served: Playwright covers the masked elements by modifying the page (an overlay is "
+        "put on it before the picture), and this package does not touch a page to take a picture. maskColor goes with "
+        "mask and is refused with it. Hide the elements yourself before the screenshot (for example set their "
+        "visibility to hidden in your own script) and restore them after.",
+    ("screenshot", "style"):
+        "screenshot(style=...) is not served: Playwright applies it by modifying the page (a <style> element is "
+        "injected before the picture and removed after), and this package does not touch a page to take a picture. Add "
+        "the style yourself with page.add_style_tag() before the screenshot and remove the element it returns after.",
+    ("screenshot", "animations"):
+        'screenshot(animations="disabled") is not served: Playwright does it by modifying the page (the finite '
+        "animations are finished and the infinite ones cancelled), and this package does not touch a page to take a "
+        "picture. Wait for the animations to end, or pause them in your own script (document.getAnimations()), before "
+        'the screenshot. animations="allow" is what is served.',
+    ("screenshot", "caret"):
+        'screenshot(caret="initial") is not served: it asks for the text caret to be drawn in the picture, and the '
+        'engine never draws it (the picture is the one caret="hide" asks for, which is the default of Playwright). Leave '
+        'caret out or pass "hide".',
+    ("screenshot", "omitBackground"):
+        "Not implemented",
+}
+
+
+def parameter_refusal(operation, parameter):
+    """The sentence for a refused (operation, parameter): `KeyError` for one that is not declared."""
+    return REFUSED_PARAMETERS[(operation, parameter)]

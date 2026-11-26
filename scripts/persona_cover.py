@@ -10,7 +10,9 @@ seeds. This computes them from the prefs themselves, never from a list of the ta
     is a seed dimension);
   * every pref whose value differs between two seeds must belong to a DIMENSION below (a group of prefs read
     together: the renderer, the screen panel, the audio chain...) or be named in EXCLUDED with its reason. A pref
-    that varies and is in neither is an error, so a new pref of a later core cannot go uncovered unnoticed;
+    that varies and is in neither is an error, so a new pref of a later core cannot go uncovered unnoticed. A pref that
+    is a function of a dimension (the bar of a maximized window is of the panel) is in DERIVED instead: it is checked to
+    take one value per value of its dimension, and it is no part of the stored features;
   * a dimension's value for a seed is the joint value of its prefs; the reachable values of a dimension are the
     ones some seed in range produces.
 
@@ -56,7 +58,7 @@ DIMENSIONS = {
     "gfx_feature_status": (P + "gfx.feature_status",),
     "screen_panel": (P + "screen.width", P + "screen.height", P + "screen.avail_device_width",
                      P + "screen.avail_device_height", "layout.css.devPixelsPerPx"),
-    "dpr": ("layout.css.devPixelsPerPx", P + "screen.frame_border", P + "screen.maximized_ui", P + "screen.popup_ui"),
+    "dpr": ("layout.css.devPixelsPerPx", P + "screen.frame_border", P + "screen.popup_ui"),
     "cores": (P + "hw_concurrency",),
     "audio": (P + "audio.sample_rate", P + "audio.output_latency_ms", P + "audio.max_channel_count"),
     "codecs": ("media.av1.enabled", "media.encoder.webm.enabled", "media.mp4.enabled", "media.webm.enabled",
@@ -72,6 +74,17 @@ ALL_DIMENSIONS = tuple(DIMENSIONS) + PROFILE_DIMENSIONS
 EXCLUDED = {
     P + "media.enumeration_ms": "the time of the first enumerateDevices(): a draw from its own stream, hundreds of values, "
                                 "no class of seeds to cover",
+}
+#: Prefs that are a function of a dimension: {pref: the dimension}. They are not part of the dimension's value (so the
+#: stored features do not depend on which core emits them) and compute() CHECKS that, across the seeds, each takes exactly
+#: one value per value of its dimension, like the webgl prefs per renderer. A derived pref the core does not emit at all is
+#: fine: it is the pref of a core that comes later than the one in use (or earlier than the one that added it), and the pair
+#: of cores must give the same file. maximized_ui is of the panel because the core declares the bar from the work area's
+#: height as well as from the scale (declared_maximized_ui: compact when the work area is short in CSS px).
+DERIVED = {
+    P + "screen.maximized_ui": "screen_panel",
+    P + "screen.ui_normal": "dpr",
+    P + "screen.ui_compact": "dpr",
 }
 #: What the candidate run visits: the smallest set that reaches every one of these dimensions' values.
 CANDIDATE_DIMENSIONS = ("webgl_renderer", "dpr")
@@ -106,6 +119,7 @@ def seed_features(seed: int) -> tuple:
     features["gfx_device"] = profile.gpu.device or "<none>"
     webgl = {k: json.dumps(v, sort_keys=True) for k, v in prefs.items() if k.startswith(WEBGL)}
     features["_webgl"] = hashlib.sha256(json.dumps(webgl, sort_keys=True).encode()).hexdigest()[:12]
+    features["_derived"] = {k: json.dumps(prefs.get(k, "<absent>"), sort_keys=True) for k in DERIVED}
     return features, {k: json.dumps(v, sort_keys=True) for k, v in prefs.items()}
 
 
@@ -125,11 +139,25 @@ def _range(bounds: tuple) -> tuple:
     return features, seen
 
 
+def check_derived(features: dict) -> None:
+    """Raises when a DERIVED pref takes two values within one value of its dimension. features: {seed: {dimension: value,
+    "_derived": {pref: value}}}. A pref no seed has is skipped (a core that does not emit it)."""
+    for pref, dim in DERIVED.items():
+        seen = {}
+        for seed in sorted(features):
+            value = features[seed]["_derived"][pref]
+            if seen.setdefault(features[seed][dim], (value, seed))[0] != value:
+                first = seen[features[seed][dim]]
+                raise SystemExit("the derived pref %s is not a function of the dimension %s (seed %d: %s, seed %d: %s, "
+                                 "both with %s): it belongs to a wider dimension" % (
+                                     pref, dim, first[1], first[0], seed, value, features[seed][dim]))
+
+
 def compute(max_seed: int = MAX_SEED, workers: int | None = None) -> dict:
     """The features of every seed 0..max_seed-1: {seed: {dimension: value}} (the dimensions of ALL_DIMENSIONS).
 
-    Raises when a pref varies across the seeds and is in no dimension and not in EXCLUDED, or when the webgl prefs are
-    not a function of the renderer."""
+    Raises when a pref varies across the seeds and is in no dimension and not in EXCLUDED or DERIVED, when a DERIVED
+    pref is not a function of its dimension, or when the webgl prefs are not a function of the renderer."""
     workers = workers or max(1, min(os.cpu_count() or 1, 8))
     step = max(1, -(-max_seed // (workers * 4)))
     bounds = [(lo, min(lo + step, max_seed)) for lo in range(0, max_seed, step)]
@@ -145,10 +173,12 @@ def compute(max_seed: int = MAX_SEED, workers: int | None = None) -> dict:
             seen.setdefault(k, set()).update(vs)
     covered = {k for keys in DIMENSIONS.values() for k in keys}
     varying = sorted(k for k, vs in seen.items() if len(vs) > 1)
-    loose = [k for k in varying if k not in covered and k not in EXCLUDED and not k.startswith(WEBGL)]
+    loose = [k for k in varying if k not in covered and k not in EXCLUDED and k not in DERIVED and not k.startswith(WEBGL)]
     if loose:
         raise SystemExit("prefs that vary across seeds and belong to no dimension and are not excluded: %s\n"
-                         "add each to a DIMENSION or to EXCLUDED (with the reason) in scripts/persona_cover.py" % loose)
+                         "add each to a DIMENSION, to DERIVED (a function of one) or to EXCLUDED (with the reason) in "
+                         "scripts/persona_cover.py" % loose)
+    check_derived(features)
     byrenderer = {}
     for seed in sorted(features):
         f = features[seed]
@@ -156,6 +186,8 @@ def compute(max_seed: int = MAX_SEED, workers: int | None = None) -> dict:
             raise SystemExit("the webgl prefs are not a function of the renderer (seed %d, %s): split the dimension"
                              % (seed, f["webgl_renderer"]))
         del f["_webgl"]
+    for f in features.values():
+        del f["_derived"]
     stale = [k for k in EXCLUDED if k not in seen or len(seen[k]) < 2]
     if stale:
         raise SystemExit("excluded prefs that no longer vary: %s: remove them from EXCLUDED" % stale)

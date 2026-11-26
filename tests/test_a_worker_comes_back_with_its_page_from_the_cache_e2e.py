@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler
 import pytest
 
 from _bfcache_evidence import decide_outcome, read_after_go_back, wait_cacheable
+from _evidence_on_failure import FailureEvidence
 from _servers import LocalServer
 
 STRATEGY_1 = {
@@ -160,13 +161,30 @@ def _ask(page, where):
     return target.evaluate("window.__ask()")
 
 
+#: The engine's own log of the session history and the back-forward cache, kept with the evidence of a red run (one file per process): whether
+#: the restore happened, in which process, and what the parent did with the history entry. Run 45691494388 (job 139520127265) saw go_back
+#: end with "no new navigation on frame mainframe-11 in 30s" for top/other-site/goto and kept nothing to say whether the engine restored the
+#: page. A diagnostic no page reads.
+BFCACHE_LOG = "timestamp,SHIPBFCache:5,nsSHistory:5,SessionHistory:4,BCWebProgress:4,DocumentChannel:4,BrowsingContext:4"
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize("how", ["goto", "location"])
 @pytest.mark.parametrize("away", ["same-site", "other-site"])
 @pytest.mark.parametrize("where", ["top", "oop-frame"])
 def test_a_worker_leaves_with_its_page_for_the_cache_and_comes_back_the_same(firefox_binary, sites, events, where,
                                                                              away, how, engine_at_least):
+    """When it fails it saves, under ``invpw-evidence/worker-back-from-the-cache-<where>-<away>-<how>/``, the Juggler wire, the engine trace,
+    the engine log BFCACHE_LOG and ``after-go-back.jsonl`` (what the page said when go_back raised, and 2 s later)."""
     engine_at_least("firefox-62")
+    reads = _Reads()
+    with FailureEvidence("worker-back-from-the-cache-%s-%s-%s" % (where, away, how)) as evidence:
+        evidence.note_records("after-go-back", reads)
+        evidence.arm(moz_log=BFCACHE_LOG)
+        _the_case(firefox_binary, sites, events, where, away, how, reads)
+
+
+def _the_case(firefox_binary, sites, events, where, away, how, reads):
     from invisible_playwright import InvisiblePlaywright
 
     with InvisiblePlaywright(seed=42, binary_path=firefox_binary, humanize=False,
@@ -206,7 +224,7 @@ def test_a_worker_leaves_with_its_page_for_the_cache_and_comes_back_the_same(fir
 
         # 3. back from the cache: the same worker, told once, after the restored document's contexts are cleared
         back = len(events)
-        page.go_back(wait_until="load")
+        _go_back_and_record(page, reads)
         # What it knows is written down BEFORE anything is asserted. A goto is started by the PARENT and Firefox may refuse the cache for it,
         # to the same site or to another (measured: the navigation's own channel is still in the old document's loadgroup when the parent
         # checks: SHIPBFCache log, CanonicalBrowsingContext::AllowedInBFCache); then the document is built again and the contract is the one
@@ -276,3 +294,34 @@ def _assert_a_new_page_with_a_new_worker(page, events, where, old, back):
         elif m == "Page.workerDestroyed":
             live.pop(p["workerId"], None)
     assert list(live) == [new[0]], "live workers after the page was built again: %r" % list(live.values())
+
+
+class _Reads:
+    """What the page says right after a go_back that raised, and once more later (``FailureEvidence.note_records`` shape)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.records = []
+
+    def read(self, page, when):
+        record = {"when": when, "t": time.time(), "client_url": page.url}
+        try:
+            record.update(page.evaluate(
+                "() => ({url: location.href, shown: window.__shown || null, history: history.length,"
+                " type: (performance.getEntriesByType('navigation')[0] || {}).type || null, state: document.readyState})"))
+        except Exception as problem:       # the page may be gone or changing: that is what is being recorded
+            record["read_error"] = "%s: %s" % (type(problem).__name__, problem)
+        with self.lock:
+            self.records.append(record)
+
+
+def _go_back_and_record(page, reads):
+    """``page.go_back(wait_until="load")``; when it raises, what the page says then and after a short pause is recorded first (the error is raised
+    unchanged: the pause only dates a restore that lands after the wait, it decides nothing)."""
+    try:
+        page.go_back(wait_until="load")
+    except Exception:
+        reads.read(page, "right after the go_back raised")
+        page.wait_for_timeout(2000)
+        reads.read(page, "2 s later")
+        raise

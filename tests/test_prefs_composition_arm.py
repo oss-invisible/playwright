@@ -46,7 +46,7 @@ DELIBERATE_VS_PUBLIC_API = {
 }
 
 
-def test_the_wrapper_composes_what_the_public_api_composes():
+def test_the_wrapper_composes_what_the_public_api_composes(lab_exit):
     profile = generate_profile(SEED)
     mine = build_prefs(profile=profile, locale=LOCALE, timezone=TZ,
                        extra_prefs=None, virtual_display=False,

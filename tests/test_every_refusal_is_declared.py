@@ -137,3 +137,46 @@ def test_every_declared_refusal_is_still_refused():
         + "\n  ".join(stale)
         + "\n\nRemove them: an inventory that describes a gap which has been "
           "closed is as wrong as one that misses a gap.")
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------
+#  Refusals of a PARAMETER of a served operation
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------
+# The operations above are refused whole. A served operation can also refuse one parameter (or one value of it): `screenshot` refuses `mask`, `style`,
+# `animations="disabled"`, `caret="initial"` and `omitBackground` with png, because Playwright honours them by modifying the page. Those are keyed by
+# (operation, parameter) in `perimeter.REFUSED_PARAMETERS`, which holds the sentence the caller reads, and raised in `server.py` through
+# `_refuse_parameter(operation, parameter)`, the one function that reads that table. The wire-method budget is about operations and does not see them.
+def _parameter_refusals_in_the_server():
+    tree = ast.parse(SERVER.read_text(encoding="utf-8"))
+    found = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_refuse_parameter"
+                and len(node.args) == 2 and all(isinstance(a, ast.Constant) for a in node.args)):
+            found.add((node.args[0].value, node.args[1].value))
+    return found
+
+
+def test_the_parameter_refusals_are_readable():
+    """The safety net: an empty derivation would make the two assertions below compare nothing with nothing."""
+    assert len(_parameter_refusals_in_the_server()) >= 5, "no `_refuse_parameter(operation, parameter)` call found in server.py: the reader is broken"
+    assert len(perimeter.REFUSED_PARAMETERS) >= 5
+
+
+def test_every_parameter_refusal_is_declared_in_the_perimeter():
+    undeclared = sorted(_parameter_refusals_in_the_server() - set(perimeter.REFUSED_PARAMETERS))
+    assert not undeclared, (
+        "server.py refuses these parameters and perimeter.REFUSED_PARAMETERS does not name them:\n  " + "\n  ".join("%s.%s" % k for k in undeclared)
+        + "\nAdd each as (operation, parameter): the sentence a caller reads.")
+
+
+def test_every_declared_parameter_refusal_is_still_raised():
+    stale = sorted(set(perimeter.REFUSED_PARAMETERS) - _parameter_refusals_in_the_server())
+    assert not stale, (
+        "these are declared in perimeter.REFUSED_PARAMETERS and server.py no longer raises them:\n  " + "\n  ".join("%s.%s" % k for k in stale)
+        + "\nRemove them: an inventory that describes a refusal that is gone is as wrong as one that misses one.")
+
+
+def test_a_parameter_refusal_is_a_sentence_a_person_can_act_on():
+    for key, sentence in perimeter.REFUSED_PARAMETERS.items():
+        assert isinstance(sentence, str) and len(sentence) >= len("Not implemented"), key
+        assert perimeter.parameter_refusal(*key) == sentence

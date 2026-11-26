@@ -10,6 +10,12 @@ red when our engine does not idle where stock does. Profile P4: a user journey o
 (tests/fakeweb/journey_site.py); stock Firefox runs first, then our engine, and the verdict compares every step field by
 field (ok, url, title, marker, cookies, history length, open pages, idle, the step's own values). --repetitions is the
 number of walks (P4: default 1). The stock client drives both.
+
+The bound of a P2 wait: a P2 page is finite (MAX_DELAY_MS, 3000 ms, is its longest response) and networkidle needs 500 ms of quiet,
+so the 10 s default is a cap with margin, never to be read as a cause. A stock cell that does not idle is a broken control or, by
+pages.json `stock_firefox_may_lose` (a request the page itself aborts, which stock may never report the end of), stock unsettled:
+not red, and ours is then judged against the outcome the page declares. The report keeps `stock_unsettled`, `platform` and the
+`stock_unsettled_rate` per pattern, so the rate per platform can be followed across runs from the artifacts.
 """
 from __future__ import annotations
 
@@ -104,16 +110,31 @@ def main(argv=None):
 
     if args.no_stock:       # stock is what pages.json says it is
         stock = [dict(c, idle=declared.get(c["pattern"], "idle") == "idle") for c in candidate]
-    fails, broken = profile_p2.verdict(candidate, stock, declared)
-    report = {"profile": args.profile, "patterns": patterns, "repetitions": args.repetitions,
-              "candidate": candidate, "stock": stock, "fails": fails, "broken_control": broken}
+    may_lose = pages.get("stock_firefox_may_lose", {})
+    fails, broken, unsettled = profile_p2.verdict(candidate, stock, declared, may_lose)
+    return finish_p2(args, patterns, candidate, stock, fails, broken, unsettled, may_lose)
+
+
+def finish_p2(args, patterns, candidate, stock, fails, broken, unsettled, may_lose):
+    """The report of a P2 run (written to --out), the lines printed, and the exit code: 1 on a fail or a broken control, never on unsettled alone."""
+    by_key = {(c["round"], c["pattern"], c["canary"], c["after"]): c for c in stock}
+    unsettled_cells = [{"round": key[0], "pattern": key[1], "in_flight": [r.get("url") for r in by_key[key].get("in_flight") or []]}
+                       for key, _err in unsettled]
+    rate = {pattern: {"unsettled": sum(1 for u in unsettled_cells if u["pattern"] == pattern),
+                      "rounds": sum(1 for c in stock if c["pattern"] == pattern and not c["canary"])}
+            for pattern in may_lose}
+    report = {"profile": args.profile, "patterns": patterns, "repetitions": args.repetitions, "platform": sys.platform,
+              "candidate": candidate, "stock": stock, "fails": fails, "broken_control": broken,
+              "stock_unsettled": unsettled_cells, "stock_unsettled_rate": rate}
     if args.out:
         pathlib.Path(args.out).write_text(json.dumps(report, indent=1), encoding="utf-8")
     for key, err in fails:
         print("FAIL  round %d  %s%s: %s" % (key[0], key[1], " (canary after %s)" % key[3] if key[2] else "", err))
     for key, err in broken:
         print("BROKEN CONTROL  stock did not idle on %s round %d: %s" % (key[1], key[0], err))
-    print("cells: %d, fails: %d, broken controls: %d" % (len(candidate), len(fails), len(broken)))
+    for cell in unsettled_cells:
+        print("STOCK UNSETTLED  %s round %d: %s (pages.json stock_firefox_may_lose)" % (cell["pattern"], cell["round"], ", ".join(map(str, cell["in_flight"]))))
+    print("cells: %d, fails: %d, broken controls: %d, stock unsettled: %d" % (len(candidate), len(fails), len(broken), len(unsettled_cells)))
     return 1 if (fails or broken) else 0
 
 
