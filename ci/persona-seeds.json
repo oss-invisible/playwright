@@ -6,7 +6,7 @@
   6,
   63
  ],
- "core_version": "69.82.0",
+ "core_version": "70.83.0",
  "counts": {
   "audio": {
    "audio.sample_rate=44100|audio.output_latency_ms=20|audio.max_channel_count=2": 4315,

@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.60.0] - UNRELEASED
 
 ### Changed
-- Pins invisible-core PLACEHOLDER-70 on the engine firefox-70 (PLACEHOLDER: the engine release tag and the core version are written when they are published).
+- Pins invisible-core 70.83.0 on the engine firefox-70 (Firefox 159.0).
 - The engine carries Firefox's fix for the race between the start and the shutdown of its telemetry (Glean): a browser closed while it was
   still starting no longer leaves that work half done.
 - ElementHandle pointer actions (`click`, `dblclick`, `hover`, `tap`, `check`, `uncheck`, `set_checked`) now use the same humanised pointer walk as selector actions (they used to jump to the exact centre of the element in one move).
