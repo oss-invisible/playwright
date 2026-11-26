@@ -20,55 +20,5 @@ file name, and change its row (name, version, sha256).
 |---|---|---|---|---|---|
 | `bot-detector-2.0.0.esm.js` | client-side bot detector | 2.0.0 | MIT | `f438ed251dc7414ece9d4a2b6941441ad9ffae1a1905817f5f0c7366e701dd86` | in the file header (copyright line and licence reference) |
 | `fingerprint-library-5.2.0.umd.min.js` | open-source fingerprint library | 5.2.0 | MIT | `a8de5ead580c42d2e2b01a5752aa08da510852230971aa18554d67cd5de5775b` | in the file header (copyright line and full licence text) |
-| `headless-detector-10aa672.js` | headless / stealth / lies detector | git `10aa6724` | MIT | `80f43f364bd973bc03cb5b82de033ce28b2bbb145cb04237632a46ef040a92be` | not in the file: kept below |
-| `rules-scanner-1.0.6.es.js` | automation-rules scanner | 1.0.6 | MIT | `5680b88e6075fceab5343d31b43dcb1892a98cff072d37084efdd244fd2cb809` | not in the file: kept below |
-
-## Licence notice of the two bundles that carry none
-
-The MIT licence asks that the copyright notice and the permission notice stay with every copy. Two
-bundles are a compiled dist with no header, and the files stay byte-identical to upstream, so the
-notice is kept here, copied verbatim from the `LICENSE` file of the upstream repository at the exact
-commit of the vendored version (the headless detector: the commit of its file name; the rules
-scanner: the commit recorded in the package metadata of version 1.0.6).
-
-Headless detector (`headless-detector-10aa672.js`):
-
-> MIT License
->
-> Copyright (c) 2021 abrahamjuliot
->
-> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-> associated documentation files (the "Software"), to deal in the Software without restriction,
-> including without limitation the rights to use, copy, modify, merge, publish, distribute,
-> sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
-> furnished to do so, subject to the following conditions:
->
-> The above copyright notice and this permission notice shall be included in all copies or
-> substantial portions of the Software.
->
-> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
-> NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-> DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
-> OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-Rules scanner (`rules-scanner-1.0.6.es.js`):
-
-> The MIT License (MIT)
->
-> Copyright (c) 2017 antoinevastel <antoine.vastel@gmail.com>
->
-> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-> associated documentation files (the "Software"), to deal in the Software without restriction,
-> including without limitation the rights to use, copy, modify, merge, publish, distribute,
-> sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
-> furnished to do so, subject to the following conditions:
->
-> The above copyright notice and this permission notice shall be included in all copies or
-> substantial portions of the Software.
->
-> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
-> NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-> DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
-> OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+| `headless-detector-10aa672.js` | headless / stealth / lies detector | git `10aa6724` | MIT | `80f43f364bd973bc03cb5b82de033ce28b2bbb145cb04237632a46ef040a92be` | not in the file (the upstream notice is pending a decision) |
+| `rules-scanner-1.0.6.es.js` | automation-rules scanner | 1.0.6 | MIT | `5680b88e6075fceab5343d31b43dcb1892a98cff072d37084efdd244fd2cb809` | not in the file (the upstream notice is pending a decision) |
