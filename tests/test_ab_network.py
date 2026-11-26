@@ -2069,9 +2069,14 @@ time.sleep(60)
 
 
 def _alive(pid):
+    """Whether ``pid`` still runs. A process that exits between the two questions (it exists, then it is read) is gone, not an error: ``Process(pid)`` raises
+    ``NoSuchProcess`` for it (wrapper #603's round, pytest ubuntu py3.13: ``process PID not found`` from the grandchild the guard had just killed)."""
     import psutil
 
-    return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    try:
+        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
 
 def _wait_gone(pid, seconds=10.0):
@@ -2158,6 +2163,24 @@ def _assert_alive_since_its_line(run, spent):
     assert alive is not None, "the launch line's time does not read: %r" % run.launch
     assert 0 <= alive <= spent + 1, "the launch was alive for %.2f s, outside what its line and the run allow (0 to %.2f s)" % (alive, spent + 1)
     assert ("was alive for %d s;" % alive) in run.timeout_message("the network oracle", 3)
+
+
+def test_a_process_that_exits_between_being_listed_and_being_read_is_gone(monkeypatch):
+    """The race at its source, made on purpose: the process is there when it is listed and gone when it is read. The old helper let ``NoSuchProcess`` out of
+    ``_alive`` and the test failed on a grandchild the guard had killed; now it is gone. A process that is really there is still alive (the control)."""
+    import os
+
+    import psutil
+
+    def vanished(pid, *a, **k):
+        raise psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: True)
+    monkeypatch.setattr(psutil, "Process", vanished)
+    assert _alive(424242) is False
+    assert _wait_gone(424242, seconds=1.0) is True
+    monkeypatch.undo()
+    assert _alive(os.getpid()) is True
 
 
 def test_a_launch_that_began_late_is_named_with_the_time_since_its_own_line(tmp_path):
