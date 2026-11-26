@@ -146,3 +146,55 @@ def test_without_a_core_folder_nothing_is_done_and_the_session_s_limit_is_the_ha
         assert soft == hard, "the session's core limit is (%r, %r)" % (soft, hard)
     else:  # Windows has no core limit and no core files: lifting is a no-op that does not raise
         assert os.name == "nt", os.name
+
+
+def _memory(strings, arrays):
+    """A fake memory of a dead process: `strings` {address: bytes with their NUL}, `arrays` {address: [pointer, ...]}; the two readers gdb gives."""
+    cells = {}
+    for address, data in strings.items():
+        for i, byte in enumerate(data):
+            cells[address + i] = byte
+    for address, pointers in arrays.items():
+        for k, pointer in enumerate(pointers):
+            for i, byte in enumerate(pointer.to_bytes(8, "little")):
+                cells[address + 8 * k + i] = byte
+
+    def word(address):
+        return int.from_bytes(bytes(cells[address + i] for i in range(8)), "little")
+
+    def cstring(address):
+        out = b""
+        while cells[address] != 0:
+            out += bytes([cells[address]])
+            address += 1
+        return out.decode("utf-8")
+
+    return word, cstring
+
+
+def test_the_reader_of_a_dead_process_gives_its_arguments_and_only_the_names_of_its_environment():
+    """Run 45755178008 kept a core named after a thread (FSBroker7536) of a process the oracle had not launched: its arguments say which process it was. The values of
+    the environment are never read out (a CI environment carries tokens)."""
+    import ci_crash_evidence as crash
+
+    word, cstring = _memory({0x3000: b"/e/firefox\0", 0x3100: b"--backgroundtask\0", 0x3200: b"HOME=/home/runner\0", 0x3300: b"GITHUB_TOKEN=s3cr3t\0"},
+                            {0x1000: [0x3000, 0x3100], 0x2000: [0x3200, 0x3300, 0]})
+    args, names, problems = crash.argv_and_env_keys(word, cstring, 2, 0x1000, 0x2000)
+    assert args == ["/e/firefox", "--backgroundtask"]
+    assert names == ["HOME", "GITHUB_TOKEN"] and "s3cr3t" not in repr((args, names, problems))
+    assert problems == []
+    # an argc that is not a count, and memory that ends in the middle, are said, not raised
+    args, names, problems = crash.argv_and_env_keys(word, cstring, -1, 0x1000, 0x5000)
+    assert args == [] and names == [] and len(problems) == 2
+
+
+def test_both_readers_of_a_core_print_which_process_it_was():
+    """The e2e reader (tests/_crash_cores.py) and the oracles' (scripts/ci_crash_evidence.py) run the same gdb step, and its Python is valid."""
+    import ci_crash_evidence as crash
+
+    command = crash.argv_gdb_command()
+    assert command in _crash_cores.GDB_COMMANDS and command in crash.GDB_COMMANDS
+    assert command.startswith("python exec(") and command.endswith(")")
+    source = eval(command[len("python exec("):-1])
+    compile(source, "<gdb>", "exec")
+    assert "__libc_argv" in source and "environ" in source and "def argv_and_env_keys" in source

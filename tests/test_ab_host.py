@@ -2391,7 +2391,7 @@ def test_the_strace_tail_is_the_last_100_lines_and_the_signal_line_that_is_furth
     assert crash.strace_tail(short) == ['1 execve("/e", [], 0x1) = 0']
 
 
-def test_the_core_is_run_through_gdb_with_the_three_commands_and_the_build_ids_are_asked_of_readelf_and_eu_unstrip(tmp_path):
+def test_the_core_is_run_through_gdb_with_its_commands_and_the_build_ids_are_asked_of_readelf_and_eu_unstrip(tmp_path):
     core = tmp_path / "core.firefox.4242.1"
     core.write_bytes(b"\x7fELF")
     binary = tmp_path / "engine" / "firefox"
@@ -2405,7 +2405,7 @@ def test_the_core_is_run_through_gdb_with_the_three_commands_and_the_build_ids_a
     gdb = [c for c in run.calls if c[0].endswith("gdb")][0]
     assert gdb[:2] == ["/usr/bin/gdb", "-batch"] and gdb[-2:] == [str(binary), str(core)]
     commands = [gdb[i + 1] for i, a in enumerate(gdb) if a == "-ex"]
-    assert commands == ["thread apply all bt", "x/s *(char**)&gMozCrashReason", "info sharedlibrary"]
+    assert commands == ["thread apply all bt", "x/s *(char**)&gMozCrashReason", "info sharedlibrary", crash.argv_gdb_command()]
     assert "Thread 1 (" in got["cores"]["backtraces"][core.name] and "MOZ_CRASH(shutdown)" in got["cores"]["backtraces"][core.name]
     ids = got["cores"]["build_ids"][core.name]
     assert ids["binary"] == "Build ID: abc123" and ids["libxul"] == "Build ID: abc123" and "deadbeef" in ids["core"]
