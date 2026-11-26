@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import contextlib
 import time
 
 from fakeweb import journey_site
@@ -588,11 +589,42 @@ def drive(browser, origin_a, origin_o, rounds=1, idle_timeout_ms=15000, trace=Fa
     return records
 
 
-def run_on_candidate(sync_playwright, binary, origin_a, origin_o, rounds=1, **kw):
-    """Our engine, served over the Playwright WebSocket and driven by the stock client."""
+#: The engine's own log of where a mouse event goes, the same for stock Firefox and for ours (one file per process): `apz.inputqueue` and
+#: `apz.child` say whether the event left the parent for the content process and how the content process took it, `MouseBoundaryEvents`
+#: says whether the content process turned it into the page's mouse events. Run 45668588036 lost the first mousemove to a page whose
+#: BrowsingContext had just been replaced (no ack in 5 s, the content process alive): with both legs logged, "differs from stock" is read
+#: from the two logs side by side. A diagnostic no page reads.
+INPUT_LOG = "timestamp,apz.inputqueue:4,apz.child:4,MouseBoundaryEvents:4"
+
+
+@contextlib.contextmanager
+def _input_log(moz_log_dir, leg):
+    """While the browser of `leg` is launched: MOZ_LOG = INPUT_LOG into `<moz_log_dir>/<leg>/engine%PID` (Firefox writes one file per process);
+    nothing when `moz_log_dir` is None. The environment is put back as it was."""
+    if moz_log_dir is None:
+        yield None
+        return
+    folder = os.path.join(str(moz_log_dir), leg)
+    os.makedirs(folder, exist_ok=True)
+    saved = {name: os.environ.get(name) for name in ("MOZ_LOG", "MOZ_LOG_FILE")}
+    os.environ["MOZ_LOG"], os.environ["MOZ_LOG_FILE"] = INPUT_LOG, os.path.join(folder, "engine%PID")
+    try:
+        yield folder
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def run_on_candidate(sync_playwright, binary, origin_a, origin_o, rounds=1, moz_log_dir=None, **kw):
+    """Our engine, served over the Playwright WebSocket and driven by the stock client. `moz_log_dir`: the input log of the engine goes to
+    `<moz_log_dir>/candidate/` (INPUT_LOG)."""
     from invisible_playwright._juggler.remote import launch_server
 
-    server = launch_server(headless=True, binary_path=binary, locale="en-US", timezone="Europe/Rome")
+    with _input_log(moz_log_dir, "candidate"):
+        server = launch_server(headless=True, binary_path=binary, locale="en-US", timezone="Europe/Rome")
     try:
         with sync_playwright() as p:
             browser = p.firefox.connect(server.ws_endpoint)
@@ -604,9 +636,10 @@ def run_on_candidate(sync_playwright, binary, origin_a, origin_o, rounds=1, **kw
         server.close()
 
 
-def run_on_stock(sync_playwright, origin_a, origin_o, rounds=1, **kw):
-    with sync_playwright() as p:
-        browser = p.firefox.launch()
+def run_on_stock(sync_playwright, origin_a, origin_o, rounds=1, moz_log_dir=None, **kw):
+    """Stock Firefox (the client's own build) driven by the stock client. `moz_log_dir`: its input log goes to `<moz_log_dir>/stock/` (INPUT_LOG)."""
+    with sync_playwright() as p, _input_log(moz_log_dir, "stock") as folder:
+        browser = p.firefox.launch(env=dict(os.environ)) if folder else p.firefox.launch()
         try:
             return drive(browser, origin_a, origin_o, rounds, **kw)
         finally:

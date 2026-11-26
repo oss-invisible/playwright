@@ -36,10 +36,11 @@ HARD = ["leaving_beacons_subframe", "leaving_beacons", "cancel_among_beacons"]
 def run_p4(args, sync_playwright, not_idle_steps):
     rounds = args.repetitions or 1
     kw = {"idle_timeout_ms": args.idle_timeout_ms or 15000, "trace": args.trace}
+    logs = {"moz_log_dir": args.moz_log_dir}      # the same input log for both legs (profile_p4.INPUT_LOG), side by side
     origin_a, origin_o, stop = journey_site.start((0, 0))
     try:     # stock first, then ours: the same invocation, one browser at a time
-        stock = [] if args.no_stock else profile_p4.run_on_stock(sync_playwright, origin_a, origin_o, rounds, **kw)
-        candidate = profile_p4.run_on_candidate(sync_playwright, args.binary, origin_a, origin_o, rounds, **kw)
+        stock = [] if args.no_stock else profile_p4.run_on_stock(sync_playwright, origin_a, origin_o, rounds, **logs, **kw)
+        candidate = profile_p4.run_on_candidate(sync_playwright, args.binary, origin_a, origin_o, rounds, **logs, **kw)
     finally:
         stop()
     if args.no_stock:       # stock is what pages.json says it is
@@ -77,6 +78,8 @@ def main(argv=None):
     ap.add_argument("--trace", action="store_true",
                     help="p4: keep per step the request events the client reported and the hits the server saw (report only)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--moz-log-dir", default=None,
+                    help="p4: the engine's input log of BOTH legs (profile_p4.INPUT_LOG) into DIR/stock/ and DIR/candidate/, one file per process")
     args = ap.parse_args(argv)
 
     import importlib

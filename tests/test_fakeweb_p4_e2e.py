@@ -36,6 +36,9 @@ LONG_LAST_STAGE_MS = 3000
 SLOW_LOAD_MS = 20000
 #: The guard of the fourth test: a wait for something that must NOT happen (`load` of a page that never loads) ends at this deadline, and the test wants it to.
 NEGATIVE_HANG_GUARD_MS = 3000
+#: The engine's own log of where a mouse event goes (profile_p4.INPUT_LOG, the same the stock leg of scripts/run_fakeweb.py keeps), kept with the
+#: evidence of the two walks (one file per process).
+INPUT_LOG = profile_p4.INPUT_LOG
 
 
 def _stock_client():
@@ -51,7 +54,7 @@ def test_the_journey_succeeds_on_every_step_and_idles_where_stock_does(firefox_b
     """When it fails it saves, under `invpw-evidence/fakeweb-journey-idles-where-stock-does/`, what answers whether the browser sent the
     request a step holds, when the site received and answered it, and what the client heard of it before `networkidle` returned:
     `fakeweb-server-record.jsonl` (the site's own record), `client-request-log.jsonl` (every request event the client heard, with the step),
-    `cells.json` (each step's record with `in_flight_at_idle_end`), `juggler-wire.jsonl` and `juggler-engine-trace/`."""
+    `cells.json` (each step's record with `in_flight_at_idle_end`), `juggler-wire.jsonl`, `juggler-engine-trace/` and `moz-log/` (INPUT_LOG)."""
     not_idle = json.loads((HERE / "pages.json").read_text(encoding="utf-8"))["journey_p4"]["not_idle_steps"]
     with FailureEvidence("fakeweb-journey-idles-where-stock-does") as evidence:
         origin_a, origin_o, stop = journey_site.start((0, 0))
@@ -59,7 +62,7 @@ def test_the_journey_succeeds_on_every_step_and_idles_where_stock_does(firefox_b
         step_log = []
         evidence.note_cells(step_log)
         try:
-            evidence.arm()
+            evidence.arm(moz_log=INPUT_LOG)
             steps = profile_p4.run_on_candidate(_stock_client(), firefox_binary, origin_a, origin_o, 1,
                                                 client_log=evidence.client_log, step_log=step_log)
         finally:
@@ -76,14 +79,14 @@ def test_the_journey_leaves_every_page_only_once_its_noise_is_done(firefox_binar
     the walk, its stylesheet `ld3` and the `release?id=lp...` that ends its fetch chain (with the page as their referrer) and the woff2 of its five @font-face rules arriving before the
     walk's next navigation (journey_site.pages_left_before_their_noise). When it fails it saves, under
     `invpw-evidence/fakeweb-journey-leaves-a-page-when-its-noise-is-done/`, `fakeweb-server-record.jsonl` (every request with its
-    referrer and the moment it arrived), `client-request-log.jsonl` and `cells.json` (each step's moments)."""
+    referrer and the moment it arrived), `client-request-log.jsonl`, `cells.json` (each step's moments) and `moz-log/` (INPUT_LOG)."""
     with FailureEvidence("fakeweb-journey-leaves-a-page-when-its-noise-is-done") as evidence:
         origin_a, origin_o, stop = journey_site.start((0, 0), last_stage_ms=LONG_LAST_STAGE_MS)
         evidence.watch_server(stop)
         step_log = []
         evidence.note_cells(step_log)
         try:
-            evidence.arm()
+            evidence.arm(moz_log=INPUT_LOG)
             steps = profile_p4.run_on_candidate(_stock_client(), firefox_binary, origin_a, origin_o, 1,
                                                 client_log=evidence.client_log, step_log=step_log)
         finally:

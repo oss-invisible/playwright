@@ -132,7 +132,7 @@ jobs:
         run: |
           PREFIX=""; [ "$RUNNER_OS" = Linux ] && PREFIX="xvfb-run -a"
           set +e
-          $PREFIX python -u scripts/run_fakeweb.py --profile p4 --binary "$FF" --repetitions 3 --out fakeweb-p4.json 2>&1 | tee fakeweb-p4.log
+          $PREFIX python -u scripts/run_fakeweb.py --profile p4 --binary "$FF" --repetitions 3 --moz-log-dir fakeweb-p4-moz-log --out fakeweb-p4.json 2>&1 | tee fakeweb-p4.log
           python scripts/fakeweb_p4_report.py journey fakeweb-p4.json > fakeweb-p4-summary.md
           rc=$?
           cat fakeweb-p4-summary.md >> "$GITHUB_STEP_SUMMARY"
@@ -172,6 +172,7 @@ jobs:
             fakeweb-*.json
             fakeweb-*.log
             fakeweb-*.md
+            fakeweb-p4-moz-log/
           if-no-files-found: warn
           retention-days: 14
 
