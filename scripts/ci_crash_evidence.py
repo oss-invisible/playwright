@@ -54,8 +54,74 @@ TAB_PREFIX = "crash.tab."
 TAB_LOST = ("cannot find session", "target closed", "targetclosederror", "session closed", "has been closed", "pipe is closed", "pipe closed", "page crashed", "tab crashed")
 STRACE_TAIL_LINES = 100
 SIGNAL_LINES = 20
-#: The gdb commands: every thread's stack, the reason MOZ_CRASH wrote, the libraries the core mapped.
-GDB_COMMANDS = ("thread apply all bt", "x/s *(char**)&gMozCrashReason", "info sharedlibrary")
+def argv_and_env_keys(word, cstring, argc, argv, environ, most=1024):
+    """The command line of a dead process and the NAMES of its environment, read from its memory: `word(address)` reads 8 bytes (little endian), `cstring(address)`
+    a NUL-ended string; `argc`/`argv` are glibc's `__libc_argc`/`__libc_argv` (the arguments main received), `environ` is libc's `environ` (the environment at the
+    end). Only the names of the variables are returned, never their values (a CI environment carries tokens). ([args], [names], what could not be read)."""
+    args, names, problems = [], [], []
+    if not 0 <= argc <= most:
+        problems.append("argc %r is not a count" % (argc,))
+        argc = 0
+    for i in range(argc):
+        try:
+            args.append(cstring(word(argv + 8 * i)))
+        except Exception as problem:
+            problems.append("argv[%d]: %s" % (i, problem))
+            break
+    at = environ
+    while at and len(names) < most:
+        try:
+            pointer = word(at)
+            if pointer == 0:
+                break
+            names.append(cstring(pointer).split("=", 1)[0])
+        except Exception as problem:
+            problems.append("environ: %s" % (problem,))
+            break
+        at += 8
+    return args, names, problems
+
+
+#: The readers gdb gives `argv_and_env_keys` (its memory of the core), and what it prints. Which process died (a parent, a background task, a content process) is in
+#: its arguments; the name of the crashing thread only says which thread. The core of run 45755178008 named a thread FSBroker7536 of a process the oracle did not launch.
+ARGV_GDB_READERS = r'''
+import gdb
+_inf = gdb.selected_inferior()
+def _word(a):
+    return int.from_bytes(bytes(_inf.read_memory(a, 8)), "little")
+def _cstring(a):
+    out = b""
+    while len(out) < 65536:
+        chunk = bytes(_inf.read_memory(a + len(out), 64))
+        if b"\0" in chunk:
+            return (out + chunk.split(b"\0", 1)[0]).decode("utf-8", "replace")
+        out += chunk
+    return out.decode("utf-8", "replace")
+def _value(expression):
+    try:
+        return int(gdb.parse_and_eval(expression))
+    except Exception as problem:
+        print("process: %s unreadable: %s" % (expression, problem))
+        return 0
+'''
+ARGV_GDB_PRINT = r'''
+_args, _names, _problems = argv_and_env_keys(_word, _cstring, _value("*(int*)&__libc_argc"), _value("(long)*(char***)&__libc_argv"),
+                                             _value("(long)*(char***)&environ"))
+print("process argv (%d): %r" % (len(_args), _args))
+print("process environment names (%d): %s" % (len(_names), " ".join(sorted(set(_names)))))
+for _p in _problems:
+    print("process: %s" % _p)
+'''
+
+
+def argv_gdb_command() -> str:
+    """The one gdb command (`python exec(...)`) that prints the dead process's arguments and the names of its environment (`argv_and_env_keys`)."""
+    import inspect
+    return "python exec(%r)" % (ARGV_GDB_READERS + inspect.getsource(argv_and_env_keys) + ARGV_GDB_PRINT,)
+
+
+#: The gdb commands: every thread's stack, the reason MOZ_CRASH wrote, the libraries the core mapped, and which process it was (its arguments).
+GDB_COMMANDS = ("thread apply all bt", "x/s *(char**)&gMozCrashReason", "info sharedlibrary", argv_gdb_command())
 GDB_LIMIT = 400_000
 CORE_LIMIT = 3
 #: The exit code of Linux processes that a signal ended is the negative of its number (Python's `Popen`).
