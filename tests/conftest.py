@@ -270,6 +270,34 @@ def _no_test_asks_the_world_where_it_leaves_from():
         pytest.fail("the question of the exit went toward the internet: " + "; ".join(asked), pytrace=False)
 
 
+def _park_the_os_cursor():
+    """Windows: the OS cursor goes where no window of the browsers below the test process covers (the bottom-right corner while none is open), read back."""
+    if sys.platform == "win32":
+        import _os_cursor
+
+        _os_cursor.park()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _the_os_cursor_is_outside_the_browser_window_of_a_module(request):
+    """A browser a module-scoped fixture starts opens its window before any test of the module runs: the cursor is parked before that, once per module that has an
+    e2e test (``tests/_os_cursor.py``; Windows only, the Linux e2e run under xvfb-run whose pointer is virtual)."""
+    if sys.platform == "win32" and any(getattr(item, "module", None) is request.module and item.get_closest_marker("e2e") is not None
+                                       for item in request.session.items):
+        _park_the_os_cursor()
+
+
+@pytest.fixture(autouse=True)
+def _the_os_cursor_is_outside_the_browser_window(request):
+    """A headed window that opens under the real cursor gets a native mouse move for it (the runner's cursor is at 512,384, inside the window), and the first
+    native move of a process passes Gecko's filter: the page sees a ``mousemove`` with ``buttons=0`` in the middle of the gesture a test records. Every e2e
+    test on Windows starts with the cursor parked outside the window the engine opens, before its browser starts. A ``headless=True`` browser runs on a desktop of
+    its own and never receives it; the parking is the same for it and costs one system call. The gestures that record pointer events then call
+    ``_os_cursor.require_outside()`` at their start."""
+    if request.node.get_closest_marker("e2e") is not None:
+        _park_the_os_cursor()
+
+
 @pytest.fixture
 def lab_exit(monkeypatch, tmp_path):
     """The exit of the lab and its GeoIP database, declared for one test that is not e2e (``tests/_lab_egress.py``, as the e2e have it).
