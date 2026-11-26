@@ -1,0 +1,34 @@
+# A one-job question for the e2e arrangement: can a GitHub Windows runner's screen be made larger than the browser window the e2e open
+# (1936x1048 for a 1920x1080 identity), so that the OS cursor can be parked outside it? The runner's screen is 1024x768 by default.
+# It runs on a push to its own branch only and is green whatever it finds; the log is the answer.
+name: runner resolution hunt
+on:
+  push:
+    branches: [hunt/runner-resolution]
+permissions:
+  contents: read
+concurrency:
+  group: runner-resolution-hunt-${{ github.run_id }}
+jobs:
+  resolution:
+    name: resolution (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        image: [windows-2022, windows-latest]
+    steps:
+      - name: Before, the modes, and each requested resolution read back
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          function Show($label) { $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; $p = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "${label}: virtual $($b.Width)x$($b.Height) at $($b.X),$($b.Y); primary $($p.Width)x$($p.Height)" }
+          Show "before"
+          Get-Command Set-DisplayResolution -ErrorAction SilentlyContinue | Format-List Name, Source, Version
+          Get-CimInstance Win32_VideoController | Format-List Name, CurrentHorizontalResolution, CurrentVerticalResolution, VideoModeDescription
+          foreach ($r in @(@(2560,1440), @(1920,1080), @(2560,1600), @(3840,2160))) {
+            try { Set-DisplayResolution -Width $r[0] -Height $r[1] -Force -ErrorAction Stop; Start-Sleep -Seconds 2; Show "after $($r[0])x$($r[1])" }
+            catch { "set $($r[0])x$($r[1]) failed: $($_.Exception.Message)" }
+          }
