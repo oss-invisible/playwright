@@ -36,12 +36,9 @@ LONG_LAST_STAGE_MS = 3000
 SLOW_LOAD_MS = 20000
 #: The guard of the fourth test: a wait for something that must NOT happen (`load` of a page that never loads) ends at this deadline, and the test wants it to.
 NEGATIVE_HANG_GUARD_MS = 3000
-#: The engine's own log of where a mouse event goes, kept with the evidence of the two walks (one file per process): ``apz.inputqueue`` and
-#: ``apz.child`` say whether the event left the parent for the content process and how the content process took it, ``MouseBoundaryEvents``
-#: says whether the content process turned it into the page's mouse events. Run 45668588036 lost the first mousemove to a page whose
-#: BrowsingContext had just been replaced (no ack in 5 s, the content process alive), and its evidence could not say where the event died.
-#: A diagnostic no page reads.
-INPUT_LOG = "timestamp,apz.inputqueue:4,apz.child:4,MouseBoundaryEvents:4"
+#: The engine's own log of where a mouse event goes (profile_p4.INPUT_LOG, the same the stock leg of scripts/run_fakeweb.py keeps), kept with the
+#: evidence of the two walks (one file per process).
+INPUT_LOG = profile_p4.INPUT_LOG
 
 
 def _stock_client():

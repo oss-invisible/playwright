@@ -6,6 +6,7 @@ resource type than `beacon` is red. With a traced stock walk the trace verdict i
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -620,3 +621,20 @@ def test_the_workflow_starts_on_the_fake_web_files_of_a_pull_request_and_of_main
     on = WORKFLOW.split("\npermissions:", 1)[0]
     assert "  push:\n    branches: [main]\n    paths:" in on and "  pull_request:\n    paths:" in on and "  workflow_dispatch:" in on
     assert on.count("'tests/fakeweb/**'") == 2 and on.count("'.github/workflows/fakeweb.yml'") == 2
+
+
+def test_both_legs_of_the_journey_keep_the_same_input_log_and_the_environment_is_put_back(tmp_path, monkeypatch):
+    """Run 45668588036 lost a mousemove on ours only in the record: with --moz-log-dir both legs log profile_p4.INPUT_LOG, stock into stock/ and ours into
+    candidate/, one file per process, and the variables are as they were once the browser of a leg is launched. The journey step of the workflow passes it."""
+    from fakeweb import profile_p4
+
+    monkeypatch.setenv("MOZ_LOG", "before")
+    monkeypatch.delenv("MOZ_LOG_FILE", raising=False)
+    for leg in ("stock", "candidate"):
+        with profile_p4._input_log(tmp_path, leg) as folder:
+            assert os.environ["MOZ_LOG"] == profile_p4.INPUT_LOG
+            assert os.environ["MOZ_LOG_FILE"] == os.path.join(str(tmp_path), leg, "engine%PID") and Path(folder).is_dir()
+        assert os.environ["MOZ_LOG"] == "before" and "MOZ_LOG_FILE" not in os.environ
+    with profile_p4._input_log(None, "stock") as folder:
+        assert folder is None and os.environ["MOZ_LOG"] == "before"
+    assert "--moz-log-dir fakeweb-p4-moz-log" in WORKFLOW and "fakeweb-p4-moz-log/" in WORKFLOW
