@@ -235,19 +235,29 @@ def test_the_gateway_marks_a_deallocation_from_its_payload_and_the_mark_alone_ta
     assert [e["deallocation"] for e in events] == [False, True, True], "marked by meaning, whoever the datagram is for (the walk counts only the TURN address's)"
 
 
-def test_a_deallocation_before_the_page_began_closing_is_a_problem_and_one_after_it_is_not():
-    """The page's own times on the recorder's clock: the call of the page plus (closing - start) of its performance.now() is the moment it began closing (``closing_began``)."""
+def test_a_deallocation_before_the_page_began_closing_is_evidence_and_never_a_problem():
+    """The page's own times on the recorder's clock (the call of the page plus (closing - start) of its performance.now()) give ``early``. It stays in the facts as evidence, and is no problem:
+    the page's clock is the engine's reduced-precision timer, and on Windows the published engine against itself came out "early" (wrapper #612's round), so it cannot order the two events."""
     def at_page(lab, clients, stage):
         if stage == "page":
             clients.append(Client(lab).send(signed_allocate(ALLOCATE), "stun-0x0003"))
-            clients[0].send(signed_refresh(REFRESH_A, 0), "stun-0x0004")        # the deallocation comes while the page is still open
+            clients[0].send(signed_refresh(REFRESH_A, 0), "stun-0x0004")        # the deallocation comes, by the page's clock, while the page is still open
     before, _ = walk("b", at_page, times={"start": 100.0, "closing": 100.0 + 600000.0})        # the page closes ten minutes after the call
     assert before["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0, "early": 1}
     report = ab.compare_transcripts(before, before, [], 0, "a", "b")
-    assert report["differences"] == [] and len(report["problems"]) == 2 and all(p.endswith(RULE) for p in report["problems"])
-    assert all("reached the lab TURN before the page began closing its connection. Fix: " in p for p in report["problems"])
+    assert report["differences"] == [] and report["problems"] == []
 
-    after, _ = walk("b", allocation_then((REFRESH_A, 0)), times={"start": 100.0, "closing": 100.0})          # closing at the start: the call itself is the bound
+    after, _ = walk("b", allocation_then((REFRESH_A, 0)), times={"start": 100.0, "closing": 100.0})
     assert after["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0, "early": 0}
     assert ab.compare_transcripts(after, after, [], 0, "a", "b")["problems"] == []
     assert ab.closing_began(5.0, {"start": 250.0, "closing": 1750.0}) == 6.5 and ab.closing_began(5.0, None) is None and ab.closing_began(5.0, {"start": 1.0}) is None
+
+
+def test_the_recorded_windows_case_of_the_published_engine_against_itself_is_no_problem():
+    """Wrapper #612's round, e2e (network, windows): seeds 63 (firefox-68) and 6 (firefox-68-again) each had one deallocation "before the page began closing" by the page's clock."""
+    def side(seed):
+        return {"seeds": {seed: {"webrtc": {"turn": {"deallocation": {"repeated": 0, "unallocated": 0, "early": 1}}}}}}
+    assert ab.turn_deallocation_problems(side("63"), "firefox-68") == []
+    assert ab.turn_deallocation_problems(side("6"), "firefox-68-again") == []
+    still = {"seeds": {"6": {"webrtc": {"turn": {"deallocation": {"repeated": 1, "unallocated": 1, "early": 1}}}}}}
+    assert len(ab.turn_deallocation_problems(still, "firefox-68")) == 2
