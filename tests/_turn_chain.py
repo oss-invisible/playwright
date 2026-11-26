@@ -136,7 +136,10 @@ class TurnServer:
     """UDP TURN server on 127.0.0.1. ``seen`` is every datagram as (source ip, source port, STUN type), in order;
     ``requests`` the same datagrams as (monotonic time, transaction id, STUN type, carries credentials): a retransmission has the
     transaction id of the request it repeats, so the TRANSACTIONS of a road are the distinct ids (:meth:`transactions`);
-    ``allocations`` the successful Allocates as (source ip, source port, username, time).
+    ``allocations`` the successful Allocates as (source ip, source port, username, time); ``deallocations`` the requests that END an allocation as (source ip, source
+    port, transaction id, time, index in ``allocations`` of the allocation they end, or None when that source has none): a deallocation is recognised by what it means, a
+    Refresh (0x0004) whose LIFETIME (0x000D) is 0 (RFC 5766 section 7.1), not by its type: a Refresh with a lifetime above 0 keeps the allocation and is not one. The server
+    answers it as it answers any Refresh; a retransmission is another datagram of the same transaction (:meth:`deallocation_transactions`).
 
     A request that carries USERNAME is checked: its MESSAGE-INTEGRITY must be the HMAC under the long-term key of that user (``PASSWORD``).
     A missing or wrong one is answered 401 with the realm and the nonce, makes no allocation, and is written in ``refused`` as
@@ -149,6 +152,7 @@ class TurnServer:
         self.seen: List[Tuple[str, int, int]] = []
         self.allocations: List[Tuple[str, int, str, float]] = []
         self.requests: List[Tuple[float, bytes, int, bool]] = []
+        self.deallocations: List[Tuple[str, int, bytes, float, Optional[int]]] = []
         self.refused: List[Tuple[str, int, str, bytes, float]] = []
         self._closed = False
         threading.Thread(target=self._serve, daemon=True).start()
@@ -160,6 +164,17 @@ class TurnServer:
             if request[2] == mtype:
                 first.setdefault(request[1], request)
         return sorted(first.values(), key=lambda r: r[0])
+
+    def deallocation_transactions(self) -> List[Tuple[str, int, bytes, float, Optional[int]]]:
+        """The first datagram of each deallocation transaction, in order: a retransmission of it is not another deallocation."""
+        first: Dict[bytes, Tuple[str, int, bytes, float, Optional[int]]] = {}
+        for record in list(self.deallocations):
+            first.setdefault(record[2], record)
+        return sorted(first.values(), key=lambda r: r[3])
+
+    def deallocation_tids(self) -> set:
+        """The transaction ids (bytes) of every deallocation received: what ties its datagrams on the wire to the server's record of it."""
+        return {record[2] for record in list(self.deallocations)}
 
     def close(self) -> None:
         self._closed = True
@@ -177,6 +192,10 @@ class TurnServer:
             self.seen.append((src[0], src[1], mtype))
             attrs = _attrs(data)
             self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
+            lifetime = attrs.get(0x000D)
+            if mtype == 0x0004 and lifetime is not None and len(lifetime) == 4 and struct.unpack("!I", lifetime)[0] == 0:
+                held = [i for i, a in enumerate(self.allocations) if a[:2] == (src[0], src[1])]
+                self.deallocations.append((src[0], src[1], tid, time.monotonic(), held[-1] if held else None))
             user_raw = attrs.get(0x0006)
             if mtype in (0x0003, 0x0004, 0x0008, 0x0009) and user_raw is not None:
                 user = user_raw.decode(errors="replace")

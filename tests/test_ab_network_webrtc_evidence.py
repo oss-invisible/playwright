@@ -104,7 +104,7 @@ def test_the_evidence_of_the_walk_lists_every_datagram_with_its_time_target_mess
     page = {"start": 1.0, "offer": 2.0, "candidates": [{"t": 3.0, "type": "host"}], "errors": [{"t": 4.0, "code": 701, "url": "turn:x"}], "gathered": 5.0, "closing": 6.0, "closed": 6.5}
     evidence = ab.webrtc_evidence(lab_with(rec, counted=counted, evaluate={"called": 0.5, "returned": 7.0}, page=page))
     json.dumps(evidence)
-    assert set(evidence) == {"phase_t", "evaluate", "page", "datagrams", "turn", "returned", "send_errors"}
+    assert set(evidence) == {"phase_t", "evaluate", "page", "datagrams", "turn", "returned", "send_errors", "deallocation"}
     assert evidence["page"] == page and evidence["evaluate"] == {"called": 0.5, "returned": 7.0}
     assert set(evidence["phase_t"]) == {"webrtc", "webrtc.end"} and evidence["phase_t"]["webrtc"] <= evidence["phase_t"]["webrtc.end"]
     datagrams = evidence["datagrams"]
@@ -120,7 +120,7 @@ def test_the_evidence_of_the_walk_leaves_out_the_datagrams_of_other_stages_and_s
     rec.set_phase("h3")
     rec.event("udp", target="127.0.0.1:1", message="quic-long", tid=None, opener=None)
     empty = ab.webrtc_evidence(lab_with(rec))
-    assert empty == {"phase_t": {"webrtc": None, "webrtc.end": None}, "evaluate": None, "page": None, "datagrams": [], "turn": [], "returned": [], "send_errors": []}
+    assert empty == {"phase_t": {"webrtc": None, "webrtc.end": None}, "evaluate": None, "page": None, "datagrams": [], "turn": [], "returned": [], "send_errors": [], "deallocation": {"seen": False, "records": []}}
 
 
 def evidence_transcript(label, datagrams):

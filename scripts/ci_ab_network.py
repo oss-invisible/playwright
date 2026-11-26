@@ -322,6 +322,25 @@ def turn_path_problems(transcript: Dict[str, Any], label: str) -> List[str]:
     return out
 
 
+def turn_deallocation_problems(transcript: Dict[str, Any], label: str) -> List[str]:
+    """What the lab's TURN server heard of deallocations (``webrtc/turn/deallocation``, written by ``walk_webrtc`` with :func:`deallocation_facts`) that a walk must not have: an allocation ended
+    by more than one deallocation, a deallocation from an address that has no allocation. One deallocation, or none, is the engine's best effort at teardown and is evidence, not a leaf."""
+    out: List[str] = []
+    for seed, body in sorted((transcript.get("seeds") or {}).items()):
+        walk = body.get("webrtc")
+        facts = ((walk or {}).get("turn") or {}).get("deallocation") if isinstance(walk, dict) else None
+        if not isinstance(facts, dict):
+            continue
+        for key, what, fix in (("repeated", "%d allocation(s) of the lab TURN were ended by more than one deallocation (a Refresh with LIFETIME 0)",
+                                "find what sends the teardown twice; the engine sends it once"),
+                               ("unallocated", "the lab TURN heard %d deallocation(s) (a Refresh with LIFETIME 0) from an address that has no allocation",
+                                "find what deallocates an allocation it never made; the lab's record is TurnServer.deallocations in tests/_turn_chain.py")):
+            if facts.get(key):
+                out.append("seeds/%s/webrtc: %s: %s. Fix: %s. Rule: the TURN deallocation is one best-effort send at teardown (nICEr nr_turn_client_deallocate)"
+                           % (seed, label, what % facts[key], fix))
+    return out
+
+
 def exit_lines(transcript: Dict[str, Any], label: str, side: str) -> List[str]:
     """The red lines of the launches of one side that did not end with 0 (``exits``, which ``run`` writes: scripts/ci_crash_evidence.py). A transcript that has no ``exits``
     was not made by ``run`` and says nothing about it; one that has it and no launch in it is a run whose probe saw no browser, which is red."""
@@ -342,8 +361,9 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     la, lb = flatten(a.get("seeds") or {}), flatten(b.get("seeds") or {})
     attribution, attribution_differences, unattributed = _udp_attribution(la, lb)
     overrun_paths, overruns = _udp_overruns(la, lb, label_a, label_b)
-    turn_problems = turn_path_problems(a, label_a) + turn_path_problems(b, label_b)
-    refused_paths = {p for p in set(la) | set(lb) if re.match(r"^seeds/[^/]+/webrtc/turn/refused$", p)}
+    turn_problems = (turn_path_problems(a, label_a) + turn_path_problems(b, label_b) +
+                     turn_deallocation_problems(a, label_a) + turn_deallocation_problems(b, label_b))
+    refused_paths = {p for p in set(la) | set(lb) if re.match(r"^seeds/[^/]+/webrtc/turn/(refused|deallocation/(repeated|unallocated))$", p)}
     paths = sorted((set(la) | set(lb)) - attribution - overrun_paths - refused_paths)
     problems: List[str] = []
     if set(a.get("seeds") or {}) != set(b.get("seeds") or {}):
@@ -986,6 +1006,7 @@ def make_lab_classes() -> Tuple[type, type, type]:
             self.seen: list = []
             self.allocations: list = []
             self.requests: list = []
+            self.deallocations: list = []
             self.refused: list = []
             self._closed = False
             threading.Thread(target=self._serve, daemon=True).start()
@@ -1283,9 +1304,10 @@ def guarded(fn: Callable[[], Any]) -> Any:
         return {"error": _first_line(exc)}
 
 
-def phase_data(lab: Lab, phase: str, skip_connects: Callable[[str], bool] = lambda target: False) -> Dict[str, Any]:
+def phase_data(lab: Lab, phase: str, skip_connects: Callable[[str], bool] = lambda target: False,
+               skip_udp: Callable[[Dict[str, Any]], bool] = lambda event: False) -> Dict[str, Any]:
     """What the lab saw in a stage and the stages under it: the CONNECTs, the DoH questions, the datagrams, the HTTP requests of the tees. Where the lab looked who opened an entry
-    (``Lab(attribute_in=...)``), each summary says so: ``openers``. ``skip_connects`` leaves out the CONNECTs it is true of."""
+    (``Lab(attribute_in=...)``), each summary says so: ``openers``. ``skip_connects`` leaves out the CONNECTs it is true of, ``skip_udp`` the datagrams (events) it is true of."""
     queries = [(q.name, q.qtype, q.via) for q in lab.rec.slice("doh", phase)]
     gateway = getattr(lab, "gateway", None)
     attributing = bool(gateway is not None and gateway.attribute_in)
@@ -1293,7 +1315,7 @@ def phase_data(lab: Lab, phase: str, skip_connects: Callable[[str], bool] = lamb
     connects = [e for e in lab.rec.of(phase, "connect") if not skip_connects(e["target"])]
     return {"connects": connect_summary([e["target"] for e in connects], lab.norm, [e.get("opener") for e in connects]),
             "dns": dns_summary(queries, [gateway.opener_of_connection(i) for i in asked_on] if attributing else None),
-            "udp": udp_summary(lab.rec.of(phase, "udp"), lab.norm), "requests": request_summary(lab.rec.of(phase, "http"), lab.norm)}
+            "udp": udp_summary([e for e in lab.rec.of(phase, "udp") if not skip_udp(e)], lab.norm), "requests": request_summary(lab.rec.of(phase, "http"), lab.norm)}
 
 
 def launch_data(lab: Lab) -> Dict[str, Any]:
@@ -1623,13 +1645,30 @@ def walk_webrtc(browser: Any, lab: Lab) -> Dict[str, Any]:
     lab.rec.set_phase("webrtc.end")
     # What the page measured of itself goes to the evidence and to nothing that is compared: ``webrtc_summary`` reads the fields it always read.
     lab.webrtc["page"] = result.pop("times", None)
-    data = phase_data(lab, "webrtc")
+    # The TURN deallocation (a Refresh with LIFETIME 0) is one best-effort send at teardown (nICEr nr_turn_client_deallocate): it reaches the lab in some walks and not in others for the
+    # same engine, so it is evidence (``webrtc_evidence``) and no leaf: out of the messages, out of the transaction count of the TURN address. It is told by the transaction id the
+    # lab's TURN server wrote for it, never by when it came.
+    ended = {tid.hex() for tid in lab.turn.deallocation_tids()}
+    data = phase_data(lab, "webrtc", skip_udp=lambda event: event["target"] == TURN_TARGET and event.get("tid") in ended)
     lab.webrtc["counted"] = len(lab.rec.of("webrtc", "udp"))
     out = webrtc_summary(result, lab.exit_ip)
     out.update(connects=data["connects"], dns=data["dns"], udp=data["udp"],
-               turn={"messages": sorted({"0x%04x" % t for _ip, _port, t in lab.turn.seen}), "allocated": bool(lab.turn.allocations),
-                     "refused": len(lab.turn.refused)})
+               turn={"messages": sorted({"0x%04x" % t for _when, tid, t, _credentials in lab.turn.requests if tid.hex() not in ended}), "allocated": bool(lab.turn.allocations),
+                     "refused": len(lab.turn.refused), "deallocation": deallocation_facts(lab.turn)})
     return lab.norm.walk(out)
+
+
+def deallocation_facts(turn: Any) -> Dict[str, int]:
+    """What the lab's TURN server heard of deallocations that a walk must not have: ``repeated`` allocations that were ended by more than one transaction, and ``unallocated``
+    deallocations from an address that has no allocation. Both are 0 in a healthy walk; ``turn_deallocation_problems`` says it when they are not, and they are never compared."""
+    ends: collections.Counter = collections.Counter()
+    unallocated = 0
+    for _ip, _port, _tid, _t, allocation in turn.deallocation_transactions():
+        if allocation is None:
+            unallocated += 1
+        else:
+            ends[allocation] += 1
+    return {"repeated": sum(1 for n in ends.values() if n > 1), "unallocated": unallocated}
 
 
 def webrtc_evidence(lab: Lab) -> Dict[str, Any]:
@@ -1646,8 +1685,14 @@ def webrtc_evidence(lab: Lab) -> Dict[str, Any]:
     # The lab's TURN server: each request with what it carried and what it answered; the relay's datagrams back to the browser: the address each claims and the 5-tuple it goes to.
     exchanges = [e for e in getattr(getattr(lab, "turn", None), "exchanges", None) or [] if began is None or e["t"] >= began]
     returned = [{"t": e["t"], "phase": e["phase"], "claimed": e["claimed"], "to": e["to"], "relay": e["relay"], "message": e["message"], "tid": e.get("tid")} for e in lab.rec.of("webrtc", "udp_back")]
+    # The deallocation (a Refresh with LIFETIME 0, sent once at teardown): whether the lab's TURN server heard it, and for each transaction when (the recorder's clock, from the exchange of
+    # the same transaction id) and which. It is no leaf: the walk leaves it out of what it compares.
+    heard = getattr(getattr(lab, "turn", None), "deallocation_transactions", None)
+    when = {e["tid"]: e["t"] for e in reversed(exchanges)}
+    records = [{"t": when.get(tid.hex()), "tid": tid.hex(), "src": "%s:%d" % (ip, port), "allocation": allocation} for ip, port, tid, _t, allocation in (heard() if heard else [])]
     return {"phase_t": {name: lab.rec.phase_t.get(name) for name in ("webrtc", "webrtc.end")}, "evaluate": info.get("evaluate"), "page": info.get("page"), "datagrams": datagrams,
-            "turn": exchanges, "returned": returned, "send_errors": list(getattr(getattr(lab, "gateway", None), "send_errors", None) or [])}
+            "turn": exchanges, "returned": returned, "send_errors": list(getattr(getattr(lab, "gateway", None), "send_errors", None) or []),
+            "deallocation": {"seen": bool(records), "records": records}}
 
 
 def direct_report(lab: Lab, watcher: Any, trap: Any) -> Dict[str, Any]:
