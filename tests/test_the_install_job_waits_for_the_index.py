@@ -52,61 +52,75 @@ os.replace(tmp, p)
 # the clock moves only by what the script sleeps and by what a call is said to cost, never by the real time a call took. How many rounds the
 # wait makes is then decided by the answers of the installers and by its own arithmetic, whatever the load of the machine running the test.
 # A call is free in fake time; one that hangs (exit code HUNG) costs the whole limit it was given, as a real one would. `subprocess` is imported
-# before the clock is replaced, so its own timeouts stay on the real one.
+# before the clock is replaced, so its own timeouts stay on the real one - but not its `time.sleep`: on POSIX `Popen.wait(timeout)` (which `run` ends
+# with) polls `waitpid` in a loop that sleeps through the MODULE attribute `time.sleep`, up to 0.05 s a turn. A child that has closed its pipes and is not
+# yet reaped (an interpreter shutting down on a busy machine) made that loop spin with the fake sleep, each turn adding up to 0.05 s of fake time at no
+# real cost: 60 turns passed the 3 s of INDEX_WAIT_SECONDS after one all-yes round ("1 of 3 rounds in a row ()" on the Linux job of #612). So the real
+# `run` executes with the real clock back in place, and the fake one is put back when it returns.
 _HUNG = 99
 _FAKE_CLOCK = """
 import subprocess, time
 _now = [1000.0]
 _run = subprocess.run
+_real_monotonic = time.monotonic
+_real_sleep = time.sleep
+
+
+def _fake_sleep(seconds):
+    _now[0] += seconds
 
 
 def _run_in_fake_time(*args, **kwargs):
-    done = _run(*args, **dict(kwargs, timeout=60))
+    time.monotonic, time.sleep = _real_monotonic, _real_sleep
+    try:
+        done = _run(*args, **dict(kwargs, timeout=60))
+    finally:
+        time.monotonic, time.sleep = lambda: _now[0], _fake_sleep
     if done.returncode == %d:
         _now[0] += kwargs["timeout"]
         raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
     return done
 
 
-def _sleep(seconds):
-    _now[0] += seconds
-
-
 subprocess.run = _run_in_fake_time
 time.monotonic = lambda: _now[0]
-time.sleep = _sleep
+time.sleep = _fake_sleep
 """ % _HUNG
 
 
-def _tool(tmp_path, name, plan, load=0.0):
+def _tool(tmp_path, name, plan, load=0.0, linger=0.0):
     """A regular package `name` on the shim path whose `__main__` answers call number i as plan[i] says (the last letter repeats):
     y = resolves it, n = no such version, h = does not answer (exits with HUNG, which the fake clock below turns into a call that outlived its limit).
-    It counts its calls in `<name>-calls`. `load` is real time every call spends before it answers: what a machine busy with other work takes."""
+    It counts its calls in `<name>-calls`. `load` is real time every call spends before it answers: what a machine busy with other work takes.
+    `linger` is real time it spends AFTER it answered and closed its pipes, before it exits: a child that is not yet reaped (the window a busy machine opens)."""
     shim = tmp_path / "shim" / name
     shim.mkdir(parents=True)
     (shim / "__init__.py").write_text("", encoding="utf-8")   # a REGULAR package: a namespace one loses to the real one of the environment
     (shim / "__main__.py").write_text(_COUNT_CALL % str(tmp_path / (name + "-calls")) + textwrap.dedent("""
-        import sys, time
+        import os, sys, time
         sys.stdin.read() if %r == "uv" else None
         plan = %r
         what = plan[min(n, len(plan) - 1)]
         time.sleep(%r)
-        if what == "h":
-            sys.exit(%d)
-        if what == "y":
-            sys.exit(0)
-        sys.stderr.write("ERROR: No matching distribution found for invisible-playwright==9.9.9" + chr(10))
-        sys.exit(1)
-    """) % (name, plan, load, _HUNG), encoding="utf-8")
+        code = %d if what == "h" else 0 if what == "y" else 1
+        if what == "n":
+            sys.stderr.write("ERROR: No matching distribution found for invisible-playwright==9.9.9" + chr(10))
+        if %r:
+            sys.stdout.flush(); sys.stderr.flush()
+            os.close(1); os.close(2)
+            time.sleep(%r)
+            os._exit(code)
+        sys.exit(code)
+    """) % (name, plan, load, _HUNG, linger, linger), encoding="utf-8")
 
 
-def _run_the_wait(tmp_path, pip="y", uv="y", *, seconds=3.0, poll=0.05, call_seconds=None, load=0.0):
+def _run_the_wait(tmp_path, pip="y", uv="y", *, seconds=3.0, poll=0.05, call_seconds=None, load=0.0, linger=0.0):
     """Run the script of the step in a project named ``invisible-playwright`` 9.9.9, with a ``pip`` and a ``uv`` that answer as their plans say.
     Returns (completed process, pip calls, uv calls)."""
     # The tree declares 0.99.0 and the ledger pull request records 9.9.9 (what the step before the wait computes): the wait is about the latter.
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "invisible-playwright"\nversion = "0.99.0"\n', encoding="utf-8")
-    _tool(tmp_path, "pip", pip, load)
-    _tool(tmp_path, "uv", uv, load)
+    _tool(tmp_path, "pip", pip, load, linger)
+    _tool(tmp_path, "uv", uv, load, linger)
     env = dict(os.environ, PYTHONPATH=str(tmp_path / "shim"), INDEX_WAIT_SECONDS=str(seconds), INDEX_WAIT_POLL=str(poll), INVPW_E2E_VERSION="9.9.9")
     if call_seconds is not None:
         env["INDEX_WAIT_CALL_SECONDS"] = str(call_seconds)
@@ -146,6 +160,41 @@ def test_calls_that_take_long_on_a_busy_machine_do_not_cut_the_rounds_short(tmp_
     r, pip_calls, uv_calls = _run_the_wait(tmp_path, pip="y", uv="nyyy", seconds=1.0, load=0.3)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (pip_calls, uv_calls) == (4, 4), "pip %d, uv %d" % (pip_calls, uv_calls)
+
+
+def test_a_call_that_is_slow_to_exit_after_it_answered_does_not_move_the_fake_clock(tmp_path):
+    """The red of #612 (1 of 3 rounds, empty reason, 3 s of fake time gone after one all-yes round): the fake clock moved while the REAL `subprocess.run`
+    ran, because on POSIX `Popen.wait(timeout)` sleeps through `time.sleep` (0.05 s a turn, a busy loop) while a child that closed its pipes is not yet
+    reaped. Here `communicate` does what that loop does (a thousand turns of 0.05 s) on every OS; a sleep of the script itself, outside the call, still counts."""
+    script = textwrap.dedent("""
+        import subprocess, sys, time
+        _communicate = subprocess.Popen.communicate
+
+
+        def _then_the_turns_of_the_wait_loop(self, *args, **kwargs):
+            out = _communicate(self, *args, **kwargs)
+            for _ in range(1000):
+                time.sleep(0.05)
+            return out
+
+
+        subprocess.Popen.communicate = _then_the_turns_of_the_wait_loop
+        before = _now[0]
+        subprocess.run([sys.executable, "-c", "pass"], capture_output=True, text=True)
+        inside = _now[0] - before
+        time.sleep(1.0)
+        print("inside=%r after_own_sleep=%r" % (inside, _now[0] - before))
+    """)
+    r = subprocess.run([sys.executable, "-c", _FAKE_CLOCK + script], cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip() == "inside=0.0 after_own_sleep=1.0", r.stdout + r.stderr
+
+
+def test_children_not_yet_reaped_when_their_pipes_close_do_not_cut_the_rounds_short(tmp_path):
+    """The same cause through the real `Popen._wait` (POSIX): each call closes its pipes and exits 0.3 s later, 6 calls against 3 s of fake time."""
+    r, pip_calls, uv_calls = _run_the_wait(tmp_path, linger=0.3)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (pip_calls, uv_calls) == (3, 3), "pip %d, uv %d" % (pip_calls, uv_calls)
 
 
 def test_the_wait_ends_in_an_error_that_names_the_missing_version_when_the_index_never_has_it(tmp_path):
