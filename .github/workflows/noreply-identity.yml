@@ -9,4 +9,4 @@ permissions:
   contents: read
 jobs:
   noreply-identity:
-    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@6d048ac02fc886a50791a4ae0423cbca2a547d72 # core main, the last change of noreply-identity.yml
+    uses: oss-invisible/core/.github/workflows/noreply-identity.yml@1baf9479b288a2563010945ca9233c8b1db91202 # core main, the last change of noreply-identity.yml
