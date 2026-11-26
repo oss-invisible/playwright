@@ -656,6 +656,10 @@ jobs:
     runs-on: windows-2022
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
     timeout-minutes: 50
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     defaults:
       run:
         shell: bash
@@ -849,6 +853,10 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     defaults:
       run:
         shell: bash
@@ -1089,6 +1097,10 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     defaults:
       run:
         shell: bash
@@ -1289,6 +1301,10 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: windows-2022
     timeout-minutes: 40
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     strategy:
       fail-fast: false
       matrix:
