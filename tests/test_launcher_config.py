@@ -9,6 +9,7 @@ from invisible_core import generate_profile
 # turned unused in there and were removed. An import is not unused merely
 # because the file holding it does not use it - another module can be reaching
 # a name THROUGH it, and no single-file analysis can see that.
+from invisible_core import constants as _constants
 from invisible_core.constants import (TASKBAR_PX as _TASKBAR_H,
                                       WINDOW_FRAME_BY_DPR as _FRAMES)
 from invisible_playwright.launcher import InvisiblePlaywright
@@ -31,7 +32,10 @@ def test_chrome_offsets_are_positive_ints():
     """
     assert _TASKBAR_H > 0
     for frame in _FRAMES.values():
-        assert frame.border >= 0 and frame.maximized_ui > 0 and frame.popup_ui > 0
+        # the bar: from the panel via declared_maximized_ui (core with ui_normal/ui_compact), the frame's field on the older pinned core
+        bar = (_constants.declared_maximized_ui(frame, 1000) if hasattr(_constants, "declared_maximized_ui")
+               else frame.maximized_ui)
+        assert frame.border >= 0 and bar > 0 and frame.popup_ui > 0
 
     for seed in range(40):
         p = generate_profile(seed)
@@ -174,7 +178,7 @@ def no_geo_lookup(monkeypatch):
 
 
 @pytest.mark.unit
-def test_enter_with_profile_dir_calls_launch_persistent_context(tmp_path, monkeypatch, no_geo_lookup):
+def test_enter_with_profile_dir_calls_launch_persistent_context(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """When profile_dir is set, __enter__ must call
     `firefox.launch_persistent_context(user_data_dir=...)` and NOT
     `firefox.launch(...)`. This is the structural test that the persistent
@@ -217,7 +221,7 @@ def test_enter_with_profile_dir_calls_launch_persistent_context(tmp_path, monkey
 
 
 @pytest.mark.unit
-def test_enter_without_profile_dir_calls_launch_not_persistent(tmp_path, monkeypatch, no_geo_lookup):
+def test_enter_without_profile_dir_calls_launch_not_persistent(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """Default path: profile_dir=None → firefox.launch, not
     launch_persistent_context. Sentinel that the non-persistent flow
     isn't accidentally rerouted."""
@@ -246,7 +250,7 @@ def test_enter_without_profile_dir_calls_launch_not_persistent(tmp_path, monkeyp
 
 
 @pytest.mark.unit
-def test_persistent_context_user_data_dir_is_created_if_missing(tmp_path, monkeypatch, no_geo_lookup):
+def test_persistent_context_user_data_dir_is_created_if_missing(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """First-run scenario: the directory the user names doesn't exist yet.
     __enter__ must mkdir -p it (Playwright won't, and would crash with
     'user_data_dir does not exist')."""
@@ -269,7 +273,7 @@ def test_persistent_context_user_data_dir_is_created_if_missing(tmp_path, monkey
 
 
 @pytest.mark.unit
-def test_teardown_closes_persistent_context(tmp_path, monkeypatch, no_geo_lookup):
+def test_teardown_closes_persistent_context(tmp_path, monkeypatch, no_geo_lookup, declared_engine):
     """The teardown must close the persistent context. Forgetting this
     leaves Firefox + Playwright running until the parent process exits,
     which on long-running tools (job orchestrators, MCP servers) leaks

@@ -164,3 +164,41 @@ def test_an_excluded_pref_that_stopped_varying_is_an_error(monkeypatch):
     with pytest.raises(SystemExit) as e:
         pc.compute(50, workers=1)
     assert "no longer vary" in str(e.value)
+
+
+def test_a_derived_pref_with_two_values_within_one_value_of_its_dimension_is_an_error():
+    pref = "zoom.stealth.screen.ui_normal"  # of the dpr
+    rows = {
+        1: {"dpr": "d1", "_derived": {p: "1" for p in pc.DERIVED}},
+        2: {"dpr": "d1", "_derived": {p: "1" for p in pc.DERIVED}},
+        3: {"dpr": "d2", "_derived": {p: "2" for p in pc.DERIVED}},
+    }
+    rows = {seed: dict(f, screen_panel="panel-" + f["dpr"]) for seed, f in rows.items()}
+    pc.check_derived(rows)  # a function of the dimension: fine
+    rows[2]["_derived"][pref] = "9"  # the same dpr, another bar
+    with pytest.raises(SystemExit) as e:
+        pc.check_derived(rows)
+    assert pref in str(e.value) and "not a function of the dimension dpr" in str(e.value)
+
+
+def test_a_derived_pref_the_core_does_not_emit_is_accepted():
+    rows = {s: {"dpr": "d%d" % (s % 2), "screen_panel": "p%d" % s, "_derived": {p: "<absent>" for p in pc.DERIVED}}
+            for s in range(6)}
+    pc.check_derived(rows)  # a core that predates the pref: no seed has it
+    rows[3]["_derived"]["zoom.stealth.screen.ui_compact"] = "73"  # a core that emits it for some seeds only varies
+    with pytest.raises(SystemExit):
+        pc.check_derived(rows)
+
+
+def test_a_derived_pref_is_in_no_dimension_and_names_a_dimension():
+    in_a_dimension = {k for keys in pc.DIMENSIONS.values() for k in keys}
+    assert not set(pc.DERIVED) & in_a_dimension
+    assert not set(pc.DERIVED) & set(pc.EXCLUDED)
+    assert set(pc.DERIVED.values()) <= set(pc.DIMENSIONS)
+    assert pc.DERIVED["zoom.stealth.screen.maximized_ui"] == "screen_panel"
+
+
+def test_the_derived_prefs_of_the_core_in_use_are_functions_of_their_dimensions():
+    # compute() raises on the first seed pair that breaks it; this core's own prefs, over a range.
+    features = pc.compute(2000, workers=1)
+    assert all("_derived" not in f for f in features.values())

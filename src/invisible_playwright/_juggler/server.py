@@ -47,7 +47,7 @@ from invisible_core.juggler import PageActs, popup_number
 from invisible_core.juggler import connection as juggler
 from invisible_core.juggler.actions import Actions
 from invisible_core.juggler.deadline import Deadline
-from . import _bindings, dialogs
+from . import _bindings, dialogs, perimeter
 from ._reaped import SessionRemoval
 from ._threads import ThreadStarterLease
 from .pointer import Pointer
@@ -676,6 +676,37 @@ def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
         argument.release()
 
 
+def _refuse_parameter(operation: str, parameter: str):
+    """Refuse one parameter of a served operation with the sentence `perimeter.REFUSED_PARAMETERS` holds for it.
+
+    ⛔ THE ONLY WAY A PARAMETER IS REFUSED, so that the inventory and the code cannot drift: the test of the refusals reads
+    every call of this function in the file and holds it to that table, both ways."""
+    raise ProtocolException(perimeter.parameter_refusal(operation, parameter))
+
+
+def _refuse_unserved_screenshot_parameters(params: Dict) -> None:
+    """⛔ WHAT STOCK DOES BY MODIFYING THE PAGE IS REFUSED, NOT IGNORED, AND BEFORE THE PAGE IS TOUCHED. `mask`, `style` and
+    `animations="disabled"` change the page before the picture in Playwright; this server took them without reading them, and the
+    picture came back as if they had not been written. `caret="initial"` asks for the text caret to be drawn, which the engine never
+    does. `omitBackground` with png is Firefox's own `Not implemented` (stock reaches it only for png). The sentences are
+    `perimeter.REFUSED_PARAMETERS`'.
+
+    ⛔ THE ONE CHECK, CALLED FIRST BY THE PAGE'S SCREENSHOT AND BY THE ELEMENT'S (a locator's is the element's): the element's call
+    scrolls the element into view and measures it, and a call that is going to be refused must not have done either. It reads
+    `params` and nothing else, so calling it again with the same parameters, as the element's call does through the page's, answers
+    the same."""
+    if params.get("mask"):
+        _refuse_parameter("screenshot", "mask")
+    if params.get("style"):
+        _refuse_parameter("screenshot", "style")
+    if params.get("animations") == "disabled":
+        _refuse_parameter("screenshot", "animations")
+    if params.get("caret") == "initial":
+        _refuse_parameter("screenshot", "caret")
+    if params.get("omitBackground") and params.get("type") != "jpeg":
+        _refuse_parameter("screenshot", "omitBackground")
+
+
 def _round_px(value: float) -> int:
     """To the nearest whole pixel, halves up (Python's `round` goes to even: 0.5 -> 0, 1.5 -> 2)."""
     import math
@@ -1071,6 +1102,8 @@ class ElementHandleDispatcher(Dispatcher):
         Playwright's screenshotter does: the left and top edges to the nearest
         pixel, the size from the rounded right and bottom edges.
         """
+        # ⛔ THE REFUSAL COMES BEFORE THE SCROLL AND THE MEASURE: a call that is refused must not have moved the page.
+        _refuse_unserved_screenshot_parameters(params)
         # An element with no layout object (display: none, detached) cannot be scrolled to: the engine says so
         # with an exception of its own. For the caller that is the same answer as an empty box.
         try:
@@ -1123,17 +1156,24 @@ class ElementHandleDispatcher(Dispatcher):
     # `page.query_selector(...).click()` is ordinary code - and the rest keep
     # reporting themselves as missing rather than being filled in for symmetry.
     #
-    # ⛔ THEY GO THROUGH THE SAME `actions` AS THE SELECTOR VERSIONS, and that is
-    # the whole design. `click` here is the humanised pointer: approach, hover,
-    # press, release, with the hit-target check and the actionability retry. A
-    # second, simpler path would be quicker to write and would give this package
-    # two click behaviours with two fingerprints, which is the one thing it
-    # exists not to have.
+    # ⛔ THEY GO THROUGH THE SAME `actions` AND THE SAME HAND AS THE SELECTOR
+    # VERSIONS, and that is the whole design. The pointer actions (click,
+    # dblclick, hover, tap, check, uncheck) are drawn by `FrameDispatcher._by_hand`
+    # (`Pointer.act`): a path onto the element, a landing point of the session's
+    # own, and then the core's action with the hit-target check and the
+    # actionability retry. They used to call `actions` directly, and the core's
+    # approach with no client cursor is ONE `mousemove` onto the exact centre of the
+    # element's box and a press there: a handle click was a jump to the centre where
+    # the selector's was a walk, two click behaviours with two fingerprints, which
+    # is the one thing this package exists not to have.
     #
     # What differs from a selector click is exactly what SHOULD differ: the node
     # is not looked up again, because a handle names one node and re-querying
-    # would find a different element with the same description; and the node is
-    # not disposed afterwards, because the caller still holds it.
+    # would find a different element with the same description (the hand aims at
+    # the handle's own object, `element=`); and the node is not disposed
+    # afterwards, because the caller still holds it. The keyboard and text
+    # actions (fill, type, press, focus, selectText, setInputFiles) have no hand to
+    # draw: their rhythm lives in the core's action, which both doors call.
     #
     # The parameter helpers are the frame's. `self.frame._timeout` rather than a
     # copy: the rules for reading a timeout, a position and the pointer flags out
@@ -1151,29 +1191,37 @@ class ElementHandleDispatcher(Dispatcher):
                 "element_id": self.object_id,
                 **self.frame._act_opts(params)}
 
+    def _by_hand(self, params: Dict, run: Callable[[Any, Any], Any]) -> Any:
+        """A pointer action of THIS node with the session's hand in front of it: the Frame's own (`FrameDispatcher._by_hand`, the one
+        walk), aimed at the handle's object and not at a selector. `run(position, timeout)` is the plain action; it takes the position
+        and the timeout the hand chose, and everything else from `_act_args`."""
+        return self.frame._by_hand(params, self.frame.frame_id, _HANDLE, run, element=self.object_id)
+
     def op_click(self, params: Dict) -> Any:
-        self.frame._waiting_after(params, lambda: self.frame.actions.click(
-            _HANDLE, position=self.frame._position(params),
-            **self.frame._pointer(params), **self._act_args(params)))
+        pointer = self.frame._pointer(params)
+        self.frame._waiting_after(params, lambda: self._by_hand(
+            params, lambda position, timeout: self.frame.actions.click(
+                _HANDLE, **{**self._act_args(params), "timeout": timeout},
+                position=position, **pointer)))
         return None
 
     def op_hover(self, params: Dict) -> Any:
-        self.frame.actions.hover(_HANDLE, position=self.frame._position(params),
-                                 **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.hover(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_dblclick(self, params: Dict) -> Any:
         pointer = self.frame._pointer(params)
         # dblclick sets its own clickCount; the caller's is not a second one.
         pointer.pop("clicks", None)
-        self.frame.actions.dblclick(
-            _HANDLE, position=self.frame._position(params), **pointer,
-            **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.dblclick(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout},
+            position=position, **pointer))
         return None
 
     def op_tap(self, params: Dict) -> Any:
-        self.frame.actions.tap(_HANDLE, position=self.frame._position(params),
-                               **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.tap(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_select_text(self, params: Dict) -> Any:
@@ -1187,13 +1235,13 @@ class ElementHandleDispatcher(Dispatcher):
         return None
 
     def op_check(self, params: Dict) -> Any:
-        self.frame.actions.check(_HANDLE, position=self.frame._position(params),
-                                 **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.check(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_uncheck(self, params: Dict) -> Any:
-        self.frame.actions.uncheck(_HANDLE, position=self.frame._position(params),
-                                   **self._act_args(params))
+        self._by_hand(params, lambda position, timeout: self.frame.actions.uncheck(
+            _HANDLE, **{**self._act_args(params), "timeout": timeout}, position=position))
         return None
 
     def op_fill(self, params: Dict) -> Any:
@@ -1807,7 +1855,7 @@ class FrameDispatcher(Dispatcher):
         return result
 
     def _by_hand(self, params: Dict, frame_id: str, selector: str,
-                 run: Callable[[Any, Any], Any]) -> Any:
+                 run: Callable[[Any, Any], Any], *, element: Optional[str] = None) -> Any:
         """Run a pointer action with the hand of the session in front of it.
 
         ⛔ THE WALK ONTO THE ELEMENT IS DRAWN HERE, once, for every client: it
@@ -1816,13 +1864,17 @@ class FrameDispatcher(Dispatcher):
         `run(position, timeout)` is the plain action; with no hand (humanising
         off, the engine's own expansion) it is all that happens, with the
         caller's own arguments.
+
+        ⛔ ONE WALK FOR EVERY DOOR. An ElementHandle's pointer actions come through
+        here too, with `element` the object id of the node they name: the hand then
+        aims at THAT node (`selector` is not looked up) and leaves it undisposed.
         """
         hand = self.page.pointer
         if hand is None or not hand.active:
             return run(self._position(params), self._timeout(params))
         return hand.act(frame_id, selector, self._position(params),
                         self._timeout(params), run,
-                        trial=self._act_opts(params)["trial"])
+                        trial=self._act_opts(params)["trial"], element=element)
 
     def op_click(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
@@ -4458,6 +4510,10 @@ class PageDispatcher(Dispatcher):
         # A clip the CALLER supplied is passed through untouched. Playwright
         # documents it in page coordinates, which is what the engine wants, so
         # there is nothing to translate.
+        # ⛔ THE REFUSALS ARE `_refuse_unserved_screenshot_parameters`, THE FIRST THING HERE AND THE FIRST THING IN THE ELEMENT'S SCREENSHOT.
+        # It is idempotent, so the element's call, which hands its rectangle and the caller's parameters to this one, passes it twice
+        # and the second pass is the same answer.
+        _refuse_unserved_screenshot_parameters(params)
         clip = params.get("clip")
         if not clip:
             box = self.injected.evaluate(

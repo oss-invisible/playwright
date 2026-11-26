@@ -22,6 +22,15 @@
 #   Windows runner separates the two without asking anyone to stay off it
 #   for six hours.
 #
+# A second use, chosen by the input `ab_network_webrtc_seed` (empty = the loop
+# above, as always): the network oracle's WebRTC walk of that seed, alone,
+# `runs` times for each engine of its A/A (the published engine twice). It
+# exists to tell two readings apart when the A/A of that walk differs from
+# itself in the number of TURN Allocate datagrams (scripts/ci_ab_network.py:
+# AB_NETWORK_HUNT): each repetition keeps every datagram with its time and its
+# STUN transaction id and the page's own ICE times (network/hunt/<engine>-<i>.json,
+# summary in network/hunt/summary.json). It decides nothing: the step exits 0.
+#
 # Doesn't start on its own: `workflow_dispatch` only. It's not a gate, it's
 # an investigation tool, and it must not be added to the required contexts.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,6 +43,10 @@ on:
         description: "How many runs at most (at 12% it takes ~18 for a 90% chance)"
         required: false
         default: "18"
+      ab_network_webrtc_seed:
+        description: "A seed (e.g. 4) to repeat ONLY the network oracle's WebRTC walk of, `runs` times for each engine of its A/A, instead of the e2e loop. Empty: the e2e loop."
+        required: false
+        default: ""
       os:
         description: "Where to hunt. windows-latest answers a DIFFERENT question: are the interaction retries seen on the dev machine the product or contention?"
         required: false
@@ -75,6 +88,11 @@ jobs:
     needs: linux-deps-hunt
     if: ${{ !cancelled() && (needs.linux-deps-hunt.result == 'success' || needs.linux-deps-hunt.result == 'skipped') }}
     runs-on: ${{ inputs.os }}
+    # TEMP and TMP on D:\a\_temp (the runner's temp folder): the Firefox profiles land in TEMP and on C: they saturate the disk (queue up to 144,
+    # latencies up to 4 s, parent main thread still 40-60 s). On the job, not in a step: `runner.temp` is not readable in a job's `env`.
+    env:
+      TEMP: ${{ startsWith(inputs.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
+      TMP: ${{ startsWith(inputs.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
     # 18 runs of ~6 minutes plus install time. Deliberately generous: the
     # ceiling here must NEVER be the thing that stops the hunt, or we're back
     # to a killed job that explains nothing, which is the original defect.
@@ -121,10 +139,29 @@ jobs:
           sudo apt-get $APT update
           sudo cp /tmp/linux-deps/*.deb /var/cache/apt/archives/
           sudo apt-get $APT install -y --no-download --no-install-recommends $(cat /tmp/linux-deps/roots.txt)
+      - name: The security state (a fixed directory of the repository)
+        if: inputs.ab_network_webrtc_seed != ''
+        run: python scripts/ci_lab_security_state.py set --pin ci/security-state.pin.json
       - name: Fetch the published firefox binary
         run: echo "FF=$(python -m invisible_playwright fetch | tail -1)" >> "$GITHUB_ENV"
+      - name: The GeoIP database (made by the repository, same bytes every run)
+        if: inputs.ab_network_webrtc_seed != ''
+        run: python scripts/ci_lab_geoip.py build
+
+      # The hunt of the network oracle's WebRTC walk: instead of the loop below, never with it. `runs` is the number of repetitions per engine.
+      - name: The network oracle's WebRTC walk of one seed, repeated (decides nothing)
+        if: inputs.ab_network_webrtc_seed != ''
+        env:
+          PYTHONUNBUFFERED: "1"
+          AB_NETWORK_HUNT: webrtc:${{ inputs.ab_network_webrtc_seed }}:${{ inputs.runs }}
+        run: |
+          set -u
+          if [ "$RUNNER_OS" = "Linux" ]; then PRE="xvfb-run -a"; else PRE=""; fi
+          mkdir -p network
+          $PRE python -u scripts/ci_ab_network.py ab --a-a --out network --published-binary "$FF"
 
       - name: Loop until it catches one
+        if: inputs.ab_network_webrtc_seed == ''
         env:
           PYTHONUNBUFFERED: "1"
           INVPW_TEST_WATCHDOG_FILE: evidence/e2e-watchdog.log
@@ -177,5 +214,14 @@ jobs:
           path: |
             evidence/runs
             evidence/e2e-watchdog.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the hunt of the network oracle's WebRTC walk
+        if: always() && inputs.ab_network_webrtc_seed != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-hunt-network-webrtc-${{ inputs.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: network/hunt
           if-no-files-found: warn
           retention-days: 14

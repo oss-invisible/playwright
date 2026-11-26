@@ -87,7 +87,7 @@ def slow(monkeypatch):
     return vd
 
 
-def test_a_second_browser_is_served_while_the_first_starts_its_display(slow):
+def test_a_second_browser_is_served_while_the_first_starts_its_display(slow, declared_engine):
     """While the first browser's display start is in progress (blocked until the
     test lets it return), the loop answers a second browser. If the start ran on
     the loop, the loop would stand still inside it and the second browser could

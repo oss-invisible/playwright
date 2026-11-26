@@ -411,6 +411,17 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # The runner's screen (1024x768 by default) is smaller than the browser window the e2e open (1936x1048 for a 1920x1080 identity), so the
+      # OS cursor cannot be parked outside it (tests/_os_cursor.py) and a native move for it reaches the page. 1920x1080 is the largest mode the
+      # runner's video device accepts (run 45730213378 of oss-invisible/playwright): it leaves the strip below the window free. Declared here, read back.
+      - name: The runner's screen is 1920x1080, larger than the browser window is tall (read back)
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "the runner's screen: $($b.Width)x$($b.Height) at $($b.X),$($b.Y)"
+          if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: Install wrapper + test deps (the stock client is in the dev extra)
@@ -457,6 +468,17 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # The runner's screen (1024x768 by default) is smaller than the browser window the e2e open (1936x1048 for a 1920x1080 identity), so the
+      # OS cursor cannot be parked outside it (tests/_os_cursor.py) and a native move for it reaches the page. 1920x1080 is the largest mode the
+      # runner's video device accepts (run 45730213378 of oss-invisible/playwright): it leaves the strip below the window free. Declared here, read back.
+      - name: The runner's screen is 1920x1080, larger than the browser window is tall (read back)
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "the runner's screen: $($b.Width)x$($b.Height) at $($b.X),$($b.Y)"
+          if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       # The A/A of the three A/B oracles (page, network, host) runs on the first seeds of the candidate set on a pull request, and on ALL of them when the pull request
@@ -634,12 +656,27 @@ jobs:
     runs-on: windows-2022
     # the network oracle's own guard (2197 s, two engine runs: the measured runs 45121964904 and 45153612447 plus 25%) and the job's own steps, with room for a slow runner
     timeout-minutes: 50
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # The runner's screen (1024x768 by default) is smaller than the browser window the e2e open (1936x1048 for a 1920x1080 identity), so the
+      # OS cursor cannot be parked outside it (tests/_os_cursor.py) and a native move for it reaches the page. 1920x1080 is the largest mode the
+      # runner's video device accepts (run 45730213378 of oss-invisible/playwright): it leaves the strip below the window free. Declared here, read back.
+      - name: The runner's screen is 1920x1080, larger than the browser window is tall (read back)
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "the runner's screen: $($b.Width)x$($b.Height) at $($b.X),$($b.Y)"
+          if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
@@ -816,12 +853,27 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # The runner's screen (1024x768 by default) is smaller than the browser window the e2e open (1936x1048 for a 1920x1080 identity), so the
+      # OS cursor cannot be parked outside it (tests/_os_cursor.py) and a native move for it reaches the page. 1920x1080 is the largest mode the
+      # runner's video device accepts (run 45730213378 of oss-invisible/playwright): it leaves the strip below the window free. Declared here, read back.
+      - name: The runner's screen is 1920x1080, larger than the browser window is tall (read back)
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "the runner's screen: $($b.Width)x$($b.Height) at $($b.X),$($b.Y)"
+          if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
@@ -1045,12 +1097,27 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && inputs.only != 'windows-control-a'
     runs-on: windows-2022
     timeout-minutes: 45
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # The runner's screen (1024x768 by default) is smaller than the browser window the e2e open (1936x1048 for a 1920x1080 identity), so the
+      # OS cursor cannot be parked outside it (tests/_os_cursor.py) and a native move for it reaches the page. 1920x1080 is the largest mode the
+      # runner's video device accepts (run 45730213378 of oss-invisible/playwright): it leaves the strip below the window free. Declared here, read back.
+      - name: The runner's screen is 1920x1080, larger than the browser window is tall (read back)
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "the runner's screen: $($b.Width)x$($b.Height) at $($b.X),$($b.Y)"
+          if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
@@ -1234,6 +1301,10 @@ jobs:
     if: needs.core-on-index.outputs.available == 'true' && needs.e2e-page-final-touched.outputs.touched == 'true'
     runs-on: windows-2022
     timeout-minutes: 40
+    # TEMP and TMP on D:\a\_temp, as every Windows job that launches a browser (see e2e-windows): on C: the profiles saturate the disk.
+    env:
+      TEMP: 'D:\a\_temp'
+      TMP: 'D:\a\_temp'
     strategy:
       fail-fast: false
       matrix:
@@ -1244,6 +1315,17 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 1 }
+      # The runner's screen (1024x768 by default) is smaller than the browser window the e2e open (1936x1048 for a 1920x1080 identity), so the
+      # OS cursor cannot be parked outside it (tests/_os_cursor.py) and a native move for it reaches the page. 1920x1080 is the largest mode the
+      # runner's video device accepts (run 45730213378 of oss-invisible/playwright): it leaves the strip below the window free. Declared here, read back.
+      - name: The runner's screen is 1920x1080, larger than the browser window is tall (read back)
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "the runner's screen: $($b.Width)x$($b.Height) at $($b.X),$($b.Y)"
+          if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)

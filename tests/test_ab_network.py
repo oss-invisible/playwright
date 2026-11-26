@@ -37,7 +37,7 @@ def transcript(label="a", seeds=(11, 12)):
                                          "requests": {"GET A/": {"count": 1, "headers": [["Host", "journey-a.test:A"], ["Accept", "*/*"]], "name_orders": ["Host,Accept"],
                                                                  "body_length": 0}}}}},
             "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": wc.parse_client_hello(build_hello())}]}}},
-            "webrtc": {"candidates": ["udp comp1 prio100 srflx <exit>"], "gathering": "complete"},
+            "webrtc": {"candidates": ["udp comp1 prio100 srflx <exit>"], "candidate_types": ["relay", "srflx"], "gathering": "complete"},
             "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
             "lab": {"direct": {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}},
         }
@@ -1261,7 +1261,7 @@ def minimal_run():
                         "end_stream": True}]}
     body = {"journey": {"steps": {"%02d" % i: step for i in range(17)}, "connects": ab.connect_summary(["127.0.0.1:7000"], norm),
                         "dns": ab.dns_summary([("journey-a.test", 1, "lab")])}, "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": tls, "h2": h2}]}}},
-            "webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "gathering": "complete"}, "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
+            "webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "candidate_types": ["relay", "srflx"], "gathering": "complete"}, "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
             "lab": {"direct": {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}}}
     leaves = ab.flatten({"11": body})
     by_category = {}
@@ -2069,9 +2069,14 @@ time.sleep(60)
 
 
 def _alive(pid):
+    """Whether ``pid`` still runs. A process that exits between the two questions (it exists, then it is read) is gone, not an error: ``Process(pid)`` raises
+    ``NoSuchProcess`` for it (wrapper #603's round, pytest ubuntu py3.13: ``process PID not found`` from the grandchild the guard had just killed)."""
     import psutil
 
-    return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    try:
+        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
 
 def _wait_gone(pid, seconds=10.0):
@@ -2141,10 +2146,75 @@ def test_the_tree_guard_returns_at_the_timeout_kills_the_grandchild_and_names_th
         message = run.timeout_message("the network oracle", 3)
         assert message.startswith("the network oracle did not end within 3 s: the launch exit-pings of seed 11 (firefox-68-again) was alive for ")
         assert message.endswith(" s; its tree was killed")
-        assert 2 <= run.launch["alive_s"] < 3 + 5
+        _assert_alive_since_its_line(run, spent)
     finally:
         if pidfile.is_file():
             _kill_if_alive(int(pidfile.read_text()))
+
+
+def _assert_alive_since_its_line(run, spent):
+    """The time the message gives is measured from the launch line the oracle wrote to the moment the run was read, and it is what the message says.
+
+    ⛔ NOT A WINDOW OF SECONDS. This used to assert ``2 <= alive_s < 8``: a child that a loaded machine starts late writes its launch line late, so the launch was alive for
+    less than 2 s when the tree was killed, and the check failed although the guard had done everything right (the wrapper's pre-push under the load of the whole suite:
+    ``2 <= 1.75824``). What can be said whatever the load: the line cannot have been written before the run began nor after it was read, and its ``at`` is whole seconds
+    (``launch_line``: ``timespec="seconds"``), so ``0 <= alive_s <= spent + 1``; and the message gives that number, not another."""
+    alive = run.launch["alive_s"]
+    assert alive is not None, "the launch line's time does not read: %r" % run.launch
+    assert 0 <= alive <= spent + 1, "the launch was alive for %.2f s, outside what its line and the run allow (0 to %.2f s)" % (alive, spent + 1)
+    assert ("was alive for %d s;" % alive) in run.timeout_message("the network oracle", 3)
+
+
+def test_a_process_that_exits_between_being_listed_and_being_read_is_gone(monkeypatch):
+    """The race at its source, made on purpose: the process is there when it is listed and gone when it is read. The old helper let ``NoSuchProcess`` out of
+    ``_alive`` and the test failed on a grandchild the guard had killed; now it is gone. A process that is really there is still alive (the control)."""
+    import os
+
+    import psutil
+
+    def vanished(pid, *a, **k):
+        raise psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: True)
+    monkeypatch.setattr(psutil, "Process", vanished)
+    assert _alive(424242) is False
+    assert _wait_gone(424242, seconds=1.0) is True
+    monkeypatch.undo()
+    assert _alive(os.getpid()) is True
+
+
+def test_a_launch_that_began_late_is_named_with_the_time_since_its_own_line(tmp_path):
+    """The case the old check got wrong, made on purpose: a child slowed by a loaded machine writes its launch line one second before the tree is killed. The guard
+    still names that launch and the time since ITS line (1 s); the old window ``2 <= alive_s < 8`` called that a failure, the check above accepts it."""
+    import datetime
+
+    import ci_crash_evidence as crash
+
+    killed = datetime.datetime(2026, 11, 26, 12, 0, 3, tzinfo=datetime.timezone.utc)
+    began = killed - datetime.timedelta(seconds=1)
+    text = crash.launch_line(11, "exit-pings", "firefox-68-again", at=began) + "\nthe grandchild is alive\n"
+    run = crash.TreeRun(None, text, "", 3.0, True)
+    run.launch = crash.last_launch(text, now=killed)
+    assert run.launch["alive_s"] == 1.0
+    assert not (2 <= run.launch["alive_s"] < 3 + 5), "the old window rejects this launch: that was the defect"
+    _assert_alive_since_its_line(run, spent=3.0)
+    assert run.timeout_message("the network oracle", 3).startswith(
+        "the network oracle did not end within 3 s: the launch exit-pings of seed 11 (firefox-68-again) was alive for 1 s;")
+
+
+def test_the_check_refuses_a_time_its_line_cannot_give(tmp_path):
+    """The control: a launch line from before the run (or a clock that went back) gives a time the run could not have had, and the check says so."""
+    import datetime
+
+    import ci_crash_evidence as crash
+
+    killed = datetime.datetime(2026, 11, 26, 12, 0, 3, tzinfo=datetime.timezone.utc)
+    for began, wrong in ((killed - datetime.timedelta(seconds=30), "30 s before a run of 3 s"), (killed + datetime.timedelta(seconds=5), "after the read")):
+        text = crash.launch_line(11, "exit-pings", "firefox-68-again", at=began)
+        run = crash.TreeRun(None, text, "", 3.0, True)
+        run.launch = crash.last_launch(text, now=killed)
+        with pytest.raises(AssertionError):
+            _assert_alive_since_its_line(run, spent=3.0)
 
 
 def test_the_tree_guard_is_silent_when_the_run_ends_by_itself_and_keeps_stdout_stderr_and_the_code_apart(tmp_path):

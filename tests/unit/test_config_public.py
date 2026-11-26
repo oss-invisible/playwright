@@ -16,7 +16,7 @@ from invisible_playwright import ensure_binary, get_default_stealth_prefs
 
 pytestmark = pytest.mark.unit
 
-def test_public_import_matches_direct_import():
+def test_public_import_matches_direct_import(lab_exit):
     """The wrapper's re-export IS the core's function, not a copy of it."""
     from invisible_core.config import get_default_stealth_prefs as _core
 

@@ -298,18 +298,40 @@ def run_on_stock(sync_playwright, origin, patterns, repetitions, **kw):
             browser.close()
 
 
-def verdict(candidate, stock, declared):
-    """The cells where the candidate fails and stock idles, and the cells where stock is not what pages.json declares."""
+def _unsettled(cell, may_lose):
+    """True when a stock cell that did not idle is one pages.json `stock_firefox_may_lose` allows: its pattern has an entry, the cell lists
+    requests still in flight, and every one of them is a request that entry names (`url`, a regex searched in the request's url)."""
+    entry = (may_lose or {}).get(cell["pattern"])
+    in_flight = cell.get("in_flight")
+    if not entry or not in_flight:
+        return False
+    return all(re.search(entry["url"], str(r.get("url", ""))) for r in in_flight)
+
+
+def verdict(candidate, stock, declared, may_lose=None):
+    """Returns (fails, broken, unsettled).
+
+    fails: the cells where the candidate does not idle and stock does, and the cells where stock is unsettled (below) and the candidate does not idle
+    on a page that stock_firefox declares idle (it is judged against the declared outcome there).
+    broken: the cells where stock is not what pages.json declares (idle) and is not unsettled.
+    unsettled: the stock cells that did not idle only because stock lost the end of a request the page itself aborted (`may_lose`: pattern -> {"url": regex, ...}):
+    every request in flight at the expiry is one the entry names. Not a broken control."""
+    may_lose = may_lose or {}
     key = lambda c: (c["round"], c["pattern"], c["canary"], c["after"])      # noqa: E731
     stock_by = {key(c): c for c in stock}
-    fails, broken = [], []
+    fails, broken, unsettled = [], [], []
+    unsettled_keys = set()
+    for s in stock:
+        if declared.get(s["pattern"]) == "idle" and not s["idle"]:
+            if _unsettled(s, may_lose):
+                unsettled.append((key(s), s["err"]))
+                unsettled_keys.add(key(s))
+            else:
+                broken.append((key(s), s["err"]))
     for c in candidate:
         s = stock_by.get(key(c))
         if s is None:
             continue
-        if s["idle"] and not c["idle"]:
+        if not c["idle"] and (s["idle"] or (key(c) in unsettled_keys and declared.get(c["pattern"]) == "idle")):
             fails.append((key(c), c["err"]))
-    for s in stock:
-        if declared.get(s["pattern"]) == "idle" and not s["idle"]:
-            broken.append((key(s), s["err"]))
-    return fails, broken
+    return fails, broken, unsettled
