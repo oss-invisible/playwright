@@ -37,7 +37,7 @@ def transcript(label="a", seeds=(11, 12)):
                                          "requests": {"GET A/": {"count": 1, "headers": [["Host", "journey-a.test:A"], ["Accept", "*/*"]], "name_orders": ["Host,Accept"],
                                                                  "body_length": 0}}}}},
             "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": wc.parse_client_hello(build_hello())}]}}},
-            "webrtc": {"candidates": ["udp comp1 prio100 srflx <exit>"], "gathering": "complete"},
+            "webrtc": {"candidates": ["udp comp1 prio100 srflx <exit>"], "candidate_types": ["relay", "srflx"], "gathering": "complete"},
             "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
             "lab": {"direct": {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}},
         }
@@ -1261,7 +1261,7 @@ def minimal_run():
                         "end_stream": True}]}
     body = {"journey": {"steps": {"%02d" % i: step for i in range(17)}, "connects": ab.connect_summary(["127.0.0.1:7000"], norm),
                         "dns": ab.dns_summary([("journey-a.test", 1, "lab")])}, "https": {"h2": {"v1": {"connections": [{"alpn": "h2", "tls": tls, "h2": h2}]}}},
-            "webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "gathering": "complete"}, "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
+            "webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "candidate_types": ["relay", "srflx"], "gathering": "complete"}, "idle": {"c1": {"destinations": {"connects": [], "dns": []}}},
             "lab": {"direct": {"witness_tcp": [], "witness_udp": [], "watcher": [], "doh_direct": [], "resolver_trap": [], "blind": []}}}
     leaves = ab.flatten({"11": body})
     by_category = {}

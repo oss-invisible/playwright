@@ -93,6 +93,15 @@ def _attrs(data: bytes) -> Dict[int, bytes]:
     return out
 
 
+def is_deallocation(data: bytes) -> bool:
+    """Whether a datagram is a TURN deallocation, by what it means (RFC 5766 section 7.1): a STUN Refresh (0x0004) whose LIFETIME (0x000D) is 0. A Refresh with a lifetime above 0, with
+    none, or any other message type, is not one. The one reading of it: the TURN server of the lab and the gateway of the lab both use it."""
+    if len(data) < 20 or struct.unpack("!I", data[4:8])[0] != MAGIC or struct.unpack("!H", data[:2])[0] != 0x0004:
+        return False
+    lifetime = _attrs(data).get(0x000D)
+    return lifetime is not None and len(lifetime) == 4 and struct.unpack("!I", lifetime)[0] == 0
+
+
 def _attr(t: int, v: bytes) -> bytes:
     return struct.pack("!HH", t, len(v)) + v + b"\x00" * (-len(v) % 4)
 
@@ -111,11 +120,39 @@ def _message(mtype: int, tid: bytes, attrs: bytes, key: Optional[bytes] = None) 
     return head + attrs + _attr(0x0008, mac)
 
 
+def long_term_key(user: str) -> bytes:
+    """The long-term credential key of RFC 5389 section 15.4: md5(username:realm:password)."""
+    return hashlib.md5(("%s:%s:%s" % (user, REALM, PASSWORD)).encode(), usedforsecurity=False).digest()
+
+
+def integrity_valid(data: bytes, user: str) -> bool:
+    """Whether the MESSAGE-INTEGRITY of a request is the HMAC-SHA1 under the long-term key of ``user`` (RFC 5389 section 15.4): over the message up to the
+    attribute, with the length field of the header set as if the message ended with that attribute (24 bytes more than what came before it). A request
+    with no MESSAGE-INTEGRITY, or a truncated one, is not valid."""
+    i = 20
+    while i + 4 <= len(data):
+        t, n = struct.unpack("!HH", data[i:i + 4])
+        if t == 0x0008:
+            if n != 20 or i + 24 > len(data):
+                return False
+            head = data[:2] + struct.pack("!H", i + 24 - 20) + data[4:20]
+            return hmac.compare_digest(hmac.new(long_term_key(user), head + data[20:i], hashlib.sha1).digest(), data[i + 4:i + 24])
+        i += 4 + ((n + 3) & ~3)
+    return False
+
+
 class TurnServer:
     """UDP TURN server on 127.0.0.1. ``seen`` is every datagram as (source ip, source port, STUN type), in order;
     ``requests`` the same datagrams as (monotonic time, transaction id, STUN type, carries credentials): a retransmission has the
     transaction id of the request it repeats, so the TRANSACTIONS of a road are the distinct ids (:meth:`transactions`);
-    ``allocations`` the successful Allocates as (source ip, source port, username, time)."""
+    ``allocations`` the successful Allocates as (source ip, source port, username, time); ``deallocations`` the requests that END an allocation as (source ip, source
+    port, transaction id, time, index in ``allocations`` of the allocation they end, or None when that source has none): a deallocation is recognised by what it means, a
+    Refresh (0x0004) whose LIFETIME (0x000D) is 0 (RFC 5766 section 7.1), not by its type: a Refresh with a lifetime above 0 keeps the allocation and is not one. The server
+    answers it as it answers any Refresh; a retransmission is another datagram of the same transaction (:meth:`deallocation_transactions`).
+
+    A request that carries USERNAME is checked: its MESSAGE-INTEGRITY must be the HMAC under the long-term key of that user (``PASSWORD``).
+    A missing or wrong one is answered 401 with the realm and the nonce, makes no allocation, and is written in ``refused`` as
+    (source ip, source port, username, transaction id, time): a client with the wrong password never gets a relay here, as on a real server."""
 
     def __init__(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -124,6 +161,8 @@ class TurnServer:
         self.seen: List[Tuple[str, int, int]] = []
         self.allocations: List[Tuple[str, int, str, float]] = []
         self.requests: List[Tuple[float, bytes, int, bool]] = []
+        self.deallocations: List[Tuple[str, int, bytes, float, Optional[int]]] = []
+        self.refused: List[Tuple[str, int, str, bytes, float]] = []
         self._closed = False
         threading.Thread(target=self._serve, daemon=True).start()
 
@@ -134,6 +173,17 @@ class TurnServer:
             if request[2] == mtype:
                 first.setdefault(request[1], request)
         return sorted(first.values(), key=lambda r: r[0])
+
+    def deallocation_transactions(self) -> List[Tuple[str, int, bytes, float, Optional[int]]]:
+        """The first datagram of each deallocation transaction, in order: a retransmission of it is not another deallocation."""
+        first: Dict[bytes, Tuple[str, int, bytes, float, Optional[int]]] = {}
+        for record in list(self.deallocations):
+            first.setdefault(record[2], record)
+        return sorted(first.values(), key=lambda r: r[3])
+
+    def deallocation_tids(self) -> set:
+        """The transaction ids (bytes) of every deallocation received: what ties its datagrams on the wire to the server's record of it."""
+        return {record[2] for record in list(self.deallocations)}
 
     def close(self) -> None:
         self._closed = True
@@ -148,25 +198,39 @@ class TurnServer:
             if len(data) < 20 or struct.unpack("!I", data[4:8])[0] != MAGIC:
                 continue
             mtype, tid = struct.unpack("!H", data[:2])[0], data[8:20]
-            self.seen.append((src[0], src[1], mtype))
             attrs = _attrs(data)
+            if is_deallocation(data):                              # recorded BEFORE the request: whoever reads `requests` already knows which of them it ended
+                held = [i for i, a in enumerate(self.allocations) if a[:2] == (src[0], src[1])]
+                self.deallocations.append((src[0], src[1], tid, time.monotonic(), held[-1] if held else None))
+            self.seen.append((src[0], src[1], mtype))
             self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
+            user_raw = attrs.get(0x0006)
+            if mtype in (0x0003, 0x0004, 0x0008, 0x0009) and user_raw is not None:
+                user = user_raw.decode(errors="replace")
+                if not integrity_valid(data, user):               # the wrong password, or no MESSAGE-INTEGRITY: 401, no allocation
+                    self.refused.append((src[0], src[1], user, tid, time.monotonic()))
+                    self.sock.sendto(_message(mtype | 0x0110, tid, self._unauthorized()), src)
+                    continue
             if mtype == 0x0003:                                   # Allocate
                 if 0x0008 not in attrs or 0x0006 not in attrs:   # no credentials: 401 with a realm and a nonce
-                    err = _attr(0x0009, b"\x00\x00\x04\x01Unauthorized") + _attr(0x0014, REALM.encode()) + _attr(0x0015, NONCE.encode())
-                    self.sock.sendto(_message(0x0113, tid, err), src)
+                    self.sock.sendto(_message(0x0113, tid, self._unauthorized()), src)
                     continue
                 user = attrs[0x0006].decode(errors="replace")
-                key = hashlib.md5(("%s:%s:%s" % (user, REALM, PASSWORD)).encode(), usedforsecurity=False).digest()
+                key = long_term_key(user)
                 body = (_attr(0x0016, _xor_addr(*RELAYED)) + _attr(0x0020, _xor_addr(src[0], src[1])) +
                         _attr(0x000D, struct.pack("!I", 600)))
                 self.allocations.append((src[0], src[1], user, time.monotonic()))
                 self.sock.sendto(_message(0x0103, tid, body, key), src)
             elif mtype in (0x0004, 0x0008, 0x0009):                # Refresh, CreatePermission, ChannelBind
                 user = attrs.get(0x0006, b"").decode(errors="replace")
-                key = hashlib.md5(("%s:%s:%s" % (user, REALM, PASSWORD)).encode(), usedforsecurity=False).digest()
+                key = long_term_key(user)
                 body = _attr(0x000D, struct.pack("!I", 600)) if mtype == 0x0004 else b""
                 self.sock.sendto(_message(mtype | 0x0100, tid, body, key), src)
+
+    @staticmethod
+    def _unauthorized() -> bytes:
+        """The attributes of a 401: ERROR-CODE, the realm and the nonce of the long-term credential."""
+        return _attr(0x0009, b"\x00\x00\x04\x01Unauthorized") + _attr(0x0014, REALM.encode()) + _attr(0x0015, NONCE.encode())
 
 
 # ── the gateway ────────────────────────────────────────────────────────────────
