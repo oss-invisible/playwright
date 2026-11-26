@@ -8,8 +8,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 - Pins invisible-core PLACEHOLDER-70 on the engine firefox-70 (PLACEHOLDER: the engine release tag and the core version are written when they are published).
-- After `set_viewport_size`, the window reads the frame a restored retail Firefox window has (outerWidth/outerHeight and the screen position
-  around the new content size), instead of the maximised window's frame around a smaller content area.
 - The engine carries Firefox's fix for the race between the start and the shutdown of its telemetry (Glean): a browser closed while it was
   still starting no longer leaves that work half done.
 - ElementHandle pointer actions (`click`, `dblclick`, `hover`, `tap`, `check`, `uncheck`, `set_checked`) now use the same humanised pointer walk as selector actions (they used to jump to the exact centre of the element in one move).
