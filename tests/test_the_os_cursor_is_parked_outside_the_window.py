@@ -194,3 +194,32 @@ def test_without_windows_nothing_is_parked_and_every_precondition_holds(monkeypa
     require_outside()
     assert cursor_is_outside([RUNNER_WINDOW]) is True
     assert _os_cursor.browser_windows() == []
+
+
+def test_on_the_runners_1920x1080_screen_the_strip_below_the_window_holds_the_cursor():
+    """The arrangement the Windows e2e jobs declare (e2e.yml: the runner's screen is set to 1920x1080, the largest mode its video device accepts, run
+    45730213378): the window of a 1920x1080 identity, (-8, 0, 1928, 1040), leaves y 1040..1080 free, and the cursor is parked there."""
+    window = (-8, 0, 1928, 1040)
+    point = park_outside([window], (0, 0, 1920, 1080))
+    assert point[1] >= 1040 + MARGIN and point[1] < 1080
+    assert cursor_is_outside([window], point)
+
+
+def test_every_windows_e2e_job_declares_the_runners_screen_before_its_e2e():
+    """The step that sets the runner's screen (1024x768 by default, smaller than the window) is in every Windows job of e2e.yml, before its first `run:`
+    step that starts pytest; a job added without it would park the cursor inside the window, and the gestures' precondition would say so only on Windows."""
+    import pathlib
+    import re
+
+    workflow = (pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "e2e.yml").read_text(encoding="utf-8")
+    jobs = re.split(r"\n  (?=[a-z0-9-]+:\n)", workflow)
+    windows = [j for j in jobs if re.search(r"^    runs-on: windows", j, re.M)]
+    assert windows, "no Windows job found in e2e.yml: the check reads nothing"
+    missing = []
+    for job in windows:
+        name = job.split(":", 1)[0].strip()
+        step = job.find("The runner's screen is 1920x1080")
+        pytest_at = min((m.start() for m in re.finditer(r"pytest|run_e2e", job)), default=-1)
+        if step < 0 or (pytest_at >= 0 and step > pytest_at):
+            missing.append(name)
+    assert not missing, "these Windows jobs of e2e.yml start their e2e without declaring the runner's screen first: %s" % missing
