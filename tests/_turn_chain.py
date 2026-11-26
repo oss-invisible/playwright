@@ -93,6 +93,15 @@ def _attrs(data: bytes) -> Dict[int, bytes]:
     return out
 
 
+def is_deallocation(data: bytes) -> bool:
+    """Whether a datagram is a TURN deallocation, by what it means (RFC 5766 section 7.1): a STUN Refresh (0x0004) whose LIFETIME (0x000D) is 0. A Refresh with a lifetime above 0, with
+    none, or any other message type, is not one. The one reading of it: the TURN server of the lab and the gateway of the lab both use it."""
+    if len(data) < 20 or struct.unpack("!I", data[4:8])[0] != MAGIC or struct.unpack("!H", data[:2])[0] != 0x0004:
+        return False
+    lifetime = _attrs(data).get(0x000D)
+    return lifetime is not None and len(lifetime) == 4 and struct.unpack("!I", lifetime)[0] == 0
+
+
 def _attr(t: int, v: bytes) -> bytes:
     return struct.pack("!HH", t, len(v)) + v + b"\x00" * (-len(v) % 4)
 
@@ -189,13 +198,12 @@ class TurnServer:
             if len(data) < 20 or struct.unpack("!I", data[4:8])[0] != MAGIC:
                 continue
             mtype, tid = struct.unpack("!H", data[:2])[0], data[8:20]
-            self.seen.append((src[0], src[1], mtype))
             attrs = _attrs(data)
-            self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
-            lifetime = attrs.get(0x000D)
-            if mtype == 0x0004 and lifetime is not None and len(lifetime) == 4 and struct.unpack("!I", lifetime)[0] == 0:
+            if is_deallocation(data):                              # recorded BEFORE the request: whoever reads `requests` already knows which of them it ended
                 held = [i for i, a in enumerate(self.allocations) if a[:2] == (src[0], src[1])]
                 self.deallocations.append((src[0], src[1], tid, time.monotonic(), held[-1] if held else None))
+            self.seen.append((src[0], src[1], mtype))
+            self.requests.append((time.monotonic(), tid, mtype, 0x0008 in attrs and 0x0006 in attrs))
             user_raw = attrs.get(0x0006)
             if mtype in (0x0003, 0x0004, 0x0008, 0x0009) and user_raw is not None:
                 user = user_raw.decode(errors="replace")

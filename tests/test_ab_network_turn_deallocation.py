@@ -62,7 +62,7 @@ class Client:
 
     def send(self, datagram, message):
         before = len(self.lab.turn.requests)
-        self.lab.rec.event("udp", target=ab.TURN_TARGET, message=message, tid=ab.stun_tid(datagram), opener=None)
+        self.lab.gateway._route(_turn_chain.TURN_IP, _turn_chain.TURN_PORT, 1, datagram, 1, None)     # the gateway writes the event, as it does for a browser's datagram
         self.sock.sendto(datagram, self.lab.turn.address)
         wait_for(lambda: len(self.lab.turn.requests) > before, "the lab TURN heard the datagram")
         self.sock.recvfrom(2048)                                  # every request here is answered
@@ -72,7 +72,7 @@ class Client:
         self.sock.close()
 
 
-def walk(label, script):
+def walk(label, script, times=None):
     """The WebRTC walk of seed 4 on a lab, as ``run`` makes it, whose page does ``script(lab, clients)`` (the datagrams during the page, and at the close of the context, as the engine
     ends its allocations when the page closes), and the transcript of that seed."""
     clients = []
@@ -83,7 +83,8 @@ def walk(label, script):
 
         def evaluate(self, js, arg):
             script(lab, clients, "page")
-            return {"candidates": [RELAY_CANDIDATE], "errors": [], "sdp": "v=0\r\n", "gathering": "complete"}
+            result = {"candidates": [RELAY_CANDIDATE], "errors": [], "sdp": "v=0", "gathering": "complete"}
+            return result if times is None else dict(result, times=times)
 
     class Browser:
         def new_context(self, **kwargs):
@@ -131,7 +132,7 @@ def test_a_refresh_with_a_lifetime_above_zero_stays_in_the_messages_and_in_the_c
     assert walk_of["turn"]["messages"] == ["0x0003", "0x0004"] and walk_of["udp"]["counts"] == {ab.TURN_TARGET: 2}
     assert walk_of["udp"]["messages"] == {ab.TURN_TARGET: ["stun-0x0003", "stun-0x0004"]}
     assert evidence["deallocation"] == {"seen": False, "records": []}
-    assert walk_of["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0}
+    assert walk_of["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0, "early": 0}
     gone, _ = walk("b", allocation_then())
     differing = [d["path"] for d in ab.compare_transcripts(kept, gone, [], 0, "a", "b")["differences"]]
     assert "seeds/4/webrtc/turn/messages/1" in differing and "seeds/4/webrtc/udp/counts/%s" % ab.TURN_TARGET in differing, "a keep-alive IS the engine's doing, and is compared"
@@ -145,13 +146,13 @@ def test_the_deallocation_goes_to_the_evidence_with_its_time_and_its_transaction
     assert record["tid"] == REFRESH_A.hex() and record["allocation"] == 0 and record["src"].startswith("127.0.0.1:")
     assert isinstance(record["t"], float) and record["t"] >= evidence["phase_t"]["webrtc"], "the time is the recorder's, the one of the other evidence"
     assert [d["tid"] for d in evidence["datagrams"]].count(REFRESH_A.hex()) == 1, "the datagram itself is still in the evidence, as every datagram is"
-    assert transcript["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0}
+    assert transcript["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0, "early": 0}
 
 
 def test_two_deallocations_of_one_allocation_are_a_problem_and_no_leaf(capsys):
     twice, _ = walk("b", allocation_then((REFRESH_A, 0), (REFRESH_B, 0)))
     once, _ = walk("a", allocation_then((REFRESH_A, 0)))
-    assert twice["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 1, "unallocated": 0}
+    assert twice["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 1, "unallocated": 0, "early": 0}
     assert twice["seeds"]["4"]["webrtc"]["turn"]["messages"] == ["0x0003"]
     report = ab.compare_transcripts(once, twice, [], 0, "a", "b")
     assert report["differences"] == [] and report["verdict"] == "red" and len(report["problems"]) == 1
@@ -170,7 +171,7 @@ def test_a_deallocation_for_an_address_that_has_no_allocation_is_a_problem():
             clients.append(Client(lab).send(signed_refresh(REFRESH_C, 0), "stun-0x0004"))      # another socket: another address, which was never allocated
 
     orphan, evidence = walk("b", script)
-    assert orphan["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 1}
+    assert orphan["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 1, "early": 0}
     assert evidence["deallocation"]["records"][0]["allocation"] is None
     report = ab.compare_transcripts(orphan, orphan, [], 0, "a", "b")
     assert report["differences"] == [] and len(report["problems"]) == 2, "each side that did it is named"
@@ -211,3 +212,42 @@ def test_the_turn_server_does_not_record_a_refresh_with_lifetime_600_or_any_othe
     assert server.deallocations == [], "a lifetime of 0 in another message type (CreatePermission) is not a deallocation: the type counts too"
     server, _, _ = serve_one(signed_refresh(REFRESH_C, 0)[:20] + _turn_chain._attr(0x0006, b"lab"))
     assert server.deallocations == [], "a Refresh with no LIFETIME is not one"
+
+
+def test_the_gateway_marks_a_deallocation_from_its_payload_and_the_mark_alone_takes_it_out_of_the_count():
+    """The datagram can be at the gateway before the lab's TURN server has recorded it: the count does not wait for the server."""
+    def script(lab, clients, stage):
+        if stage == "page":
+            clients.append(Client(lab).send(signed_allocate(ALLOCATE), "stun-0x0003"))
+        else:
+            for tid, lifetime in ((REFRESH_A, 600), (REFRESH_B, 0)):
+                lab.gateway._route(_turn_chain.TURN_IP, _turn_chain.TURN_PORT, 1, signed_refresh(tid, lifetime), 1, None)     # never sent to the server
+
+    transcript, _ = walk("a", script)
+    walk_of = transcript["seeds"]["4"]["webrtc"]
+    assert walk_of["udp"]["counts"] == {ab.TURN_TARGET: 2} and walk_of["udp"]["messages"] == {ab.TURN_TARGET: ["stun-0x0003", "stun-0x0004"]}, "the 600 stays, the 0 goes, by the mark"
+    with ab.Lab(host="127.0.0.1") as lab:
+        lab.rec.set_phase("webrtc")
+        for tid, lifetime in ((REFRESH_A, 600), (REFRESH_B, 0)):
+            lab.gateway._route(_turn_chain.TURN_IP, _turn_chain.TURN_PORT, 1, signed_refresh(tid, lifetime), 1, None)
+        lab.gateway._route("127.0.0.1", 5555, 1, signed_refresh(REFRESH_C, 0), 1, None)
+        events = lab.rec.of("webrtc", "udp")
+    assert [e["deallocation"] for e in events] == [False, True, True], "marked by meaning, whoever the datagram is for (the walk counts only the TURN address's)"
+
+
+def test_a_deallocation_before_the_page_began_closing_is_a_problem_and_one_after_it_is_not():
+    """The page's own times on the recorder's clock: the call of the page plus (closing - start) of its performance.now() is the moment it began closing (``closing_began``)."""
+    def at_page(lab, clients, stage):
+        if stage == "page":
+            clients.append(Client(lab).send(signed_allocate(ALLOCATE), "stun-0x0003"))
+            clients[0].send(signed_refresh(REFRESH_A, 0), "stun-0x0004")        # the deallocation comes while the page is still open
+    before, _ = walk("b", at_page, times={"start": 100.0, "closing": 100.0 + 600000.0})        # the page closes ten minutes after the call
+    assert before["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0, "early": 1}
+    report = ab.compare_transcripts(before, before, [], 0, "a", "b")
+    assert report["differences"] == [] and len(report["problems"]) == 2 and all(p.endswith(RULE) for p in report["problems"])
+    assert all("reached the lab TURN before the page began closing its connection. Fix: " in p for p in report["problems"])
+
+    after, _ = walk("b", allocation_then((REFRESH_A, 0)), times={"start": 100.0, "closing": 100.0})          # closing at the start: the call itself is the bound
+    assert after["seeds"]["4"]["webrtc"]["turn"]["deallocation"] == {"repeated": 0, "unallocated": 0, "early": 0}
+    assert ab.compare_transcripts(after, after, [], 0, "a", "b")["problems"] == []
+    assert ab.closing_began(5.0, {"start": 250.0, "closing": 1750.0}) == 6.5 and ab.closing_began(5.0, None) is None and ab.closing_began(5.0, {"start": 1.0}) is None
