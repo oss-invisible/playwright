@@ -23,6 +23,11 @@ Fullscreen, in every case, twice (steps F0 and F1): the page enters fullscreen w
 value must be the one it had before, exactly. F0 is right after the maximized reading, before any ``set_viewport_size``; F1 is after call 2. Retail goes back to the
 window it had; an engine that treats a change of the page's size as a resize of the window does not, and this is the step that tells.
 
+Alongside the window, the page's probe (a copy of the one of RetailCaptures' ``window_geometry/page.html``) reads, at every step, what a page reads of the
+viewport: ``matchMedia`` width, height, aspect-ratio and resolution (found exactly by binary search over ``min-`` queries), ``documentElement.clientWidth`` and
+``clientHeight``, and ``visualViewport`` width, height, scale, offsetLeft, offsetTop, pageLeft and pageTop. They are compared with retail's (``RETAIL_PROBE``,
+printed from the raw files of capture round 4), in the maximized step and after each call; after leaving fullscreen they must equal the reading before it.
+
 The invariant, in every step: ``event.screenX - event.clientX == mozInnerScreenX`` and ``event.screenY - event.clientY == mozInnerScreenY``, up to the rounding of
 the event's integer coordinates (``screenX`` and ``clientX`` of an event are whole numbers, ``mozInnerScreen`` is not at a fractional scale). At scale 1.0 the
 frame is whole and the offset is exactly equal.
@@ -51,6 +56,7 @@ browsing context the load left (``tests/_navigation_moved_trace.py``): a load th
 """
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -91,6 +97,55 @@ window.addEventListener('mousemove', e => {
   window.__last = {n: window.__moves, cx: e.clientX, cy: e.clientY, sx: e.screenX, sy: e.screenY,
                    dx: e.screenX - e.clientX, dy: e.screenY - e.clientY};
 }, true);
+// Everything a page can read that may differ under responsive-design mode (inRDMPane), read here in the page itself and
+// returned as a JSON string (the content script parses it): the screen, the pixel ratio, the media queries (the integers
+// found by binary search over min- queries, the booleans as .matches), touch, the visual viewport, the root's client size.
+window.__probe = () => {
+  const matches = (query) => matchMedia(query).matches;
+  // The largest integer n in [0, hi] for which make(n) matches; every min- query is true up to the value and false after.
+  const largest = (make, hi) => {
+    let lo = 0;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (matches(make(mid))) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  };
+  const found = {
+    width: largest((n) => `(min-width: ${n}px)`, 65536),
+    height: largest((n) => `(min-height: ${n}px)`, 65536),
+    "device-width": largest((n) => `(min-device-width: ${n}px)`, 65536),
+    "device-height": largest((n) => `(min-device-height: ${n}px)`, 65536),
+    // the ratio times 10000, rounded down
+    "aspect-ratio_x10000": largest((n) => `(min-aspect-ratio: ${n}/10000)`, 1000000),
+    "device-aspect-ratio_x10000": largest((n) => `(min-device-aspect-ratio: ${n}/10000)`, 1000000),
+    // the resolution in dppx times 100, rounded down (0.01 dppx)
+    "resolution_x100": largest((n) => `(min-resolution: ${n / 100}dppx)`, 2000),
+  };
+  const queries = {};
+  for (const q of [
+    `(width: ${found.width}px)`, `(height: ${found.height}px)`,
+    `(device-width: ${found["device-width"]}px)`, `(device-height: ${found["device-height"]}px)`,
+    "(pointer: fine)", "(pointer: coarse)", "(pointer: none)",
+    "(any-pointer: fine)", "(any-pointer: coarse)", "(any-pointer: none)",
+    "(hover: hover)", "(hover: none)", "(any-hover: hover)", "(any-hover: none)",
+    "(orientation: portrait)", "(orientation: landscape)",
+  ]) queries[q] = matches(q);
+  const s = screen;
+  const vv = window.visualViewport;
+  return JSON.stringify({
+    screen: {width: s.width, height: s.height, availWidth: s.availWidth, availHeight: s.availHeight,
+             availLeft: s.availLeft, availTop: s.availTop, colorDepth: s.colorDepth,
+             orientation: s.orientation ? {type: s.orientation.type, angle: s.orientation.angle} : null},
+    devicePixelRatio: window.devicePixelRatio,
+    found: found,
+    matches: queries,
+    touch: {maxTouchPoints: navigator.maxTouchPoints, ontouchstart: "ontouchstart" in window, touchEvent: typeof TouchEvent},
+    visualViewport: vv ? {width: vv.width, height: vv.height, scale: vv.scale, offsetLeft: vv.offsetLeft, offsetTop: vv.offsetTop,
+                          pageLeft: vv.pageLeft, pageTop: vv.pageTop} : null,
+    client: {width: document.documentElement.clientWidth, height: document.documentElement.clientHeight},
+  });
+};
 </script>"""
 
 READ = """() => ({ow: outerWidth, oh: outerHeight, iw: innerWidth, ih: innerHeight, sx: screenX, sy: screenY,
@@ -147,6 +202,63 @@ CASES: Dict[str, Dict[str, Any]] = {
 }
 
 
+# What retail answers to the page's probe (``window.__probe`` above, the very function of RetailCaptures' page.html), per case and step: the media queries found
+# by binary search (width, height, aspect-ratio times 10000 rounded down, resolution in dppx times 100), the root's client size and the visual viewport.
+# Each value below is the one printed by a script from the raw.json named in the comment above its case (round 4 of the window-geometry capture, Firefox 159.0
+# retail on GitHub's Windows runners, display launch "a", whose steps are the ones of this test: maximized, juggler = call 1, juggler2 = call 2,
+# juggler_back = call 3); none is retyped. The keys of a case are the capture's step names. Round 3 (window-geometry-r3) holds the same values for the steps it has.
+RETAIL_PROBE: Dict[str, Dict[str, Dict[str, Any]]] = {
+    # source: RetailCaptures/captures/firefox-159.0/github-runner/2026-11-25-window-geometry-r4/dpr1/1920x1080/a/raw.json, steps[...].content.probe
+    # sha256 5b6eea2939717aacafb539af3f67611a151a4ae0cfabb7b60dcf5a71c8c575be
+    "1920x1080-dpr1.0": {
+        # maximized
+        "maximized": {"mq_width": 1920, "mq_height": 947, "mq_aspect_x10000": 20274, "mq_resolution_x100": 100, "client_w": 1920, "client_h": 947, "vv_w": 1920, "vv_h": 947, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 1 (juggler)
+        "juggler": {"mq_width": 390, "mq_height": 844, "mq_aspect_x10000": 4620, "mq_resolution_x100": 100, "client_w": 390, "client_h": 844, "vv_w": 390, "vv_h": 844, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 2 (juggler2)
+        "juggler2": {"mq_width": 414, "mq_height": 896, "mq_aspect_x10000": 4620, "mq_resolution_x100": 100, "client_w": 414, "client_h": 896, "vv_w": 414, "vv_h": 896, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 3 (juggler_back)
+        "juggler_back": {"mq_width": 1920, "mq_height": 947, "mq_aspect_x10000": 20274, "mq_resolution_x100": 100, "client_w": 1920, "client_h": 947, "vv_w": 1920, "vv_h": 947, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+    },
+    # source: RetailCaptures/captures/firefox-159.0/github-runner/2026-11-25-window-geometry-r4/dpr1.25/1920x1080/a/raw.json, steps[...].content.probe
+    # sha256 17ba49d7573e3aa61ff439e89392c9d3ea6dc83051f97b6dbd2a4fb7a8fb9887
+    "1920x1080-dpr1.25": {
+        # maximized
+        "maximized": {"mq_width": 1536, "mq_height": 731, "mq_aspect_x10000": 21006, "mq_resolution_x100": 125, "client_w": 1536, "client_h": 731, "vv_w": 1536, "vv_h": 731.2000122070312, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 1 (juggler)
+        "juggler": {"mq_width": 390, "mq_height": 690, "mq_aspect_x10000": 5654, "mq_resolution_x100": 125, "client_w": 390, "client_h": 690, "vv_w": 390.3999938964844, "vv_h": 690.4000244140625, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 2 (juggler2)
+        "juggler2": {"mq_width": 414, "mq_height": 640, "mq_aspect_x10000": 6475, "mq_resolution_x100": 125, "client_w": 414, "client_h": 640, "vv_w": 414.3999938964844, "vv_h": 640, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 3 (juggler_back)
+        "juggler_back": {"mq_width": 1536, "mq_height": 731, "mq_aspect_x10000": 21006, "mq_resolution_x100": 125, "client_w": 1536, "client_h": 731, "vv_w": 1536, "vv_h": 731.2000122070312, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+    },
+    # source: RetailCaptures/captures/firefox-159.0/github-runner/2026-11-25-window-geometry-r4/dpr1.5/1920x1080/a/raw.json, steps[...].content.probe
+    # sha256 6422295bf112ab74b1c4cf691fd1c0382655093037c39aa6cae96d91fca5785f
+    "1920x1080-dpr1.5": {
+        # maximized
+        "maximized": {"mq_width": 1280, "mq_height": 599, "mq_aspect_x10000": 21357, "mq_resolution_x100": 150, "client_w": 1280, "client_h": 599, "vv_w": 1280, "vv_h": 599.3333129882812, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 1 (juggler)
+        "juggler": {"mq_width": 390, "mq_height": 550, "mq_aspect_x10000": 7090, "mq_resolution_x100": 150, "client_w": 390, "client_h": 550, "vv_w": 390, "vv_h": 550, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 2 (juggler2)
+        "juggler2": {"mq_width": 414, "mq_height": 500, "mq_aspect_x10000": 8280, "mq_resolution_x100": 150, "client_w": 414, "client_h": 500, "vv_w": 414, "vv_h": 500, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 3 (juggler_back)
+        "juggler_back": {"mq_width": 1280, "mq_height": 599, "mq_aspect_x10000": 21357, "mq_resolution_x100": 150, "client_w": 1280, "client_h": 599, "vv_w": 1280, "vv_h": 599.3333129882812, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+    },
+    # source: RetailCaptures/captures/firefox-159.0/github-runner/2026-11-25-window-geometry-r4/dpr2/1600x1200/a/raw.json, steps[...].content.probe
+    # sha256 be0c1610951900a32095d4965a7c9a9eae2fbf3e14791b2a55fdc8d25c75e360
+    "1600x1200-dpr2.0": {
+        # maximized
+        "maximized": {"mq_width": 800, "mq_height": 479, "mq_aspect_x10000": 16701, "mq_resolution_x100": 200, "client_w": 800, "client_h": 479, "vv_w": 800, "vv_h": 479, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 1 (juggler)
+        "juggler": {"mq_width": 390, "mq_height": 430, "mq_aspect_x10000": 9069, "mq_resolution_x100": 200, "client_w": 390, "client_h": 430, "vv_w": 390, "vv_h": 430, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 2 (juggler2)
+        "juggler2": {"mq_width": 414, "mq_height": 380, "mq_aspect_x10000": 10894, "mq_resolution_x100": 200, "client_w": 414, "client_h": 380, "vv_w": 414, "vv_h": 380, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+        # call 3 (juggler_back)
+        "juggler_back": {"mq_width": 800, "mq_height": 479, "mq_aspect_x10000": 16701, "mq_resolution_x100": 200, "client_w": 800, "client_h": 479, "vv_w": 800, "vv_h": 479, "vv_scale": 1, "vv_left": 0, "vv_top": 0, "vv_page_left": 0, "vv_page_top": 0},
+    },
+}
+
+
 def _stable(page, ask: Optional[Tuple[int, int]], fullscreen: Optional[bool] = None) -> Dict[str, Any]:
     """The window as the page reads it once it has settled: the inner size is the asked one (when one was asked), the document is in fullscreen or not
     (when that was asked) and two looks in a row are equal.
@@ -165,6 +277,31 @@ def _stable(page, ask: Optional[Tuple[int, int]], fullscreen: Optional[bool] = N
 
     wait_until(settled, DEADLINE_S, lambda: page.wait_for_timeout(100))
     return seen["now"]
+
+
+def _probe(page) -> Dict[str, Any]:
+    """What ``window.__probe`` answers, reduced to the values RETAIL_PROBE holds (the page gives its own JSON string)."""
+    raw = json.loads(page.evaluate("() => window.__probe()"))
+    found, client, vv = raw["found"], raw["client"], raw["visualViewport"]
+    return {"mq_width": found["width"], "mq_height": found["height"], "mq_aspect_x10000": found["aspect-ratio_x10000"],
+            "mq_resolution_x100": found["resolution_x100"], "client_w": client["width"], "client_h": client["height"],
+            "vv_w": vv["width"], "vv_h": vv["height"], "vv_scale": vv["scale"], "vv_left": vv["offsetLeft"], "vv_top": vv["offsetTop"],
+            "vv_page_left": vv["pageLeft"], "vv_page_top": vv["pageTop"]}
+
+
+PROBE_NAMES = {"mq_width": "matchMedia width", "mq_height": "matchMedia height", "mq_aspect_x10000": "matchMedia aspect-ratio (x10000)",
+               "mq_resolution_x100": "matchMedia resolution (dppx x100)", "client_w": "documentElement.clientWidth",
+               "client_h": "documentElement.clientHeight", "vv_w": "visualViewport.width", "vv_h": "visualViewport.height",
+               "vv_scale": "visualViewport.scale", "vv_left": "visualViewport.offsetLeft", "vv_top": "visualViewport.offsetTop",
+               "vv_page_left": "visualViewport.pageLeft", "vv_page_top": "visualViewport.pageTop"}
+
+
+def _check_probe(step: str, probe: Dict[str, Any], expected: Dict[str, Any], who: str) -> None:
+    """The probe of one step against ``expected`` (retail's values, or the reading before a fullscreen round trip), key by key."""
+    assert set(expected) == set(PROBE_NAMES), "%s: the expected probe names %r" % (step, sorted(expected))
+    for key, name in PROBE_NAMES.items():
+        assert probe[key] == pytest.approx(expected[key], abs=FLOAT), (
+            "%s: %s reads %r, %s reads %r (whole probe: %r)" % (step, name, probe[key], who, expected[key], probe))
 
 
 def _event_offset(page, point: Tuple[int, int]) -> Dict[str, Any]:
@@ -200,10 +337,11 @@ def _check_reading(step: str, reading: Dict[str, Any], event: Dict[str, Any], ex
             "%s: at scale 1.0 the events carry (%r, %r) and mozInnerScreen is (%r, %r)" % (step, event["dx"], event["dy"], reading["mx"], reading["my"]))
 
 
-def _fullscreen_round_trip(page, step: str, before: Dict[str, Any], before_event: Dict[str, Any], screen: Tuple[int, int], dpr: float,
-                           points: Iterator[Tuple[int, int]]) -> None:
+def _fullscreen_round_trip(page, step: str, before: Dict[str, Any], before_event: Dict[str, Any], before_probe: Dict[str, Any],
+                           screen: Tuple[int, int], dpr: float, points: Iterator[Tuple[int, int]]) -> None:
     """Enters fullscreen with a real click, reads the window, leaves it and reads it again: it must be exactly the window of ``before``.
 
+    ``before_probe`` is the probe (media queries, client size, visual viewport) read with ``before``: after leaving fullscreen it is read again, equal.
     ``screen`` is the declared screen in CSS pixels. In fullscreen outer == inner == screen, the window sits at the origin and so does its content."""
     assert before["fs"] is False, "%s: the window is in fullscreen before the test enters it: %r" % (step, before)
     page.mouse.click(*BUTTON)           # the client's own click: a trusted event, so a user gesture
@@ -226,6 +364,7 @@ def _fullscreen_round_trip(page, step: str, before: Dict[str, Any], before_event
     same = {key: before[key] for key in ("iw", "ih", "ow", "oh", "sx", "sy", "mx", "my")}
     _check_reading("%s, after leaving fullscreen" % step, after, after_event, same, dpr)
     assert after["availH"] == before["availH"], "%s: availHeight reads %r after fullscreen, %r before" % (step, after["availH"], before["availH"])
+    _check_probe("%s, after leaving fullscreen" % step, _probe(page), before_probe, "the reading before fullscreen")
     for key in ("dx", "dy"):
         assert abs(after_event[key] - before_event[key]) < EVENT_ROUNDING, (
             "%s: the offset of the events (%s) was %r before fullscreen and is %r after it" % (step, key, before_event[key], after_event[key]))
@@ -254,12 +393,14 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
             if "availH" in spec:
                 assert maximized["availH"] == spec["availH"], "the compact bar: screen.availHeight reads %r, retail %r" % (maximized["availH"], spec["availH"])
             _check_reading("maximized (%s)" % case, maximized, maximized_event, spec["maximized"], dpr)
+            maximized_probe = _probe(page)
+            _check_probe("maximized (%s)" % case, maximized_probe, RETAIL_PROBE[case]["maximized"], "retail Firefox 159.0 on Windows")
 
             # F0. fullscreen and back, before any set_viewport_size: the window it had, exactly
-            _fullscreen_round_trip(page, "F0 (%s)" % case, maximized, maximized_event, screen, dpr, points)
+            _fullscreen_round_trip(page, "F0 (%s)" % case, maximized, maximized_event, maximized_probe, screen, dpr, points)
 
             # 2 to 4. set_viewport_size, twice and back to the maximized inner size
-            for number, call in enumerate(spec["calls"], start=1):
+            for number, (call, retail_step) in enumerate(zip(spec["calls"], ("juggler", "juggler2", "juggler_back")), start=1):
                 width, height = call["size"]
                 if number == len(spec["calls"]):
                     assert (width, height) == (maximized["iw"], maximized["ih"]), (
@@ -269,9 +410,12 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
                 reading = _stable(page, (width, height))
                 event = _event_offset(page, next(points))
                 _check_reading("set_viewport_size(%d, %d), call %d (%s)" % (width, height, number, case), reading, event, call, dpr)
+                probe = _probe(page)
+                _check_probe("set_viewport_size(%d, %d), call %d (%s)" % (width, height, number, case), probe, RETAIL_PROBE[case][retail_step],
+                             "retail Firefox 159.0 on Windows")
                 if number == 2:
                     # F1. fullscreen and back after call 2: the window of call 2, exactly
-                    _fullscreen_round_trip(page, "F1 (%s)" % case, reading, event, screen, dpr, points)
+                    _fullscreen_round_trip(page, "F1 (%s)" % case, reading, event, probe, screen, dpr, points)
 
 
 #: The headers that give the second page its own browsing context group (and make it cross-origin isolated).
