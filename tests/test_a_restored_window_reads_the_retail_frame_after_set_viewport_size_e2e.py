@@ -2,7 +2,8 @@
 
 What it checks: the numbers a page reads (``outerWidth``, ``outerHeight``, ``innerWidth``, ``innerHeight``, ``screenX``, ``screenY``,
 ``mozInnerScreenX/Y``) and the offset the mouse events carry (``screenX - clientX``, ``screenY - clientY``) in four steps, against retail Firefox 159.0 on
-Windows 11 measured live (GitHub runs oss-invisible/core 45679625406 and 45695770162; RetailCaptures ``notes/window-geometry.md``):
+Windows 11 measured live (GitHub runs oss-invisible/core 45657528859, 45672953042, 45679625406 and 45695770162; RetailCaptures
+``notes/window-geometry.md``):
 
   1. the window as it opens, maximized;
   2. after ``set_viewport_size(w1, h1)``: the window is restored, so it sits at a small positive position (the frame's default, 4 at scale 1.0) and its content
@@ -11,9 +12,16 @@ Windows 11 measured live (GitHub runs oss-invisible/core 45679625406 and 4569577
   4. after ``set_viewport_size`` back to the maximized inner size: the window STAYS restored (a page that asks for the size it had does not get the maximized
      window back), so its outer size is the inner size plus the restored frame, not the maximized one.
 
-Three display scales on the same 1920x1080 panel (device pixels): 1.0, 1.25 and 1.5. At 1.5 the browser chrome is the compact bar (``screen.availHeight`` 672 CSS pixels).
+Four display scales: 1.0, 1.25 and 1.5 on a 1920x1080 panel (device pixels) and 2.0 on a 1600x1200 one. At 1.5 and 2.0 the browser chrome is the compact bar
+(``screen.availHeight`` 672 CSS pixels at 1.5, 552 at 2.0).
 A page reads everything in CSS pixels, so the frame in CSS pixels is the frame in device pixels over the scale, rounded the way retail rounds it: the numbers
 below are what retail answers, not a formula of this test.
+
+Fullscreen, in every case, twice (steps F0 and F1): the page enters fullscreen with a real click on a button whose handler calls
+``document.documentElement.requestFullscreen()`` (the click is the client's own, so it is a user gesture, as in ``scripts/ci_host_gate.py``) and reads the window
+(outer == inner == the declared CSS screen, ``screenX/Y`` 0, ``mozInnerScreen`` 0, the events' offset 0), then ``document.exitFullscreen()`` and reads it again: EVERY
+value must be the one it had before, exactly. F0 is right after the maximized reading, before any ``set_viewport_size``; F1 is after call 2. Retail goes back to the
+window it had; an engine that treats a change of the page's size as a resize of the window does not, and this is the step that tells.
 
 The invariant, in every step: ``event.screenX - event.clientX == mozInnerScreenX`` and ``event.screenY - event.clientY == mozInnerScreenY``, up to the rounding of
 the event's integer coordinates (``screenX`` and ``clientX`` of an event are whole numbers, ``mozInnerScreen`` is not at a fractional scale). At scale 1.0 the
@@ -44,7 +52,7 @@ browsing context the load left (``tests/_navigation_moved_trace.py``): a load th
 from __future__ import annotations
 
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 from _evidence_on_failure import FailureEvidence
@@ -63,12 +71,20 @@ FLOAT = 0.001
 DEADLINE_S = 30
 
 #: Points the mouse moves to, in CSS pixels of the content; a move to the point the pointer is on makes no event, so each step uses another one.
-POINTS: List[Tuple[int, int]] = [(60, 70), (120, 150), (80, 110), (150, 170)]
+POINTS: List[Tuple[int, int]] = [(60, 70), (120, 150), (80, 110), (150, 170), (70, 90), (130, 160), (90, 120), (140, 175),
+                                 (65, 100), (125, 155), (85, 115), (145, 165), (75, 95), (135, 150), (95, 125), (155, 170)]
+#: The button whose click asks for fullscreen: ``position:fixed`` at (20, 20), 160x40 CSS pixels; its centre is the point of the real click.
+BUTTON = (100, 40)
 
 PAGE = """<!doctype html><meta charset=utf-8><title>restored window</title>
-<style>html,body{margin:0;padding:0;height:100%}</style>
-<body><script>
-window.__last = null; window.__moves = 0;
+<style>html,body{margin:0;padding:0;height:100%}
+#fs{position:fixed;left:20px;top:20px;width:160px;height:40px;margin:0;z-index:2147483647}</style>
+<body><button id=fs>fullscreen</button><script>
+window.__last = null; window.__moves = 0; window.__fsRequest = 'not asked';
+document.getElementById('fs').addEventListener('click', () => {
+  window.__fsRequest = 'pending';
+  document.documentElement.requestFullscreen().then(() => { window.__fsRequest = 'resolved'; }, e => { window.__fsRequest = 'rejected: ' + e; });
+});
 window.addEventListener('mousemove', e => {
   if (!e.isTrusted) return;
   window.__moves++;
@@ -78,13 +94,15 @@ window.addEventListener('mousemove', e => {
 </script>"""
 
 READ = """() => ({ow: outerWidth, oh: outerHeight, iw: innerWidth, ih: innerHeight, sx: screenX, sy: screenY,
-                 mx: mozInnerScreenX, my: mozInnerScreenY, dpr: devicePixelRatio, availH: screen.availHeight})"""
+                 mx: mozInnerScreenX, my: mozInnerScreenY, dpr: devicePixelRatio, availH: screen.availHeight,
+                 scw: screen.width, sch: screen.height, fs: document.fullscreenElement !== null})"""
 
 # What retail answers, per case: the maximized reading, then the calls of set_viewport_size in order (the last one goes back to the maximized inner size).
 # A key that is not in an entry is a value the measurement did not name: it is not asserted (the invariant of the events is, always).
 CASES: Dict[str, Dict[str, Any]] = {
     "1920x1080-dpr1.0": {
         "dpr": 1.0,
+        "panel": (1920, 1080),
         "maximized": {"ow": 1936, "oh": 1048, "iw": 1920, "ih": 947, "sx": -8, "sy": -8, "mx": 0, "my": 85},
         "calls": [
             {"size": (390, 844), "ow": 516, "oh": 945, "sx": 4, "sy": 4, "mx": 12, "my": 89, "dx": 12, "dy": 89},
@@ -94,6 +112,7 @@ CASES: Dict[str, Dict[str, Any]] = {
     },
     "1920x1080-dpr1.25": {
         "dpr": 1.25,
+        "panel": (1920, 1080),
         "maximized": {"ow": 1550, "oh": 830, "iw": 1536, "ih": 731, "sx": -7, "sy": -7, "my": 84.8},
         "calls": [
             {"size": (390, 690), "ow": 514, "oh": 789, "sx": 3, "sy": 3, "mx": 10.4, "my": 88},
@@ -104,6 +123,7 @@ CASES: Dict[str, Dict[str, Any]] = {
     # the compact bar: availHeight is 672 CSS pixels
     "1920x1080-dpr1.5": {
         "dpr": 1.5,
+        "panel": (1920, 1080),
         "availH": 672,
         "maximized": {"iw": 1280, "ih": 599, "my": 72.667},
         "calls": [
@@ -112,11 +132,24 @@ CASES: Dict[str, Dict[str, Any]] = {
             {"size": (1280, 599), "ow": 1295, "oh": 678, "sx": 3, "sy": 3, "mx": 10, "my": 75.333},
         ],
     },
+    # the compact bar again, on a 1600x1200 panel (retail live: availHeight is 552 CSS pixels)
+    "1600x1200-dpr2.0": {
+        "dpr": 2.0,
+        "panel": (1600, 1200),
+        "availH": 552,
+        "maximized": {"ow": 813, "oh": 565, "iw": 800, "ih": 479, "sx": -6, "sy": -6, "mx": 0, "my": 73},
+        "calls": [
+            {"size": (390, 430), "ow": 513, "oh": 516, "sx": 2, "sy": 2, "mx": 8.5, "my": 75},
+            {"size": (414, 380), "ow": 513, "oh": 460, "sx": 2, "sy": 2, "mx": 8.5, "my": 75},
+            {"size": (800, 479), "ow": 813, "oh": 558, "sx": 2, "sy": 2, "mx": 8.5, "my": 75},
+        ],
+    },
 }
 
 
-def _stable(page, ask: Optional[Tuple[int, int]]) -> Dict[str, Any]:
-    """The window as the page reads it once it has settled: the inner size is the asked one (when one was asked) and two looks in a row are equal.
+def _stable(page, ask: Optional[Tuple[int, int]], fullscreen: Optional[bool] = None) -> Dict[str, Any]:
+    """The window as the page reads it once it has settled: the inner size is the asked one (when one was asked), the document is in fullscreen or not
+    (when that was asked) and two looks in a row are equal.
 
     A condition, not a pause. The last reading is returned either way, so a window that never settles is red where the assertions name what was read."""
     seen: Dict[str, Any] = {"now": None, "before": None}
@@ -125,6 +158,8 @@ def _stable(page, ask: Optional[Tuple[int, int]]) -> Dict[str, Any]:
         seen["before"], seen["now"] = seen["now"], page.evaluate(READ)
         now = seen["now"]
         if ask is not None and (now["iw"], now["ih"]) != ask:
+            return False
+        if fullscreen is not None and now["fs"] is not fullscreen:
             return False
         return now == seen["before"]
 
@@ -165,13 +200,48 @@ def _check_reading(step: str, reading: Dict[str, Any], event: Dict[str, Any], ex
             "%s: at scale 1.0 the events carry (%r, %r) and mozInnerScreen is (%r, %r)" % (step, event["dx"], event["dy"], reading["mx"], reading["my"]))
 
 
+def _fullscreen_round_trip(page, step: str, before: Dict[str, Any], before_event: Dict[str, Any], screen: Tuple[int, int], dpr: float,
+                           points: Iterator[Tuple[int, int]]) -> None:
+    """Enters fullscreen with a real click, reads the window, leaves it and reads it again: it must be exactly the window of ``before``.
+
+    ``screen`` is the declared screen in CSS pixels. In fullscreen outer == inner == screen, the window sits at the origin and so does its content."""
+    assert before["fs"] is False, "%s: the window is in fullscreen before the test enters it: %r" % (step, before)
+    page.mouse.click(*BUTTON)           # the client's own click: a trusted event, so a user gesture
+    wait_until(lambda: page.evaluate("() => window.__fsRequest") not in ("not asked", "pending"), DEADLINE_S, lambda: page.wait_for_timeout(50))
+    request = page.evaluate("() => window.__fsRequest")
+    assert request == "resolved", "%s: requestFullscreen after a real click answers %r, retail enters fullscreen" % (step, request)
+    scw, sch = screen
+    inside = _stable(page, screen, fullscreen=True)
+    inside_event = _event_offset(page, next(points))
+    assert inside["fs"] is True and (inside["scw"], inside["sch"]) == screen, (
+        "%s: in fullscreen the page reads fullscreenElement set=%r and screen %rx%r, the declared screen is %rx%r (%r)"
+        % (step, inside["fs"], inside["scw"], inside["sch"], scw, sch, inside))
+    _check_reading("%s, in fullscreen" % step, inside, inside_event,
+                   {"ow": scw, "oh": sch, "iw": scw, "ih": sch, "sx": 0, "sy": 0, "mx": 0, "my": 0, "dx": 0, "dy": 0}, dpr)
+
+    page.evaluate("() => { document.exitFullscreen(); }")
+    after = _stable(page, (before["iw"], before["ih"]), fullscreen=False)
+    after_event = _event_offset(page, next(points))
+    assert after["fs"] is False, "%s: the page reads fullscreenElement set after exitFullscreen: %r" % (step, after)
+    same = {key: before[key] for key in ("iw", "ih", "ow", "oh", "sx", "sy", "mx", "my")}
+    _check_reading("%s, after leaving fullscreen" % step, after, after_event, same, dpr)
+    assert after["availH"] == before["availH"], "%s: availHeight reads %r after fullscreen, %r before" % (step, after["availH"], before["availH"])
+    for key in ("dx", "dy"):
+        assert abs(after_event[key] - before_event[key]) < EVENT_ROUNDING, (
+            "%s: the offset of the events (%s) was %r before fullscreen and is %r after it" % (step, key, before_event[key], after_event[key]))
+
+
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefox_binary, case):
     from invisible_playwright import InvisiblePlaywright
 
     spec = CASES[case]
     dpr = spec["dpr"]
-    pin = {"screen.width": PANEL[0], "screen.height": PANEL[1], "screen.dpr": dpr}
+    panel = spec["panel"]
+    # the declared screen a page reads: the panel over the scale, rounded as the engine rounds it
+    screen = (int(panel[0] / dpr + 0.5), int(panel[1] / dpr + 0.5))
+    points = iter(POINTS)
+    pin = {"screen.width": panel[0], "screen.height": panel[1], "screen.dpr": dpr}
     with Sites() as s:
         s.route("A", "/page", PAGE)
         with InvisiblePlaywright(seed=42, pin=pin, binary_path=firefox_binary, headless=True, humanize=False) as browser:
@@ -180,10 +250,13 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
 
             # 1. the window as it opens
             maximized = _stable(page, None)
-            maximized_event = _event_offset(page, POINTS[0])
+            maximized_event = _event_offset(page, next(points))
             if "availH" in spec:
                 assert maximized["availH"] == spec["availH"], "the compact bar: screen.availHeight reads %r, retail %r" % (maximized["availH"], spec["availH"])
             _check_reading("maximized (%s)" % case, maximized, maximized_event, spec["maximized"], dpr)
+
+            # F0. fullscreen and back, before any set_viewport_size: the window it had, exactly
+            _fullscreen_round_trip(page, "F0 (%s)" % case, maximized, maximized_event, screen, dpr, points)
 
             # 2 to 4. set_viewport_size, twice and back to the maximized inner size
             for number, call in enumerate(spec["calls"], start=1):
@@ -194,8 +267,11 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
                         % (maximized["iw"], maximized["ih"], width, height))
                 page.set_viewport_size({"width": width, "height": height})
                 reading = _stable(page, (width, height))
-                event = _event_offset(page, POINTS[number])
+                event = _event_offset(page, next(points))
                 _check_reading("set_viewport_size(%d, %d), call %d (%s)" % (width, height, number, case), reading, event, call, dpr)
+                if number == 2:
+                    # F1. fullscreen and back after call 2: the window of call 2, exactly
+                    _fullscreen_round_trip(page, "F1 (%s)" % case, reading, event, screen, dpr, points)
 
 
 #: The headers that give the second page its own browsing context group (and make it cross-origin isolated).
