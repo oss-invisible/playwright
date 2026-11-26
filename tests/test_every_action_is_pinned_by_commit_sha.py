@@ -171,8 +171,8 @@ jobs:
 VENDORED = Path(__file__).resolve().parent / "pinned"
 REUSABLE = {
     # uses (without @) -> (commit our callers pin, git blob id of the file at that commit, vendored copy)
-    "oss-invisible/core/.github/workflows/noreply-identity.yml": ("db3b67efd8d52924ecfe4c69e6daa33cdac58e8c",
-                                                                  "3c3066500c32869347087e08ef69c6bc72c7f858", "core-noreply-identity.yml"),
+    "oss-invisible/core/.github/workflows/noreply-identity.yml": ("1baf9479b288a2563010945ca9233c8b1db91202",
+                                                                  "0fb97825b60feae542d90f593c9921b598a55e0c", "core-noreply-identity.yml"),
 }
 
 

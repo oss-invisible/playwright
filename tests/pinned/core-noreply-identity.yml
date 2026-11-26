@@ -3,14 +3,15 @@ name: noreply-identity
 # Every commit, annotated tag and tagger this event makes public must carry a
 # GitHub noreply address. Reusable: any repository of the organisation calls it
 # with `uses: oss-invisible/core/.github/workflows/noreply-identity.yml@main`.
-# Pull requests and pushes to main of THIS repository come through ci.yml (the
-# `gate` waits for it); here `push` covers the branches without a pull request
-# and the tags. No `pull_request` trigger and no cancelling concurrency:
+# Pull requests, merge groups and pushes to main of THIS repository come through
+# ci.yml (the `gate` waits for it); here `push` covers the branches without a pull
+# request (not the branches of the merge queue, which ci.yml's merge_group run
+# covers) and the tags. No `pull_request` trigger and no cancelling concurrency:
 # tests/test_ci_runs_once_per_commit.py holds both.
 on:
   workflow_call:
   push:
-    branches-ignore: [main]
+    branches-ignore: [main, "gh-readonly-queue/**"]
     tags: ["**"]
 
 permissions:
@@ -47,6 +48,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MG_BASE_REF: ${{ github.event.merge_group.base_ref }}
           REF: ${{ github.ref }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.event.after }}
@@ -70,6 +74,10 @@ jobs:
           case "$EVENT" in
             pull_request|pull_request_target)
               python3 "$script" --event pull_request --base "$BASE_SHA" --head "$HEAD_SHA" --base-ref "$BASE_REF"
+              ;;
+            merge_group)
+              # A queue run is judged as a pull request: what the group adds to its base.
+              python3 "$script" --event pull_request --base "$MG_BASE_SHA" --head "$MG_HEAD_SHA" --base-ref "${MG_BASE_REF#refs/heads/}"
               ;;
             push)
               python3 "$script" --event push --ref "$REF" --before "$BEFORE" --after "$AFTER"
