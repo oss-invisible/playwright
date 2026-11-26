@@ -303,6 +303,25 @@ def _udp_overruns(la: Dict[str, Any], lb: Dict[str, Any], label_a: str, label_b:
     return paths, problems
 
 
+def turn_path_problems(transcript: Dict[str, Any], label: str) -> List[str]:
+    """Whether the TURN path of the lab WORKED in each WebRTC walk of a transcript: a relay candidate was made, no error names the lab's TURN server (701 is what a browser reports when
+    every answer it got was thrown away as invalid, as with a wrong credential), and the server refused no request (``webrtc/turn/refused``, written by ``walk_webrtc``). An A/A that
+    compared two runs in which the TURN path failed the same way would pass; this is the line that says it did not work. A transcript with no WebRTC walk says nothing."""
+    out: List[str] = []
+    for seed, body in sorted((transcript.get("seeds") or {}).items()):
+        walk = body.get("webrtc")
+        if not isinstance(walk, dict):
+            continue
+        errors = [e for e in walk.get("errors") or [] if TURN_TARGET in str(e)]
+        refused = (walk.get("turn") or {}).get("refused") or 0
+        if "relay" in (walk.get("candidate_types") or []) and not errors and not refused:
+            continue
+        seen = (errors + ["the lab TURN refused %d request(s)" % refused] * bool(refused)) or ["no error"]
+        out.append("seeds/%s/webrtc: %s made no relay candidate through the lab TURN (%s). Fix: the probe's credential must be the lab TURN's (tests/_turn_chain.py PASSWORD) "
+                   "and the lab's answers must reach the browser. Rule: the A/A proves the TURN path it compares" % (seed, label, "; ".join(seen)))
+    return out
+
+
 def exit_lines(transcript: Dict[str, Any], label: str, side: str) -> List[str]:
     """The red lines of the launches of one side that did not end with 0 (``exits``, which ``run`` writes: scripts/ci_crash_evidence.py). A transcript that has no ``exits``
     was not made by ``run`` and says nothing about it; one that has it and no launch in it is a run whose probe saw no browser, which is red."""
@@ -323,7 +342,9 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     la, lb = flatten(a.get("seeds") or {}), flatten(b.get("seeds") or {})
     attribution, attribution_differences, unattributed = _udp_attribution(la, lb)
     overrun_paths, overruns = _udp_overruns(la, lb, label_a, label_b)
-    paths = sorted((set(la) | set(lb)) - attribution - overrun_paths)
+    turn_problems = turn_path_problems(a, label_a) + turn_path_problems(b, label_b)
+    refused_paths = {p for p in set(la) | set(lb) if re.match(r"^seeds/[^/]+/webrtc/turn/refused$", p)}
+    paths = sorted((set(la) | set(lb)) - attribution - overrun_paths - refused_paths)
     problems: List[str] = []
     if set(a.get("seeds") or {}) != set(b.get("seeds") or {}):
         problems.append("the sides ran different seeds: %s and %s" % (sorted(a.get("seeds") or {}), sorted(b.get("seeds") or {})))
@@ -362,6 +383,7 @@ def compare_transcripts(a: Dict[str, Any], b: Dict[str, Any], volatile: List[Dic
     problems += exit_lines(a, label_a, "A") + exit_lines(b, label_b, "B")
     problems += invariants
     problems += overruns
+    problems += turn_problems
     problems += ["the volatile entry %r matches no leaf of either transcript: it is stale, drop it" % p for p in stale]
     problems += ["%s: %s %s | %s %s" % (d["path"], label_a, json.dumps(d["a"], sort_keys=True)[:160], label_b, json.dumps(d["b"], sort_keys=True)[:160])
                  for d in differences]
@@ -1605,7 +1627,8 @@ def walk_webrtc(browser: Any, lab: Lab) -> Dict[str, Any]:
     lab.webrtc["counted"] = len(lab.rec.of("webrtc", "udp"))
     out = webrtc_summary(result, lab.exit_ip)
     out.update(connects=data["connects"], dns=data["dns"], udp=data["udp"],
-               turn={"messages": sorted({"0x%04x" % t for _ip, _port, t in lab.turn.seen}), "allocated": bool(lab.turn.allocations)})
+               turn={"messages": sorted({"0x%04x" % t for _ip, _port, t in lab.turn.seen}), "allocated": bool(lab.turn.allocations),
+                     "refused": len(lab.turn.refused)})
     return lab.norm.walk(out)
 
 

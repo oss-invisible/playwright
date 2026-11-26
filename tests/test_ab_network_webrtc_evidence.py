@@ -132,7 +132,7 @@ def evidence_transcript(label, datagrams):
     rec.set_phase("webrtc.end")
     evidence = ab.webrtc_evidence(lab_with(rec, counted=len(datagrams), page={"gathered": float(len(datagrams))}))
     return {"format": ab.FORMAT, "label": label, "platform": "linux",
-            "seeds": {"4": {"webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "gathering": "complete", "udp": {"counts": {ab.TURN_TARGET: 8}}}}},
+            "seeds": {"4": {"webrtc": {"candidates": ["udp comp1 prio1 srflx <exit>"], "candidate_types": ["relay", "srflx"], "gathering": "complete", "udp": {"counts": {ab.TURN_TARGET: 8}}}}},
             "evidence": {"format": ab.EVIDENCE_FORMAT, "seeds": {"4": {"journey": [], "https": {}, "h3": [], "webrtc": evidence}}}}
 
 

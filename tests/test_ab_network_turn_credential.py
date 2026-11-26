@@ -40,7 +40,7 @@ def walk_transcript(label, tids):
     """A transcript of seed 4 whose WebRTC walk sent ``tids`` (one entry per datagram, in order) to the TURN server, summarised as ``run`` summarises them."""
     events = [{"target": ab.TURN_TARGET, "message": "stun-0x0003", "tid": tid, "opener": None} for tid in tids]
     return {"format": ab.FORMAT, "label": label, "platform": "linux",
-            "seeds": {"4": {"webrtc": {"candidates": ["udp comp1 prio1 relay <exit>"], "gathering": "complete", "udp": ab.udp_summary(events, ab.Normalizer({}))}}}}
+            "seeds": {"4": {"webrtc": {"candidates": ["udp comp1 prio1 relay <exit>"], "candidate_types": ["relay"], "gathering": "complete", "udp": ab.udp_summary(events, ab.Normalizer({}))}}}}
 
 
 A, B = "aa" * 12, "bb" * 12
@@ -212,3 +212,57 @@ def test_the_server_of_the_lab_keeps_the_list_of_refusals_too():
         json.dumps(server.exchanges)
     finally:
         server.close()
+
+
+# ----------------------------------------------------------------------------------------------------------------- the A/A proves the TURN path it compares
+def with_walk(transcript, **fields):
+    """The same transcript with fields of its seed-4 WebRTC walk replaced."""
+    out = json.loads(json.dumps(transcript))
+    out["seeds"]["4"]["webrtc"].update(fields)
+    return out
+
+
+def turn_lines(report):
+    """The problems that say the TURN path did not work (a leaf that differs because of it is reported too, as a difference: that is not what is held here)."""
+    return [p for p in report["problems"] if p.startswith("seeds/4/webrtc: ")]
+
+
+def test_a_transcript_whose_walk_made_no_relay_candidate_is_a_problem_on_both_sides_of_the_a_a():
+    good = walk_transcript("a", FIRST_RUN)
+    assert ab.compare_transcripts(good, walk_transcript("b", SECOND_RUN), [], 0, "a", "b")["problems"] == []
+    no_relay = with_walk(walk_transcript("b", FIRST_RUN), candidate_types=["host", "srflx"])
+    report = ab.compare_transcripts(good, no_relay, [], 0, "a", "b")
+    assert report["verdict"] == "red" and len(turn_lines(report)) == 1
+    assert report["problems"][0].startswith("seeds/4/webrtc: b made no relay candidate through the lab TURN (no error). Fix: the probe's credential must be the lab TURN's (tests/_turn_chain.py PASSWORD)")
+    assert report["problems"][0].endswith("Rule: the A/A proves the TURN path it compares")
+    both = ab.compare_transcripts(no_relay, with_walk(good, candidate_types=[]), [], 0, "a", "b")
+    assert [p.split(" made")[0] for p in turn_lines(both)] == ["seeds/4/webrtc: a", "seeds/4/webrtc: b"], "each side that has none is named"
+
+
+def test_a_701_for_the_lab_turn_is_a_problem_even_when_a_relay_candidate_is_there_and_one_for_another_server_is_not(capsys):
+    good = walk_transcript("a", FIRST_RUN)
+    broken = with_walk(good, errors=["701 turn:%s?transport=udp" % ab.TURN_TARGET])
+    report = ab.compare_transcripts(good, broken, [], 0, "a", "b")
+    assert report["verdict"] == "red" and len(turn_lines(report)) == 1 and "701 turn:198.51.100.7:3478" in turn_lines(report)[0] and turn_lines(report)[0].startswith("seeds/4/webrtc: b ")
+    ab.print_report(report, True)
+    out = capsys.readouterr().out
+    assert re.search(r"^FAIL seeds/4/webrtc: b made no relay candidate through the lab TURN \(701 turn:", out, re.M) and "AB NETWORK A/A FAILED:" in out and "2 problems" in out
+    other = with_walk(good, errors=["701 stun:198.51.100.5:19302"])
+    assert turn_lines(ab.compare_transcripts(good, other, [], 0, "a", "b")) == []
+
+
+def test_a_transcript_with_a_relay_candidate_and_no_error_is_not_a_problem_and_one_with_no_walk_says_nothing():
+    good = walk_transcript("a", FIRST_RUN)
+    assert ab.turn_path_problems(good, "a") == []
+    assert ab.turn_path_problems({"seeds": {"4": {"journey": {}}}}, "a") == []
+    assert ab.turn_path_problems({"seeds": {}}, "a") == []
+
+
+def test_a_request_the_lab_turn_refused_is_a_problem_and_the_count_is_not_a_compared_leaf():
+    good = with_walk(walk_transcript("a", FIRST_RUN), turn={"messages": ["0x0003"], "allocated": True, "refused": 0})
+    refused = with_walk(good, turn={"messages": ["0x0003"], "allocated": True, "refused": 2})
+    report = ab.compare_transcripts(good, refused, [], 0, "a", "b")
+    assert report["differences"] == [] and len(report["problems"]) == 1 and len(turn_lines(report)) == 1 and "the lab TURN refused 2 request(s)" in report["problems"][0]
+    assert ab.compare_transcripts(good, good, [], 0, "a", "b")["problems"] == []
+    walk = inspect.getsource(ab.walk_webrtc)
+    assert '"refused": len(lab.turn.refused)' in walk, "the walk writes what the lab TURN refused"
