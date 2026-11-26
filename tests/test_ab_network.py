@@ -2141,10 +2141,57 @@ def test_the_tree_guard_returns_at_the_timeout_kills_the_grandchild_and_names_th
         message = run.timeout_message("the network oracle", 3)
         assert message.startswith("the network oracle did not end within 3 s: the launch exit-pings of seed 11 (firefox-68-again) was alive for ")
         assert message.endswith(" s; its tree was killed")
-        assert 2 <= run.launch["alive_s"] < 3 + 5
+        _assert_alive_since_its_line(run, spent)
     finally:
         if pidfile.is_file():
             _kill_if_alive(int(pidfile.read_text()))
+
+
+def _assert_alive_since_its_line(run, spent):
+    """The time the message gives is measured from the launch line the oracle wrote to the moment the run was read, and it is what the message says.
+
+    ⛔ NOT A WINDOW OF SECONDS. This used to assert ``2 <= alive_s < 8``: a child that a loaded machine starts late writes its launch line late, so the launch was alive for
+    less than 2 s when the tree was killed, and the check failed although the guard had done everything right (the wrapper's pre-push under the load of the whole suite:
+    ``2 <= 1.75824``). What can be said whatever the load: the line cannot have been written before the run began nor after it was read, and its ``at`` is whole seconds
+    (``launch_line``: ``timespec="seconds"``), so ``0 <= alive_s <= spent + 1``; and the message gives that number, not another."""
+    alive = run.launch["alive_s"]
+    assert alive is not None, "the launch line's time does not read: %r" % run.launch
+    assert 0 <= alive <= spent + 1, "the launch was alive for %.2f s, outside what its line and the run allow (0 to %.2f s)" % (alive, spent + 1)
+    assert ("was alive for %d s;" % alive) in run.timeout_message("the network oracle", 3)
+
+
+def test_a_launch_that_began_late_is_named_with_the_time_since_its_own_line(tmp_path):
+    """The case the old check got wrong, made on purpose: a child slowed by a loaded machine writes its launch line one second before the tree is killed. The guard
+    still names that launch and the time since ITS line (1 s); the old window ``2 <= alive_s < 8`` called that a failure, the check above accepts it."""
+    import datetime
+
+    import ci_crash_evidence as crash
+
+    killed = datetime.datetime(2026, 11, 26, 12, 0, 3, tzinfo=datetime.timezone.utc)
+    began = killed - datetime.timedelta(seconds=1)
+    text = crash.launch_line(11, "exit-pings", "firefox-68-again", at=began) + "\nthe grandchild is alive\n"
+    run = crash.TreeRun(None, text, "", 3.0, True)
+    run.launch = crash.last_launch(text, now=killed)
+    assert run.launch["alive_s"] == 1.0
+    assert not (2 <= run.launch["alive_s"] < 3 + 5), "the old window rejects this launch: that was the defect"
+    _assert_alive_since_its_line(run, spent=3.0)
+    assert run.timeout_message("the network oracle", 3).startswith(
+        "the network oracle did not end within 3 s: the launch exit-pings of seed 11 (firefox-68-again) was alive for 1 s;")
+
+
+def test_the_check_refuses_a_time_its_line_cannot_give(tmp_path):
+    """The control: a launch line from before the run (or a clock that went back) gives a time the run could not have had, and the check says so."""
+    import datetime
+
+    import ci_crash_evidence as crash
+
+    killed = datetime.datetime(2026, 11, 26, 12, 0, 3, tzinfo=datetime.timezone.utc)
+    for began, wrong in ((killed - datetime.timedelta(seconds=30), "30 s before a run of 3 s"), (killed + datetime.timedelta(seconds=5), "after the read")):
+        text = crash.launch_line(11, "exit-pings", "firefox-68-again", at=began)
+        run = crash.TreeRun(None, text, "", 3.0, True)
+        run.launch = crash.last_launch(text, now=killed)
+        with pytest.raises(AssertionError):
+            _assert_alive_since_its_line(run, spent=3.0)
 
 
 def test_the_tree_guard_is_silent_when_the_run_ends_by_itself_and_keeps_stdout_stderr_and_the_code_apart(tmp_path):
