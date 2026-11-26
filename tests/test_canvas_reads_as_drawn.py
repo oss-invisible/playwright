@@ -26,9 +26,13 @@ Run: pytest tests/test_canvas_reads_as_drawn.py -m e2e -v
 from __future__ import annotations
 
 import hashlib
+import threading
+import types
 
 import pytest
 
+from _evidence_on_failure import FailureEvidence
+from _webgl_unavailable import SECOND_ATTEMPT_AFTER_MS, split_probe, unavailable_message
 from invisible_playwright import InvisiblePlaywright
 
 _GRID_JS = """(offscreen) => {
@@ -161,9 +165,12 @@ def test_two_seeds_on_the_same_machine_draw_the_same_text(firefox_binary):
 
 _NON_PREMULTIPLIED_JS = """async () => {
   const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+  const statusMessages = [];
+  c.addEventListener('webglcontextcreationerror', e => statusMessages.push(e.statusMessage));
   const gl = c.getContext('webgl', {premultipliedAlpha: false, alpha: true,
                                     preserveDrawingBuffer: true, antialias: true});
-  if (!gl) return null;
+  if (!gl) return {unavailable: true, statusMessages,
+                   webglInterface: typeof WebGLRenderingContext, webgl2Interface: typeof WebGL2RenderingContext};
   const alpha = 128 / 255;
   const vs = gl.createShader(gl.VERTEX_SHADER);
   gl.shaderSource(vs, 'attribute vec2 p; attribute vec3 c; varying vec3 v;'
@@ -192,9 +199,39 @@ _NON_PREMULTIPLIED_JS = """async () => {
 }"""
 
 
-def _non_premultiplied(firefox_binary, hw_seed):
+#: A second attempt at a context, on a fresh canvas, made 2 s after a first one that gave none: it only records (what the page heard, and the
+#: renderer if a context exists); the verdict stays the first attempt's.
+_SECOND_ATTEMPT_JS = """() => {
+  const out = {};
+  try {
+    const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+    const statusMessages = [];
+    c.addEventListener('webglcontextcreationerror', e => statusMessages.push(e.statusMessage));
+    const gl = c.getContext('webgl', {premultipliedAlpha: false, alpha: true,
+                                      preserveDrawingBuffer: true, antialias: true});
+    out.statusMessages = statusMessages;
+    out.created = !!gl;
+    if (gl) {
+      out.renderer = gl.getParameter(gl.RENDERER);
+      out.vendor = gl.getParameter(gl.VENDOR);
+      const info = gl.getExtension('WEBGL_debug_renderer_info');
+      if (info) {
+        out.unmaskedRenderer = gl.getParameter(info.UNMASKED_RENDERER_WEBGL);
+        out.unmaskedVendor = gl.getParameter(info.UNMASKED_VENDOR_WEBGL);
+      }
+    }
+  } catch (e) { out.error = String(e); }
+  return out;
+}"""
+
+
+def _non_premultiplied(firefox_binary, hw_seed, attempts=None):
     """(the pixels of toDataURL, the pixels of toBlob) of one half-transparent, non-premultiplied WebGL canvas,
-    as 128x128 RGBA bytes, with the engine on (hw_seed > 0) or off (0)."""
+    as 128x128 RGBA bytes, with the engine on (hw_seed > 0) or off (0).
+
+    When the page gets no context the first time, the assertion carries why: what the page heard on
+    `webglcontextcreationerror` and, after a pause of 2 s, what a second attempt on a fresh canvas heard (and its
+    renderer if it got one). The second attempt changes no verdict. `attempts`, a record the evidence keeps, gets both."""
     import base64
 
     from _page_bytes import unfiltered
@@ -205,8 +242,18 @@ def _non_premultiplied(firefox_binary, hw_seed):
     ) as b:
         p = b.new_context().new_page()
         p.goto("about:blank", timeout=30_000)
-        got = p.evaluate(_NON_PREMULTIPLIED_JS)
-    assert got is not None, "webgl is unavailable: a WebGL canvas cannot be read"
+        got, first = split_probe(p.evaluate(_NON_PREMULTIPLIED_JS))
+        second = None
+        if got is None:
+            p.wait_for_timeout(SECOND_ATTEMPT_AFTER_MS)
+            try:
+                second = p.evaluate(_SECOND_ATTEMPT_JS)
+            except Exception as problem:         # only a note: the first attempt is the verdict
+                second = {"error": repr(problem)}
+    if attempts is not None:
+        with attempts.lock:
+            attempts.records.append({"hw_seed": hw_seed, "context": got is not None, "first": first, "second": second})
+    assert got is not None, unavailable_message(first, second)
     assert got["premultipliedAlpha"] is False, "the context is premultiplied: %r" % got["premultipliedAlpha"]
     images = [unfiltered(base64.b64decode(got["url"].split(",", 1)[1])), unfiltered(base64.b64decode(got["blob"]))]
     for png in images:
@@ -224,8 +271,20 @@ def test_a_non_premultiplied_webgl_canvas_reads_the_same_through_todataurl_and_t
     canvas is half transparent (alpha 128/255, colours as drawn), so a premultiplied reading changes the bytes.
     Negative control, in the same test: with the engine off the two readers are the bytes as drawn, their alpha is
     the 128 drawn, and the engine-on PNG differs from them."""
-    on_url, on_blob = _non_premultiplied(firefox_binary, 12345)
-    off_url, off_blob = _non_premultiplied(firefox_binary, 0)
+    with FailureEvidence("canvas-webgl-non-premultiplied") as evidence:
+        attempts = types.SimpleNamespace(lock=threading.Lock(), records=[])
+        evidence.note_records("webgl-attempts", attempts)
+        # One arming before both launches (engine on, then off): the variables it sets stay for the second launch, and the
+        # engine writes one log file per process (MOZ_LOG_FILE has %PID), so both are covered; a second arm() would lose
+        # the first one's patch. gfx2d is the module of gfxCriticalNote (gfx/2d/Factory.cpp, LazyLogModule "gfx2d"); the
+        # engine has no log module named GfxInfo or WebGL (none in widget/ or dom/canvas), so none is asked for.
+        evidence.arm(moz_log="timestamp,gfx2d:5")
+        on_url, on_blob = _non_premultiplied(firefox_binary, 12345, attempts)
+        off_url, off_blob = _non_premultiplied(firefox_binary, 0, attempts)
+        _the_engine_off_and_on_readings_agree(on_url, on_blob, off_url, off_blob)
+
+
+def _the_engine_off_and_on_readings_agree(on_url, on_blob, off_url, off_blob):
     alphas = {off_url[i] for i in range(3, len(off_url), 4)}
     assert alphas <= set(range(126, 131)), (
         "engine off: the alpha of the PNG is %s, not the 128 that was drawn" % sorted(alphas))
