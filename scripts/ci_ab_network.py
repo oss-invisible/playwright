@@ -324,7 +324,8 @@ def turn_path_problems(transcript: Dict[str, Any], label: str) -> List[str]:
 
 def turn_deallocation_problems(transcript: Dict[str, Any], label: str) -> List[str]:
     """What the lab's TURN server heard of deallocations (``webrtc/turn/deallocation``, written by ``walk_webrtc`` with :func:`deallocation_facts`) that a walk must not have: an allocation ended
-    by more than one deallocation, a deallocation from an address that has no allocation. One deallocation, or none, is the engine's best effort at teardown and is evidence, not a leaf."""
+    by more than one deallocation, a deallocation from an address that has no allocation. One deallocation, or none, is the engine's best effort at teardown and is evidence, not a leaf; so is
+    ``early`` (see the comment below)."""
     out: List[str] = []
     for seed, body in sorted((transcript.get("seeds") or {}).items()):
         walk = body.get("webrtc")
@@ -334,9 +335,11 @@ def turn_deallocation_problems(transcript: Dict[str, Any], label: str) -> List[s
         for key, what, fix in (("repeated", "%d allocation(s) of the lab TURN were ended by more than one deallocation (a Refresh with LIFETIME 0)",
                                 "find what sends the teardown twice; the engine sends it once"),
                                ("unallocated", "the lab TURN heard %d deallocation(s) (a Refresh with LIFETIME 0) from an address that has no allocation",
-                                "find what deallocates an allocation it never made; the lab's record is TurnServer.deallocations in tests/_turn_chain.py"),
-                               ("early", "%d deallocation(s) (a Refresh with LIFETIME 0) reached the lab TURN before the page began closing its connection",
-                                "find what ends the allocation while the page still holds it; the engine sends it only while it shuts the client down, after the close")):
+                                "find what deallocates an allocation it never made; the lab's record is TurnServer.deallocations in tests/_turn_chain.py")):
+            # ``early`` (a deallocation before the page began closing) is evidence, never a problem: the bound maps the page's performance.now() onto the recorder's clock,
+            # and the page's clock is the engine's reduced-precision timer, not the recorder's. On Windows the published engine against itself was "early" on seeds 63 and 6
+            # (wrapper #612's round, e2e (network, windows)), so the two events cannot be ordered on that mapping. Ordering them on one clock would take a marker the page
+            # sends through the gateway before pc.close(), and that request would itself become a compared leaf of the walk.
             if facts.get(key):
                 out.append("seeds/%s/webrtc: %s: %s. Fix: %s. Rule: the TURN deallocation is one best-effort send at teardown (nICEr nr_turn_client_deallocate)"
                            % (seed, label, what % facts[key], fix))
@@ -1676,7 +1679,8 @@ def closing_began(called: float, page: Optional[Dict[str, Any]]) -> Optional[flo
 def deallocation_facts(turn: Any, marked: List[Dict[str, Any]], began_closing: Optional[float]) -> Dict[str, int]:
     """What the lab heard of deallocations that a walk must not have: ``repeated`` allocations that were ended by more than one transaction, ``unallocated`` deallocations from an address
     that has no allocation (both from the lab's TURN server), and ``early`` deallocation transactions that the gateway carried (``marked``, its events of them) before the page began closing
-    (``began_closing``, :func:`closing_began`; unknown: none is early). All are 0 in a healthy walk; ``turn_deallocation_problems`` says it when they are not, and they are never compared."""
+    (``began_closing``, :func:`closing_began`; unknown: none is early). ``repeated`` and ``unallocated`` are 0 in a healthy walk and ``turn_deallocation_problems`` says it when they are not;
+    ``early`` is evidence only (the page's clock cannot order it, see ``turn_deallocation_problems``). None of them is compared."""
     ends: collections.Counter = collections.Counter()
     unallocated = 0
     for _ip, _port, _tid, _t, allocation in turn.deallocation_transactions():
