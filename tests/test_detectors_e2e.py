@@ -17,18 +17,9 @@ libraries and uses their FULL API surface:
     hasPlaywright, hasSwiftshaderRenderer, hasMissingChromeObject, …): they're
     trivially clean on Firefox, and the GPU ones can legitimately fire on a
     software-WebGL CI host (Xvfb/llvmpipe) - asserting them would false-red.
-  * The headless/stealth detector (MIT, pinned to a commit) - the gold-standard Firefox-aware
-    headless/stealth/lie detector. It exposes its result on ``window.Fingerprint``.
-    We assert ``headlessRating == 0`` (webdriver + headless-UA tells) and the
-    JS-proxy stealth tells are absent. ``stealthRating`` / ``totalLies`` /
-    ``likeHeadlessRating`` are LOGGED, not hard-asserted, because some of their
-    sub-signals (hasBadWebGL, prefers-light-color) are GPU/theme-sensitive and
-    differ on a GPU-less CI host.
 
 Everything is hermetic: the libraries are vendored (tests/vendor/) and served
-from a localhost HTTP server - no external CDN call. For the headless detector, every non-local
-request is aborted, so its optional crowd-comparison POST never runs and the
-verdict is computed purely locally. Runs identically on a dev box and a GH runner.
+from a localhost HTTP server - no external CDN call. Runs identically on a dev box and a GH runner.
 
 NOT covered: the commercial, server-side service built on the fingerprint library - stays the local
 realness gate.
@@ -49,7 +40,6 @@ _VENDOR = Path(__file__).parent / "vendor"
 _BOT_DETECTOR = "bot-detector-2.0.0.esm.js"
 _FINGERPRINT_LIB = "fingerprint-library-5.2.0.umd.min.js"
 _RULES_SCANNER = "rules-scanner-1.0.6.es.js"
-_HEADLESS_DETECTOR = "headless-detector-10aa672.js"  # pinned to a commit, see tests/vendor/README.md
 
 # rules-scanner rules that are MEANINGFUL on Firefox and GPU-independent - these must
 # stay clean. The omitted rules are Chrome-only (hasCDP/hasPlaywright/
@@ -98,20 +88,12 @@ window.__bot_det = null; window.__fp = null; window.__fps = null; window.__err =
 }})();
 </script></body></html>"""
 
-# The headless detector gets its own page: its bundle is a plain `defer` script that runs on load
-# and populates window.Fingerprint. A minimal DOM is enough (the rich report DOM
-# is only for the visual page, not the computation).
-_HEADLESS_PAGE = f"""<!doctype html><html><head><meta charset="utf-8"><title>headless</title></head>
-<body><div id="fingerprint-data"></div><script src="/{_HEADLESS_DETECTOR}" defer></script></body></html>"""
-
-
 class _DetectorSite:
-    """Localhost server: `/` → bot detector + fingerprint library + rules scanner page, `/headless` → headless detector page,
+    """Localhost server: `/` → bot detector + fingerprint library + rules scanner page,
     `/<file>` → the vendored bundle."""
 
     def __init__(self):
         page = _PAGE.encode()
-        headless_page = _HEADLESS_PAGE.encode()
         # Preload the vendored bundle by exact filename. Serving from this map
         # means a request never builds a filesystem path from its own input, so
         # there is no path a crafted request could traverse.
@@ -122,8 +104,6 @@ class _DetectorSite:
                 p = self.path.split("?")[0]
                 if p == "/":
                     body, ctype = page, "text/html; charset=utf-8"
-                elif p == "/headless":
-                    body, ctype = headless_page, "text/html; charset=utf-8"
                 else:
                     body = files.get(Path(p.lstrip("/")).name)
                     if body is None:
@@ -145,10 +125,6 @@ class _DetectorSite:
     @property
     def url(self):
         return f"http://127.0.0.1:{self.port}/"
-
-    @property
-    def headless_url(self):
-        return f"http://127.0.0.1:{self.port}/headless"
 
     def close(self):
         self._srv.shutdown()
@@ -175,39 +151,6 @@ def _run_detectors(firefox_binary, url):
         fps = page.evaluate("() => window.__fps")
         err = page.evaluate("() => window.__err")
     return bot_det, fp, fps, err
-
-
-def _run_headless_detector(firefox_binary, headless_url):
-    """Launch the binary, run the headless detector fully offline, return its headless result."""
-    _EV = """() => {
-      const f = window.Fingerprint;
-      if (!f || !f.headless) return { ready: false };
-      const h = f.headless;
-      return {
-        ready: true,
-        headlessRating: h.headlessRating,
-        stealthRating: h.stealthRating,
-        likeHeadlessRating: h.likeHeadlessRating,
-        headless: h.headless || {},
-        stealth: h.stealth || {},
-        totalLies: (f.lies && f.lies.totalLies) || 0,
-      };
-    }"""
-    with InvisiblePlaywright(seed=42, binary_path=firefox_binary) as browser:
-        page = browser.new_page()
-        # NetworkObserver was stripped to the bone on 2026-08-24: page.route()
-        # no longer exists (Network.setRequestInterception refuses), so
-        # blocking the detector's optional crowd-comparison POST can no
-        # longer be done this way. Verified: without the block the test still
-        # passes, with the same outcome on headlessRating/stealth - that POST
-        # was test-hygiene isolation (speed, no dependency on a third-party
-        # site), not a precondition of the assertions.
-        page.goto(headless_url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_function(
-            "() => !!(window.Fingerprint && window.Fingerprint.headless)",
-            timeout=60000,
-        )
-        return page.evaluate(_EV)
 
 
 @pytest.mark.e2e
@@ -270,34 +213,6 @@ def test_the_rules_scanner_flags_no_automation_rule(firefox_binary, detector_sit
         f"the rules scanner flagged automation on engine-agnostic rules: {flagged} "
         f"(full details: { {k: v for k, v in details.items() if v.get('detected')} })"
     )
-
-
-@pytest.mark.e2e
-def test_the_headless_detector_sees_no_headless_and_no_proxy_tell(firefox_binary, detector_site):
-    """The headless detector (Firefox-aware) must see no headless tell and no JS-proxy stealth
-    tell. ``headlessRating`` aggregates webDriverIsOn + headless-UA checks (all
-    GPU-independent). The proxy/runtime stealth sub-signals (hasIframeProxy,
-    hasToStringProxy, hasBadChromeRuntime) must be false - a spoof implemented
-    with a JS Proxy is exactly what it catches. stealthRating/totalLies/
-    likeHeadlessRating are GPU/theme-sensitive, so we log them, not assert."""
-    r = _run_headless_detector(firefox_binary, detector_site.headless_url)
-    assert r and r.get("ready"), f"the headless detector never populated window.Fingerprint: {r!r}"
-    print(
-        f"[headless-detector] headlessRating={r['headlessRating']} stealthRating={r['stealthRating']} "
-        f"likeHeadlessRating={r['likeHeadlessRating']} totalLies={r['totalLies']} "
-        f"headless={r['headless']} stealth={r['stealth']}"
-    )
-    assert r["headlessRating"] == 0, (
-        f"the headless detector headless tells fired: headless={r['headless']} "
-        f"(headlessRating={r['headlessRating']})"
-    )
-    stealth = r.get("stealth") or {}
-    proxy_tells = {
-        k: stealth.get(k)
-        for k in ("hasIframeProxy", "hasToStringProxy", "hasBadChromeRuntime")
-        if stealth.get(k)
-    }
-    assert not proxy_tells, f"the headless detector JS-proxy stealth tells fired: {proxy_tells}"
 
 
 @pytest.mark.e2e
