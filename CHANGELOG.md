@@ -4,9 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.59.1] - 2026-11-25
+## [0.60.0] - 2026-11-26
 
 ### Changed
+- Pins invisible-core 70.83.0 on the engine firefox-70 (Firefox 159.0).
+- The engine carries Firefox's fix for the race between the start and the shutdown of its telemetry (Glean): a browser closed while it was
+  still starting no longer leaves that work half done.
 - ElementHandle pointer actions (`click`, `dblclick`, `hover`, `tap`, `check`, `uncheck`, `set_checked`) now use the same humanised pointer walk as selector actions (they used to jump to the exact centre of the element in one move).
 - Screenshot parameters that Playwright honours by modifying the page (`mask`/`maskColor`, `style`, `animations="disabled"`,
   `caret="initial"`) are now refused by name with a clear error instead of being silently ignored; `omitBackground` with PNG answers
