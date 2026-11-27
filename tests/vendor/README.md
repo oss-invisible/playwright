@@ -18,4 +18,4 @@ file name, and change its row (name, version, sha256).
 |---|---|---|---|---|---|
 | `bot-detector-2.0.0.esm.js` | client-side bot detector | 2.0.0 | MIT | `f438ed251dc7414ece9d4a2b6941441ad9ffae1a1905817f5f0c7366e701dd86` | in the file header (copyright line and licence reference) |
 | `fingerprint-library-5.2.0.umd.min.js` | open-source fingerprint library | 5.2.0 | MIT | `a8de5ead580c42d2e2b01a5752aa08da510852230971aa18554d67cd5de5775b` | in the file header (copyright line and full licence text) |
-| `rules-scanner-1.0.6.es.js` | automation-rules scanner | 1.0.6 | MIT | `a5ec46ae9e412470088531b97ff7c1bdbff1da338aef0647d3eb91afc57e73d5` | in the file header (the upstream MIT notice, verbatim) |
+| `rules-scanner-1.0.6.es.js` | automation-rules scanner | 1.0.6 | MIT | `4ae2557e92451687e275877039d4dff4601ad1344c5bc8206e9c7087fbf5e91a` | in the file header (upstream's MIT notice: the copyright holder and year and the full permission text verbatim; the contact address is left out) |
