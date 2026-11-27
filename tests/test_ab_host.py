@@ -674,10 +674,35 @@ def test_a_windows_kind_that_is_gone_from_the_candidate_is_red_by_its_command_li
     assert report["verdict"] == "red" and {d["leaf"] for d in report["differences"]} == {"proc.utility/sandboxingKind=1/notForBrowser"}
 
 
+def etw_open(pid, name):
+    return ('<Event %s><System><Provider Name="Microsoft-Windows-Kernel-File"/><EventID>12</EventID><Execution ProcessID="%d" ThreadID="7"/></System>'
+            '<EventData><Data Name="Irp">0x1</Data><Data Name="FileName">%s</Data></EventData></Event>' % (NS, pid, name))
+
+
 def etw(*events):
-    body = "".join('<Event %s><System><Provider Name="Microsoft-Windows-Kernel-File"/><EventID>12</EventID><Execution ProcessID="%d" ThreadID="7"/></System>'
-                   '<EventData><Data Name="Irp">0x1</Data><Data Name="FileName">%s</Data></EventData></Event>' % (NS, pid, name) for pid, name in events)
-    return "<Events>%s</Events>" % body
+    return "<Events>%s</Events>" % "".join(etw_open(pid, name) for pid, name in events)
+
+
+def device_path(path):
+    """A drive path as the system names it in a Kernel-Process event (a device path)."""
+    return "\\Device\\HarddiskVolume3" + path[2:]
+
+
+def etw_start(pid, ppid, image):
+    """Kernel-Process event 1 (ProcessStart): the image is a device path, as the system writes it."""
+    return ('<Event %s><System><Provider Name="Microsoft-Windows-Kernel-Process"/><EventID>1</EventID><Execution ProcessID="4" ThreadID="8"/></System>'
+            '<EventData><Data Name="ProcessID">%d</Data><Data Name="CreateTime">2026-11-26T10:00:00.0Z</Data><Data Name="ParentProcessID">%d</Data>'
+            '<Data Name="ImageName">%s</Data></EventData></Event>' % (NS, pid, ppid, device_path(image)))
+
+
+def etw_life(tree_xml, opens):
+    """The session XML of a machine whose tree is `tree_xml` (the 4688 of the audit): each process starts where the audit says, its opens follow its start, the rest come last."""
+    rest, out = list(opens), []
+    for e in host.parse_audit_events("\n".join(tree_xml)):
+        out.append(etw_start(e["pid"], e["ppid"], e["image"]))
+        out += [etw_open(*o) for o in rest if o[0] == e["pid"]]
+        rest = [o for o in rest if o[0] != e["pid"]]
+    return "<Events>%s</Events>" % "".join(out + [etw_open(*o) for o in rest])
 
 
 def test_the_etw_file_events_are_read_for_the_processes_of_the_tree_only(tmp_path):
@@ -721,8 +746,9 @@ def logman_list(sessions):
 class FakeTools:
     """`_tool` of a Windows machine: the audit, the registry, the Security log, logman and tracerpt, with a record of what was asked."""
 
-    def __init__(self, work, tree, files, canaries=("start", "end"), still_listed=0, list_failures=0):
+    def __init__(self, work, tree, files, canaries=("start", "end"), still_listed=0, list_failures=0, session=None):
         self.work, self.tree, self.files, self.canaries, self.calls = work, tree, files, canaries, []
+        self.session = session  # the events of the session as the test writes them (the starts, the opens, the stops); None: a start for every process of the audit, its opens after it
         self.list_failures = list_failures  # the first reads of the list fail with 4200 (ERROR_WMI_GUID_NOT_FOUND)
         self.sessions, self.still_listed, self.stopped = {}, still_listed, {}  # a stopped session is listed `still_listed` more times, then gone
 
@@ -758,7 +784,8 @@ class FakeTools:
             return "\n".join(self.tree)
         if tool == "tracerpt":
             mine = [(os.getpid(), str(p)) for p in sorted(self.work.glob("canary-*")) if any(c in p.name for c in self.canaries)]
-            Path(argv[argv.index("-o") + 1]).write_text(etw(*(self.files + mine)), encoding="utf-8")
+            text = etw_life(self.tree, self.files + mine) if self.session is None else "<Events>%s</Events>" % "".join(self.session + [etw_open(*m) for m in mine])
+            Path(argv[argv.index("-o") + 1]).write_text(text, encoding="utf-8")
             Path(argv[argv.index("-summary") + 1]).write_text("Events Lost: 0\n", encoding="utf-8")
         return ""
 
@@ -801,6 +828,114 @@ def test_the_windows_trace_is_red_for_a_process_it_has_no_file_of(tmp_path, monk
     trace, _fake = a_windows_run(tmp_path, monkeypatch, [f for f in TREE_FILES if f[0] != 107])
     got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
     assert got["problems"] == ["the file trace holds no open of the process(es) 107"]
+
+
+# -
+# Every open is attributed to the life of its process in the same stream (run 46058507264: Windows hands a pid that ended to the next process, and the opens of the oracle's own
+# `logman` and `wevtutil` were counted as a pingsender's and a tab's).
+
+LOGMAN = "C:\\Windows\\System32\\logman.exe"
+WEVTUTIL = "C:\\Windows\\System32\\wevtutil.exe"
+XUL = "C:\\lab\\ff\\xul.dll"
+WEVTAPI = "C:\\Windows\\System32\\wevtapi.dll"
+LIFE_ROOT = audit(10, 100, 1, FIREFOX, '"%s" -profile "D:\\t\\p"' % FIREFOX)
+LIFE_PINGSENDER = audit(11, 2764, 100, FIREFOX, '"%s" --backgroundtask pingsender' % FIREFOX)
+LIFE_TAB = audit(12, 102, 100, FIREFOX, '"%s" -contentproc --channel="100.1.2" -isForBrowser -prefsHandle 9 tab' % FIREFOX)
+LOGMAN_OPENS = [LOGMAN, "C:\\Windows\\System32\\pla.dll", WEVTAPI]
+
+
+def a_finished_run(tmp_path, monkeypatch, tree, session):
+    monkeypatch.setattr(host, "_tool", FakeTools(tmp_path, tree, [], session=session))
+    trace = host.WindowsTrace(tmp_path)
+    trace.start()
+    got = trace.finish({100}, alive=lambda pid: False, sleep=lambda s: None)
+    trace.cleanup()
+    return trace, got
+
+
+def a_pid_that_was_the_logman_of_the_oracle_and_then_a_pingsender():
+    """Run 46058507264: pid 2764 was `logman query -ets` (before the root), then the `firefox --backgroundtask pingsender` of the tree."""
+    return ([etw_start(2764, os.getpid(), LOGMAN)] + [etw_open(2764, n) for n in LOGMAN_OPENS] + [etw_stop(2764, 0, "2026-11-26T10:00:01.0Z", "logman.exe")]
+            + [etw_start(100, 1, FIREFOX), etw_open(100, XUL), etw_start(2764, 100, FIREFOX), etw_open(2764, XUL)])
+
+
+def test_the_opens_of_a_logman_that_had_the_pid_of_a_pingsender_are_not_the_pingsenders(tmp_path, monkeypatch):
+    _trace, got = a_finished_run(tmp_path, monkeypatch, [LIFE_ROOT, LIFE_PINGSENDER], a_pid_that_was_the_logman_of_the_oracle_and_then_a_pingsender())
+    assert {n for p, n in got["files"] if p == 2764} == {XUL}, "only what the firefox life of the pid opened is the tree's"
+    assert got["problems"] == []
+    assert {(d["pid"], d["life"], d["file"]) for d in got["lives"]["dropped"]} == {(2764, device_path(LOGMAN), n) for n in LOGMAN_OPENS}
+    assert [(r["pid"], r["image"], r["tree"], r["opens"]) for r in got["lives"]["lives"] if r["pid"] == 2764] == [(2764, device_path(LOGMAN), False, 3), (2764, device_path(FIREFOX), True, 1)]
+
+
+def test_the_opens_of_a_wevtutil_born_with_the_pid_of_a_finished_tab_are_not_the_tabs(tmp_path, monkeypatch):
+    session = [etw_start(100, 1, FIREFOX), etw_open(100, XUL), etw_start(102, 100, FIREFOX), etw_open(102, XUL), etw_stop(102, 0, "2026-11-26T10:00:02.0Z", "firefox.exe"),
+               etw_start(102, os.getpid(), WEVTUTIL), etw_open(102, WEVTAPI)]
+    _trace, got = a_finished_run(tmp_path, monkeypatch, [LIFE_ROOT, LIFE_TAB], session)
+    assert {n for p, n in got["files"] if p == 102} == {XUL}
+    assert got["problems"] == []
+    assert [(d["pid"], d["file"]) for d in got["lives"]["dropped"]] == [(102, WEVTAPI)]
+    assert [e["code"] for e in got["exits"] if e["pid"] == 102] == [0], "the tab's own stop is its exit"
+
+
+def test_a_life_of_a_tool_of_the_oracle_that_is_counted_as_the_tree_is_red_and_names_it(tmp_path, monkeypatch):
+    monkeypatch.setitem(host.ORACLE_TOOLS, "wevtutil.exe", "wevtutil qe Security /c:1")
+    taken_in = audit(13, 108, 100, WEVTUTIL, "wevtutil qe Security")
+    session = [etw_start(100, 1, FIREFOX), etw_open(100, XUL), etw_start(108, 100, WEVTUTIL), etw_open(108, WEVTAPI)]
+    _trace, got = a_finished_run(tmp_path, monkeypatch, [LIFE_ROOT, taken_in], session)
+    assert len(got["problems"]) == 1 and "pid 108" in got["problems"][0] and "wevtutil.exe" in got["problems"][0] and "tool the oracle runs" in got["problems"][0], got["problems"]
+    assert "wevtutil qe Security /c:1" in got["problems"][0], "the command the oracle ran is named"
+
+
+def test_a_process_of_the_tree_with_no_start_in_the_session_is_red_and_names_its_pid(tmp_path, monkeypatch):
+    _trace, got = a_finished_run(tmp_path, monkeypatch, [LIFE_ROOT, LIFE_PINGSENDER], [etw_start(100, 1, FIREFOX), etw_open(100, XUL), etw_open(2764, XUL)])
+    assert [p for p in got["problems"] if "no life" in p and "pid 2764" in p], got["problems"]
+    assert not [p for p in got["problems"] if "tree pid 100 " in p], "the root has its life"
+    assert got["lives"]["dropped"] == [{"pid": 2764, "life": "no life seen", "file": XUL}], "its open is listed, never counted"
+    assert {p for p, _n in got["files"]} == {100}
+
+
+def test_the_starts_and_stops_of_a_session_are_lives_in_the_order_of_the_file_and_a_life_is_the_trees_by_its_pid_creator_and_image(tmp_path):
+    lives = host.Lives({7})
+    xml = tmp_path / "session.xml"
+    xml.write_text("<Events>%s</Events>" % "".join([etw_open(7, "C:\\early.dll"), etw_start(7, 1, LOGMAN), etw_open(7, "C:\\a.dll"), etw_stop(7, 3, "t", "logman.exe"),
+                                                    etw_open(7, "C:\\late.dll"), etw_start(7, 100, FIREFOX), etw_open(7, "C:\\b.dll")]), encoding="utf-8")
+    host.etw_files(xml, None, None, None, None, lives)
+    assert [(life["pid"], life["ppid"], life["base"], life["start"], life["stop"], life["code"]) for life in lives.items] == [(7, 1, "logman.exe", 2, 4, 3), (7, 100, "firefox.exe", 6, None, None)]
+    assert [(index, name) for _pid, index, name, _pos, _d in lives.opens] == [(None, "C:\\early.dll"), (0, "C:\\a.dll"), (None, "C:\\late.dll"), (1, "C:\\b.dll")]
+    right = host.parse_audit_events(audit(1, 7, 100, "D:\\other\\FIREFOX.EXE", "x"))
+    assert host.attribute_opens(lives, right)["files"] == {(7, "C:\\b.dll")}, "the image is compared by its base name, without the case"
+    for wrong in (audit(1, 7, 101, FIREFOX, "x"), audit(1, 7, 100, "C:\\lab\\ff\\plugin-container.exe", "x"), audit(1, 8, 100, FIREFOX, "x")):
+        assert host.attribute_opens(lives, host.parse_audit_events(wrong))["files"] == set()
+
+
+def test_the_tools_the_oracle_runs_are_recorded_by_their_image_name(monkeypatch):
+    monkeypatch.setattr(host, "ORACLE_TOOLS", {})
+    monkeypatch.setattr(host.subprocess, "run", lambda *a, **k: type("Done", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    host._tool(["logman", "query", "-ets"])
+    host._tool(["C:\\Windows\\System32\\WevtUtil.exe", "qe", "Security"])
+    assert sorted(host.ORACLE_TOOLS) == ["logman.exe", "wevtutil.exe"] and host.ORACLE_TOOLS["logman.exe"] == "logman query -ets"
+
+
+def test_the_lives_and_the_filtered_session_are_saved_next_to_the_audit_and_a_write_that_fails_is_said_not_raised(tmp_path, monkeypatch, capsys):
+    import gzip
+
+    session = a_pid_that_was_the_logman_of_the_oracle_and_then_a_pingsender() + [etw_open(999, "C:\\unrelated.dll")]
+    _trace, got = a_finished_run(tmp_path, monkeypatch, [LIFE_ROOT, LIFE_PINGSENDER], session)
+    folder = tmp_path / "footprint-68.audit"
+    host.save_lives(folder, "measured", 4, got)
+    assert sorted(p.name for p in folder.iterdir()) == ["measured-4.etw.xml.gz", "measured-4.lives.json"]
+    saved = json.loads((folder / "measured-4.lives.json").read_text(encoding="utf-8"))
+    assert saved["format"] == host.LIVES_FORMAT and (saved["launch"], saved["seed"]) == ("measured", 4) and len(saved["dropped"]) == 3
+    assert [r["tree"] for r in saved["lives"] if r["pid"] == 2764] == [False, True]
+    text = gzip.open(folder / "measured-4.etw.xml.gz", "rt", encoding="utf-8").read()
+    assert text.count("pla.dll") == 1 and "unrelated.dll" not in text, "the opens of the pids of the tree, not the machine's"
+    assert text.count("<EventID>1</EventID>") == 3 and text.count("<EventID>2</EventID>") == 1, "every start and stop"
+    host.save_lives(None, "measured", 4, got)  # no folder: nothing happens
+    host.save_lives(folder, "measured", 5, None)  # nothing read: nothing happens
+    blocked = tmp_path / "file"
+    blocked.write_text("x", encoding="utf-8")
+    host.save_lives(blocked / "audit", "measured", 5, got)
+    assert "the lives of the tree could not be saved (seed 5, launch measured)" in capsys.readouterr().out
 
 
 def test_a_windows_tool_that_fails_says_so_and_is_not_an_empty_trace(tmp_path, monkeypatch):
