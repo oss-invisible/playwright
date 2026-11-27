@@ -122,7 +122,7 @@ def _x_side(parent: psutil.Process) -> dict:
         if environ.get("XAUTHORITY"):
             env["XAUTHORITY"] = environ["XAUTHORITY"]
         try:
-            done = subprocess.run(["xlsclients", "-display", display], capture_output=True, text=True, timeout=5, env=env)
+            done = subprocess.run(["xlsclients", "-display", display], capture_output=True, text=True, timeout=30, env=env)
             out["x_clients"] = len([l for l in done.stdout.splitlines() if l.strip()]) if done.returncode == 0 else None
             if done.returncode != 0:
                 out["x_clients_error"] = (done.stderr or "").strip()[:200]
