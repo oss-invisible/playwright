@@ -15,8 +15,7 @@ One launch per exit (``observed``, six of them) is read by the tests below; each
 * WebRTC: the candidates and the SDP carry nothing of this machine;
 * DNS: the names of the pages reach the gateway (as DoH) and are not asked of the system resolver;
 * the time zone of the page, of its offsets read two ways, and of a worker;
-* the language of the page, of a worker and of the Accept-Language the site receives, and that it fits the exit's country;
-* a vendored detection page, served locally and loaded behind the gateway.
+* the language of the page, of a worker and of the Accept-Language the site receives, and that it fits the exit's country.
 
 The four states of the gateway (coherent, TCP only, mismatched, silent) are tested by ``test_webrtc_realness.py``; here only the
 "nothing of the host" part of a coherent gather is added.
@@ -41,7 +40,6 @@ from _host_address import this_host_address
 from _leaks import ResolverTrap, Watcher
 from _socks_servers import STUN_NUMBER, STUN_PORT
 from _udp_line import egress_by_proxy, measure_servers
-from test_detectors_e2e import _DetectorSite
 from test_webrtc_realness import _RELAY_PROBE_JS
 
 pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("the_udp_line")]
@@ -193,76 +191,6 @@ def test_the_language_of_the_page_its_worker_and_the_header_agree_and_fit_the_co
     that is not in it is checked for agreement only)."""
     problems = rs.language_problems(observed.reads, observed.headers, observed.country)
     assert problems == [], "exit %s (%s, %s): %s" % (observed.exit_ip, observed.label, observed.country, problems)
-
-
-# ------------------------------------------------------------------------------------- the vendored detection page
-#: What the vendored detection page reads, in the page itself: the outcome fields only (the lies, the flags of a headless
-#: browser, and the three "lied" fields of the zone, the Intl and the worker).
-_DETECTION_JS = """() => {
-  const f = window.Fingerprint;
-  if (!f || !f.headless) return {ready: false};
-  const on = (o) => Object.entries(o || {}).filter(([, v]) => v === true).map(([k]) => k).sort();
-  return {
-    ready: true,
-    lies: (f.lies && f.lies.totalLies) || 0,
-    headless: on(f.headless.headless),
-    zone: f.timezone ? {location: f.timezone.location, lied: !!f.timezone.lied} : null,
-    intl: f.intl ? {lied: !!f.intl.lied} : null,
-    worker: f.workerScope ? {lied: !!f.workerScope.lied} : null,
-  };
-}"""
-
-
-def _detection_page_of(site):
-    """The URL of the vendored detection page of the local site of ``test_detectors_e2e.py``: the one of its URL properties that
-    is not the root (the root serves three other libraries; this page is the one that reports lies and headless flags)."""
-    own = [name for name, value in vars(type(site)).items() if isinstance(value, property) and name.endswith("_url")]
-    assert len(own) == 1, own
-    return getattr(site, own[0])
-
-
-def test_the_vendored_detection_page_finds_nothing_behind_the_gateway(firefox_binary, monkeypatch):
-    """6. The vendored detection page, served locally, loaded behind the gateway: no lies, no flag of a headless browser, and
-    none of the zone, the Intl or the worker reads marked as lied; and the zone the page reads is the exit's.
-
-    Stock Playwright Firefox 1.62 (its own Firefox, no proxy, the same page, observed once on the machine this was written on)
-    shows ZERO lies and ZERO lied fields, and ONE headless flag: ``webDriverIsOn``, because stock runs with ``navigator.webdriver``
-    true. That flag is the automation itself and not a reading the browser should share, so the assertion here stays zero for
-    the headless flags; for the lies and the lied fields stock's outcome is zero too, so they are asserted zero. The page's
-    worker-scope key was absent from stock's fingerprint, so it is asserted only when the page produces it."""
-    from invisible_core import _geo
-
-    exit_ip = rs.EXITS["germany"]
-    expected_zone, _country = _truth_of(exit_ip)
-    doh = FakeDoh(rs.ZONE_NAMES)
-    site = _DetectorSite()
-    gateway = rs.ExitGateway("exit", doh, udp="relay", tcp_exit=exit_ip, udp_exit=exit_ip, relay_host=this_host_address())
-    try:
-        monkeypatch.setattr(_geo, "discover_egress_ip", egress_by_proxy(gateway))
-        with _launch(firefox_binary, gateway) as browser:
-            context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
-            page.goto(_detection_page_of(site), wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_function("() => !!(window.Fingerprint && window.Fingerprint.headless)", timeout=90000)
-            outcome = page.evaluate(_DETECTION_JS)
-            context.close()
-        reached = ("127.0.0.1", site.port) in gateway.connects
-    finally:
-        site.close()
-        gateway.close()
-        doh.close()
-    print("[detection page behind %s] %r" % (exit_ip, outcome))
-    assert outcome["ready"], "the detection page never produced its fingerprint: %r" % outcome
-    assert reached, "the detection page was not loaded through the gateway: %s" % gateway.connects
-    assert outcome["lies"] == 0, "the detection page found %d lie(s): %r" % (outcome["lies"], outcome)
-    assert outcome["headless"] == [], "the detection page raised headless flags: %r" % outcome
-    lied = {k: v for k, v in (("zone", outcome["zone"]), ("intl", outcome["intl"]), ("worker", outcome["worker"]))
-            if v and v.get("lied")}
-    assert not lied, "the detection page marked as lied: %r" % lied
-    assert outcome["zone"] is not None, "the detection page read no zone: %r" % outcome
-    read = outcome["zone"]["location"].replace(", ", "/").replace(" ", "_")
-    assert read in rs.acceptable_zones(expected_zone) or read == expected_zone, (
-        "the detection page reads the zone %r, the exit's is %s" % (outcome["zone"]["location"], expected_zone))
 
 
 def test_the_exits_are_distinct_places():

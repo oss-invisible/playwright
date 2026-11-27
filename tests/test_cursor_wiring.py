@@ -1020,7 +1020,7 @@ def test_neither_entry_point_decides_the_cursor_default(cls):
     What the value IS gets asserted where it lives, in the core's own suite,
     and end to end by `test_the_show_cursor_kwarg_reaches_the_prefs`.
 
-    (Owner decision 2026-08-28: on. Camoufox ships it on too. The argument for
+    (Owner decision 2026-08-28: on. The studied system ships it on too. The argument for
     off has not gone away and is recorded next to the constant: a pointer
     gliding across a window with nobody touching the mouse reads as "this is a
     bot" to any person glancing at the monitor.)
