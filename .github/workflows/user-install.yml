@@ -109,12 +109,12 @@ jobs:
         with: { python-version: '3.11' }
 
       # Only what the TEST needs, from the wrapper's hashed lock (ci/py-lock/gate.txt), the one the other test jobs read: never a hand list, which is how
-      # `psutil` (imported by tests/_os_cursor.py since #609) was missing here and ledger #618 was red. The lock holds `uv` (the wait below asks it, and the
+      # `psutil` (imported by the OS-cursor helper of the tests since #609) was missing here and ledger #618 was red. The lock holds `uv` (the wait below asks it, and the
       # release test installs the package with it) and holds neither invisible-playwright nor invisible-core: the package under test is installed by the
       # test itself, into a venv it creates, from the index - installing it
       # here as well would put a second copy on the path and the assertions
       # would be reading the wrong one. The runner's own pip, nothing unhashed.
-      # tests/test_the_install_job_has_every_module_its_tests_import.py holds every third-party module the tests import to that lock.
+      # A rule test of the unit suite (the install job has every module its tests import) holds every third-party module the tests import to that lock.
       - name: Test harness only
         run: python -m pip install --require-hashes -r ci/py-lock/gate.txt
 
