@@ -7,7 +7,9 @@ THIRD-PARTY distribution the gate installs from the wrapper:
 
   * the wrapper's dependencies (`[project].dependencies` of pyproject.toml, without `invisible_core`, which is built as a wheel of ours) and its `dev` extra;
   * the dependencies of the core the wrapper pins (`invisible_core==X`: the `[project].dependencies` of the core's pyproject.toml at the tag vX);
-  * playwright at scripts/playwright_pin.txt (the stock client the gate drives the engine with) and cryptography at CRYPTOGRAPHY (the lab's PKI).
+  * playwright at scripts/playwright_pin.txt (the stock client the gate drives the engine with) and cryptography at CRYPTOGRAPHY (the lab's PKI);
+  * the installer the install-from-index job needs beside pytest (HARNESS: `uv`, which the release test installs the package with and the wait asks), so that
+    job installs its test harness from this lock and from nothing else (tests/test_the_install_job_has_every_module_its_tests_import.py).
 
 One command regenerates both files after a dependency change or a bump of the core pin:
 
@@ -36,6 +38,8 @@ PLAYWRIGHT_PIN = ROOT / "scripts" / "playwright_pin.txt"
 
 #: What the lab's PKI needs, as the series' gate installs it today.
 CRYPTOGRAPHY = "cryptography==44.0.3"
+#: Installers the install-from-index job (user-install.yml) needs and no dependency of the wrapper brings: the README's way in (`uv`) and the wait on the index.
+HARNESS = ["uv>=0.5"]
 #: The floor of the lock: the Python the unit job judges; `--universal` covers every Linux and Windows wheel of every Python from it.
 PYTHON_VERSION = "3.11"
 DEFAULT_EXCLUDE_NEWER = "2026-11-25T00:00:00Z"
@@ -124,7 +128,7 @@ def core_dependencies(core_pyproject_text: str) -> list:
 def expected_requirements(pyproject_text: str, core_requires: list, playwright_pin: str) -> list:
     """The requirements the lock must cover, in the order the input prints them."""
     src = wrapper_sources(pyproject_text)
-    reqs = set(src["dependencies"]) | set(src["dev"]) | set(core_requires) | {"playwright==%s" % playwright_pin.strip(), CRYPTOGRAPHY}
+    reqs = set(src["dependencies"]) | set(src["dev"]) | set(core_requires) | set(HARNESS) | {"playwright==%s" % playwright_pin.strip(), CRYPTOGRAPHY}
     return sorted(reqs, key=lambda r: (base_name(r), r))
 
 
@@ -141,6 +145,7 @@ def make_in(pyproject_text: str, core_pyproject_text: str, playwright_pin: str, 
         "# core-requires: %s" % SEP.join(core_requires),
         "# playwright: %s from scripts/playwright_pin.txt (the stock client the gate drives the engine with)" % playwright_pin.strip(),
         "# cryptography: %s (the lab's PKI)" % CRYPTOGRAPHY.split("==")[1],
+        "# harness: %s (the installers of the install-from-index job)" % SEP.join(HARNESS),
     ]
     return "\n".join(head + expected_requirements(pyproject_text, core_requires, playwright_pin)) + "\n"
 
