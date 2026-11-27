@@ -254,10 +254,13 @@ def test_a_call_killed_while_it_counts_leaves_the_count_it_found(tmp_path):
 
 
 def test_the_harness_has_uv_for_the_wait_to_ask():
-    """Read as text: PyYAML is not a dependency of this package (nor of [dev]), as tests/test_ci_runs_once_per_commit.py says."""
+    """The harness is the wrapper's hashed lock (tests/test_the_install_job_has_every_module_its_tests_import.py holds the step to it), so `uv` is there when the lock holds it.
+    Read as text: PyYAML is not a dependency of this package (nor of [dev]), as tests/test_ci_runs_once_per_commit.py says."""
     found = re.search(r"^[ \t]*-[ \t]*name:[ \t]*Test harness only[ \t]*\n[ \t]*run:[ \t]*(?P<run>.+)$", WORKFLOW.read_text(encoding="utf-8"), re.M)
     assert found, "the harness step is gone"
-    assert "pip" in found.group("run") and found.group("run").split()[-1] == "uv", found.group("run")
+    assert found.group("run").split()[-2:] == ["-r", "ci/py-lock/gate.txt"], found.group("run")
+    held = re.findall(r"^uv==", (ROOT / "ci" / "py-lock" / "gate.txt").read_text(encoding="utf-8"), re.M)
+    assert held, "the lock the harness installs does not hold uv, which the wait asks (python -m uv)"
 
 
 def test_the_wait_step_still_passes_the_gate_of_the_core():

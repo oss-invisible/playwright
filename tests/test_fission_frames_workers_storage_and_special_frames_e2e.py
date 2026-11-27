@@ -126,29 +126,35 @@ def worker_pages(sites):
     return sites
 
 
-def test_the_frames_are_in_other_processes(page, worker_pages):
-    page.goto(worker_pages.url("A", "/workers"), wait_until="load")
-    b = wait_frame(page, worker_pages.url("B"), "/workers-b")
-    assert_other_process(page.main_frame, b)
-    assert_other_process(b, wait_frame(page, worker_pages.url("C"), "/workers-c"))
+def test_the_frames_are_in_other_processes(page, worker_pages, evidence):
+    held, watch = evidence
+    with OnFailure(held, watch):     # a failure keeps the module's evidence: the wire, the engine trace, every frame's lifecycle
+        watch.listen(page, "page")
+        page.goto(worker_pages.url("A", "/workers"), wait_until="load")
+        b = wait_frame(page, worker_pages.url("B"), "/workers-b")
+        assert_other_process(page.main_frame, b)
+        assert_other_process(b, wait_frame(page, worker_pages.url("C"), "/workers-c"))
 
 
 @pytest.mark.parametrize("kind", ["blob", "url"])
-def test_a_dedicated_worker_reports_the_identity_of_the_window_in_every_frame(page, worker_pages, kind):
-    page.goto(worker_pages.url("A", "/workers"), wait_until="load")
-    frames = {"top": page.main_frame,
-              "frame": wait_frame(page, worker_pages.url("B"), "/workers-b"),
-              "nested": wait_frame(page, worker_pages.url("C"), "/workers-c")}
-    reference = page.main_frame.evaluate(WINDOW_JS)
-    assert not mismatches(reference, reference), reference
-    problems = []
-    for name, frame in frames.items():
-        window = frame.evaluate(WINDOW_JS)
-        worker = frame.evaluate(WORKER_JS, kind)
-        problems += ["%s window: %s" % (name, p) for p in mismatches(reference, window)]
-        problems += ["%s %s worker: %s" % (name, kind, p) for p in mismatches(reference, worker)]
-        problems += ["%s worker against its own window: %s" % (name, p) for p in mismatches(window, worker)]
-    assert not problems, "identity differs between the top window and the frames and workers:\n  " + "\n  ".join(problems)
+def test_a_dedicated_worker_reports_the_identity_of_the_window_in_every_frame(page, worker_pages, kind, evidence):
+    held, watch = evidence
+    with OnFailure(held, watch):     # a failure keeps the module's evidence: the wire, the engine trace, every frame's lifecycle
+        watch.listen(page, "page")
+        page.goto(worker_pages.url("A", "/workers"), wait_until="load")
+        frames = {"top": page.main_frame,
+                  "frame": wait_frame(page, worker_pages.url("B"), "/workers-b"),
+                  "nested": wait_frame(page, worker_pages.url("C"), "/workers-c")}
+        reference = page.main_frame.evaluate(WINDOW_JS)
+        assert not mismatches(reference, reference), reference
+        problems = []
+        for name, frame in frames.items():
+            window = frame.evaluate(WINDOW_JS)
+            worker = frame.evaluate(WORKER_JS, kind)
+            problems += ["%s window: %s" % (name, p) for p in mismatches(reference, window)]
+            problems += ["%s %s worker: %s" % (name, kind, p) for p in mismatches(reference, worker)]
+            problems += ["%s worker against its own window: %s" % (name, p) for p in mismatches(window, worker)]
+        assert not problems, "identity differs between the top window and the frames and workers:\n  " + "\n  ".join(problems)
 
 
 SHARED_WORKER_JS = """() => new Promise(resolve => {
@@ -174,33 +180,39 @@ SERVICE_WORKER_JS = """() => new Promise(resolve => {
 })"""
 
 
-def test_a_shared_worker_made_in_a_frame_of_another_site_reports_the_identity_of_the_top(page, worker_pages):
+def test_a_shared_worker_made_in_a_frame_of_another_site_reports_the_identity_of_the_top(page, worker_pages, evidence):
     """As stock Firefox does: a SharedWorker can be made from a frame of another site (its own site's worker
     script), starts, and answers. What it reports about the browser is what the top window reads."""
-    worker_pages.route("B", "/shared-worker.js", "onconnect = e => { e.ports[0].postMessage(%s); };" % IDENTITY,
-                       ctype="text/javascript")
-    page.goto(worker_pages.url("A", "/workers"), wait_until="load")
-    frame = wait_frame(page, worker_pages.url("B"), "/workers-b")
-    result = frame.evaluate(SHARED_WORKER_JS)
-    assert result["outcome"] == "ok", result
-    assert not mismatches(page.main_frame.evaluate(WINDOW_JS), result["identity"]), result
+    held, watch = evidence
+    with OnFailure(held, watch):     # a failure keeps the module's evidence: the wire, the engine trace, every frame's lifecycle
+        watch.listen(page, "page")
+        worker_pages.route("B", "/shared-worker.js", "onconnect = e => { e.ports[0].postMessage(%s); };" % IDENTITY,
+                           ctype="text/javascript")
+        page.goto(worker_pages.url("A", "/workers"), wait_until="load")
+        frame = wait_frame(page, worker_pages.url("B"), "/workers-b")
+        result = frame.evaluate(SHARED_WORKER_JS)
+        assert result["outcome"] == "ok", result
+        assert not mismatches(page.main_frame.evaluate(WINDOW_JS), result["identity"]), result
 
 
-def test_a_service_worker_registered_from_a_frame_of_another_site_reports_the_identity_of_the_top(page, worker_pages):
+def test_a_service_worker_registered_from_a_frame_of_another_site_reports_the_identity_of_the_top(page, worker_pages, evidence):
     """As stock Firefox does: a frame of another site registers a ServiceWorker of its own site (scope the site's
     root), it becomes active, and answers a message; what it reports about the browser is what the top window
     reads."""
-    worker_pages.route("B", "/service-worker.js",
-                       "self.addEventListener('install', e => self.skipWaiting());"
-                       "self.addEventListener('activate', e => e.waitUntil(clients.claim()));"
-                       "self.addEventListener('message', e => e.source.postMessage(%s));" % IDENTITY,
-                       ctype="text/javascript", headers=[("Service-Worker-Allowed", "/")])
-    page.goto(worker_pages.url("A", "/workers"), wait_until="load")
-    frame = wait_frame(page, worker_pages.url("B"), "/workers-b")
-    result = frame.evaluate(SERVICE_WORKER_JS)
-    assert result["outcome"] == "registered", result
-    assert result["scope"] == worker_pages.url("B", "/"), result
-    assert not mismatches(page.main_frame.evaluate(WINDOW_JS), result["identity"]), result
+    held, watch = evidence
+    with OnFailure(held, watch):     # a failure keeps the module's evidence: the wire, the engine trace, every frame's lifecycle
+        watch.listen(page, "page")
+        worker_pages.route("B", "/service-worker.js",
+                           "self.addEventListener('install', e => self.skipWaiting());"
+                           "self.addEventListener('activate', e => e.waitUntil(clients.claim()));"
+                           "self.addEventListener('message', e => e.source.postMessage(%s));" % IDENTITY,
+                           ctype="text/javascript", headers=[("Service-Worker-Allowed", "/")])
+        page.goto(worker_pages.url("A", "/workers"), wait_until="load")
+        frame = wait_frame(page, worker_pages.url("B"), "/workers-b")
+        result = frame.evaluate(SERVICE_WORKER_JS)
+        assert result["outcome"] == "registered", result
+        assert result["scope"] == worker_pages.url("B", "/"), result
+        assert not mismatches(page.main_frame.evaluate(WINDOW_JS), result["identity"]), result
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +269,7 @@ def test_what_a_frame_of_another_site_stores_is_seen_by_the_frame_and_by_the_con
         assert answer == {"cookie": "hdrcookie=1; jscookie=2", "ls": "frame-ls", "ss": "frame-ss"}
 
 
-def test_storage_of_site_b_is_partitioned_between_a_frame_of_a_and_b_as_a_top_page(page, storage_pages):
+def test_storage_of_site_b_is_partitioned_between_a_frame_of_a_and_b_as_a_top_page(page, storage_pages, evidence):
     """The retail outcome, not stock Playwright's: cookies and web storage are partitioned by the top-level site.
     What site B wrote inside a frame of A is not visible to B opened as a top page: its `document.cookie` is empty
     and its `localStorage` item is null (`context.cookies()` still lists B's cookies, with B's domain, because it
@@ -270,22 +282,25 @@ def test_storage_of_site_b_is_partitioned_between_a_frame_of_a_and_b_as_a_top_pa
     and shows the stored values to B as a top page (observed with Playwright 1.62: `document.cookie` is
     `hdrcookie=1; jscookie=2` and the item is `frame-ls`), which is not what a page sees in a real browser, so
     its answer is not the one asserted."""
-    context = page.context
-    page.goto(storage_pages.url("A", "/storage"), wait_until="load")
-    wait_frame(page, storage_pages.url("B"), "/storage-b")
-    own = context.new_page()
-    own.goto(storage_pages.url("B", "/storage-own"), wait_until="load")
-    assert own.evaluate("window.__r") == {"cookie": "", "ls": None, "ss": None}
-    assert sorted(c["name"] for c in context.cookies(storage_pages.url("B"))) == ["hdrcookie", "jscookie"]
-    # the reverse: B writes as a top page, then is framed by A and reads
-    own.goto(storage_pages.url("B", "/storage-top-writes"), wait_until="load")
-    assert own.evaluate("window.__r") == {"cookie": "topcookie=3", "top": "top-ls"}
-    reader = context.new_page()
-    reader.goto(storage_pages.url("A", "/storage-read"), wait_until="load")
-    frame = wait_frame(reader, storage_pages.url("B"), "/storage-read-b")
-    # B inside A reads its own partition: the two cookies the frame wrote above are there, what B wrote as a top page
-    # (`topcookie`, the `top-only` item) is not.
-    assert frame.evaluate("window.__r") == {"cookie": "hdrcookie=1; jscookie=2", "top": None}
+    held, watch = evidence
+    with OnFailure(held, watch):     # a failure keeps the module's evidence: the wire, the engine trace, every frame's lifecycle
+        watch.listen(page, "page")
+        context = page.context
+        page.goto(storage_pages.url("A", "/storage"), wait_until="load")
+        wait_frame(page, storage_pages.url("B"), "/storage-b")
+        own = context.new_page()
+        own.goto(storage_pages.url("B", "/storage-own"), wait_until="load")
+        assert own.evaluate("window.__r") == {"cookie": "", "ls": None, "ss": None}
+        assert sorted(c["name"] for c in context.cookies(storage_pages.url("B"))) == ["hdrcookie", "jscookie"]
+        # the reverse: B writes as a top page, then is framed by A and reads
+        own.goto(storage_pages.url("B", "/storage-top-writes"), wait_until="load")
+        assert own.evaluate("window.__r") == {"cookie": "topcookie=3", "top": "top-ls"}
+        reader = context.new_page()
+        reader.goto(storage_pages.url("A", "/storage-read"), wait_until="load")
+        frame = wait_frame(reader, storage_pages.url("B"), "/storage-read-b")
+        # B inside A reads its own partition: the two cookies the frame wrote above are there, what B wrote as a top page
+        # (`topcookie`, the `top-only` item) is not.
+        assert frame.evaluate("window.__r") == {"cookie": "hdrcookie=1; jscookie=2", "top": None}
 
 
 # ---------------------------------------------------------------------------
@@ -322,31 +337,34 @@ def special_pages(sites):
 
 
 @pytest.mark.parametrize("where", ["top", "inside_b"])
-def test_special_frames_are_listed_evaluated_and_reached_by_frame_locator(page, special_pages, where):
+def test_special_frames_are_listed_evaluated_and_reached_by_frame_locator(page, special_pages, where, evidence):
     """As stock Firefox does: `srcdoc` and every `sandbox`ed srcdoc frame is `about:srcdoc`, the empty one is
     `about:blank`, the `data:` one keeps its url; all are in `page.frames` under their parent, named by their id;
     `evaluate` works in all of them and finds `window.v` where the document's script could run (not in the
     sandbox without `allow-scripts`, not in the empty frame); `frame_locator` reaches the text inside each, in
     the empty frame once something is written there; the same at the top level and inside a frame of B."""
-    path = "/special" if where == "top" else "/special-in-b"
-    page.goto(special_pages.url("A", path), wait_until="load")
-    owner_site = "A" if where == "top" else "B"
-    owner = wait_frame(page, special_pages.url(owner_site), "/special")
-    if where == "inside_b":
-        assert_other_process(page.main_frame, owner)
-    expected_count = 1 + (where == "inside_b") + len(SPECIAL_FRAMES)
-    assert wait_for(page, lambda: len(page.frames) == expected_count), [(f.name, f.url) for f in page.frames]
-    inner = {f.name: f for f in page.frames if f.parent_frame is owner}
-    assert sorted(inner) == sorted(SPECIAL_FRAMES), [(f.name, f.url) for f in page.frames]
-    scope = page.frame_locator("#b") if where == "inside_b" else page
-    for frame_id, (url, value, text) in SPECIAL_FRAMES.items():
-        frame = inner[frame_id]
-        if url is None:
-            assert frame.url.startswith("data:text/html,"), frame.url
-        else:
-            assert frame.url == url, (frame_id, frame.url)
-        assert frame.evaluate("window.v") == value, frame_id
-        if frame_id == "blank":
-            frame.evaluate("document.body.innerHTML = '<p id=x>written</p>'")
-            text = "written"
-        assert scope.frame_locator("#" + frame_id).locator("#x").inner_text() == text, frame_id
+    held, watch = evidence
+    with OnFailure(held, watch):     # a failure keeps the module's evidence: the wire, the engine trace, every frame's lifecycle
+        watch.listen(page, "page")
+        path = "/special" if where == "top" else "/special-in-b"
+        page.goto(special_pages.url("A", path), wait_until="load")
+        owner_site = "A" if where == "top" else "B"
+        owner = wait_frame(page, special_pages.url(owner_site), "/special")
+        if where == "inside_b":
+            assert_other_process(page.main_frame, owner)
+        expected_count = 1 + (where == "inside_b") + len(SPECIAL_FRAMES)
+        assert wait_for(page, lambda: len(page.frames) == expected_count), [(f.name, f.url) for f in page.frames]
+        inner = {f.name: f for f in page.frames if f.parent_frame is owner}
+        assert sorted(inner) == sorted(SPECIAL_FRAMES), [(f.name, f.url) for f in page.frames]
+        scope = page.frame_locator("#b") if where == "inside_b" else page
+        for frame_id, (url, value, text) in SPECIAL_FRAMES.items():
+            frame = inner[frame_id]
+            if url is None:
+                assert frame.url.startswith("data:text/html,"), frame.url
+            else:
+                assert frame.url == url, (frame_id, frame.url)
+            assert frame.evaluate("window.v") == value, frame_id
+            if frame_id == "blank":
+                frame.evaluate("document.body.innerHTML = '<p id=x>written</p>'")
+                text = "written"
+            assert scope.frame_locator("#" + frame_id).locator("#x").inner_text() == text, frame_id
