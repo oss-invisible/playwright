@@ -252,6 +252,33 @@ jobs:
         shell: bash
         run: python scripts/ci_lab_geoip.py build
 
+      # The regression checker of the core's main (rule ci-14), on every leg: the tests of this repository run it on registries they write
+      # (tests/test_the_regression_registry_is_checked_in_the_pr_round.py reads its path from INVISIBLE_CORE_MAIN_CHECKER and fails when it is absent), and the
+      # step "Check the regression registry" below runs it on ci/regressions.json. Sparse: the checker and its sibling, nothing else. It is moved out of the
+      # workspace (the lint above and the tests walk the workspace; the core's files are not this repository's).
+      - name: The core's main (the regression checker)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (v4.4.0)
+        with:
+          repository: oss-invisible/core
+          ref: main
+          path: .core-main
+          sparse-checkout: |
+            scripts/ci_regressions.py
+            scripts/ci_skips.py
+          sparse-checkout-cone-mode: false
+
+      - name: The regression checker of the core's main (a core main without it is red)
+        shell: bash
+        run: |
+          if [ ! -f .core-main/scripts/ci_regressions.py ] || [ ! -f .core-main/scripts/ci_skips.py ]; then
+            echo "FAIL the core's main has no scripts/ci_regressions.py or scripts/ci_skips.py. Fix: merge the core's change that adds the regression checker first; this check is never skipped. Rule: ci-14 regression registry"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/core-main"
+          cp .core-main/scripts/ci_regressions.py .core-main/scripts/ci_skips.py "$RUNNER_TEMP/core-main/"
+          rm -rf .core-main
+          echo "INVISIBLE_CORE_MAIN_CHECKER=$RUNNER_TEMP/core-main/ci_regressions.py" >> "$GITHUB_ENV"
+
       - name: Run pytest
         if: matrix.python != '3.11'
         shell: bash
@@ -340,6 +367,24 @@ jobs:
           git show origin/main:ci/required-suites.json > "$RUNNER_TEMP/main/required-suites.json"
           if git cat-file -e origin/main:ci/retired-tests.json; then git show origin/main:ci/retired-tests.json > "$RUNNER_TEMP/main/retired-tests.json"; fi
           python "$RUNNER_TEMP/main/ci_verdict.py" judge --required ci/required-suites.json --suite "wrapper.unit.all.$SUITE_OS" --os "$SUITE_OS" --junit "$RUNNER_TEMP/unit-junit.xml" --binary "$(python -c 'import sys; print(sys.executable)')" --main-required "$RUNNER_TEMP/main/required-suites.json"
+
+      # RULE ci-14: every defect that was seen once is closed by a test that failed on the old code, and that test is on a list nobody can shorten
+      # (ci/regressions.json). The checker is the core's, read from the core's main (the step above that names it) and never from this branch (a branch
+      # that edits its own judge passes itself); the registry of main is read from origin/main (fetched above), so the list only grows. The check does not
+      # depend on the system, so it runs on the Linux leg of Python 3.11 only. A core main without the checker made the step above FAIL: a check that does
+      # not run is red.
+      - name: Check the regression registry
+        if: always() && matrix.python == '3.11' && startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          main_args=()
+          if git cat-file -e origin/main:ci/regressions.json 2>/dev/null; then
+            git show origin/main:ci/regressions.json > "$RUNNER_TEMP/main-regressions.json"
+            main_args=(--main-registry "$RUNNER_TEMP/main-regressions.json")
+          else
+            echo "ci/regressions.json is not on main yet: the registry is checked without the comparison with main"
+          fi
+          python "$INVISIBLE_CORE_MAIN_CHECKER" check --registry ci/regressions.json "${main_args[@]}" --root . --suites ci/required-suites.json
 
   # ONE SINGLE CONTEXT FOR BRANCH PROTECTION. Measured 2026-08-13: this
   # repo's protection required `pytest (windows-latest, py3.11)`, which the
