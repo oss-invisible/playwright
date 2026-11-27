@@ -24,6 +24,9 @@ pytest wrote and fails on every one of them.
         The one exception is `retired-tests.json` NEXT TO main's list (read from main, never from the judged branch): a file it names that
         no longer exists in the checkout may leave the rows, and the minimum of a row may go down by the tests main counted for it in that
         row (`tests: {row id: n}`), and by no more. A retired file still on disk, or any other lost test, stays red.
+        The same file may also retire single tests whose file stays: {"nodeid": "<file>::<test>", "suite": <row id>, "count": n, "reason",
+        "decided_by", "date"}. The minimum of that row may go down by the sum of the `count` of its entries and by no more, and only for a nodeid
+        whose file the row of main lists; a declared nodeid that the judged leg still collects is red, and so is any test that goes without an entry.
         What the file of main is can be said only by the gate, which checks main out (a failed download is not
         "main has no list"): the file exists -> it is compared; it does not exist and the gate passed
         --main-has-no-list (main was checked out and has no such file) -> passed, declared; it does not exist
@@ -333,16 +336,21 @@ def _int(value):
 RETIRED_NAME = "retired-tests.json"
 
 
-def validate_retired(data):
-    """-> the reasons why `data` is not a well-formed list of retired files (empty if it is). An entry: the file, why it went, the date, and
-    for each row id the number of tests the file had in that row on main (counted with the row's marker)."""
+def validate_retired(data, suite_ids=None):
+    """-> the reasons why `data` is not a well-formed list of retired tests (empty if it is). Two kinds of entry, in one list:
+    a FILE that is gone ({file, reason, date, tests: {row id: number of tests the file had in that row on main, counted with the row's marker}}), and
+    a single TEST whose file stays ({nodeid: "<file>::<test>", suite: row id, count > 0, reason, decided_by, date}). `suite_ids`, when given, are the
+    row ids of main's list: the suite of a nodeid entry must be one of them."""
     if not isinstance(data, list):
         return ["the retired list must be a JSON list"]
-    problems, seen = [], set()
+    problems, seen, seen_nodes = [], set(), set()
     for i, e in enumerate(data):
         where = "retired entry %d" % i
         if not isinstance(e, dict):
             problems.append("%s is not an object" % where)
+            continue
+        if "nodeid" in e or "suite" in e:
+            problems += _validate_retired_node(e, where, suite_ids, seen_nodes)
             continue
         f = e.get("file")
         if not isinstance(f, str) or not f.strip():
@@ -361,9 +369,35 @@ def validate_retired(data):
     return problems
 
 
+def _validate_retired_node(e, where, suite_ids, seen):
+    problems = []
+    nid, suite = e.get("nodeid"), e.get("suite")
+    if "file" in e or "tests" in e:
+        problems.append("%s: an entry is a retired file (file, tests) or a retired test (nodeid, suite, count), not both" % where)
+    parts = nid.split("::", 1) if isinstance(nid, str) else []
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        problems.append("%s: nodeid must be \"<file>::<test>\"" % where)
+    else:
+        where = "retired test %s" % nid
+    if not isinstance(suite, str) or not suite.strip():
+        problems.append("%s: suite must be a non-empty string (the id of a row)" % where)
+    elif suite_ids is not None and suite not in suite_ids:
+        problems.append("%s: the suite %s is not a row of main's required list" % (where, suite))
+    if isinstance(nid, str) and isinstance(suite, str):
+        if (nid, suite) in seen:
+            problems.append("%s: appears more than once for the suite %s" % (where, suite))
+        seen.add((nid, suite))
+    if not _is_int(e.get("count")) or e.get("count") < 1:
+        problems.append("%s: count must be an integer >= 1 (the tests the suite loses)" % where)
+    for key in ("reason", "decided_by", "date"):
+        if not isinstance(e.get(key), str) or not e.get(key).strip():
+            problems.append("%s: %s must be a non-empty string" % (where, key))
+    return problems
+
+
 def retired_of_main(main_required):
-    """The retired files of main: ``ci/retired-tests.json`` next to main's list, read from main and never from the judged branch. It may not
-    exist (main older than the format): nothing is retired. A malformed one is a problem, never an empty list. -> (entries, problems)."""
+    """The retired files and tests of main: ``ci/retired-tests.json`` next to main's list, read from main and never from the judged branch. It may
+    not exist (main older than the format): nothing is retired. A malformed one is a problem, never an empty list. -> (entries, problems)."""
     path = Path(main_required).with_name(RETIRED_NAME)
     if not path.is_file():
         return [], []
@@ -371,22 +405,52 @@ def retired_of_main(main_required):
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return [], ["the retired list of main %s cannot be read: %s" % (path, exc)]
-    bad = validate_retired(data)
+    try:
+        rows = json.loads(Path(main_required).read_text(encoding="utf-8"))
+        suite_ids = {r.get("id") for r in rows if isinstance(r, dict)} if isinstance(rows, list) else None
+    except (OSError, ValueError):
+        suite_ids = None  # the list of main itself is read (and refused) by the caller
+    bad = validate_retired(data, suite_ids)
     if bad:
         return [], ["the retired list of main %s is malformed: %s" % (path, "; ".join(bad))]
     return data, []
 
 
-def against_main(current, main, retired=(), exists=os.path.exists):
+def _retired_tests_of(row, retired, collected, judged):
+    """-> (the number of tests the row may lose because main retired them one by one, problems). An entry counts only if the file of its nodeid is
+    in the row of main (a nodeid that the row does not run is not a test the row loses). The judge has the junit of the leg it judges and only
+    counts of main, so a declared nodeid that the judged leg still collects is red (and counts for nothing), and the nodeid of another row is taken
+    on its count, the leg of that row checking it."""
+    allowed, problems = 0, []
+    listed = row.get("tests", [])
+    for e in retired:
+        if not (isinstance(e, dict) and isinstance(e.get("nodeid"), str) and e.get("suite") == row.get("id")):
+            continue
+        nid = e["nodeid"]
+        if nid not in listed and nid.split("::", 1)[0] not in listed:
+            continue
+        if collected is not None and judged == row.get("id") and any(n == nid or _base(n) == nid for n in collected):
+            problems.append("the test %s is declared retired for %s, but the suite still collects it: it did not leave" % (nid, row.get("id")))
+            continue
+        allowed += _int(e.get("count"))
+    return allowed, problems
+
+
+def against_main(current, main, retired=(), exists=os.path.exists, collected=None, judged=None):
     """The list only grows: every suite of main is still here, with no lower minimum, no exact turned off, no lost
     test or OS and the same marker. `main` is read leniently (it may be older than the current format).
 
     The one way a test leaves a row is `retired` (the list of MAIN, never of the branch): a file that main retired and that no longer exists
     (`exists`, in the checkout judged) is not a lost test, and the minimum of the row may go down by exactly the tests main counted for that file
-    in that row (``tests[row id]``), and by no more. A retired file that is still on disk is not excused: it must stay in its rows."""
+    in that row (``tests[row id]``), and by no more. A retired file that is still on disk is not excused: it must stay in its rows.
+
+    The other way is a single retired test (``nodeid``, ``suite``, ``count``) whose file stays in the row: the minimum of the suite may go down by
+    the ``count`` of its entries, and by no more. ``collected`` (the node ids of the junit of the judged leg) and ``judged`` (that leg's suite) let
+    the judge see that a declared nodeid is gone from the leg; of the collection of main it has only the count."""
     problems = []
     if not isinstance(main, list):
         return ["the list of main is not a JSON list: it cannot be compared"]
+    retired = list(retired)
     gone = {e["file"]: e["tests"] for e in retired if isinstance(e, dict) and isinstance(e.get("file"), str)
             and isinstance(e.get("tests"), dict) and not exists(e["file"])}
     by_id = {s.get("id"): s for s in current if isinstance(s, dict)}
@@ -402,10 +466,13 @@ def against_main(current, main, retired=(), exists=os.path.exists):
         excused = [t for t in lost if t in gone]
         lost = [t for t in lost if t not in gone]
         allowed = sum(_int(gone[t].get(sid)) for t in excused)
+        by_test, why = _retired_tests_of(old, retired, collected, judged)
+        allowed += by_test
+        problems += why
         if _int(new.get("min_tests")) < _int(old.get("min_tests")) - allowed:
             problems.append("the minimum of %s went down: %s on main, %s here%s"
                             % (sid, old.get("min_tests"), new.get("min_tests"),
-                               " (retired files account for %d of it)" % allowed if allowed else ""))
+                               " (retired files and tests account for %d of it)" % allowed if allowed else ""))
         if old.get("exact") is True and new.get("exact") is not True:
             problems.append("the suite %s is no longer exact, as it is on main" % sid)
         if lost:
@@ -547,7 +614,8 @@ def cmd_judge(ns):
             try:
                 retired, retired_problems = retired_of_main(ns.main_required)
                 problems += retired_problems
-                problems += against_main(suites, _read_json_list(ns.main_required), retired)
+                problems += against_main(suites, _read_json_list(ns.main_required), retired,
+                                         collected={n for n, _o in cases}, judged=ns.suite)
             except Usage as exc:
                 problems.append(str(exc))
         elif ns.main_has_no_list:

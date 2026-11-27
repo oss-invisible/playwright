@@ -345,6 +345,120 @@ def test_a_retired_file_does_not_excuse_another_loss_in_the_same_row(tmp_path, m
     assert code == 1 and "tests/test_e.py" in capsys.readouterr().out
 
 
+# --- retired tests: a single test of a file that stays, declared by nodeid ----------------------------------------
+GONE_NODE = FILE_A + "::test_gone"
+
+
+def _retired_test(nodeid=GONE_NODE, suite="s.one", count=1, **over):
+    entry = {"nodeid": nodeid, "suite": suite, "count": count, "reason": "removed with its bundle", "decided_by": "pm", "date": "2026-11-27"}
+    entry.update(over)
+    return entry
+
+
+def _main_that_had_the_test(tmp_path, retired, min_tests=5):
+    """main's row of FILE_A, FILE_B, NODE with one more test (the one that is retired) in the floor."""
+    return _main_with(tmp_path, [_suite(min_tests=min_tests)], retired)
+
+
+def test_a_declared_test_lets_the_floor_drop_by_exactly_its_count_is_green(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test()])
+    assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0  # 5 on main, 4 here, 1 declared
+
+
+def test_the_counts_of_the_entries_of_a_suite_are_summed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    other = FILE_B + "::test_also_gone"
+    main = _main_that_had_the_test(tmp_path, [_retired_test(), _retired_test(other), _retired_test(count=1, nodeid=FILE_A + "::t3")], min_tests=7)
+    assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0  # 7 -> 4: three declared
+
+
+def test_a_floor_that_drops_by_more_than_the_declared_count_is_red(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test(count=1)], min_tests=6)  # 6 -> 4 here: one declared, two lost
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
+    assert code == 1 and "went down" in capsys.readouterr().out
+
+
+def test_a_test_that_goes_with_no_entry_is_red(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, None)
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
+    assert code == 1 and "went down" in capsys.readouterr().out
+
+
+def test_an_entry_of_another_suite_or_of_a_file_the_row_does_not_run_excuses_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    for i, entry in enumerate([_retired_test(suite="s.another"), _retired_test(nodeid="tests/test_unlisted.py::test_gone")]):
+        folder = tmp_path / ("case%d" % i)
+        folder.mkdir()
+        main = _main_that_had_the_test(folder, [entry])
+        sub = tmp_path / ("run%d" % i)
+        sub.mkdir()
+        code, _r = _judge(sub, GREEN, extra=["--main-required", str(main)])
+        assert code == 1 and "went down" in capsys.readouterr().out, entry
+
+
+def test_a_declared_test_that_the_suite_still_collects_is_red(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test()])
+    still = GREEN + [_case(FILE_A, "test_gone")]
+    code, _r = _judge(tmp_path, still, rows=[_suite(min_tests=5)], extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and GONE_NODE in out and "still collects it" in out
+
+
+def test_a_declared_test_still_collected_with_a_parameter_is_red_and_excuses_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test()])
+    still = GREEN[:3] + [_case(FILE_A, "test_gone[p1]")]  # 4 tests, the floor of 4 lowered by the entry
+    code, _r = _judge(tmp_path, still, extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and "still collects it" in out and "went down" in out
+
+
+def test_the_retired_tests_of_the_branch_excuse_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, None)
+    (tmp_path / verdict.RETIRED_NAME).write_text(json.dumps([_retired_test()]), encoding="utf-8")
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
+    assert code == 1 and "went down" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad, why", [
+    ({"nodeid": FILE_A}, "nodeid must be"),
+    ({"nodeid": FILE_A + "::"}, "nodeid must be"),
+    ({"nodeid": "::test_gone"}, "nodeid must be"),
+    ({"nodeid": 3}, "nodeid must be"),
+    ({"suite": "s.unknown"}, "not a row of main"),
+    ({"suite": ""}, "suite must be"),
+    ({"count": 0}, "count must be"),
+    ({"count": True}, "count must be"),
+    ({"count": "1"}, "count must be"),
+    ({"reason": ""}, "reason must be"),
+    ({"decided_by": ""}, "decided_by must be"),
+    ({"decided_by": None}, "decided_by must be"),
+    ({"date": ""}, "date must be"),
+    ({"file": GONE, "tests": {"s.one": 1}}, "not both"),
+])
+def test_a_malformed_retired_test_of_main_is_red(tmp_path, monkeypatch, capsys, bad, why):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test(**bad)])
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and "retired list of main" in out and why in out, out
+    assert why in " ".join(verdict.validate_retired([_retired_test(**bad)], {"s.one"}))
+
+
+def test_the_same_test_declared_twice_for_a_suite_is_red():
+    assert any("more than once" in p for p in verdict.validate_retired([_retired_test(), _retired_test()], {"s.one"}))
+    assert verdict.validate_retired([_retired_test(), _retired_test(suite="s.two")], {"s.one", "s.two"}) == []
+
+
+def test_files_and_tests_may_share_the_list():
+    assert verdict.validate_retired([_retired(), _retired_test()], {"s.one"}) == []
+
+
 # --- args --------------------------------------------------------------------------------------------------------
 def test_args_prints_the_files_and_node_ids_one_per_line(tmp_path, capsys):
     required = _write_required(tmp_path / "required.json", [_suite()])
@@ -689,7 +803,10 @@ def test_the_real_retired_list_is_well_formed_and_names_rows_that_exist():
     assert verdict.validate_retired(data) == []
     ids = {r["id"] for r in _real()}
     for entry in data:
-        assert set(entry["tests"]) <= ids, entry["file"]
+        if "nodeid" in entry:
+            assert entry["suite"] in ids, entry["nodeid"]
+        else:
+            assert set(entry["tests"]) <= ids, entry["file"]
 
 
 def test_the_tests_a_retired_file_had_are_what_the_collection_counts_while_it_exists():
@@ -699,6 +816,8 @@ def test_the_tests_a_retired_file_had_are_what_the_collection_counts_while_it_ex
     import sys
     markers = {r["id"]: r["marker"] for r in _real()}
     for entry in json.loads(RETIRED.read_text(encoding="utf-8")):
+        if "nodeid" in entry:
+            continue  # a retired test is counted by the next test
         if not (ROOT / entry["file"]).is_file():
             continue
         for row, declared in entry["tests"].items():
@@ -706,6 +825,27 @@ def test_the_tests_a_retired_file_had_are_what_the_collection_counts_while_it_ex
                                    "-m", markers[row], entry["file"]], cwd=str(ROOT), capture_output=True, text=True)
             counted = sum(1 for line in done.stdout.splitlines() if "::" in line)
             assert counted == declared, "%s in %s: declared %d, collected %d" % (entry["file"], row, declared, counted)
+
+
+def test_every_retired_test_names_a_file_its_row_runs_and_counts_what_the_collection_counts_while_it_exists():
+    """A retired test leaves a file that stays, in a row that lists that file or that very node id; while the test is still defined in the tree
+    (the PR that removes it deletes it) its count is the number of tests the row's marker collects under that node id."""
+    import subprocess
+    import sys
+    rows = {r["id"]: r for r in _real()}
+    for entry in json.loads(RETIRED.read_text(encoding="utf-8")):
+        if "nodeid" not in entry:
+            continue
+        nid, row = entry["nodeid"], rows[entry["suite"]]
+        path, _sep, name = nid.partition("::")
+        assert nid in row["tests"] or path in row["tests"], "%s is not run by %s" % (nid, row["id"])
+        assert (ROOT / path).is_file(), "%s: the file of a retired test stays" % nid
+        if _node_problems(row["id"], path, name, ROOT):
+            continue  # already out of the tree
+        done = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-o", "addopts=",
+                               "-m", row["marker"], nid], cwd=str(ROOT), capture_output=True, text=True)
+        counted = sum(1 for line in done.stdout.splitlines() if "::" in line)
+        assert counted == entry["count"], "%s in %s: declared %d, collected %d" % (nid, row["id"], entry["count"], counted)
 
 
 WHOLE_SUITE_MARKER = "not slow and not e2e"  # the exact expression of the unit job of tests.yml (pyproject addopts)
