@@ -58,7 +58,6 @@ ACCEPTED LOSSES (the rule of the host paths trades them for a verdict that does 
   * the cause of the variable start of the pingsender is not known: whether a launch has it, how many, and what it spawns are listed, never red (a candidate whose pingsender starts in every launch where the 68's never does is not seen by the kinds; its paths and destinations are); no type of the pings is held, no preference for it;
   * how many processes of a kind a launch has is not compared (a candidate that spawns two gpu processes where the 68 spawns one is not seen): only that a kind is there in every launch of one
     engine and in none of the other's;
-  * a pid that Windows reuses may attribute to the engine the tools of the oracle itself, among the processes that touched a path.
 
 How the trace is taken:
 
@@ -71,6 +70,9 @@ How the trace is taken:
     poll of the job's pids can. The files come from an ETW session on Microsoft-Windows-Kernel-File (the Create events: every path a process
     opens, a library included) taken with `logman` and read with `tracerpt`, both part of Windows. It needs an administrator (the hosted runners
     are): a failure says so only when Windows answered "access denied" (0x80070005), any other failure says its command, its code and Windows' text.
+    Every open is attributed to the life of its process in the same stream (Kernel-Process start and stop, matched to the 4688 by pid, creator's pid and image, in file order):
+    Windows hands the pid of a process that ended to the next one (run 46058507264: the opens of the oracle's own `logman` and `wevtutil` were counted as a pingsender's and a tab's), so
+    the opens of another life of a pid of the tree are listed (`<footprint>.audit/<launch>-<seed>.lives.json`) and never judged, and a life of a tool of the oracle counted as the tree's is red.
     The session of a launch is gone from the list of `logman query -ets` before the next launch may start. Two canary files of the oracle's own, opened after the session starts and before it stops, must be in the trace: a session that did not
     see them is red, not empty.
 
@@ -100,7 +102,8 @@ process kind and the file leaves whose only toucher on the published side is tha
 
 Evidence of the tree (Windows): every launch (the warm-up, each seed, the idle launch and the stock control) saves the raw events of the audit that its tree was read from, the 4688 births
 and the 4689 ends, the excluded ones as well, in `<footprint>.audit/<launch>-<seed>.json` (`audit_listing`: record id, event, pid, creator's pid, image, `ParentProcessName`, time, command
-line, whether it is in the tree and why). It changes no verdict and is not a leaf of the footprint.
+line, whether it is in the tree and why), the lives of every pid of the tree (`<launch>-<seed>.lives.json`: each life with its creator, image, positions, exit code, whether it is the tree's and its
+opens, and the opens dropped as another life's) and the session XML filtered to those pids and the Kernel-Process starts and stops (`<launch>-<seed>.etw.xml.gz`). They change no verdict and are not a leaf of the footprint.
 """
 from __future__ import annotations
 
@@ -109,6 +112,7 @@ import codecs
 import contextlib
 import datetime
 import collections
+import gzip
 import ipaddress
 import json
 import os
@@ -1273,11 +1277,115 @@ def wof_base(name: str) -> str:
     return name[:-len(WOF_STREAM)] if len(name) > len(WOF_STREAM) and name.lower().endswith(WOF_STREAM) else name
 
 
-def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tuple:
+class Lives:
+    """The lives of the processes of one ETW stream, built while `etw_files` reads it in order. A life is one process: Kernel-Process event 1 (start) opens a new life of its pid,
+    event 2 (stop) closes it; Windows hands a pid that ended to the next process, so a pid has many lives in a stream. `items` are the lives (`{"pid", "ppid", "image", "base", "start",
+    "stop", "code", "exit"}`, positions in the file and never times), `opens` the opens of the pids in `watch`, each `(pid, index of its life or None, file name, position, disposition or
+    None)`: None is "no life seen" (no start of that pid came before the open, or its life was already closed)."""
+
+    def __init__(self, watch=()) -> None:
+        self.watch = set(watch)
+        self.items: list = []
+        self.current: dict = {}
+        self.opens: list = []
+
+    def start(self, pid: int, ppid: int, image: str, position: int) -> None:
+        self.current[pid] = len(self.items)
+        self.items.append({"pid": pid, "ppid": ppid, "image": image, "base": _base(image).lower(), "start": position, "stop": None, "code": None, "exit": None})
+
+    def stop(self, pid: int, code: int, position: int, exit_record=None) -> None:
+        index = self.current.pop(pid, None)
+        if index is not None:
+            self.items[index].update(stop=position, code=code, exit=exit_record)
+
+    def opened(self, pid: int, name: str, position: int, disposition) -> None:
+        self.opens.append((pid, self.current.get(pid), name, position, disposition))
+
+
+def tree_lives(lives: Lives, tree) -> tuple:
+    """`({index of a life: the 4688 of the tree it is}, [problem])`: a life is the tree's when its pid, its creator's pid and its image's base name (case-insensitive) are those of a
+    4688 of the tree (`process_tree`); two 4688 and two lives of the same three are matched in order. A 4688 of the tree with no life in the stream is a problem that names its pid: the
+    attribution of its opens cannot be made without it."""
+    by_key: dict = {}
+    for i, life in enumerate(lives.items):
+        by_key.setdefault((life["pid"], life["ppid"], life["base"]), []).append(i)
+    taken: dict = {}
+    matched: dict = {}
+    problems = []
+    for e in tree:
+        key = (e["pid"], e.get("ppid"), _base(e["image"]).lower())
+        n = taken.get(key, 0)
+        if n < len(by_key.get(key, ())):
+            matched[by_key[key][n]] = e
+            taken[key] = n + 1
+        else:
+            problems.append("the file trace has no life (Kernel-Process start) of the process of the tree pid %d (%s, created by pid %s): its opens cannot be attributed" % (
+                e["pid"], _base(e["image"]), e.get("ppid")))
+    return matched, problems
+
+
+def oracle_tool_problems(lives: Lives, matched: dict, tools) -> list:
+    """The problems of the lives counted as the tree's that are a tool of the oracle (`tools`: {image base name, lower case: the command the oracle ran}, see `ORACLE_TOOLS`): a life of
+    `logman`, `wevtutil`, `tracerpt`, `auditpol` or `reg` is never the engine's, whatever way it came into the tree (run 45221868374: `walk_tree` took 7 `wevtutil` into it)."""
+    out = []
+    for index, record in sorted(matched.items()):
+        life = lives.items[index]
+        if life["base"] in tools:
+            out.append("pid %d (%s, %s) is counted in the tree and is a tool the oracle runs (`%s`): a life of an oracle tool is never the engine's" % (
+                life["pid"], life["base"], (record.get("cmd") or "")[:200], tools[life["base"]]))
+    return out
+
+
+def attribute_opens(lives: Lives, tree, tools=()) -> dict:
+    """What `lives` says of the opens of the processes of `tree` (`tree_lives`): `{"files": {(pid, name)}, "order": {(pid, name): position}, "dispositions": {(pid, name): {n}},
+    "missing": [pid of a life of the tree with no open], "dropped": [{"pid", "life", "file"}], "lives": [one row per life of a pid of the tree], "problems": [...]}`. Only an open inside
+    a life of the tree is the tree's; an open of a pid of the tree outside it (another life of the pid, or none seen) is dropped and listed, never judged. `foreign_exits` are the
+    stop records (`etw_files`' `exits`) of the lives of those pids that are not the tree's."""
+    matched, problems = tree_lives(lives, tree)
+    problems = problems + oracle_tool_problems(lives, matched, tools)
+    pids = {e["pid"] for e in tree}
+    files: set = set()
+    order: dict = {}
+    dispositions: dict = {}
+    counted: dict = {}
+    dropped: dict = {}
+    seen_in: dict = {}
+    for pid, index, name, position, disposition in lives.opens:
+        if pid not in pids:
+            continue
+        seen_in[index] = seen_in.get(index, 0) + 1
+        if index in matched:
+            files.add((pid, name))
+            order.setdefault((pid, name), position)
+            if disposition is not None:
+                dispositions.setdefault((pid, name), set()).add(disposition)
+            counted.setdefault(index, set()).add(name)
+        else:
+            dropped.setdefault((pid, index, name), {"pid": pid, "life": lives.items[index]["image"] if index is not None else "no life seen", "file": name})
+    rows = []
+    for index, life in enumerate(lives.items):
+        if life["pid"] in pids:
+            rows.append({"pid": life["pid"], "ppid": life["ppid"], "image": life["image"], "start": life["start"], "stop": life["stop"], "code": life["code"],
+                         "tree": index in matched, "opens": len(counted.get(index, ())) if index in matched else seen_in.get(index, 0)})
+    if seen_in.get(None):
+        rows.append({"pid": None, "ppid": None, "image": "no life seen", "start": None, "stop": None, "code": None, "tree": False, "opens": seen_in[None]})
+    missing = sorted({lives.items[i]["pid"] for i in matched if i not in counted})
+    foreign = [life["exit"] for index, life in enumerate(lives.items) if life["pid"] in pids and index not in matched and life["exit"] is not None]
+    return {"files": files, "order": order, "dispositions": dispositions, "missing": missing, "dropped": list(dropped.values()), "lives": rows, "problems": problems,
+            "foreign_exits": foreign}
+
+
+EVENT_NS = "http://schemas.microsoft.com/win/2004/08/events/event"
+ET.register_namespace("", EVENT_NS)
+
+
+def etw_files(path, pids=None, exits=None, order=None, dispositions=None, lives=None, evidence=None) -> tuple:
     """`({(pid, file name)}, events)` of the Create events a `tracerpt -of XML` file holds, for the processes in `pids` (every process when None). Read as a
     stream: the file has every open of the machine for the length of the run. With a list in `exits`, the process stops of the same file (Kernel-Process, event 2)
     are appended to it as `{"pid", "code", "time", "image"}`: how each process ended; with a dict in `order`, the position in the file (the order the system
-    logged them in, never a time) of the first open of each `(pid, name)` is put in it."""
+    logged them in, never a time) of the first open of each `(pid, name)` is put in it. With a `Lives` in `lives`, the starts and stops of the processes (Kernel-Process, events 1 and 2)
+    make the lives of the pids, and the opens of its `watch` are each put in the life their pid has at that position (`attribute_opens`). With a text file in `evidence`, the events of
+    those pids and every start and stop are written to it as they are read (the XML of the session, filtered)."""
     seen, events = set(), 0
     for _ev, el in ET.iterparse(path, events=("end",)):
         if el.tag.rsplit("}", 1)[-1] != "Event":
@@ -1299,8 +1407,20 @@ def etw_files(path, pids=None, exits=None, order=None, dispositions=None) -> tup
                 event_id = (child.text or "").strip()
         if name:
             name = wof_base(name)
-        if exits is not None and event_id == "2" and "ExitCode" in data and data.get("ProcessID"):
-            exits.append({"pid": _number(data["ProcessID"]), "code": _number(data["ExitCode"]), "time": when, "image": data.get("ImageName", "")})
+        is_start = event_id == "1" and "ParentProcessID" in data and bool(data.get("ProcessID"))
+        is_stop = event_id == "2" and "ExitCode" in data and bool(data.get("ProcessID"))
+        stop = {"pid": _number(data["ProcessID"]), "code": _number(data["ExitCode"]), "time": when, "image": data.get("ImageName", "")} if is_stop else None
+        if exits is not None and is_stop:
+            exits.append(stop)
+        if lives is not None:
+            if is_start:
+                lives.start(_number(data["ProcessID"]), _number(data["ParentProcessID"]), data.get("ImageName", ""), events)
+            elif is_stop:
+                lives.stop(stop["pid"], stop["code"], events, stop)
+            elif name and pid is not None and pid in lives.watch:
+                lives.opened(pid, name, events, _number(data["CreateOptions"]) >> 24 if data.get("CreateOptions") else None)
+        if evidence is not None and (is_start or is_stop or (lives is not None and pid in lives.watch)):
+            evidence.write(ET.tostring(el, encoding="unicode"))
         if name and pid is not None and (pids is None or pid in pids):
             seen.add((pid, name))
             if order is not None:
@@ -1320,8 +1440,20 @@ def parse_audit_setting(csv_text: str) -> str:
     return row[head.index("Inclusion Setting")] if "Inclusion Setting" in head and len(row) == len(head) else ""
 
 
+#: The tools the oracle itself ran through `_tool`, by the base name of the image each one is (`logman.exe`, lower case): {image: the first command run}. A life of one of them is never the
+#: engine's (`oracle_tool_problems`).
+ORACLE_TOOLS: dict = {}
+
+
+def tool_image(argv0) -> str:
+    """The image base name (lower case, with its extension) the Windows tool `argv0` runs as: `logman` is `logman.exe`."""
+    base = _base(str(argv0)).lower()
+    return base if "." in base else base + ".exe"
+
+
 def _tool(argv, timeout: float = 300.0) -> str:
     """A Windows tool's output, or a TraceError that says what failed."""
+    ORACLE_TOOLS.setdefault(tool_image(argv[0]), " ".join(str(a) for a in argv)[:200])
     try:
         done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -1348,6 +1480,7 @@ class WindowsTrace:
         self.exits_ok = False
         self.ends_ok = False
         self.before_end = None
+        self.etw_evidence = None  # the session XML of the last `finish`, filtered to the pids of the tree (`save_lives`)
         self.audit_raw: tuple = ([], [])  # the births and the ends of the last read of the log (`audit_listing`)
 
     def _canary(self, which: str) -> str:
@@ -1479,11 +1612,22 @@ class WindowsTrace:
         summary = self.work / "files.txt"
         _tool(["tracerpt", str(self.etl), "-of", "XML", "-o", str(self.xml), "-summary", str(summary), "-y"])
         exits: list = []
-        order: dict = {}
-        dispositions: dict = {}
-        everything, events = etw_files(self.xml, None, exits, order, dispositions)
         tree_pids = {e["pid"] for e in tree}
-        seen = {(p, n) for p, n in everything if p in tree_pids or p == os.getpid()}
+        lives = Lives(tree_pids)
+        self.etw_evidence = self.work / "files.etw.xml.gz"
+        try:
+            with gzip.open(self.etw_evidence, "wt", encoding="utf-8") as evidence:
+                evidence.write("<Events>")
+                everything, events = etw_files(self.xml, None, exits, None, None, lives, evidence)
+                evidence.write("</Events>")
+        except OSError as e:  # the evidence is never red: a file that cannot be written is said, the trace is read as before
+            print("the filtered session XML could not be written (%s): %s" % (self.etw_evidence, e))
+            self.etw_evidence = None
+            exits.clear()
+            lives = Lives(tree_pids)
+            everything, events = etw_files(self.xml, None, exits, None, None, lives)
+        got = attribute_opens(lives, tree, ORACLE_TOOLS)
+        seen = {(p, n) for p, n in everything if p == os.getpid()} | got["files"]
         outside: dict = {}
         for p, n in everything:
             if p not in tree_pids and p != os.getpid():
@@ -1496,13 +1640,14 @@ class WindowsTrace:
         lost = re.search(r"(?i)events?\s+lost\D{0,20}(\d+)", summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else "")
         if lost and int(lost.group(1)):
             problems.append("the file trace lost %s events" % lost.group(1))
-        missing = sorted(tree_pids - {pid for pid, _n in seen})
-        if missing:
-            problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in missing[:10]))
-        return {"tree": tree, "audit": audit, "files": {(p, n) for p, n in seen if p in tree_pids}, "outside": {k: len(v) for k, v in sorted(outside.items())},
-                "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids], "exits_available": self.exits_ok,
-                "order": {k: v for k, v in order.items() if k[0] in tree_pids},
-                "dispositions": {k: sorted(v) for k, v in dispositions.items() if k[0] in tree_pids}}
+        problems.extend(got["problems"])
+        if got["missing"]:
+            problems.append("the file trace holds no open of the process(es) %s" % ", ".join(str(p) for p in got["missing"][:10]))
+        foreign = {id(x) for x in got["foreign_exits"]}
+        return {"tree": tree, "audit": audit, "files": got["files"], "outside": {k: len(v) for k, v in sorted(outside.items())},
+                "exited": exited, "events": events, "problems": problems, "exits": [e for e in exits if e["pid"] in tree_pids and id(e) not in foreign],
+                "exits_available": self.exits_ok, "order": got["order"], "dispositions": {k: sorted(v) for k, v in got["dispositions"].items()},
+                "lives": {"lives": got["lives"], "dropped": got["dropped"]}, "etw_evidence": self.etw_evidence}
 
     def cleanup(self, sleep=time.sleep, now=time.monotonic, gone_limit=SESSION_GONE_LIMIT) -> None:
         """Put the machine back: the session closed and gone from the list, the audit as it was."""
@@ -2142,6 +2287,25 @@ def save_audit(folder, launch: str, seed: int, audit) -> None:
         print("the audit of the tree could not be saved (seed %d, launch %s): %s" % (seed, launch, e))
 
 
+LIVES_FORMAT = "ab-host-lives/1"
+
+
+def save_lives(folder, launch: str, seed: int, got) -> None:
+    """Saves next to the audit of a Windows launch (`save_audit`) what says whom each open was attributed to: `<folder>/<launch>-<seed>.lives.json` (`finish`'s `lives`: every life of every pid
+    of the tree in the stream with its creator, image, positions, exit code, whether it is the tree's and the opens counted, and the opens dropped because they are of another life of the
+    pid) and `<folder>/<launch>-<seed>.etw.xml.gz` (the session XML of the launch filtered to the events of every pid that was ever a pid of the tree and every Kernel-Process start and
+    stop: the raw XML holds every open of the machine). Evidence: it changes no verdict. No folder, no file; a write that fails is said on the output."""
+    if not folder or not got or not got.get("lives"):
+        return
+    try:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        write_json(Path(folder) / ("%s-%d.lives.json" % (launch, seed)), dict(got["lives"], format=LIVES_FORMAT, launch=launch, seed=seed))
+        if got.get("etw_evidence"):
+            shutil.copyfile(got["etw_evidence"], Path(folder) / ("%s-%d.etw.xml.gz" % (launch, seed)))
+    except (OSError, ValueError, TypeError) as e:
+        print("the lives of the tree could not be saved (seed %d, launch %s): %s" % (seed, launch, e))
+
+
 def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: bool = False, crash_with: int | None = None, datareporting_dir=None, audit_dir=None) -> dict:
     """One browser, one journey, one close, one trace. Returns the seed's footprint; `name` is the folder of its work (the warm-up has one of its own).
 
@@ -2156,7 +2320,7 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
     that closes before it has initialised makes it start inside the shutdown, where the parent can end with -11), so that the work of the launch is always between the condition and the
     close; a condition that is not met is a problem of the launch (the verdict is red) and the launch goes on. Just before the close the list of `<profile>/datareporting/` is saved in
     `datareporting_dir` (`save_datareporting`: evidence for the next time, never part of the footprint). On Windows the raw events of the audit the tree was read from, the
-    excluded ones included, are saved in `audit_dir` (`save_audit`), also evidence.
+    excluded ones included, are saved in `audit_dir` (`save_audit`), with the lives of the tree and the filtered session XML (`save_lives`), also evidence.
 
     `crash_with` is the recorder's own test (`crash-probe`): the signal sent to the parent of the browser once it is up, to show that a launch that dies is red and keeps its evidence."""
     from playwright.sync_api import sync_playwright
@@ -2266,7 +2430,8 @@ def run_seed(binary: str, seed: int, work: Path, name: str | None = None, idle: 
         exited = _wait_for_tree_exit(pgid)
         if exited is not None and not exited:
             problems.append("the tree did not exit within %d s of the close: the trace is cut short" % EXIT_LIMIT_S)
-        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close, lambda audit: save_audit(audit_dir, launch_name, seed, audit))
+        result = _seed_result(binary, seed, seed_work, steps, log, trace, root_pid, windows, close, lambda audit: save_audit(audit_dir, launch_name, seed, audit),
+                              lambda got: save_lives(audit_dir, launch_name, seed, got))
         if idle:
             result["idle"] = {"notified": notified, "shortcut_changes": diff_snapshots(shortcuts_before, snapshot_places(places)) if places else None}
         watched, watcher = watcher.stop(), None
@@ -2447,14 +2612,16 @@ def _wait_for_tree_exit(pgid):
     return not _wait_for_exit(pgid, EXIT_LIMIT_S)
 
 
-def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool, close: dict | None = None, keep_audit=None) -> dict:
-    """The footprint of one launch. On Windows `keep_audit(audit)` is given the raw events of the audit the tree was read from (`save_audit`), before they are read into the footprint."""
+def _seed_result(binary: str, seed: int, seed_work: Path, steps: list, log: Path, trace, root_pid, windows: bool, close: dict | None = None, keep_audit=None, keep_lives=None) -> dict:
+    """The footprint of one launch. On Windows `keep_audit(audit)` is given the raw events of the audit the tree was read from (`save_audit`), and `keep_lives(got)` what `finish` returned (the lives of the pids of the tree and the filtered session XML, `save_lives`), before they are read into the footprint."""
     real = os.path.realpath(binary)
     ctx = _context(binary, windows, seed_work)
     if windows:
         got = trace.finish({root_pid})
         if keep_audit is not None:
             keep_audit(got.get("audit"))
+        if windows and keep_lives is not None:
+            keep_lives(got)
         procs = windows_processes(got["tree"], real)
         pairs = list(got["files"])
         labels = {pid: p["label"] for pid, p in procs.items()}
@@ -2525,7 +2692,7 @@ def run_engine(binary: str, leg: str, seeds: list, label: str, crash_dir=None, d
     """The footprint document of one engine. A discarded WARM-UP launch first, of the first seed, then every seed's journey, one browser at a time.
 
     Every launch (the warm-up, each seed and the idle one) that does not end with 0 is a problem of the run, and what it left is kept in `crash_dir` (`keep_crash`). The list of the
-    `datareporting` folder of each launch with a page is saved in `datareporting_dir` (`save_datareporting`), and on Windows the raw events of the audit of each launch in `audit_dir` (`save_audit`).
+    `datareporting` folder of each launch with a page is saved in `datareporting_dir` (`save_datareporting`), and on Windows the raw events of the audit of each launch, the lives of its tree and the filtered session XML in `audit_dir` (`save_audit`, `save_lives`).
 
     The warm-up is a control of the experiment and not an excuse: what a machine does the first time it runs an engine (its files scanned, its caches
     cold, a first-run behaviour of the engine) is in a launch that is not compared, whose trace is kept in the document (`warmup`) so that what it
@@ -2648,7 +2815,8 @@ def run_stock(leg: str, audit_dir=None) -> dict:
                 return document({"seed": 0, "steps": steps, "kinds": {}, "files": [], "ours": {}, "trace": {"source": "etw+audit", "exited": False}, "started": False,
                                  "problems": [STOCK_NO_PARENT % exe]})
             stock_phase("seed result")
-            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, parent, True, None, lambda audit: save_audit(audit_dir, "stock", 0, audit))
+            result = _seed_result(exe, 0, work, steps, work / "none.log", trace, parent, True, None, lambda audit: save_audit(audit_dir, "stock", 0, audit),
+                                   lambda got: save_lives(audit_dir, "stock", 0, got))
             result["started"] = True
             return document(result)
         except TraceError as e:
