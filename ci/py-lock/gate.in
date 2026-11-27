@@ -1,8 +1,8 @@
 # Input of the gate lock; `python scripts/ci_py_lock.py` writes it and gate.txt from the sources below. Wrapper-owned (ci-03), read at the wrapper_ref.
 # python-version: 3.11
 # exclude-newer: 2026-11-25T00:00:00Z
-# wrapper: pyproject.toml sha256 64c93d06773cc6573cd062fe67b1c852d2a36b07426ea7076632900eebe956a1 (at generation); its dependencies without invisible_core, and its `dev` extra
-# core: invisible_core==70.83.0, tag v70.83.0, pyproject.toml sha256 c0d14a4d26d3650005076ab72347eb24fba4b89e643f514e7f7334bd0a2ac174 (at generation); the core is a wheel of ours, only what it depends on is locked
+# wrapper: pyproject.toml sha256 5dab5865e744e8059bbb02c75c9dcf8f9c9eb9679cd850e19c8ac593c3dd065e (at generation); its dependencies without invisible_core, and its `dev` extra
+# core: invisible_core==70.84.0, tag v70.84.0, pyproject.toml sha256 c0d14a4d26d3650005076ab72347eb24fba4b89e643f514e7f7334bd0a2ac174 (at generation); the core is a wheel of ours, only what it depends on is locked
 # core-requires: platformdirs>=4 | psutil>=5.9 | requests[socks]>=2.31 | maxminddb>=2.2 | tzdata>=2024.1
 # playwright: 1.61.0 from scripts/playwright_pin.txt (the stock client the gate drives the engine with)
 # cryptography: 44.0.3 (the lab's PKI)
