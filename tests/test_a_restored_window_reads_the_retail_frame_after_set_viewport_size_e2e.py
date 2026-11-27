@@ -41,6 +41,22 @@ run the same assertions: the declaration, not the host, is what is read.
 
 The page is a local one (``Sites``); the mouse is the client's own (``page.mouse.move``), so the events are trusted ones.
 
+Frames and popups, against retail round 5 (GitHub run oss-invisible/core 45952171443; RetailCaptures ``captures/WINDOW_GEOMETRY_POPUP_FRAME.csv``, whose values are
+copied by a script into ``RETAIL_FRAMES`` and ``RETAIL_POPUPS`` below, with the file's sha256). This is the comparison with RETAIL; the popup test of the repo
+(``test_popup_geometry_is_the_declared_frame_e2e.py``) compares with the core's declaration.
+
+  * Frames, in the maximized state and after call 1: a same-origin frame (300x120 at x 10, y 60, from the page's own site) and a cross-site one (300x120 at x 10,
+    y 200, another local site), added to the page for the reading and removed after it. From inside each frame the test reads ``mozInnerScreenX/Y``, ``outerWidth``,
+    ``outerHeight``, ``screenX/Y`` and ``devicePixelRatio``, and the offset the events of a real mouse move over the frame carry. ``outer``, ``screenX/Y`` and ``dpr``
+    are the parent's; ``mozInnerScreen`` is the parent's plus the frame's rect, EXCEPT the cross-site frame at scale 1.25, which retail reads 0.4 CSS pixel further
+    right (maximized: same 10, 144.8; cross 10.4, 284.8; after call 1: same 20.4, 148; cross 20.8, 288).
+  * A popup opened from the maximized page after a real click on a button: ``window.open(url, '_blank', 'width=500,height=400')`` at every case, and, at scale 2.0,
+    ``'left=100,top=80,width=500,height=400'``, which retail moves up into the work area (inner 500x400, outer 513x476, screenX/Y 100, 76, mozInnerScreen 106.5, 146).
+    An unpositioned popup sits at 4 device pixels (``screenX/Y`` 4 over the scale, rounded). Everything is compared exactly.
+  * The offset of the events: retail's mouse points are its own (device pixels of its window), ours are CSS pixels of the page, and the integer ``screenX - clientX``
+    rounds by the point, so away from scale 1.0 the offset may differ from retail's by one; at scale 1.0 it is equal. In every case it is within one pixel of
+    ``mozInnerScreen`` (the invariant above).
+
 The restored state survives the replacement of the top browsing context
 (``test_the_restored_state_survives_a_browsing_context_replacement``, 1920x1080 at scale 1.0): after ``set_viewport_size(390, 844)`` the same tab
 navigates to a page served with ``Cross-Origin-Opener-Policy: same-origin`` (and ``Cross-Origin-Embedder-Policy: require-corp``) from another site of
@@ -62,7 +78,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 from _evidence_on_failure import FailureEvidence
-from _fission_frames import Sites
+from _fission_frames import Sites, wait_frame
 from _navigation_moved_trace import moved_origin, read_trace
 from _waits import wait_until
 
@@ -84,12 +100,16 @@ BUTTON = (100, 40)
 
 PAGE = """<!doctype html><meta charset=utf-8><title>restored window</title>
 <style>html,body{margin:0;padding:0;height:100%}
-#fs{position:fixed;left:20px;top:20px;width:160px;height:40px;margin:0;z-index:2147483647}</style>
-<body><button id=fs>fullscreen</button><script>
+#fs,#open{position:fixed;top:20px;width:160px;height:40px;margin:0;z-index:2147483647}
+#fs{left:20px}#open{left:200px}</style>
+<body><button id=fs>fullscreen</button><button id=open>popup</button><script>
 window.__last = null; window.__moves = 0; window.__fsRequest = 'not asked';
 document.getElementById('fs').addEventListener('click', () => {
   window.__fsRequest = 'pending';
   document.documentElement.requestFullscreen().then(() => { window.__fsRequest = 'resolved'; }, e => { window.__fsRequest = 'rejected: ' + e; });
+});
+document.getElementById('open').addEventListener('click', () => {
+  window.open(window.__popupUrl, '_blank', window.__popupFeatures);
 });
 window.addEventListener('mousemove', e => {
   if (!e.isTrusted) return;
@@ -147,6 +167,35 @@ window.__probe = () => {
   });
 };
 </script>"""
+
+# The page of a frame and of a popup: it only hears the mouse, as the top page does.
+FRAME_PAGE = """<!doctype html><meta charset=utf-8><title>probe</title>
+<style>html,body{margin:0;padding:0;height:100%}</style>
+<body><script>
+window.__last = null; window.__moves = 0;
+window.addEventListener('mousemove', e => {
+  if (!e.isTrusted) return;
+  window.__moves++;
+  window.__last = {n: window.__moves, cx: e.clientX, cy: e.clientY, sx: e.screenX, sy: e.screenY,
+                   dx: e.screenX - e.clientX, dy: e.screenY - e.clientY};
+}, true);
+</script>"""
+
+#: The frames of the reading, added to the page: ``[same-origin url, cross-site url]``, 300x120 at x 10, y 60 and y 200 (retail round 5's rects).
+FRAMES_ON = """([same, cross]) => {
+  for (const [id, src, top] of [['same', same, 60], ['cross', cross, 200]]) {
+    const f = document.createElement('iframe');
+    f.id = 'frame-' + id; f.src = src;
+    f.style.cssText = 'position:absolute;left:10px;top:' + top + 'px;width:300px;height:120px;border:0;margin:0;padding:0';
+    document.body.appendChild(f);
+  }
+}"""
+FRAMES_OFF = "() => { document.querySelectorAll('iframe').forEach(f => f.remove()); }"
+#: The real mouse move over each frame, in the page's CSS pixels: its centre.
+FRAME_POINTS = {"same": (160, 120), "cross": (160, 260)}
+#: The click that opens the popup: the centre of the ``#open`` button (``position:fixed`` at (200, 20), 160x40 CSS pixels), and the point of the mouse move in the popup.
+OPEN = (280, 40)
+POPUP_POINT = (150, 170)
 
 READ = """() => ({ow: outerWidth, oh: outerHeight, iw: innerWidth, ih: innerHeight, sx: screenX, sy: screenY,
                  mx: mozInnerScreenX, my: mozInnerScreenY, dpr: devicePixelRatio, availH: screen.availHeight,
@@ -259,15 +308,87 @@ RETAIL_PROBE: Dict[str, Dict[str, Dict[str, Any]]] = {
 }
 
 
-def _stable(page, ask: Optional[Tuple[int, int]], fullscreen: Optional[bool] = None) -> Dict[str, Any]:
+# What retail answers to a frame and to a popup (round 5 of the window-geometry capture: Firefox 159.0 retail on GitHub's Windows runners, GitHub run
+# oss-invisible/core 45952171443, display launch "a"; launch "b" equals it in every value below). Every value is printed by a script from
+# RetailCaptures/captures/WINDOW_GEOMETRY_POPUP_FRAME.csv (sha256 64f1d437a261e0305604f16ac9a6b60c62546101ac994712fbdec251e8a9c2af); none is retyped.
+# RETAIL_FRAMES[case][state][kind]: a 300x120 frame at ``rect`` (CSS pixels of the page) in a same-origin or a cross-site page, read from inside the frame:
+# the parent's mozInnerScreen (parent_mx, parent_my), the frame's (mx, my), what it reads beyond parent + rect (``extra``: 0.4 CSS pixel in x for the cross-site
+# frame at scale 1.25, nothing anywhere else), outer, screenX/Y, devicePixelRatio and the events' offset (dx, dy). The capture's state "juggler" is the parent
+# restored at Juggler's SECOND size (its step iframes_juggler, parent outer 516x989 at scale 1.0); the parent's content origin is the same after call 1 and
+# call 2 at the four cases, which is why the frame's mozInnerScreen below holds after call 1 too.
+RETAIL_FRAMES: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {
+    '1600x1200-dpr2.0': {
+        'maximized': {
+            'same': {'rect': (10, 60), 'parent_mx': 0, 'parent_my': 73, 'mx': 10, 'my': 133, 'extra': (0, 0), 'ow': 813, 'oh': 565, 'sx': -6, 'sy': -6, 'dpr': 2, 'dx': 10, 'dy': 133},
+            'cross': {'rect': (10, 200), 'parent_mx': 0, 'parent_my': 73, 'mx': 10, 'my': 273, 'extra': (0, 0), 'ow': 813, 'oh': 565, 'sx': -6, 'sy': -6, 'dpr': 2, 'dx': 10, 'dy': 273},
+        },
+        'juggler': {
+            'same': {'rect': (10, 60), 'parent_mx': 8.5, 'parent_my': 75, 'mx': 18.5, 'my': 135, 'extra': (0, 0), 'ow': 513, 'oh': 460, 'sx': 2, 'sy': 2, 'dpr': 2, 'dx': 19, 'dy': 135},
+            'cross': {'rect': (10, 200), 'parent_mx': 8.5, 'parent_my': 75, 'mx': 18.5, 'my': 275, 'extra': (0, 0), 'ow': 513, 'oh': 460, 'sx': 2, 'sy': 2, 'dpr': 2, 'dx': 19, 'dy': 275},
+        },
+    },
+    '1920x1080-dpr1.0': {
+        'maximized': {
+            'same': {'rect': (10, 60), 'parent_mx': 0, 'parent_my': 85, 'mx': 10, 'my': 145, 'extra': (0, 0), 'ow': 1936, 'oh': 1048, 'sx': -8, 'sy': -8, 'dpr': 1, 'dx': 10, 'dy': 145},
+            'cross': {'rect': (10, 200), 'parent_mx': 0, 'parent_my': 85, 'mx': 10, 'my': 285, 'extra': (0, 0), 'ow': 1936, 'oh': 1048, 'sx': -8, 'sy': -8, 'dpr': 1, 'dx': 10, 'dy': 285},
+        },
+        'juggler': {
+            'same': {'rect': (10, 60), 'parent_mx': 12, 'parent_my': 89, 'mx': 22, 'my': 149, 'extra': (0, 0), 'ow': 516, 'oh': 989, 'sx': 4, 'sy': 4, 'dpr': 1, 'dx': 22, 'dy': 149},
+            'cross': {'rect': (10, 200), 'parent_mx': 12, 'parent_my': 89, 'mx': 22, 'my': 289, 'extra': (0, 0), 'ow': 516, 'oh': 989, 'sx': 4, 'sy': 4, 'dpr': 1, 'dx': 22, 'dy': 289},
+        },
+    },
+    '1920x1080-dpr1.25': {
+        'maximized': {
+            'same': {'rect': (10, 60), 'parent_mx': 0, 'parent_my': 84.80000305175781, 'mx': 10, 'my': 144.8000030517578, 'extra': (0, 0), 'ow': 1550, 'oh': 830, 'sx': -7, 'sy': -7, 'dpr': 1.25, 'dx': 10, 'dy': 145},
+            'cross': {'rect': (10, 200), 'parent_mx': 0, 'parent_my': 84.80000305175781, 'mx': 10.399999618530273, 'my': 284.79998779296875, 'extra': (0.4, 0), 'ow': 1550, 'oh': 830, 'sx': -7, 'sy': -7, 'dpr': 1.25, 'dx': 10, 'dy': 285},
+        },
+        'juggler': {
+            'same': {'rect': (10, 60), 'parent_mx': 10.399999618530273, 'parent_my': 88, 'mx': 20.399999618530273, 'my': 148, 'extra': (0, 0), 'ow': 514, 'oh': 733, 'sx': 3, 'sy': 3, 'dpr': 1.25, 'dx': 21, 'dy': 148},
+            'cross': {'rect': (10, 200), 'parent_mx': 10.399999618530273, 'parent_my': 88, 'mx': 20.799999237060547, 'my': 288, 'extra': (0.4, 0), 'ow': 514, 'oh': 733, 'sx': 3, 'sy': 3, 'dpr': 1.25, 'dx': 20, 'dy': 288},
+        },
+    },
+    '1920x1080-dpr1.5': {
+        'maximized': {
+            'same': {'rect': (10, 60), 'parent_mx': 0, 'parent_my': 72.66666412353516, 'mx': 10, 'my': 132.6666717529297, 'extra': (0, 0), 'ow': 1295, 'oh': 687, 'sx': -7, 'sy': -7, 'dpr': 1.5, 'dx': 10, 'dy': 133},
+            'cross': {'rect': (10, 200), 'parent_mx': 0, 'parent_my': 72.66666412353516, 'mx': 10, 'my': 272.6666564941406, 'extra': (0, 0), 'ow': 1295, 'oh': 687, 'sx': -7, 'sy': -7, 'dpr': 1.5, 'dx': 10, 'dy': 273},
+        },
+        'juggler': {
+            'same': {'rect': (10, 60), 'parent_mx': 10, 'parent_my': 75.33333587646484, 'mx': 20, 'my': 135.3333282470703, 'extra': (0, 0), 'ow': 515, 'oh': 580, 'sx': 3, 'sy': 3, 'dpr': 1.5, 'dx': 20, 'dy': 135},
+            'cross': {'rect': (10, 200), 'parent_mx': 10, 'parent_my': 75.33333587646484, 'mx': 20, 'my': 275.3333435058594, 'extra': (0, 0), 'ow': 515, 'oh': 580, 'sx': 3, 'sy': 3, 'dpr': 1.5, 'dx': 20, 'dy': 275},
+        },
+    },
+}
+
+# RETAIL_POPUPS[case][step]: the popup opened from the maximized page after a real click (``popup``: no position asked; ``popup_pos``: left and top asked, only at
+# scale 2.0, where retail moves the window up into the work area: screenY 76 for the 80 asked), read from inside the popup. The events' offset (dx, dy) is the
+# one of the capture's own mouse points.
+RETAIL_POPUPS: Dict[str, Dict[str, Dict[str, Any]]] = {
+    '1600x1200-dpr2.0': {
+        'popup': {'features': 'width=500,height=400', 'iw': 500, 'ih': 400, 'ow': 513, 'oh': 476, 'sx': 2, 'sy': 2, 'mx': 8.5, 'my': 72, 'dpr': 2, 'dx': 9, 'dy': 72},
+        'popup_pos': {'features': 'left=100,top=80,width=500,height=400', 'iw': 500, 'ih': 400, 'ow': 513, 'oh': 476, 'sx': 100, 'sy': 76, 'mx': 106.5, 'my': 146, 'dpr': 2, 'dx': 107, 'dy': 146},
+    },
+    '1920x1080-dpr1.0': {
+        'popup': {'features': 'width=500,height=400', 'iw': 500, 'ih': 400, 'ow': 516, 'oh': 480, 'sx': 4, 'sy': 4, 'mx': 12, 'my': 76, 'dpr': 1, 'dx': 12, 'dy': 76},
+    },
+    '1920x1080-dpr1.25': {
+        'popup': {'features': 'width=500,height=400', 'iw': 500, 'ih': 400, 'ow': 514, 'oh': 478, 'sx': 3, 'sy': 3, 'mx': 10.399999618530273, 'my': 74.4000015258789, 'dpr': 1.25, 'dx': 11, 'dy': 74},
+    },
+    '1920x1080-dpr1.5': {
+        'popup': {'features': 'width=500,height=400', 'iw': 500, 'ih': 400, 'ow': 515, 'oh': 478, 'sx': 3, 'sy': 3, 'mx': 10, 'my': 73.33333587646484, 'dpr': 1.5, 'dx': 10, 'dy': 73},
+    },
+}
+
+
+def _stable(page, ask: Optional[Tuple[int, int]], fullscreen: Optional[bool] = None, reader=None) -> Dict[str, Any]:
     """The window as the page reads it once it has settled: the inner size is the asked one (when one was asked), the document is in fullscreen or not
-    (when that was asked) and two looks in a row are equal.
+    (when that was asked) and two looks in a row are equal. ``reader`` is the window that is read when it is not ``page`` (a popup, a frame); ``page`` paces the wait.
 
     A condition, not a pause. The last reading is returned either way, so a window that never settles is red where the assertions name what was read."""
     seen: Dict[str, Any] = {"now": None, "before": None}
+    reader = page if reader is None else reader
 
     def settled() -> bool:
-        seen["before"], seen["now"] = seen["now"], page.evaluate(READ)
+        seen["before"], seen["now"] = seen["now"], reader.evaluate(READ)
         now = seen["now"]
         if ask is not None and (now["iw"], now["ih"]) != ask:
             return False
@@ -304,14 +425,18 @@ def _check_probe(step: str, probe: Dict[str, Any], expected: Dict[str, Any], who
             "%s: %s reads %r, %s reads %r (whole probe: %r)" % (step, name, probe[key], who, expected[key], probe))
 
 
-def _event_offset(page, point: Tuple[int, int]) -> Dict[str, Any]:
-    """Moves the mouse to ``point`` and gives the last trusted mousemove the page heard for it (waits for it)."""
-    heard = page.evaluate("() => window.__moves")
+def _event_offset(page, point: Tuple[int, int], target=None, origin: Tuple[int, int] = (0, 0)) -> Dict[str, Any]:
+    """Moves the mouse to ``point`` and gives the last trusted mousemove the page heard for it (waits for it).
+
+    ``target`` is the frame that hears it when it is not the page, and ``origin`` the frame's rect x, y in the page: the event carries ``point`` less ``origin``."""
+    target = page if target is None else target
+    client = (point[0] - origin[0], point[1] - origin[1])
+    heard = target.evaluate("() => window.__moves")
     page.mouse.move(*point)
-    wait_until(lambda: page.evaluate("() => window.__moves") > heard and (page.evaluate("() => window.__last") or {}).get("cx") == point[0]
-               and (page.evaluate("() => window.__last") or {}).get("cy") == point[1],
+    wait_until(lambda: target.evaluate("() => window.__moves") > heard and (target.evaluate("() => window.__last") or {}).get("cx") == client[0]
+               and (target.evaluate("() => window.__last") or {}).get("cy") == client[1],
                DEADLINE_S, lambda: page.wait_for_timeout(50))
-    return page.evaluate("() => window.__last")
+    return target.evaluate("() => window.__last")
 
 
 def _check_reading(step: str, reading: Dict[str, Any], event: Dict[str, Any], expected: Dict[str, Any], dpr: float) -> None:
@@ -369,6 +494,64 @@ def _fullscreen_round_trip(page, step: str, before: Dict[str, Any], before_event
         assert abs(after_event[key] - before_event[key]) < EVENT_ROUNDING, (
             "%s: the offset of the events (%s) was %r before fullscreen and is %r after it" % (step, key, before_event[key], after_event[key]))
 
+def _check_events_against_retail(step: str, event: Dict[str, Any], retail: Dict[str, Any], dpr: float) -> None:
+    """The offset of the events (``screenX - clientX``, ``screenY - clientY``) against the one of retail's own mouse move: equal at scale 1.0, within one pixel at
+    the others (the capture's points are device pixels of its window, ours CSS pixels of the page, and the integer coordinates round by the point)."""
+    tolerance = 0 if dpr == 1.0 else 1
+    for key, name in (("dx", "screenX - clientX"), ("dy", "screenY - clientY")):
+        assert abs(event[key] - retail[key]) <= tolerance, (
+            "%s: %s of the mouse event is %r, retail reads %r (event %r)" % (step, name, event[key], retail[key], event))
+
+
+def _check_frames(page, sites, step: str, case: str, state: str, parent: Dict[str, Any], dpr: float) -> None:
+    """A same-origin and a cross-site frame in the page, read from inside: ``outer``, ``screenX/Y`` and ``dpr`` are the parent's, ``mozInnerScreen`` is retail's
+    (the parent's plus the frame's rect, and retail's 0.4 CSS pixel in x for the cross-site frame at scale 1.25), and so are the events' offsets.
+
+    ``parent`` is the reading of the page at this step; ``state`` is the key of RETAIL_FRAMES. The frames are added for the reading and removed after it."""
+    url = "/frame?%s" % state
+    page.evaluate(FRAMES_ON, [sites.url("A", url), sites.url("B", url)])
+    try:
+        for kind, site in (("same", "A"), ("cross", "B")):
+            retail = RETAIL_FRAMES[case][state][kind]
+            label = "%s, the %s frame" % (step, "same-origin" if kind == "same" else "cross-site")
+            frame = wait_frame(page, sites.origin[site], url, seconds=30)
+            reading = _stable(page, (300, 120), reader=frame)
+            event = _event_offset(page, FRAME_POINTS[kind], target=frame, origin=retail["rect"])
+            _check_reading(label, reading, event,
+                           {"iw": 300, "ih": 120, "ow": parent["ow"], "oh": parent["oh"], "sx": parent["sx"], "sy": parent["sy"],
+                            "mx": retail["mx"], "my": retail["my"]}, dpr)
+            # the parent's content origin plus the frame's rect, plus what retail reads beyond it
+            assert reading["mx"] == pytest.approx(parent["mx"] + retail["rect"][0] + retail["extra"][0], abs=FLOAT), (
+                "%s: mozInnerScreenX reads %r, the parent's %r plus the rect's %r plus retail's %r is %r"
+                % (label, reading["mx"], parent["mx"], retail["rect"][0], retail["extra"][0], parent["mx"] + retail["rect"][0] + retail["extra"][0]))
+            assert reading["my"] == pytest.approx(parent["my"] + retail["rect"][1] + retail["extra"][1], abs=FLOAT), (
+                "%s: mozInnerScreenY reads %r, the parent's %r plus the rect's %r plus retail's %r is %r"
+                % (label, reading["my"], parent["my"], retail["rect"][1], retail["extra"][1], parent["my"] + retail["rect"][1] + retail["extra"][1]))
+            assert (reading["ow"], reading["oh"], reading["sx"], reading["sy"], reading["dpr"]) == (
+                parent["ow"], parent["oh"], parent["sx"], parent["sy"], parent["dpr"]), (
+                "%s: outer, screenX/Y and devicePixelRatio of the frame are not the parent's (frame %r, parent %r)" % (label, reading, parent))
+            _check_events_against_retail(label, event, retail, dpr)
+    finally:
+        page.evaluate(FRAMES_OFF)
+
+
+def _check_popup(page, sites, step: str, retail: Dict[str, Any], dpr: float) -> None:
+    """Opens ``window.open(url, '_blank', features)`` with a real click on the page's button and reads the popup from inside, against retail, exactly.
+
+    The popup is closed after the reading."""
+    page.evaluate("([url, features]) => { window.__popupUrl = url; window.__popupFeatures = features; }", [sites.url("A", "/popup"), retail["features"]])
+    with page.expect_popup(timeout=30000) as opened:
+        page.mouse.click(*OPEN)       # the client's own click: a trusted event, so window.open is allowed
+    popup = opened.value
+    try:
+        popup.wait_for_load_state("load", timeout=30000)
+        reading = _stable(popup, (retail["iw"], retail["ih"]))
+        event = _event_offset(popup, POPUP_POINT)
+        _check_reading(step, reading, event, {key: retail[key] for key in ("iw", "ih", "ow", "oh", "sx", "sy", "mx", "my")}, dpr)
+        _check_events_against_retail(step, event, retail, dpr)
+    finally:
+        popup.close()
+
 
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefox_binary, case):
@@ -383,6 +566,9 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
     pin = {"screen.width": panel[0], "screen.height": panel[1], "screen.dpr": dpr}
     with Sites() as s:
         s.route("A", "/page", PAGE)
+        s.route("A", "/frame", FRAME_PAGE)      # the same-origin frame
+        s.route("B", "/frame", FRAME_PAGE)      # the cross-site frame
+        s.route("A", "/popup", FRAME_PAGE)
         with InvisiblePlaywright(seed=42, pin=pin, binary_path=firefox_binary, headless=True, humanize=False) as browser:
             page = browser.new_page()
             page.goto(s.url("A", "/page"), wait_until="load", timeout=30000)
@@ -396,8 +582,15 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
             maximized_probe = _probe(page)
             _check_probe("maximized (%s)" % case, maximized_probe, RETAIL_PROBE[case]["maximized"], "retail Firefox 159.0 on Windows")
 
+            # frames, in the maximized window: retail's mozInnerScreen, outer, screen, dpr and event offsets
+            _check_frames(page, s, "maximized (%s)" % case, case, "maximized", maximized, dpr)
+
             # F0. fullscreen and back, before any set_viewport_size: the window it had, exactly
             _fullscreen_round_trip(page, "F0 (%s)" % case, maximized, maximized_event, maximized_probe, screen, dpr, points)
+
+            # popups opened from the maximized page: no position at every case, and the positioned one at scale 2.0, as retail places them
+            for popup_step, retail_popup in RETAIL_POPUPS[case].items():
+                _check_popup(page, s, "window.open(%r) from the maximized page, %s (%s)" % (retail_popup["features"], popup_step, case), retail_popup, dpr)
 
             # 2 to 4. set_viewport_size, twice and back to the maximized inner size
             for number, (call, retail_step) in enumerate(zip(spec["calls"], ("juggler", "juggler2", "juggler_back")), start=1):
@@ -413,6 +606,9 @@ def test_a_restored_window_reads_the_retail_frame_after_set_viewport_size(firefo
                 probe = _probe(page)
                 _check_probe("set_viewport_size(%d, %d), call %d (%s)" % (width, height, number, case), probe, RETAIL_PROBE[case][retail_step],
                              "retail Firefox 159.0 on Windows")
+                if number == 1:
+                    # frames again, in the restored window of call 1
+                    _check_frames(page, s, "set_viewport_size(%d, %d), call %d (%s)" % (width, height, number, case), case, "juggler", reading, dpr)
                 if number == 2:
                     # F1. fullscreen and back after call 2: the window of call 2, exactly
                     _fullscreen_round_trip(page, "F1 (%s)" % case, reading, event, probe, screen, dpr, points)
