@@ -349,8 +349,8 @@ def test_a_retired_file_does_not_excuse_another_loss_in_the_same_row(tmp_path, m
 GONE_NODE = FILE_A + "::test_gone"
 
 
-def _retired_test(nodeid=GONE_NODE, suite="s.one", count=1, **over):
-    entry = {"nodeid": nodeid, "suite": suite, "count": count, "reason": "removed with its bundle", "decided_by": "pm", "date": "2026-11-27"}
+def _retired_test(nodeid=GONE_NODE, suite="s.one", count=1, from_min_tests=5, **over):
+    entry = {"nodeid": nodeid, "suite": suite, "count": count, "from_min_tests": from_min_tests, "reason": "removed with its bundle", "decided_by": "pm", "date": "2026-11-27"}
     entry.update(over)
     return entry
 
@@ -369,13 +369,14 @@ def test_a_declared_test_lets_the_floor_drop_by_exactly_its_count_is_green(tmp_p
 def test_the_counts_of_the_entries_of_a_suite_are_summed(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     other = FILE_B + "::test_also_gone"
-    main = _main_that_had_the_test(tmp_path, [_retired_test(), _retired_test(other), _retired_test(count=1, nodeid=FILE_A + "::t3")], min_tests=7)
+    main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=7), _retired_test(other, from_min_tests=7),
+                                              _retired_test(nodeid=FILE_A + "::t3", from_min_tests=7)], min_tests=7)
     assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0  # 7 -> 4: three declared
 
 
 def test_a_floor_that_drops_by_more_than_the_declared_count_is_red(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    main = _main_that_had_the_test(tmp_path, [_retired_test(count=1)], min_tests=6)  # 6 -> 4 here: one declared, two lost
+    main = _main_that_had_the_test(tmp_path, [_retired_test(count=1, from_min_tests=6)], min_tests=6)  # 6 -> 4 here: one declared, two lost
     code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
     assert code == 1 and "went down" in capsys.readouterr().out
 
@@ -433,6 +434,10 @@ def test_the_retired_tests_of_the_branch_excuse_nothing(tmp_path, monkeypatch, c
     ({"suite": "s.unknown"}, "not a row of main"),
     ({"suite": ""}, "suite must be"),
     ({"count": 0}, "count must be"),
+    ({"from_min_tests": 0}, "from_min_tests must be"),
+    ({"count": 3, "from_min_tests": 2}, "from_min_tests must be"),
+    ({"from_min_tests": "5"}, "from_min_tests must be"),
+    ({"from_min_tests": None}, "from_min_tests must be"),
     ({"count": True}, "count must be"),
     ({"count": "1"}, "count must be"),
     ({"reason": ""}, "reason must be"),
@@ -457,6 +462,34 @@ def test_the_same_test_declared_twice_for_a_suite_is_red():
 
 def test_files_and_tests_may_share_the_list():
     assert verdict.validate_retired([_retired(), _retired_test()], {"s.one"}) == []
+
+
+def test_an_entry_allows_the_drop_only_while_main_still_has_the_floor_it_was_written_at(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=5)], min_tests=5)
+    assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0
+    capsys.readouterr()
+    # the removal is on main: its floor is 4, the entry was written at 5 and is inert, so a further drop is red
+    sub = tmp_path / "later"
+    sub.mkdir()
+    main = _main_that_had_the_test(sub, [_retired_test(from_min_tests=5)], min_tests=4)
+    code, _r = _judge(sub, GREEN, rows=[_suite(min_tests=3)], extra=["--main-required", str(main)])
+    assert code == 1 and "went down" in capsys.readouterr().out
+
+
+def test_an_inert_entry_asks_nothing_of_a_suite_that_collects_the_test_again(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=5)], min_tests=4)
+    again = GREEN + [_case(FILE_A, "test_gone")]
+    assert _judge(tmp_path, again, rows=[_suite(min_tests=5)], extra=["--main-required", str(main)])[0] == 0
+
+
+def test_the_entries_of_one_suite_must_share_one_from_min_tests():
+    both = [_retired_test(from_min_tests=5), _retired_test(FILE_B + "::t", from_min_tests=6)]
+    assert any("disagree on from_min_tests" in p for p in verdict.validate_retired(both, {"s.one"}))
+    assert verdict.validate_retired([_retired_test(from_min_tests=5), _retired_test(FILE_B + "::t", from_min_tests=5)], {"s.one"}) == []
+    other = [_retired_test(from_min_tests=5), _retired_test(FILE_B + "::t", suite="s.two", from_min_tests=9)]
+    assert verdict.validate_retired(other, {"s.one", "s.two"}) == []
 
 
 # --- args --------------------------------------------------------------------------------------------------------

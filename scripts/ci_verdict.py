@@ -25,8 +25,10 @@ pytest wrote and fails on every one of them.
         no longer exists in the checkout may leave the rows, and the minimum of a row may go down by the tests main counted for it in that
         row (`tests: {row id: n}`), and by no more. A retired file still on disk, or any other lost test, stays red.
         The same file may also retire single tests whose file stays: {"nodeid": "<file>::<test>", "suite": <row id>, "count": n, "reason",
-        "decided_by", "date"}. The minimum of that row may go down by the sum of the `count` of its entries and by no more, and only for a nodeid
-        whose file the row of main lists; a declared nodeid that the judged leg still collects is red, and so is any test that goes without an entry.
+        "decided_by", "date", "from_min_tests"}. The minimum of that row may go down by the sum of the `count` of its entries and by no more, and
+        only for a nodeid whose file the row of main lists, and only while main's minimum of that row still equals `from_min_tests` (once the removal
+        is on main and its floor is lower, the entry is inert); a declared nodeid that the judged leg still collects is red, and so is any test that
+        goes without an entry.
         What the file of main is can be said only by the gate, which checks main out (a failed download is not
         "main has no list"): the file exists -> it is compared; it does not exist and the gate passed
         --main-has-no-list (main was checked out and has no such file) -> passed, declared; it does not exist
@@ -339,11 +341,12 @@ RETIRED_NAME = "retired-tests.json"
 def validate_retired(data, suite_ids=None):
     """-> the reasons why `data` is not a well-formed list of retired tests (empty if it is). Two kinds of entry, in one list:
     a FILE that is gone ({file, reason, date, tests: {row id: number of tests the file had in that row on main, counted with the row's marker}}), and
-    a single TEST whose file stays ({nodeid: "<file>::<test>", suite: row id, count > 0, reason, decided_by, date}). `suite_ids`, when given, are the
-    row ids of main's list: the suite of a nodeid entry must be one of them."""
+    a single TEST whose file stays ({nodeid: "<file>::<test>", suite: row id, count > 0, reason, decided_by, date, from_min_tests: the minimum of
+    the row on main when the entry was written, an integer >= count, the same for every entry of a suite}). `suite_ids`, when given, are the row
+    ids of main's list: the suite of a nodeid entry must be one of them."""
     if not isinstance(data, list):
         return ["the retired list must be a JSON list"]
-    problems, seen, seen_nodes = [], set(), set()
+    problems, seen, seen_nodes, froms = [], set(), set(), {}
     for i, e in enumerate(data):
         where = "retired entry %d" % i
         if not isinstance(e, dict):
@@ -351,6 +354,8 @@ def validate_retired(data, suite_ids=None):
             continue
         if "nodeid" in e or "suite" in e:
             problems += _validate_retired_node(e, where, suite_ids, seen_nodes)
+            if isinstance(e.get("suite"), str) and _is_int(e.get("from_min_tests")):
+                froms.setdefault(e["suite"], set()).add(e["from_min_tests"])
             continue
         f = e.get("file")
         if not isinstance(f, str) or not f.strip():
@@ -366,6 +371,9 @@ def validate_retired(data, suite_ids=None):
         counts = e.get("tests")
         if not (isinstance(counts, dict) and counts and all(isinstance(k, str) and _is_int(v) and v > 0 for k, v in counts.items())):
             problems.append("%s: tests must be {row id: number of tests of the file in that row (> 0)}" % where)
+    for suite, values in sorted(froms.items()):
+        if len(values) > 1:
+            problems.append("the retired tests of %s disagree on from_min_tests (%s): one suite, one floor of main" % (suite, sorted(values)))
     return problems
 
 
@@ -392,6 +400,9 @@ def _validate_retired_node(e, where, suite_ids, seen):
     for key in ("reason", "decided_by", "date"):
         if not isinstance(e.get(key), str) or not e.get(key).strip():
             problems.append("%s: %s must be a non-empty string" % (where, key))
+    frm = e.get("from_min_tests")
+    if not _is_int(frm) or frm < 1 or (_is_int(e.get("count")) and frm < e["count"]):
+        problems.append("%s: from_min_tests must be an integer >= count (the minimum of the suite on main when the entry was written)" % where)
     return problems
 
 
@@ -420,13 +431,16 @@ def _retired_tests_of(row, retired, collected, judged):
     """-> (the number of tests the row may lose because main retired them one by one, problems). An entry counts only if the file of its nodeid is
     in the row of main (a nodeid that the row does not run is not a test the row loses). The judge has the junit of the leg it judges and only
     counts of main, so a declared nodeid that the judged leg still collects is red (and counts for nothing), and the nodeid of another row is taken
-    on its count, the leg of that row checking it."""
+    on its count, the leg of that row checking it. An entry counts only while the minimum of the row on main is still its `from_min_tests`: once
+    the removal is on main the floor is lower and the entry is inert (it allows nothing and asks nothing)."""
     allowed, problems = 0, []
     listed = row.get("tests", [])
     for e in retired:
         if not (isinstance(e, dict) and isinstance(e.get("nodeid"), str) and e.get("suite") == row.get("id")):
             continue
         nid = e["nodeid"]
+        if _int(row.get("min_tests")) != e.get("from_min_tests"):
+            continue
         if nid not in listed and nid.split("::", 1)[0] not in listed:
             continue
         if collected is not None and judged == row.get("id") and any(n == nid or _base(n) == nid for n in collected):
