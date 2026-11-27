@@ -28,7 +28,7 @@ import sys
 
 import pytest
 
-from engine_process_tree import maps_of_the_engine_below
+from engine_process_tree import assert_the_gl_is_the_engines_own, maps_of_the_engine_below, ships_its_own_gl
 
 pytestmark = [pytest.mark.e2e,
               pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the engine's own GL is Linux's")]
@@ -226,16 +226,9 @@ ON_WINDOWS = {
 }
 
 
-def _ships_its_own_gl(binary_dir: str) -> bool:
-    """The engine's own GL is in the package from firefox-59: the test follows
-    the package under test, not the core's version (the gate runs a candidate
-    under the published core)."""
-    return os.path.isfile(os.path.join(binary_dir, "llvmpipe", "libEGL.so.1"))
-
-
 def test_webgl_draws_on_the_engine_s_own_gl(firefox_binary):
     binary_dir = os.path.dirname(os.path.realpath(firefox_binary))
-    if not _ships_its_own_gl(binary_dir):
+    if not ships_its_own_gl(binary_dir):
         pytest.skip("this engine has no GL of its own (it ships from firefox-59)")
     from invisible_playwright import InvisiblePlaywright
 
@@ -246,14 +239,7 @@ def test_webgl_draws_on_the_engine_s_own_gl(firefox_binary):
         # The engine processes BELOW THIS TEST, never the first one on the machine: an e2e run
         # has other workers' browsers in /proc, one of which has not drawn anything yet.
         below = maps_of_the_engine_below(os.getpid(), binary_dir)
-    own = os.path.join(binary_dir, "llvmpipe") + os.sep
-    assert below, "no engine process below this test"
-    drew = [pid for pid, maps in below.items()
-            if own + "libEGL.so.1" in maps and any(m.startswith(own + "libgallium-") for m in maps)]
-    assert drew, {pid: [m for m in maps if "EGL" in m or "gallium" in m] for pid, maps in below.items()}
-    foreign = {pid: [m for m in maps if "libEGL" in os.path.basename(m) and not m.startswith(own)]
-               for pid, maps in below.items()}
-    assert not any(foreign.values()), foreign
+    assert_the_gl_is_the_engines_own(firefox_binary, below)
 
 
 def test_every_declared_extension_answers_as_on_windows(firefox_binary):
