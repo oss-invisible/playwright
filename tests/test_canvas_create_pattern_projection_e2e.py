@@ -18,7 +18,7 @@ The negative control, in the same module. The same page runs with the canvas noi
 substitute_pixels`` false, the same declared GPU, the engine's own GL: no projection, because the noise is off, not because the engine is):
 the WebGL pattern pixels with the noise on must DIFFER from those (the projection is what changed them), and the 2D pattern pixels must be the
 SAME bytes with the noise on and off. A control with the engine off (``zoom.stealth.fpp.hw_seed`` 0) would draw the WebGL source on the host's
-GL, which a runner may not serve (no context, once in 3503 launches), so no launch of this file has the engine off. On Linux, in both launches,
+GL, which a runner may not serve (no context, once in 3083 launches), so no launch of this file has the engine off. On Linux, in both launches,
 the maps of the engine's processes hold the engine's own GL and no libEGL of the host's. A render that is not drawn (a blank source) fails the
 test: the pixels are checked to hold more than one colour. WebGL being unavailable on the runner is a failure, not a skip.
 

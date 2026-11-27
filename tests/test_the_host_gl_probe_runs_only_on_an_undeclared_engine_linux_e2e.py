@@ -12,7 +12,10 @@ With the engine NOT declared (``zoom.stealth.fpp.hw_seed`` = 0, the negative con
 runs in both launches, and that is what the test asserts there (``engine_reaches("firefox-69")`` decides).
 
 Why a page sees it: what the probe reads of the host decided, through the feature status, whether WebGL existed and on which path; a slow or failed probe
-took WebGL away for the whole session. Each launch also asks a page for ``getContext('webgl')``.
+took WebGL away for the whole session. Each launch also asks a page for ``getContext('webgl')``: the request is what makes Firefox read
+``GfxInfo::GetData``. With the engine declared its answer is a verdict (the engine's own GL must give a context). With the engine off it is
+evidence only, written in the failure message and never judged: the context then comes from the host's Mesa, which a runner may not serve
+(hunt run 45998187350: one engine-off launch in 3083 got no context, "Exhausted GL driver options"), and a test cannot fail for the host's GL.
 
 How it is observed (the process, not a value). A thread samples the processes below this test with psutil from before the launch to after the browser
 has closed (``tests/_process_sampler.py``). The probe lives for tens of milliseconds and a poll can fall between two samples, so the sampler alone never
@@ -89,7 +92,9 @@ def _check(firefox_binary, tmp_path, extra_prefs, want_probe):
     _require_strace_can_trace(tmp_path)
     glx, problems, webgl, report, parents, goto_at = _launch(firefox_binary, tmp_path / "launch", extra_prefs)
     assert problems == [], "the observation cannot be trusted:\n%s\n%s" % ("\n".join(problems), report)
-    assert webgl is True, "getContext('webgl') is null\n" + report
+    report = "getContext('webgl') answered %r%s\n%s" % (webgl, "" if extra_prefs is None else " (engine off: evidence, not a verdict)", report)
+    if extra_prefs is None:
+        assert webgl is True, "getContext('webgl') is null with the engine declared\n" + report
     if want_probe:
         assert glx, "no GLX probe (gfxtest glx) below the browser's parent %s\n%s" % (parents, report)
         strays = [(e.pid, s.ppid) for e, s in glx if s.ppid not in parents]
@@ -107,5 +112,6 @@ def test_a_declared_engine_starts_no_host_gl_probe(firefox_binary, engine_reache
 
 
 def test_an_undeclared_engine_starts_mozilla_s_host_gl_probe(firefox_binary, tmp_path):
-    """The negative control: with the engine off Mozilla's probe starts as in stock Firefox, on every engine, and the page still has WebGL."""
+    """The negative control: with the engine off Mozilla's probe starts as in stock Firefox, on every engine. The page still asks for WebGL
+    (the request is what makes Firefox read GfxInfo); its answer, on the host's Mesa, is written down and not judged."""
     _check(firefox_binary, tmp_path, UNDECLARED, want_probe=True)
