@@ -6,16 +6,16 @@ here means our patched build appears human to that detector; a fail
 means a real stealth hole that anti-bot kits would exploit in production.
 
 Detector libraries studied (all FOSS, MIT-licensed):
-  - github.com/fingerprintjs/BotD            - 19 detectors, the most
+  - a client-side bot detector                - 19 detectors, the most
                                                 widely deployed client-side
                                                 bot detector
-  - github.com/abrahamjuliot/creepjs         - headless / stealth / lies
+  - a headless / stealth / lies detector      - headless, stealth and lies
                                                 modules
-  - github.com/fingerprintjs/fingerprintjs   - canvas / audio / color /
+  - an open-source fingerprint library        - canvas / audio / color /
                                                 touch consistency
-  - github.com/antoinevastel/fpscanner       - UA / platform / oscpu
+  - an automation-rules scanner               - UA / platform / oscpu
                                                 cross-checks
-  - bot.sannysoft.com                        - classic Puppeteer harness
+  - a public classic-harness test page        - the classic Puppeteer harness
 
 Everything runs against `about:blank` with NO network and NO proxy. The
 suite is intended to be part of the release-gate: pre-push hook runs
@@ -77,19 +77,19 @@ def _ev(page, expr):
 
 
 # ===========================================================================
-# sannysoft.com - classic Puppeteer detection harness
+# The public classic Puppeteer detection harness
 # ===========================================================================
 
 
 @pytest.mark.e2e
-def test_sannysoft_chrome_object_consistency(page):
+def test_the_chrome_object_is_consistent(page):
     """Firefox UA + window.chrome present = bot-framework leak."""
     if "Firefox" in _ev(page, "navigator.userAgent"):
         assert not _ev(page, "typeof window.chrome !== 'undefined'")
 
 
 @pytest.mark.e2e
-def test_sannysoft_permissions_query_works(page):
+def test_the_permissions_query_works(page):
     """navigator.permissions.query() must return a proper PermissionStatus."""
     ok = _ev(page, """async () => {
         if (!navigator.permissions || !navigator.permissions.query) return false;
@@ -102,7 +102,7 @@ def test_sannysoft_permissions_query_works(page):
 
 
 @pytest.mark.e2e
-def test_sannysoft_iframe_chrome_not_leaked(page):
+def test_the_iframe_does_not_leak_the_chrome_object(page):
     """iframe.contentWindow.chrome must not leak on Firefox UA."""
     if "Firefox" not in _ev(page, "navigator.userAgent"):
         pytest.skip("Firefox-only invariant")
@@ -118,7 +118,7 @@ def test_sannysoft_iframe_chrome_not_leaked(page):
 
 
 @pytest.mark.e2e
-def test_sannysoft_iframe_languages_not_empty(page):
+def test_the_iframe_languages_are_not_empty(page):
     """Iframe-scope navigator.languages must have ≥1 entry."""
     n = _ev(page, """() => {
         const f = document.createElement('iframe');
@@ -132,12 +132,12 @@ def test_sannysoft_iframe_languages_not_empty(page):
 
 
 # ===========================================================================
-# FingerprintJS - fingerprint surface coherence
+# The open-source fingerprint library - fingerprint surface coherence
 # ===========================================================================
 
 
 @pytest.mark.e2e
-def test_fpjs_canvas_2d_context_returns_valid(page):
+def test_the_canvas_2d_context_returns_a_valid_one(page):
     ok = _ev(page, """() => {
         const c = document.createElement('canvas');
         c.width = 100; c.height = 100;
@@ -151,7 +151,7 @@ def test_fpjs_canvas_2d_context_returns_valid(page):
 
 
 @pytest.mark.e2e
-def test_fpjs_audio_context_works(page):
+def test_the_audio_context_works(page):
     ok = _ev(page, """async () => {
         try {
             const ctx = new (window.OfflineAudioContext ||
@@ -167,7 +167,7 @@ def test_fpjs_audio_context_works(page):
 
 
 @pytest.mark.e2e
-def test_fpjs_color_gamut_query_works(page):
+def test_the_color_gamut_query_works(page):
     """matchMedia('(color-gamut: ...)') must match at least srgb."""
     ok = _ev(page, """matchMedia('(color-gamut: srgb)').matches ||
                       matchMedia('(color-gamut: p3)').matches ||
@@ -176,7 +176,7 @@ def test_fpjs_color_gamut_query_works(page):
 
 
 @pytest.mark.e2e
-def test_fpjs_screen_color_depth_realistic(page):
+def test_the_screen_color_depth_is_realistic(page):
     """Atypical color depths are headless-distinctive."""
     cd = _ev(page, "screen.colorDepth")
     assert cd in (24, 30, 32)
@@ -219,12 +219,12 @@ def test_pin_audio_max_channels_lands_in_destination(page):
 
 
 # ===========================================================================
-# fpscanner-style cross-checks
+# Rules-scanner-style cross-checks
 # ===========================================================================
 
 
 @pytest.mark.e2e
-def test_fpscanner_ua_vs_platform_consistent(page):
+def test_the_ua_and_the_platform_agree(page):
     """UA OS substring must agree with navigator.platform OS substring."""
     ua = _ev(page, "navigator.userAgent")
     platform = _ev(page, "navigator.platform")
@@ -237,21 +237,21 @@ def test_fpscanner_ua_vs_platform_consistent(page):
 
 
 @pytest.mark.e2e
-def test_fpscanner_no_userAgentData_on_firefox(page):
+def test_firefox_has_no_userAgentData(page):
     """navigator.userAgentData is Chromium-only. Presence on Firefox UA = bot."""
     if "Firefox" in _ev(page, "navigator.userAgent"):
         assert not _ev(page, "'userAgentData' in navigator")
 
 
 # ===========================================================================
-# WebGL masking-detector guard (pixelscan getFixedRedBox / webglHash)
+# WebGL masking-detector guard (a public fingerprint page, fixed red box / webgl hash)
 #
-# pixelscan flags "fingerprint masking" on the WebGL readPixels output. We
-# reproduce ITS probe locally (the fingerprintjs gradient triangle) and check
+# A public fingerprint page flags "fingerprint masking" on the WebGL readPixels output. We
+# reproduce ITS probe locally (the gradient triangle of the fingerprint library) and check
 # the structural signature it keys on: our stealth readPixels noise MUST be a
 # coherent, monotonic gamma remap (smooth, ~0 spikes), NOT isolated +-1 flips
 # (which read as unnatural high-frequency noise and were flagged as masking).
-# This is the CI-safe local stand-in for pixelscan's server-side check; it
+# This is the CI-safe local stand-in for the server-side check of that page; it
 # guards the gamma fix from ever silently regressing to the +-1 algorithm.
 # ===========================================================================
 
@@ -298,7 +298,7 @@ _WEBGL_MASKING_PROBE = """() => {
 def test_webgl_readpixels_no_masking_signature(page):
     """Stealth WebGL readPixels noise must be a coherent gamma remap (smooth),
     not isolated +-1 flips. +-1 noise on the smooth gradient triangle produced
-    ~300+ 'spikes' and pixelscan flagged it as masking; the gamma remap leaves
+    ~300+ 'spikes' and that page flagged it as masking; the gamma remap leaves
     the gradient smooth (~0 spikes). Regression guard for the gamma fix."""
     res = _ev(page, _WEBGL_MASKING_PROBE)
     if res.get("error") == "no-webgl" and sys.platform == "darwin":
@@ -311,7 +311,7 @@ def test_webgl_readpixels_no_masking_signature(page):
     # genuine / gamma -> ~0; the rejected +-1 algorithm produced ~320.
     assert res["spikes"] < 30, (
         f"WebGL readPixels shows {res['spikes']} high-frequency noise spikes "
-        f"(pixelscan-maskable); the stealth noise must be a smooth gamma remap."
+        f"(flagged as masking by a public page); the stealth noise must be a smooth gamma remap."
     )
 
 

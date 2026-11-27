@@ -6,7 +6,7 @@ Two layers, both runnable on GitHub CI:
   samples. No browser, no proxy, no network. These lock in every rule we found
   on 2026-06-06: host must be mDNS ``.local``; an srflx must carry a
   GENUINE nICEr priority (never ``local_pref == 0xFFFF``) and a
-  stable, distinct foundation; CreepJS's resolver must return the egress, and a
+  stable, distinct foundation; the resolver of a public headless detector must return the egress, and a
   host-only SDP must read as "blocked". They run in the standard ``tests.yml``.
 
 * **e2e** (`@pytest.mark.e2e`) - launch the patched binary and verify the live
@@ -99,7 +99,7 @@ def srflx_candidates(cands):
 
 def host_is_mdns(cands):
     """Every host candidate must be a ``<uuid>.local`` mDNS name, never a raw
-    LAN IP (the §9.4 leak form that fails BrowserLeaks)."""
+    LAN IP (the §9.4 leak form that fails a public leak-test page)."""
     hosts = host_candidates(cands)
     return bool(hosts) and all(is_mdns(c["address"]) for c in hosts)
 
@@ -127,10 +127,10 @@ def srflx_realness(cand, expected_ip=None):
     return (not reasons), reasons
 
 
-def creep_get_ipaddress(sdp):
-    """Faithful port of CreepJS's getIPAddress(sdp): connection line first, then
+def resolve_ipaddress_from_sdp(sdp):
+    """Faithful port of the getIPAddress(sdp) of a public headless detector: connection line first, then
     the first candidate IP; '0.0.0.0' counts as blocked. Returns None if blocked
-    - i.e. exactly what makes CreepJS render 'stun connection: blocked'."""
+    - i.e. exactly what makes that detector render 'stun connection: blocked'."""
     blocked = "0.0.0.0"
     conn = (re.findall(r"c=IN\s.+\s", sdp) or [""])[0].strip().split(" ")
     conn_ip = conn[2] if len(conn) > 2 else ""
@@ -203,22 +203,22 @@ def test_srflx_foundation_distinct_from_host():
 
 
 @pytest.mark.unit
-def test_creep_resolver_returns_egress_when_srflx_present():
-    assert creep_get_ipaddress(SDP_GOOD) == "203.0.113.7"
+def test_the_resolver_returns_the_egress_when_srflx_is_present():
+    assert resolve_ipaddress_from_sdp(SDP_GOOD) == "203.0.113.7"
 
 
 @pytest.mark.unit
-def test_creep_resolver_reports_blocked_for_host_only():
+def test_the_resolver_reports_blocked_for_host_only():
     """The exact false-green we shipped: host-only (.local) SDP → no public IP
-    → CreepJS shows 'blocked'. The resolver must return None here."""
-    assert creep_get_ipaddress(SDP_BLOCKED) is None
+    → that detector shows 'blocked'. The resolver must return None here."""
+    assert resolve_ipaddress_from_sdp(SDP_BLOCKED) is None
 
 
 @pytest.mark.unit
-def test_mdns_host_is_invisible_to_creep_resolver():
+def test_mdns_host_is_invisible_to_the_resolver():
     """A .local host must NOT be mis-read as an IP (the hyphen in the UUID is
-    what makes CreepJS skip it and fall through to the srflx)."""
-    assert creep_get_ipaddress("v=0\r\nc=IN IP4 0.0.0.0\r\n" f"a={HOST_MDNS}\r\n") is None
+    what makes that detector skip it and fall through to the srflx)."""
+    assert resolve_ipaddress_from_sdp("v=0\r\nc=IN IP4 0.0.0.0\r\n" f"a={HOST_MDNS}\r\n") is None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -235,7 +235,7 @@ from invisible_core.prefs import translate_profile_to_prefs  # noqa: E402
 def test_shipped_webrtc_baseline_is_the_validated_config():
     prefs = translate_profile_to_prefs(generate_profile(seed=42), timezone="America/New_York")
     # host candidate must be mDNS .local like vanilla Firefox (manually
-    # validated on BrowserLeaks/CreepJS through a residential proxy) - not a
+    # validated on public leak-test and detector pages through a residential proxy) - not a
     # raw LAN IP.
     assert prefs["media.peerconnection.ice.obfuscate_host_addresses"] is True
     # IPv6 is removed from ICE gathering, but NOT from a pref: since 2026-08-25
@@ -1270,7 +1270,7 @@ def test_a_proxy_whose_relay_never_answers_gives_no_srflx_at_all(monkeypatch):
 # ──────────────────────────────────────────────────────────────────────────
 #  The egress IP must not change MID-SESSION.
 #
-#  Measured on 2026-08-25 on browserleaks, behind a residential proxy: the
+#  Measured on 2026-08-25 on a public leak-test page, behind a residential proxy: the
 #  page exited from 203.0.113.30 while a second reading of the exit said
 #  216.131.76.64, and the site says so plainly ("WebRTC IP doesn't match your
 #  Remote IP"). It was not a regression in the binary - interleaved A/B between

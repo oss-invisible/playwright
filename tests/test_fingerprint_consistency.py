@@ -11,11 +11,11 @@ WebGL renderer in the main thread but not in a Web Worker, the
 inconsistency proves the spoof is fake.
 
 Sources studied (all FOSS, MIT-licensed):
-  - creepjs/src/lies/index.ts   - the canonical lie detector
-  - creepjs/src/worker/index.ts - main-vs-worker scope cross-check
-  - creepjs/src/math/index.ts   - Math.x(p) deterministic equality
-  - creepjs/src/navigator/index.ts - UA/platform/oscpu invariants
-  - niespodd/browser-fingerprinting README - worker hwConcurrency,
+  - the headless detector, lies module      - the canonical lie detector
+  - the headless detector, worker module    - main-vs-worker scope cross-check
+  - the headless detector, math module      - Math.x(p) deterministic equality
+  - the headless detector, navigator module - UA/platform/oscpu invariants
+  - a public fingerprinting-notes README    - worker hwConcurrency,
                                               plugin chain, perf.timeOrigin
 
 Everything runs against `about:blank` with NO network and NO proxy.
@@ -66,7 +66,7 @@ def _ev(page, expr):
 
 # ===========================================================================
 # 1. Math determinism - same input MUST yield same output
-# Source: creepjs/src/math/index.ts
+# Source: the headless detector, math module
 # A wrapper that adds noise to Math.* (canvas-spoofing prefs) exposes
 # itself here: two consecutive calls with the same input must be
 # byte-identical.
@@ -119,7 +119,7 @@ def test_math_pow_two_arg_determinism(page):
 
 # ===========================================================================
 # 2. Worker scope vs main thread - navigator properties MUST agree
-# Source: creepjs/src/worker/index.ts
+# Source: the headless detector, worker module
 # ===========================================================================
 
 
@@ -196,7 +196,7 @@ def test_worker_platform_matches_main(page):
 
 # ===========================================================================
 # 3. Iframe scope vs window scope
-# Source: creepjs/src/lies/index.ts (getBehemothIframe pattern)
+# Source: the headless detector, lies module (getBehemothIframe pattern)
 # ===========================================================================
 
 
@@ -253,7 +253,7 @@ def test_iframe_screen_matches_window(page):
 
 
 # ===========================================================================
-# 4. UA self-consistency (creepjs/src/navigator/index.ts)
+# 4. UA self-consistency (the headless detector, navigator module)
 # ===========================================================================
 
 
@@ -285,12 +285,12 @@ def test_navigator_oscpu_matches_userAgent(page):
 
 
 # ===========================================================================
-# 5. Native function self-toString (creepjs/src/lies/index.ts hasKnownToString)
+# 5. Native function self-toString (the headless detector, lies module, hasKnownToString)
 # ===========================================================================
 
 
 def _is_native_toString(text, fn_name):
-    """Mirror of CreepJS hasKnownToString - accept the engine-specific
+    """Mirror of the headless detector hasKnownToString - accept the engine-specific
     native patterns (single-line on V8, multi-line on SpiderMonkey)."""
     import re as _re
     name = _re.escape(fn_name)
@@ -449,7 +449,7 @@ _DESCRIPTOR_NATIVE_PROPS = [
 def test_navigator_property_descriptor_is_getter_not_value(page, prop):
     """Each spoofable navigator.* property must be defined via a native
     getter - NOT Object.defineProperty(..., {value: x}). The value-field
-    descriptor is the lazy spoof leak CreepJS catches."""
+    descriptor is the lazy spoof leak the headless detector catches."""
     has_lie = _ev(page, f"""() => {{
         let proto = navigator;
         let descriptor = null;

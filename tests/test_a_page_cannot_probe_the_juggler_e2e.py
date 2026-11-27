@@ -3,9 +3,9 @@
 `new Worker("chrome://<name>/...")` returns for a chrome package the browser
 registers and throws SecurityError at once for one it does not: the parent sends
 every registered package to each content process. Every engine until firefox-47
-registered `juggler`, and captcha vendors probed it from 2026-10-06 (hCaptcha's
-hsw.js runs `new Worker("chrome://juggler/content/content/WorkerMain.js")`,
-camoufox #847): a challenge solved by hand was refused on our engine while
+registered `juggler`, and captcha vendors probed it from 2026-10-06 (the script of a
+captcha vendor runs `new Worker("chrome://juggler/content/content/WorkerMain.js")`,
+reported on another project's tracker): a challenge solved by hand was refused on our engine while
 retail Firefox passed. Measured from a page on firefox-46 and on retail Firefox
 151 under geckodriver, 2026-10-14: of the 65 chrome packages and resource
 substitutions the engine registers, `juggler` was the one retail does not; retail
