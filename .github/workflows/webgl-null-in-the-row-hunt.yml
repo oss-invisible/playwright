@@ -8,7 +8,7 @@
 # records, when it fails, the statusMessage of webglcontextcreationerror, a second attempt 2 s later and the engine's gfx2d log of every process (FailureEvidence).
 #
 # What it runs. The PUBLISHED engine (`python -m invisible_playwright fetch`) and this branch of the wrapper (main with PR #607), in 4 identical jobs (ubuntu-24.04, a budget of
-# 75 minutes each). In each, in a loop until the budget, the REAL row `wrapper.e2e.suite.linux.2` exactly as the Linux e2e job of e2e.yml runs it (scripts/run_e2e.py, 4 browsers,
+# 75 minutes each). In each, in a loop until the budget, the REAL row of the shard (`wrapper.e2e.suite.linux.1` or `.linux.2`; round 1 had linux.2 only) exactly as the Linux e2e job of e2e.yml runs it (scripts/run_e2e.py, 4 browsers,
 # --dist loadfile, the same options and environment, under xvfb-run), PLUS four hunt files on the same pytest command line (tests/hunt_webgl_null_in_the_row_{1..4}_e2e.py, 15 cases
 # each, 60 per iteration). Each case is the real test itself (tests/_hunt_webgl_null.py calls it as a function: engine on, then engine off, its own assertions and its own
 # FailureEvidence, nothing copied). The four files are put in among the files of the row (scripts/hunt_webgl_null.py args), so that under `--dist loadfile` each worker gets
@@ -54,15 +54,18 @@ jobs:
       playwright_wrapper_ref: ${{ github.sha }}
 
   hunt:
-    name: shard ${{ matrix.shard }}
+    name: shard ${{ matrix.shard }} (${{ matrix.row }})
     needs: linux-deps-webgl-null-row
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
+        # Round 2 (verdict (c) of round 1, run 45955645072: 0 nulls in 1522 engine-off launches beside linux.2): the row linux.1 added and the count
+        # doubled, four shards beside each row.
         shard: [1, 2, 3, 4]
+        row: [wrapper.e2e.suite.linux.1, wrapper.e2e.suite.linux.2]
     defaults:
       run:
         shell: bash
@@ -110,9 +113,9 @@ jobs:
         shell: bash
         run: python scripts/ci_lab_geoip.py build
       # The files of the row, as the Linux e2e job reads them, with the four hunt files put in among them.
-      - name: The files of the row wrapper.e2e.suite.linux.2, with the four hunt files among them
+      - name: The files of the row of this shard, with the four hunt files among them
         run: |
-          python scripts/ci_verdict.py args --required ci/required-suites.json --suite "wrapper.e2e.suite.linux.2" --os linux | tr -d '\r' > "$RUNNER_TEMP/row_args.txt"
+          python scripts/ci_verdict.py args --required ci/required-suites.json --suite "${{ matrix.row }}" --os linux | tr -d '\r' > "$RUNNER_TEMP/row_args.txt"
           python scripts/hunt_webgl_null.py args < "$RUNNER_TEMP/row_args.txt" > "$RUNNER_TEMP/e2e_args.txt"
           echo "$(wc -l < "$RUNNER_TEMP/row_args.txt") files in the row, $(wc -l < "$RUNNER_TEMP/e2e_args.txt") with the hunt files"
           cat "$RUNNER_TEMP/e2e_args.txt"
@@ -123,7 +126,7 @@ jobs:
           INVPW_TEST_WATCHDOG_FILE: ${{ runner.temp }}/e2e-watchdog.log
           # No iteration of the row STARTS after this many seconds of the loop; one in progress is cut at this plus 300 s (setup comes before, the ceiling of the job is 100 minutes).
           HUNT_BUDGET_S: "4500"
-          HUNT_SHARD: ${{ matrix.shard }}
+          HUNT_SHARD: ${{ matrix.shard }}-${{ matrix.row }}
         run: |
           # A step of a hunt that breaks must never end green: any error stops it, and the trap below turns a stop before its end into a red step.
           set -euo pipefail
@@ -169,7 +172,7 @@ jobs:
       - name: Summary of the job (iterations, cases, nulls with everything recorded), red when any null happened
         if: always()
         env:
-          HUNT_SHARD: ${{ matrix.shard }}
+          HUNT_SHARD: ${{ matrix.shard }}-${{ matrix.row }}
         run: |
           export HUNT_DIR="$RUNNER_TEMP/webgl-null-row"
           mkdir -p "$HUNT_DIR"
@@ -187,7 +190,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: webgl-null-row-${{ matrix.shard }}-${{ github.run_id }}
+          name: webgl-null-row-${{ matrix.row }}-${{ matrix.shard }}-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/webgl-null-row
             ${{ runner.temp }}/invpw-evidence
