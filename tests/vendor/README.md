@@ -2,23 +2,20 @@
 
 These are upstream, unmodified, MIT-licensed browser-fingerprinting / bot-detection
 libraries, vendored so the detector e2e tests run **hermetically and identically**
-on a dev box and on a GitHub runner (no external CDN at test time - Firefox
-tracking-protection blocks the openfpcdn.io CDN anyway, and we want CI offline).
+on a dev box and on a GitHub runner (no external CDN at test time, and we want CI offline).
 
 They are served from a localhost HTTP server and loaded into the patched Firefox;
-the tests assert the REAL detectors don't flag the stealth build (BotD: `bot===false`;
-fpscanner: engine-agnostic rules clean; CreepJS: `headlessRating===0` + no JS-proxy
-tells) and that the fingerprint is stable (FingerprintJS: same `visitorId` across
-launches). CreepJS runs fully offline - the tests abort every non-loopback request,
-so its optional crowd-comparison POST never fires and the verdict is computed locally.
+the tests assert the REAL detectors don't flag the stealth build (bot detector: `bot===false`;
+rules scanner: engine-agnostic rules clean) and that the fingerprint is stable (fingerprint
+library: same `visitorId` across launches).
 
-| File | Package | Version | Source | License |
-|---|---|---|---|---|
-| `botd-2.0.0.esm.js` | `@fingerprintjs/botd` | 2.0.0 | https://cdn.jsdelivr.net/npm/@fingerprintjs/botd@2.0.0/dist/botd.esm.js | MIT |
-| `fingerprintjs-5.2.0.umd.min.js` | `@fingerprintjs/fingerprintjs` | 5.2.0 | https://cdn.jsdelivr.net/npm/@fingerprintjs/fingerprintjs@5.2.0/dist/fp.umd.min.js | MIT |
-| `fpscanner-1.0.6.es.js` | `fpscanner` | 1.0.6 | https://cdn.jsdelivr.net/npm/fpscanner@1.0.6/dist/fpScanner.es.js | MIT |
-| `creepjs-10aa672.js` | `abrahamjuliot/creepjs` | git `10aa6724` | https://raw.githubusercontent.com/abrahamjuliot/creepjs/10aa6724cd33a1015db1574211890518cd04f0cc/docs/creep.js | MIT |
+Every file of this directory has one row below, with the sha256 of its bytes;
+`tests/test_the_vendored_bundles_are_listed_with_their_hash.py` is red if a file has no row, a row has no
+file, or a hash differs. To update a bundle: drop the pinned upstream dist here, bump the version in the
+file name, and change its row (name, version, sha256).
 
-All MIT (FingerprintJS Inc. / Antoine Vastel / Abraham Juliot). To update: download
-the pinned dist (jsdelivr for npm packages, raw.githubusercontent for CreepJS at a
-commit SHA), drop it here, and bump the version in the filename + this table.
+| File | Kind | Version | SPDX license | sha256 | Licence notice |
+|---|---|---|---|---|---|
+| `bot-detector-2.0.0.esm.js` | client-side bot detector | 2.0.0 | MIT | `f438ed251dc7414ece9d4a2b6941441ad9ffae1a1905817f5f0c7366e701dd86` | in the file header (copyright line and licence reference) |
+| `fingerprint-library-5.2.0.umd.min.js` | open-source fingerprint library | 5.2.0 | MIT | `a8de5ead580c42d2e2b01a5752aa08da510852230971aa18554d67cd5de5775b` | in the file header (copyright line and full licence text) |
+| `rules-scanner-1.0.6.es.js` | automation-rules scanner | 1.0.6 | MIT | `4ae2557e92451687e275877039d4dff4601ad1344c5bc8206e9c7087fbf5e91a` | in the file header (upstream's MIT notice: the copyright holder and year and the full permission text verbatim; the contact address is left out) |

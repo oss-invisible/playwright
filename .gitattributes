@@ -24,3 +24,7 @@ tests/gates/wire_method_debt.json text eol=lf
 
 # The lock of the gate is hashed byte for byte: its header names the sha256 of gate.in, so neither file may be rewritten with CRLF on a Windows checkout.
 ci/py-lock/** text eol=lf
+
+# The vendored bundles are third-party bytes whose sha256 is pinned in tests/vendor/README.md: no checkout converts their line endings
+# (a Windows runner with core.autocrlf=true would hand them over with CRLF and the hash would no longer match).
+tests/vendor/*.js -text

@@ -1,8 +1,8 @@
 """Canvas / WebGL render-stealth regression test (binary-level, 2026-06-18).
 
 Guards a patched-binary behaviour that must never regress, needed for the
-fingerprint to look like a real Windows browser to FOSS detectors (CreepJS,
-FingerprintJS, BrowserLeaks) and fixed-hash reference checks:
+fingerprint to look like a real Windows browser to FOSS detectors (a headless
+detector, a fingerprint library, a public leak-test page) and fixed-hash reference checks:
 
   Solid WebGL readback purity under render-noise - a fixed solid-colour WebGL
   readback (which reference checks hash against a universal constant) must stay
