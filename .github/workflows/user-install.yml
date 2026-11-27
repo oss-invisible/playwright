@@ -108,12 +108,15 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (v5.6.0)
         with: { python-version: '3.11' }
 
-      # Only what the TEST needs (and `uv`, for the wait below to ask uv, which the release test installs the package with). The package under test is installed by the
+      # Only what the TEST needs, from the wrapper's hashed lock (ci/py-lock/gate.txt), the one the other test jobs read: never a hand list, which is how
+      # `psutil` (imported by the OS-cursor helper of the tests since #609) was missing here and ledger #618 was red. The lock holds `uv` (the wait below asks it, and the
+      # release test installs the package with it) and holds neither invisible-playwright nor invisible-core: the package under test is installed by the
       # test itself, into a venv it creates, from the index - installing it
       # here as well would put a second copy on the path and the assertions
-      # would be reading the wrong one.
+      # would be reading the wrong one. The runner's own pip, nothing unhashed.
+      # A rule test of the unit suite (the install job has every module its tests import) holds every third-party module the tests import to that lock.
       - name: Test harness only
-        run: python -m pip install --upgrade pip pytest packaging uv
+        run: python -m pip install --require-hashes -r ci/py-lock/gate.txt
 
       # ⛔ THE VERSION OF A LEDGER PULL REQUEST IS THE ONE IT ADDS TO PUBLISHED.json, NOT THE ONE THE TREE DECLARES.
       # The ledger PR of a release is merged after this job is green, and the next release's tree can already be on main: ledger #534 recorded

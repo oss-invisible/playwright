@@ -6,6 +6,7 @@
 # core-requires: platformdirs>=4 | psutil>=5.9 | requests[socks]>=2.31 | maxminddb>=2.2 | tzdata>=2024.1
 # playwright: 1.61.0 from scripts/playwright_pin.txt (the stock client the gate drives the engine with)
 # cryptography: 44.0.3 (the lab's PKI)
+# harness: uv>=0.5 (the installers of the install-from-index job)
 aioquic>=1.2
 build>=1
 cryptography==44.0.3
@@ -23,4 +24,5 @@ pytest-xdist>=3
 requests[socks]>=2.31
 ruff>=0.6
 tzdata>=2024.1
+uv>=0.5
 websockets>=13
