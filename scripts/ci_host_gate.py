@@ -24,7 +24,12 @@ screen), so those are declared as well.
 
 The only exceptions live in host_gate/exceptions.json, each with its reason:
   - identity: values the declared identity decides; exempt from property 2,
-    never from property 1;
+    never from property 1. tests/test_host_gate_identity_exceptions.py holds
+    each one to that: a leaf the core's declared values (the panel, the scale,
+    the cores, the GPU) do not move for any seed is not identity;
+  - reference_machine: a value the reference run itself had and the declared
+    identity cannot (where its window sat, the voices its Windows had); exempt
+    from property 2 only, one named leaf per key, never a glob;
   - noise: values that differ between two launches of retail itself;
   - network: values the identity takes from the network (language and zone
     from the egress IP), which CI without a proxy cannot reproduce;
@@ -773,7 +778,7 @@ def ab_coverage(items_by_seed: dict, seeds: tuple = AB_SEEDS) -> list:
 # -
 # Compare: every leg, every visit, against each other and against retail.
 
-KINDS = ("identity", "noise", "network", "measurement", "known_defects")
+KINDS = ("identity", "reference_machine", "noise", "network", "measurement", "known_defects")
 
 
 def load_exceptions(path: Path = EXCEPTIONS) -> dict:
@@ -853,7 +858,8 @@ def compare(dumps: Path, reference: Path, exceptions: dict, notes: list | None =
                 notes.append("the retail reference has no %s* at dpr %s: those values are held to "
                              "host-independence and the invariants, not to retail" % (p, dpr))
 
-    identity = exceptions.get("identity", [])
+    # leaves that leave the retail comparison only: what the identity decides, and what the reference run itself had
+    identity = exceptions.get("identity", []) + exceptions.get("reference_machine", [])
     excusable = exceptions.get("noise", []) + exceptions.get("network", []) + exceptions.get("measurement", [])
     known = exceptions.get("known_defects", [])
     used = set()

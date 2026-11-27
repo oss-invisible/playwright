@@ -91,6 +91,24 @@ def test_an_identity_value_needs_only_host_independence(tmp_path):
     assert run(tmp_path, items, {"surface.screen.width": 2560}) == []
 
 
+REFERENCE_MACHINE = {"reference_machine": [{"keys": ["surface.window.mozInnerScreenX"], "why": "where the reference's window sat"}]}
+
+
+def test_a_reference_machine_value_may_differ_from_retail(tmp_path):
+    # the same on every seed and host, and not retail's: the reference run's own window
+    items = lambda leg, seed: {"surface.window.mozInnerScreenX": 0}
+    assert run(tmp_path, items, {"surface.window.mozInnerScreenX": 16}, REFERENCE_MACHINE) == []
+    # the same value with the entry gone is a retail difference
+    failures = run(tmp_path / "without", items, {"surface.window.mozInnerScreenX": 16}, {})
+    assert any(f.startswith("retail surface.window.mozInnerScreenX") for f in failures)
+
+
+def test_a_reference_machine_value_is_still_held_to_host_independence(tmp_path):
+    items = lambda leg, seed: {"surface.window.mozInnerScreenX": 8 if leg.startswith("linux") else 0}
+    failures = run(tmp_path, items, {"surface.window.mozInnerScreenX": 16}, REFERENCE_MACHINE)
+    assert any(f.startswith("host  surface.window.mozInnerScreenX") for f in failures)
+
+
 def test_a_value_that_does_not_depend_on_the_identity_must_be_retails(tmp_path):
     items = lambda leg, seed: {"surface.media.webrtc.vp9": [True, True, False]}
     failures = run(tmp_path, items, {"surface.media.webrtc.vp9": [True, True, True]})
