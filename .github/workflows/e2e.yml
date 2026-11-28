@@ -424,6 +424,28 @@ jobs:
           if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker ("node down: Not properly terminated", "Windows fatal exception: access violation" in a thread Python has no state for, jobs
+      # 138402013609 and 138966622085): Windows Error Reporting writes a FULL dump of a python.exe that dies from an unhandled exception, into the evidence folder the job
+      # uploads (dumps/python), so the faulting module and stack can be read. HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>, DumpType 2 = full,
+      # DumpCount = how many are kept: https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps . faulthandler (pytest enables it) is a vectored handler that
+      # returns EXCEPTION_CONTINUE_SEARCH, so WER still sees the exception. BEFORE the first pytest step; the summary step before the upload reads what it left.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes (into the evidence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'invpw-evidence\dumps\python'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: Install wrapper + test deps (the stock client is in the dev extra)
         run: |
           python -m pip install --upgrade pip
@@ -439,6 +461,18 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: INVPW_BINARY_PATH="$FF" python -u -m pytest -m e2e -p no:cacheprovider -v tests/test_control_a_selects_all_in_a_field_e2e.py
+      - name: What Windows Error Reporting kept of a crashing python.exe (size, faulting module, in the evidence)
+        if: always()
+        shell: bash
+        run: python scripts/ci_wer_dumps.py "$RUNNER_TEMP/invpw-evidence/dumps/python"
+      - name: Upload what the tests saved
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: invpw-evidence-windows-control-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/invpw-evidence
+          if-no-files-found: ignore
+          retention-days: 14
 
   # THE SAME e2e ON WINDOWS (Federico, 12/11: every test of the product runs on Linux AND Windows; where Windows behaves
   # differently the test adapts to the system). Before this, 562 of the 808 e2e had never run on Windows in any round. The census
@@ -481,6 +515,28 @@ jobs:
           if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker ("node down: Not properly terminated", "Windows fatal exception: access violation" in a thread Python has no state for, jobs
+      # 138402013609 and 138966622085): Windows Error Reporting writes a FULL dump of a python.exe that dies from an unhandled exception, into the evidence folder the job
+      # uploads (dumps/python), so the faulting module and stack can be read. HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>, DumpType 2 = full,
+      # DumpCount = how many are kept: https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps . faulthandler (pytest enables it) is a vectored handler that
+      # returns EXCEPTION_CONTINUE_SEARCH, so WER still sees the exception. BEFORE the first pytest step; the summary step before the upload reads what it left.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes (into the evidence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'invpw-evidence\dumps\python'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       # The A/A of the three A/B oracles (page, network, host) runs on the first seeds of the candidate set on a pull request, and on ALL of them when the pull request
       # changes a file of that oracle (scripts/ci_ab_pr_seeds.py holds the lists). The checkout is shallow, so the script fetches the base commit and lists the files that
       # differ from it (`git diff --name-only <base> HEAD`: HEAD is the merge commit, so this is the pull request's own change); the tests read the variables it prints.
@@ -544,6 +600,10 @@ jobs:
           path: ${{ runner.temp }}/e2e-junit-*.xml
           if-no-files-found: warn
           retention-days: 14
+      - name: What Windows Error Reporting kept of a crashing python.exe (size, faulting module, in the evidence)
+        if: always()
+        shell: bash
+        run: python scripts/ci_wer_dumps.py "$RUNNER_TEMP/invpw-evidence/dumps/python"
       - name: Upload what the tests saved
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -679,6 +739,28 @@ jobs:
           if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker ("node down: Not properly terminated", "Windows fatal exception: access violation" in a thread Python has no state for, jobs
+      # 138402013609 and 138966622085): Windows Error Reporting writes a FULL dump of a python.exe that dies from an unhandled exception, into the evidence folder the job
+      # uploads (dumps/python), so the faulting module and stack can be read. HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>, DumpType 2 = full,
+      # DumpCount = how many are kept: https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps . faulthandler (pytest enables it) is a vectored handler that
+      # returns EXCEPTION_CONTINUE_SEARCH, so WER still sees the exception. BEFORE the first pytest step; the summary step before the upload reads what it left.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes (into the evidence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'invpw-evidence\dumps\python'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
         if: github.event_name == 'pull_request'
         shell: bash
@@ -721,6 +803,10 @@ jobs:
         run: |
           Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: What Windows Error Reporting kept of a crashing python.exe (size, faulting module, in the evidence)
+        if: always()
+        shell: bash
+        run: python scripts/ci_wer_dumps.py "$RUNNER_TEMP/invpw-evidence/dumps/python"
       - name: Upload what the test saved
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -876,6 +962,28 @@ jobs:
           if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker ("node down: Not properly terminated", "Windows fatal exception: access violation" in a thread Python has no state for, jobs
+      # 138402013609 and 138966622085): Windows Error Reporting writes a FULL dump of a python.exe that dies from an unhandled exception, into the evidence folder the job
+      # uploads (dumps/python), so the faulting module and stack can be read. HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>, DumpType 2 = full,
+      # DumpCount = how many are kept: https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps . faulthandler (pytest enables it) is a vectored handler that
+      # returns EXCEPTION_CONTINUE_SEARCH, so WER still sees the exception. BEFORE the first pytest step; the summary step before the upload reads what it left.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes (into the evidence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'invpw-evidence\dumps\python'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
         if: github.event_name == 'pull_request'
         shell: bash
@@ -984,6 +1092,10 @@ jobs:
         run: |
           Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: What Windows Error Reporting kept of a crashing python.exe (size, faulting module, in the evidence)
+        if: always()
+        shell: bash
+        run: python scripts/ci_wer_dumps.py "$RUNNER_TEMP/invpw-evidence/dumps/python"
       - name: Upload what the test saved
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1120,6 +1232,28 @@ jobs:
           if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker ("node down: Not properly terminated", "Windows fatal exception: access violation" in a thread Python has no state for, jobs
+      # 138402013609 and 138966622085): Windows Error Reporting writes a FULL dump of a python.exe that dies from an unhandled exception, into the evidence folder the job
+      # uploads (dumps/python), so the faulting module and stack can be read. HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>, DumpType 2 = full,
+      # DumpCount = how many are kept: https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps . faulthandler (pytest enables it) is a vectored handler that
+      # returns EXCEPTION_CONTINUE_SEARCH, so WER still sees the exception. BEFORE the first pytest step; the summary step before the upload reads what it left.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes (into the evidence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'invpw-evidence\dumps\python'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: How many seeds the A/A of each oracle visits (all of them when the pull request touches the oracle)
         if: github.event_name == 'pull_request'
         shell: bash
@@ -1162,6 +1296,10 @@ jobs:
         run: |
           Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: What Windows Error Reporting kept of a crashing python.exe (size, faulting module, in the evidence)
+        if: always()
+        shell: bash
+        run: python scripts/ci_wer_dumps.py "$RUNNER_TEMP/invpw-evidence/dumps/python"
       - name: Upload what the test saved
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1328,6 +1466,28 @@ jobs:
           if ($b.Width -lt 1920 -or $b.Height -lt 1080) { Write-Error "the runner's screen is $($b.Width)x$($b.Height), not 1920x1080: the OS cursor could not be parked outside the browser window"; exit 1 }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
+      # The native crash of the pytest worker ("node down: Not properly terminated", "Windows fatal exception: access violation" in a thread Python has no state for, jobs
+      # 138402013609 and 138966622085): Windows Error Reporting writes a FULL dump of a python.exe that dies from an unhandled exception, into the evidence folder the job
+      # uploads (dumps/python), so the faulting module and stack can be read. HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>, DumpType 2 = full,
+      # DumpCount = how many are kept: https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps . faulthandler (pytest enables it) is a vectored handler that
+      # returns EXCEPTION_CONTINUE_SEARCH, so WER still sees the exception. BEFORE the first pytest step; the summary step before the upload reads what it left.
+      - name: Windows Error Reporting keeps a full dump of a python.exe that crashes (into the evidence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumps = Join-Path $env:RUNNER_TEMP 'invpw-evidence\dumps\python'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+          New-Item -Force -Path $wer | Out-Null
+          New-ItemProperty -Force -Path $wer -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+          New-ItemProperty -Force -Path $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\python.exe"
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+          Get-ItemProperty -Path $key | Format-List DumpFolder, DumpType, DumpCount
+          Get-ItemProperty -Path $wer | Format-List Disabled, DontShowUI
       - name: Install wrapper + test deps (+ Playwright ONLY as a system tool)
         run: |
           python -m pip install --upgrade pip
@@ -1366,6 +1526,10 @@ jobs:
         run: |
           Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+      - name: What Windows Error Reporting kept of a crashing python.exe (size, faulting module, in the evidence)
+        if: always()
+        shell: bash
+        run: python scripts/ci_wer_dumps.py "$RUNNER_TEMP/invpw-evidence/dumps/python"
       - name: Upload what the test saved
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
