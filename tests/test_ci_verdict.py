@@ -36,8 +36,15 @@ def _suite(**over):
     return row
 
 
-def _write_required(path, rows):
+def _write_required(path, rows, fragments=None, consumed=None):
+    """The list, and the folder of its fragments next to it (it always exists: it holds consumed.json). `fragments` is {slug: content}."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("[\n" + ",\n".join("  " + json.dumps(r) for r in rows) + "\n]\n", encoding="utf-8")
+    folder = path.with_name("required-suites.d")
+    folder.mkdir(exist_ok=True)
+    (folder / "consumed.json").write_text(json.dumps(consumed or []), encoding="utf-8")
+    for slug, content in (fragments or {}).items():
+        (folder / (slug + ".json")).write_text(json.dumps(content), encoding="utf-8")
     return path
 
 
@@ -60,8 +67,8 @@ GREEN = [_case(FILE_A, "test_x"), _case(FILE_A, "test_y[p1]"), _case(FILE_B, "te
 SHA = "a" * 40
 
 
-def _judge(tmp_path, cases, rows=None, extra=(), suite="s.one", os_name="linux", with_binary=True, commit=SHA):
-    required = _write_required(tmp_path / "required.json", rows or [_suite()])
+def _judge(tmp_path, cases, rows=None, extra=(), suite="s.one", os_name="linux", with_binary=True, commit=SHA, fragments=None, consumed=None):
+    required = _write_required(tmp_path / "required.json", rows or [_suite()], fragments, consumed)
     junit = _junit(tmp_path / "junit.xml", cases) if cases is not None else tmp_path / "absent.xml"
     binary = tmp_path / "firefox.bin"
     binary.write_bytes(b"engine")
@@ -181,8 +188,9 @@ def test_a_class_in_the_junit_is_part_of_the_node_id():
 
 
 # --- against main ------------------------------------------------------------------------------------------------
-def _main_file(tmp_path, rows):
-    return _write_required(tmp_path / "main.json", rows)
+def _main_file(tmp_path, rows, fragments=None, consumed=None):
+    """main's list in a folder of its own: its fragments are the folder next to IT."""
+    return _write_required(tmp_path / "mainside" / "main.json", rows, fragments, consumed)
 
 
 def test_a_list_that_only_grew_is_green(tmp_path):
@@ -260,11 +268,11 @@ def test_a_main_list_older_than_the_format_is_still_compared(tmp_path):
 GONE = "tests/test_d.py"
 
 
-def _main_with(tmp_path, rows, retired=None):
+def _main_with(tmp_path, rows, retired=None, fragments=None, consumed=None):
     """main's list in its own folder, and the retired list of main next to it."""
     folder = tmp_path / "main"
-    folder.mkdir()
-    required = _write_required(folder / "required.json", rows)
+    folder.mkdir(parents=True)
+    required = _write_required(folder / "required.json", rows, fragments, consumed)
     if retired is not None:
         (folder / verdict.RETIRED_NAME).write_text(json.dumps(retired), encoding="utf-8")
     return required
@@ -349,36 +357,51 @@ def test_a_retired_file_does_not_excuse_another_loss_in_the_same_row(tmp_path, m
 GONE_NODE = FILE_A + "::test_gone"
 
 
-def _retired_test(nodeid=GONE_NODE, suite="s.one", count=1, from_min_tests=5, **over):
-    entry = {"nodeid": nodeid, "suite": suite, "count": count, "from_min_tests": from_min_tests, "reason": "removed with its bundle", "decided_by": "pm", "date": "2026-11-27"}
+_OMIT = object()
+
+
+def _retired_test(nodeid=GONE_NODE, suite="s.one", count=1, from_min_tests=_OMIT, **over):
+    """An entry of main's retired-tests.json for a single test. `from_min_tests` is optional (and ignored): left out unless a test passes it."""
+    entry = {"nodeid": nodeid, "suite": suite, "count": count, "reason": "removed with its bundle", "decided_by": "pm", "date": "2026-11-27"}
+    if from_min_tests is not _OMIT:
+        entry["from_min_tests"] = from_min_tests
     entry.update(over)
     return entry
 
 
-def _main_that_had_the_test(tmp_path, retired, min_tests=5):
+def _main_that_had_the_test(tmp_path, retired, min_tests=5, fragments=None, consumed=None):
     """main's row of FILE_A, FILE_B, NODE with one more test (the one that is retired) in the floor."""
-    return _main_with(tmp_path, [_suite(min_tests=min_tests)], retired)
+    return _main_with(tmp_path, [_suite(min_tests=min_tests)], retired, fragments, consumed)
+
+
+def _retiring(*nodeids, row="s.one", value=-1):
+    """The fragment of the PR that retires tests: a negative value for the row, and the retirements it consumes."""
+    return {"retire-it": {row: value, "consumes": list(nodeids)}}
 
 
 def test_a_declared_test_lets_the_floor_drop_by_exactly_its_count_is_green(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     main = _main_that_had_the_test(tmp_path, [_retired_test()])
-    assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0  # 5 on main, 4 here, 1 declared
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=5)], fragments=_retiring(GONE_NODE), extra=["--main-required", str(main)])
+    assert code == 0  # 5 on main, 5 in the list, -1 of the fragment: 4 here
 
 
 def test_the_counts_of_the_entries_of_a_suite_are_summed(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    other = FILE_B + "::test_also_gone"
+    other, third = FILE_B + "::test_also_gone", FILE_A + "::t3"
     main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=7), _retired_test(other, from_min_tests=7),
-                                              _retired_test(nodeid=FILE_A + "::t3", from_min_tests=7)], min_tests=7)
-    assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0  # 7 -> 4: three declared
+                                              _retired_test(nodeid=third, from_min_tests=7)], min_tests=7)
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=7)], fragments=_retiring(GONE_NODE, other, third, value=-3),
+                      extra=["--main-required", str(main)])
+    assert code == 0  # 7 -> 4: three declared
 
 
 def test_a_floor_that_drops_by_more_than_the_declared_count_is_red(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    main = _main_that_had_the_test(tmp_path, [_retired_test(count=1, from_min_tests=6)], min_tests=6)  # 6 -> 4 here: one declared, two lost
-    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
-    assert code == 1 and "went down" in capsys.readouterr().out
+    main = _main_that_had_the_test(tmp_path, [_retired_test(count=1)], min_tests=6)  # 6 -> 4 here: one declared, two lost
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=6)], fragments=_retiring(GONE_NODE, value=-2), extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and "went down" in out and "account for 1" in out
 
 
 def test_a_test_that_goes_with_no_entry_is_red(tmp_path, monkeypatch, capsys):
@@ -396,7 +419,7 @@ def test_an_entry_of_another_suite_or_of_a_file_the_row_does_not_run_excuses_not
         main = _main_that_had_the_test(folder, [entry])
         sub = tmp_path / ("run%d" % i)
         sub.mkdir()
-        code, _r = _judge(sub, GREEN, extra=["--main-required", str(main)])
+        code, _r = _judge(sub, GREEN, rows=[_suite(min_tests=5)], fragments=_retiring(entry["nodeid"]), extra=["--main-required", str(main)])
         assert code == 1 and "went down" in capsys.readouterr().out, entry
 
 
@@ -404,7 +427,7 @@ def test_a_declared_test_that_the_suite_still_collects_is_red(tmp_path, monkeypa
     monkeypatch.chdir(tmp_path)
     main = _main_that_had_the_test(tmp_path, [_retired_test()])
     still = GREEN + [_case(FILE_A, "test_gone")]
-    code, _r = _judge(tmp_path, still, rows=[_suite(min_tests=5)], extra=["--main-required", str(main)])
+    code, _r = _judge(tmp_path, still, rows=[_suite(min_tests=6)], fragments=_retiring(GONE_NODE), extra=["--main-required", str(main)])
     out = capsys.readouterr().out
     assert code == 1 and GONE_NODE in out and "still collects it" in out
 
@@ -413,7 +436,7 @@ def test_a_declared_test_still_collected_with_a_parameter_is_red_and_excuses_not
     monkeypatch.chdir(tmp_path)
     main = _main_that_had_the_test(tmp_path, [_retired_test()])
     still = GREEN[:3] + [_case(FILE_A, "test_gone[p1]")]  # 4 tests, the floor of 4 lowered by the entry
-    code, _r = _judge(tmp_path, still, extra=["--main-required", str(main)])
+    code, _r = _judge(tmp_path, still, rows=[_suite(min_tests=5)], fragments=_retiring(GONE_NODE), extra=["--main-required", str(main)])
     out = capsys.readouterr().out
     assert code == 1 and "still collects it" in out and "went down" in out
 
@@ -422,8 +445,9 @@ def test_the_retired_tests_of_the_branch_excuse_nothing(tmp_path, monkeypatch, c
     monkeypatch.chdir(tmp_path)
     main = _main_that_had_the_test(tmp_path, None)
     (tmp_path / verdict.RETIRED_NAME).write_text(json.dumps([_retired_test()]), encoding="utf-8")
-    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main)])
-    assert code == 1 and "went down" in capsys.readouterr().out
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=5)], fragments=_retiring(GONE_NODE), extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and "not a retired test of main" in out and "went down" in out
 
 
 @pytest.mark.parametrize("bad, why", [
@@ -464,24 +488,26 @@ def test_files_and_tests_may_share_the_list():
     assert verdict.validate_retired([_retired(), _retired_test()], {"s.one"}) == []
 
 
-def test_an_entry_allows_the_drop_only_while_main_still_has_the_floor_it_was_written_at(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=5)], min_tests=5)
-    assert _judge(tmp_path, GREEN, extra=["--main-required", str(main)])[0] == 0
-    capsys.readouterr()
-    # the removal is on main: its floor is 4, the entry was written at 5 and is inert, so a further drop is red
-    sub = tmp_path / "later"
-    sub.mkdir()
-    main = _main_that_had_the_test(sub, [_retired_test(from_min_tests=5)], min_tests=4)
-    code, _r = _judge(sub, GREEN, rows=[_suite(min_tests=3)], extra=["--main-required", str(main)])
-    assert code == 1 and "went down" in capsys.readouterr().out
+def test_an_old_entry_with_from_min_tests_and_a_new_one_without_it_are_both_valid_and_the_number_is_ignored():
+    assert verdict.validate_retired([_retired_test(from_min_tests=5), _retired_test(FILE_B + "::t")], {"s.one"}) == []
+    assert verdict.validate_retired([_retired_test(from_min_tests=5, nodeid=FILE_B + "::t", suite="s.two")], {"s.one", "s.two"}) == []
 
 
-def test_an_inert_entry_asks_nothing_of_a_suite_that_collects_the_test_again(tmp_path, monkeypatch):
+def test_a_retirement_is_used_whatever_the_floor_of_main_is_now(tmp_path, monkeypatch):
+    """The old entry counted only while main's floor was still `from_min_tests`; any merge in between made it inert and the retiring PR went red.
+    Now it is used by name: main's floor is 7 (others merged), the entry says 5, and the fragment of the retirement is green."""
     monkeypatch.chdir(tmp_path)
-    main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=5)], min_tests=4)
+    main = _main_that_had_the_test(tmp_path, [_retired_test(from_min_tests=5)], min_tests=7)
+    code, _r = _judge(tmp_path, GREEN + [_case(FILE_A, "test_a"), _case(FILE_A, "test_b")], rows=[_suite(min_tests=7)],
+                      fragments=_retiring(GONE_NODE), extra=["--main-required", str(main)])
+    assert code == 0  # 7 on main, -1 of the fragment, 6 collected
+
+
+def test_an_entry_already_consumed_asks_nothing_of_a_suite_that_collects_the_test_again(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test()], min_tests=4, consumed=[GONE_NODE])
     again = GREEN + [_case(FILE_A, "test_gone")]
-    assert _judge(tmp_path, again, rows=[_suite(min_tests=5)], extra=["--main-required", str(main)])[0] == 0
+    assert _judge(tmp_path, again, rows=[_suite(min_tests=5)], consumed=[GONE_NODE], extra=["--main-required", str(main)])[0] == 0
 
 
 def test_the_entries_of_one_suite_must_share_one_from_min_tests():
@@ -805,7 +831,8 @@ def test_complete_fails_on_an_unreadable_json_and_on_a_json_that_is_not_a_result
 
 # --- the real list-----------------------------------------------------------------------------------------------
 def _real():
-    return json.loads(REQUIRED.read_text(encoding="utf-8"))
+    """The rows of the real list as the judge reads them: the base plus the fragments (`min_tests` is the effective floor)."""
+    return verdict.effective_rows(REQUIRED)
 
 
 def test_the_real_list_is_well_formed_for_the_judge_and_every_row_is_exact():
@@ -1000,3 +1027,246 @@ def test_the_real_whole_suite_rows_name_files_only_and_hold_what_the_unit_job_of
 def test_a_suite_that_needs_root_only_on_linux_still_runs_on_windows():
     doh = [r for r in _real() if r["id"] == "wrapper.e2e.doh"][0]
     assert doh["os"] == ["linux", "windows"] and doh["needs_root"] == ["linux"]
+
+
+# --- the floor is the list plus the fragments of the folder next to it ----------------------------------------------
+def _cases(n):
+    """A junit of n passing tests (the four of GREEN and more of FILE_A)."""
+    return GREEN + [_case(FILE_A, "test_more_%d" % i) for i in range(n - len(GREEN))]
+
+
+def _main_args(tmp_path, rows, fragments=None, consumed=None):
+    return ["--main-required", str(_main_file(tmp_path, rows, fragments, consumed))]
+
+
+def test_two_fragments_on_one_row_add_up(tmp_path):
+    both = {"pr-a": {"s.one": 2}, "pr-b": {"s.one": 3}}
+    assert _judge(tmp_path, _cases(9), fragments=both)[0] == 0  # 4 in the list, 2 + 3 in the fragments
+    assert verdict.effective_rows(tmp_path / "required.json")[0]["min_tests"] == 9
+    assert _judge(tmp_path, _cases(8), fragments=both)[0] == 1
+
+
+def test_main_plus_two_open_prs_is_green_and_exact_holds_on_the_sum(tmp_path, capsys):
+    both = {"pr-a": {"s.one": 2}, "pr-b": {"s.one": 3}}
+    assert _judge(tmp_path, _cases(9), fragments=both, extra=_main_args(tmp_path, [_suite()]))[0] == 0
+    capsys.readouterr()
+    code, _r = _judge(tmp_path, _cases(10), fragments=both, extra=_main_args(tmp_path, [_suite()]))
+    out = capsys.readouterr().out
+    assert code == 1 and "exact: 9" in out and "add a fragment" in out
+    # the same when main already has A and the branch adds B on top of it
+    later = tmp_path / "later"
+    assert _judge(later, _cases(9), fragments=both, extra=_main_args(later, [_suite()], {"pr-a": {"s.one": 2}}))[0] == 0
+
+
+def test_a_fragment_of_main_that_is_missing_outside_a_fold_is_red(tmp_path, capsys):
+    main = _main_args(tmp_path, [_suite()], {"pr-a": {"s.one": 2}})  # main collects 6
+    code, _r = _judge(tmp_path, _cases(4), extra=main)  # the branch deleted the fragment: its own count is exact at 4
+    out = capsys.readouterr().out
+    assert code == 1 and "fragments of main were removed outside a fold" in out and "went down" in out
+
+
+def test_a_fold_with_equal_sums_is_green(tmp_path):
+    main = _main_args(tmp_path, [_suite()], {"pr-a": {"s.one": 2}})  # 4 + 2
+    assert _judge(tmp_path, _cases(6), rows=[_suite(min_tests=6)], extra=main)[0] == 0  # the list now says 6, the fragment is gone
+
+
+def test_a_fold_that_loses_one_is_red(tmp_path, capsys):
+    main = _main_args(tmp_path, [_suite()], {"pr-a": {"s.one": 2}})
+    code, _r = _judge(tmp_path, _cases(5), rows=[_suite(min_tests=5)], extra=main)
+    out = capsys.readouterr().out
+    assert code == 1 and "is not the one of main (6 on main, 5 here)" in out
+
+
+def test_a_fold_moves_the_consumes_of_the_removed_fragments_into_consumed_json(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    retire = {"retire-it": {"s.one": -1, "consumes": [GONE_NODE]}}
+    main = _main_that_had_the_test(tmp_path, [_retired_test()], min_tests=5, fragments=retire)  # 5 - 1 = 4
+    assert _judge(tmp_path, GREEN, rows=[_suite(min_tests=4)], consumed=[GONE_NODE], extra=["--main-required", str(main)])[0] == 0
+    capsys.readouterr()
+    sub = tmp_path / "forgot"
+    main = _main_that_had_the_test(sub, [_retired_test()], min_tests=5, fragments=retire)
+    code, _r = _judge(sub, GREEN, rows=[_suite(min_tests=4)], extra=["--main-required", str(main)])  # consumed.json did not gain the nodeid
+    assert code == 1 and "a fold moves the `consumes`" in capsys.readouterr().out
+
+
+def test_a_fold_carries_no_new_fragment(tmp_path, capsys):
+    main = _main_args(tmp_path, [_suite()], {"pr-a": {"s.one": 2}})
+    code, _r = _judge(tmp_path, _cases(6), rows=[_suite(min_tests=5)], fragments={"pr-c": {"s.one": 1}}, extra=main)  # 5 + 1 = 6 as on main
+    assert code == 1 and "a fold carries no new fragment" in capsys.readouterr().out
+
+
+def test_a_fragment_of_main_that_is_edited_is_red(tmp_path, capsys):
+    main = _main_args(tmp_path, [_suite()], {"pr-a": {"s.one": 2}})
+    code, _r = _judge(tmp_path, _cases(7), fragments={"pr-a": {"s.one": 3}}, extra=main)
+    assert code == 1 and "the fragment pr-a of main was changed here" in capsys.readouterr().out
+
+
+def test_a_consumed_json_that_differs_from_main_outside_a_fold_is_red(tmp_path, capsys):
+    main = _main_args(tmp_path, [_suite()])
+    code, _r = _judge(tmp_path, GREEN, consumed=[GONE_NODE], extra=main)
+    assert code == 1 and "consumed.json differs from main's outside a fold" in capsys.readouterr().out
+
+
+def test_a_negative_value_with_no_consumes_is_a_malformed_list(tmp_path, capsys):
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=5)], fragments={"retire-it": {"s.one": -1}})
+    assert code == 2 and "negative" in capsys.readouterr().out
+
+
+def test_a_negative_value_that_consumes_a_test_main_never_retired_is_red(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, None)
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=5)], fragments=_retiring(GONE_NODE), extra=["--main-required", str(main)])
+    assert code == 1 and "not a retired test of main" in capsys.readouterr().out
+
+
+def test_a_retirement_that_main_consumed_in_its_consumed_json_cannot_be_consumed_again(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test()], consumed=[GONE_NODE])
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=5)], consumed=[GONE_NODE], fragments=_retiring(GONE_NODE),
+                      extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and "already consumed" in out and "main's consumed.json" in out
+
+
+def test_a_retirement_that_a_fragment_of_main_consumed_cannot_be_consumed_again(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    first = {"first-retire": {"s.one": -1, "consumes": [GONE_NODE]}}
+    main = _main_that_had_the_test(tmp_path, [_retired_test()], fragments=first)
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=5)], fragments=dict(first, **{"second-retire": {"s.one": -1, "consumes": [GONE_NODE]}}),
+                      extra=["--main-required", str(main)])
+    out = capsys.readouterr().out
+    assert code == 1 and "already consumed" in out and "the fragment first-retire of main" in out
+
+
+def test_the_same_retirement_in_two_fragments_of_the_branch_is_consumed_twice_and_red(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    main = _main_that_had_the_test(tmp_path, [_retired_test()], min_tests=6)
+    two = {"retire-a": {"s.one": -1, "consumes": [GONE_NODE]}, "retire-b": {"s.one": -1, "consumes": [GONE_NODE]}}
+    code, _r = _judge(tmp_path, GREEN, rows=[_suite(min_tests=6)], fragments=two, extra=["--main-required", str(main)])
+    assert code == 1 and "already consumed" in capsys.readouterr().out
+
+
+def test_main_s_list_without_its_folder_is_red(tmp_path, capsys):
+    (tmp_path / "mainside").mkdir()
+    (tmp_path / "mainside" / "main.json").write_text(json.dumps([_suite()]), encoding="utf-8")
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(tmp_path / "mainside" / "main.json")])
+    assert code == 1 and "main's fragments are not known" in capsys.readouterr().out
+
+
+def test_a_malformed_fragment_of_main_is_red_never_ignored(tmp_path, capsys):
+    main = _main_args(tmp_path, [_suite()], {"Not-A-Slug": {"s.one": 1}})
+    code, _r = _judge(tmp_path, GREEN, extra=main)
+    assert code == 1 and "main's fragments are not readable" in capsys.readouterr().out
+
+
+def _bad_fragment(tmp_path, name, content):
+    required = _write_required(tmp_path / "required.json", [_suite()])
+    folder = required.with_name("required-suites.d")
+    if name is None:
+        (folder / "consumed.json").unlink()
+        folder.rmdir()
+    else:
+        (folder / name).write_text(content, encoding="utf-8")
+    return required
+
+
+@pytest.mark.parametrize("name, content, why", [
+    ("Upper.json", '{"s.one": 1}', "the name of a fragment"),
+    ("notes.txt", "1", "the name of a fragment"),
+    ("a.json", '{"s.unknown": 1}', "not a row of the list"),
+    ("a.json", '{"s.one": 0}', "is 0"),
+    ("a.json", '{"s.one": "2"}', "must be an integer"),
+    ("a.json", '{"s.one": true}', "must be an integer"),
+    ("a.json", '{"s.one": -1}', "has no `consumes`"),
+    ("a.json", '[1]', "JSON object"),
+    ("a.json", '{"s.one": 1', "cannot be read"),
+    (None, "", "does not exist"),
+])
+def test_a_malformed_fragment_is_a_malformed_list_exit_2_with_the_reason(tmp_path, capsys, name, content, why):
+    required = _bad_fragment(tmp_path, name, content)
+    assert verdict.main(["args", "--required", str(required), "--suite", "s.one", "--os", "linux"]) == 2
+    assert why in capsys.readouterr().err
+
+
+def test_a_malformed_fragment_is_exit_2_for_judge_and_complete_too(tmp_path, capsys):
+    required = _bad_fragment(tmp_path, "a.json", '{"s.one": 0}')
+    junit = _junit(tmp_path / "junit.xml", GREEN)
+    binary = tmp_path / "bin"
+    binary.write_bytes(b"x")
+    assert verdict.main(["judge", "--required", str(required), "--suite", "s.one", "--os", "linux", "--junit", str(junit),
+                         "--binary", str(binary), "--commit", SHA]) == 2
+    assert "is 0" in capsys.readouterr().out
+    (tmp_path / "results").mkdir()
+    assert verdict.main(["complete", "--required", str(required), "--results", str(tmp_path / "results")]) == 2
+    assert "is 0" in capsys.readouterr().err
+
+
+def test_the_rewritten_base_list_has_one_value_per_line_and_is_the_dump_of_its_content():
+    text = REQUIRED.read_bytes().decode("utf-8")
+    assert "\r" not in text and text.endswith("]\n")
+    assert text == json.dumps(json.loads(text), indent=1, ensure_ascii=False) + "\n"
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip().rstrip(",")
+        # a line holds one thing: a bracket, a key with a scalar, a key opening a container, or one array item
+        assert stripped in ("[", "]", "{", "}") or stripped.startswith('"') or stripped.lstrip("-").isdigit() or stripped in ("true", "false"), (number, line)
+
+
+def test_the_real_folder_of_fragments_exists_holds_consumed_json_and_every_fragment_loads():
+    folder = verdict.fragments_dir(REQUIRED)
+    assert folder.is_dir() and (folder / "consumed.json").is_file()
+    assert [r["id"] for r in verdict.effective_rows(REQUIRED)] == [r["id"] for r in json.loads(REQUIRED.read_text(encoding="utf-8"))]
+
+
+def _git(cwd, *args):
+    import subprocess
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args],
+                          cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+def _repo_with_main(tmp_path, fragments=None):
+    """A repository whose branch `main` has ci/required-suites.json and its folder (with `fragments`)."""
+    repo = tmp_path / "repo"
+    (repo / "ci").mkdir(parents=True)
+    required = _write_required(repo / "ci" / "required-suites.json", [_suite()], fragments)
+    _git(repo, "init", "-q")
+    _git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "main")
+    return required
+
+
+def test_the_fragment_helper_adds_a_suffix_when_the_name_exists_and_never_overwrites(tmp_path, capsys):
+    required = _repo_with_main(tmp_path, {"taken-on-main": {"s.one": 1}})
+    folder = required.with_name("required-suites.d")
+
+    def run(*args):
+        code = verdict.main(["fragment", "--required", str(required), "--main-ref", "main", *args])
+        return code, capsys.readouterr().out.strip()
+
+    code, out = run("--name", "feature-x", "--set", "s.one=2")
+    assert code == 0 and Path(out) == folder / "feature-x.json" and json.loads(Path(out).read_text(encoding="utf-8")) == {"s.one": 2}
+    first = (folder / "feature-x.json").read_bytes()
+    code, out = run("--name", "feature-x", "--set", "s.one=5")
+    assert code == 0 and Path(out).name == "feature-x-2.json" and (folder / "feature-x.json").read_bytes() == first
+    code, out = run("--name", "feature-x", "--set", "s.one=7")
+    assert code == 0 and Path(out).name == "feature-x-3.json" and (folder / "feature-x-2.json").read_bytes() != first
+    # a name only main has (it is not in the working tree) is taken too
+    (folder / "taken-on-main.json").unlink()
+    code, out = run("--name", "taken-on-main", "--set", "s.one=1")
+    assert code == 0 and Path(out).name == "taken-on-main-2.json" and not (folder / "taken-on-main.json").exists()
+    # the effective list reads what the helper wrote
+    assert verdict.effective_rows(required)[0]["min_tests"] == 4 + 2 + 5 + 7 + 1
+
+
+def test_the_fragment_helper_refuses_what_the_loader_would_refuse(tmp_path, capsys):
+    required = _repo_with_main(tmp_path)
+    base = ["fragment", "--required", str(required), "--main-ref", "main"]
+    assert verdict.main(base + ["--name", "x", "--set", "s.unknown=1"]) == 2
+    assert verdict.main(base + ["--name", "x", "--set", "s.one=0"]) == 2
+    assert verdict.main(base + ["--name", "x", "--set", "s.one=-1"]) == 2  # a negative value needs --consumes
+    assert verdict.main(base + ["--name", "consumed", "--set", "s.one=1"]) == 2
+    assert verdict.main(base + ["--name", "Bad Name", "--set", "s.one=1"]) == 2
+    assert verdict.main(["fragment", "--required", str(required), "--main-ref", "no-such-ref", "--name", "x", "--set", "s.one=1"]) == 2
+    assert sorted(p.name for p in required.with_name("required-suites.d").iterdir()) == ["consumed.json"]
+    assert verdict.main(base + ["--name", "x", "--set", "s.one=-1", "--consumes", GONE_NODE]) == 0
+    assert json.loads(next(required.with_name("required-suites.d").glob("x.json")).read_text(encoding="utf-8")) == {"s.one": -1, "consumes": [GONE_NODE]}

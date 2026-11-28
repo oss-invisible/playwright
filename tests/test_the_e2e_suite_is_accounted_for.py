@@ -23,7 +23,6 @@ a minimum that is not the count, a Control+A row that is not that file. The gree
 from __future__ import annotations
 
 import functools
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +33,8 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = ROOT / "ci" / "required-suites.json"
+sys.path.insert(0, str(ROOT / "scripts"))
+import ci_verdict  # noqa: E402  (the loader of the rows: min_tests is the list plus its fragments)
 MARKER = "e2e"
 
 PARTITION = {
@@ -104,7 +105,7 @@ def _collected():
 
 
 def _rows():
-    by_id = {r["id"]: r for r in json.loads(REQUIRED.read_text(encoding="utf-8"))}
+    by_id = {r["id"]: r for r in ci_verdict.effective_rows(REQUIRED)}
     ids = [i for ids in PARTITION.values() for i in ids] + [CONTROL_A_ROW]
     missing = [i for i in ids if i not in by_id]
     assert not missing, "rows missing from ci/required-suites.json: %s" % missing

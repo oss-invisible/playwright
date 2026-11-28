@@ -41,6 +41,9 @@ def _required(tmp_path, **over):
     row.update(over)
     path = tmp_path / "required.json"
     path.write_text(json.dumps([row]), encoding="utf-8")
+    folder = tmp_path / "required-suites.d"  # the list is read with the folder of its fragments next to it
+    folder.mkdir(exist_ok=True)
+    (folder / "consumed.json").write_text("[]", encoding="utf-8")
     return str(path)
 
 

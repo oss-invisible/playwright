@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import ci_ab_oracle as ab  # noqa: E402
+import ci_verdict  # noqa: E402  (the loader of the rows: min_tests is the list plus its fragments)
 import ci_crash_evidence as crash  # noqa: E402
 import ci_host_gate as gate  # noqa: E402
 
@@ -762,7 +763,7 @@ def test_the_recorders_own_test_runs_in_the_host_job_after_the_a_a_and_is_left_o
     assert "host-crash-e2e.xml" in host_job.split("Upload what the test saved")[1]
     shared = _job(text, "e2e-linux")
     assert crash_file not in _job(text, "e2e-host-windows") and crash_file not in shared and 'wrapper.e2e.suite.linux.${{ matrix.part }}' in shared
-    rows = {r["id"]: r for r in json.loads((root / "ci" / "required-suites.json").read_text(encoding="utf-8"))}
+    rows = {r["id"]: r for r in ci_verdict.effective_rows(root / "ci" / "required-suites.json")}
     row = rows["wrapper.e2e.ab_host_crash"]
     assert row["os"] == ["linux"] and row["linux_only"].strip() and row["tests"] == [crash_file] and row["min_tests"] == 1 and row["exact"] is True and row["marker"] == "e2e"
     assert rows["wrapper.e2e.ab_host"]["min_tests"] == 1 and rows["wrapper.e2e.ab_host"]["tests"] == ["tests/test_ab_host_e2e.py"], "the A/A is still the one test of its row"

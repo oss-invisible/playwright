@@ -327,7 +327,7 @@ jobs:
 
       # The judge of the engine series' gate on the junit of the step above: the exact count of the row (not one test more, not one less), no skip, every
       # file of the row passed, and the list only grows against main. The judge and the list it compares with are read from main, never from the branch under
-      # judgment (a branch that edits its own judge or its own list cannot pass itself): a PR that adds a test and does not raise min_tests is red here.
+      # judgment (a branch that edits its own judge or its own list cannot pass itself): a PR that adds a test and does not add its fragment is red here.
       # The suite launches no browser, so --binary names the interpreter that ran it (the judge wants a file to hash; nothing reads that hash: no --out).
       - name: Judge the suite wrapper.unit.all (the exact count, with the judge and the list of main)
         if: always() && matrix.python == '3.11'
@@ -339,6 +339,13 @@ jobs:
           git show origin/main:scripts/ci_verdict.py > "$RUNNER_TEMP/main/ci_verdict.py"
           git show origin/main:ci/required-suites.json > "$RUNNER_TEMP/main/required-suites.json"
           if git cat-file -e origin/main:ci/retired-tests.json; then git show origin/main:ci/retired-tests.json > "$RUNNER_TEMP/main/retired-tests.json"; fi
+          # The floor of a row is the list plus the fragments of the folder next to it, so main's folder goes next to main's list. While main has no
+          # folder nothing is copied: the judge of main does not know it yet (and once it does, a list with no folder is red there).
+          if git cat-file -e origin/main:ci/required-suites.d; then
+            mkdir -p "$RUNNER_TEMP/main-fragments"
+            git archive origin/main ci/required-suites.d | tar -x -C "$RUNNER_TEMP/main-fragments"
+            mv "$RUNNER_TEMP/main-fragments/ci/required-suites.d" "$RUNNER_TEMP/main/required-suites.d"
+          fi
           python "$RUNNER_TEMP/main/ci_verdict.py" judge --required ci/required-suites.json --suite "wrapper.unit.all.$SUITE_OS" --os "$SUITE_OS" --junit "$RUNNER_TEMP/unit-junit.xml" --binary "$(python -c 'import sys; print(sys.executable)')" --main-required "$RUNNER_TEMP/main/required-suites.json"
 
   # ONE SINGLE CONTEXT FOR BRANCH PROTECTION. Measured 2026-08-13: this

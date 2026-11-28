@@ -13,13 +13,12 @@ This test reads the workflow as text (PyYAML is not a dependency of this package
 """
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
 import pytest
 
-from test_the_root_e2e_run_in_the_root_step_and_nowhere_else import _matrix_parts, _rows, _steps, row_problems, step_if, step_part
+from test_the_root_e2e_run_in_the_root_step_and_nowhere_else import ci_verdict, _matrix_parts, _rows, _steps, row_problems, step_if, step_part
 
 pytestmark = pytest.mark.unit
 
@@ -31,7 +30,7 @@ SUITE = "wrapper.e2e.udp.sandbox"
 
 
 def _suite() -> dict:
-    return next(s for s in json.loads((ROOT / "ci" / "required-suites.json").read_text(encoding="utf-8")) if s["id"] == SUITE)
+    return next(s for s in ci_verdict.effective_rows(ROOT / "ci" / "required-suites.json") if s["id"] == SUITE)
 
 
 def _env(body: str, key: str) -> list:
