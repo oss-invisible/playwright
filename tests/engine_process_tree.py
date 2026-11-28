@@ -12,6 +12,8 @@ folder and a `view` of the machine (the real one, or a stand-in in the unit test
 """
 from __future__ import annotations
 
+import os
+import sys
 from typing import Dict, List, Optional
 
 
@@ -52,3 +54,39 @@ def maps_of_the_engine_below(root: int, binary_dir: str, machine: Optional[Machi
         if exe and exe.startswith(binary_dir):
             found[pid] = machine.maps(pid)
     return found
+
+
+def ships_its_own_gl(binary_dir: str) -> bool:
+    """The engine's own GL is in the package from firefox-59: a test follows the package under
+    test, not the core's version (the gate runs a candidate under the published core)."""
+    return os.path.isfile(os.path.join(binary_dir, "llvmpipe", "libEGL.so.1"))
+
+
+def gl_maps_of_this_test(firefox_binary: str) -> Optional[Dict[int, List[str]]]:
+    """The maps of the engine's processes below this test, to be read while the browser is up and a
+    page has had its WebGL context; None where the verdict on the GL does not apply (not Linux,
+    or an engine with no GL of its own)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    binary_dir = os.path.dirname(os.path.realpath(firefox_binary))
+    if not ships_its_own_gl(binary_dir):
+        return None
+    return maps_of_the_engine_below(os.getpid(), binary_dir)
+
+
+def assert_the_gl_is_the_engines_own(firefox_binary: str, below: Optional[Dict[int, List[str]]]) -> None:
+    """The rule of the verdict on the GL, written once: some engine process maps the engine's own
+    libEGL.so.1 and its own libgallium-*, and none maps a libEGL that is not under the engine's
+    `llvmpipe/` folder. (GTK still opens the host's GLX at startup to choose its X11 visuals;
+    nothing of it reaches WebGL or a page, so only libEGL is held against the host's.) With
+    `below` None the verdict does not apply."""
+    if below is None:
+        return
+    own = os.path.join(os.path.dirname(os.path.realpath(firefox_binary)), "llvmpipe") + os.sep
+    assert below, "no engine process below this test"
+    drew = [pid for pid, maps in below.items()
+            if own + "libEGL.so.1" in maps and any(m.startswith(own + "libgallium-") for m in maps)]
+    assert drew, {pid: [m for m in maps if "EGL" in m or "gallium" in m] for pid, maps in below.items()}
+    foreign = {pid: [m for m in maps if "libEGL" in os.path.basename(m) and not m.startswith(own)]
+               for pid, maps in below.items()}
+    assert not any(foreign.values()), foreign

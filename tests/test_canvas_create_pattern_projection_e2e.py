@@ -7,23 +7,29 @@ CreatePattern`` used to read its source canvas through the pattern's own context
 projected ones: a page compared the two and read the difference. On firefox-68 two lines of ``CreatePattern`` (the HTMLCanvasElement and the
 OffscreenCanvas overloads; folder ``fingerprint/canvas/text-metrics`` of the series, ``dom/canvas/CanvasRenderingContext2D.cpp``) read the snapshot
 from the element, so the pattern carries the projection. A 2D canvas is not projected at all (a 2D canvas reads back exactly as drawn,
-``tests/test_canvas_reads_as_drawn.py``), so a pattern of a 2D canvas is the same pixels with the engine on and off.
+``tests/test_canvas_reads_as_drawn.py``), so a pattern of a 2D canvas is the same pixels with the noise on and off.
 
 What the test reads. One page builds a source (a WebGL canvas, a WebGL OffscreenCanvas, or a 2D canvas), fills a 2D canvas with
 ``createPattern(source, 'no-repeat')`` and reads it back with ``getImageData``, then clears it and draws the source with ``drawImage`` and reads that.
 The WebGL render is a triangle with per-vertex colours and antialiased edges on a white clear (what a fingerprinting page draws, and where the
 projection acts: ``tests/test_webgl_noise_active.py``); the 2D source is a gradient, an antialiased arc and a rotated rectangle.
 
-The negative control, in the same module. The same page runs with the engine not declared (``zoom.stealth.fpp.hw_seed`` = 0: no projection): the
-WebGL pattern pixels with the engine declared must DIFFER from those (the projection is what changed them), and the 2D pattern pixels must be the
-SAME bytes with the engine on and off. A render that is not drawn (a blank source) fails the test: the pixels are checked to hold more than one
-colour. WebGL being unavailable on the runner is a failure, not a skip.
+The negative control, in the same module. The same page runs with the canvas noise declared off and the engine still on (``zoom.stealth.canvas.
+substitute_pixels`` false, the same declared GPU, the engine's own GL: no projection, because the noise is off, not because the engine is):
+the WebGL pattern pixels with the noise on must DIFFER from those (the projection is what changed them), and the 2D pattern pixels must be the
+SAME bytes with the noise on and off. A control with the engine off (``zoom.stealth.fpp.hw_seed`` 0) would draw the WebGL source on the host's
+GL, which a runner may not serve (no context, once in 3083 launches), so no launch of this file has the engine off. On Linux, in both launches,
+the maps of the engine's processes hold the engine's own GL and no libEGL of the host's. A render that is not drawn (a blank source) fails the
+test: the pixels are checked to hold more than one colour. WebGL being unavailable on the runner is a failure, not a skip.
 
 Run: pytest tests/test_canvas_create_pattern_projection_e2e.py -m e2e -v
 """
 from __future__ import annotations
 
 import pytest
+
+from engine_process_tree import assert_the_gl_is_the_engines_own, gl_maps_of_this_test
+from invisible_playwright import InvisiblePlaywright
 
 pytestmark = pytest.mark.e2e
 
@@ -78,58 +84,73 @@ READ = """(args) => {
 KINDS = ["webgl", "offscreen-webgl", "2d"]
 
 
-def _read(firefox_binary, engine_declared):
-    from invisible_playwright import InvisiblePlaywright
+#: A hw_seed no runner has by accident (the engine is on when it is positive), the one both launches of this file declare: the same GPU, so
+#: the engine's own GL in both. The control declares only the canvas noise off.
+_HW_SEED = 12345
 
-    prefs = {} if engine_declared else {"zoom.stealth.fpp.hw_seed": 0}
+
+def _launch_prefs(noise_on: bool) -> dict:
+    """The prefs of one launch of this file: the engine always on (the same declared GPU, the engine's own GL), with the canvas noise on, or
+    with only the canvas noise declared off (``zoom.stealth.canvas.substitute_pixels`` false: no projection, the bytes as that GPU drew them)."""
+    prefs = {"zoom.stealth.fpp.hw_seed": _HW_SEED}
+    if not noise_on:
+        prefs["zoom.stealth.canvas.substitute_pixels"] = False
+    return prefs
+
+
+def _read(firefox_binary, noise_on):
     out = {}
-    with InvisiblePlaywright(seed=21, binary_path=firefox_binary, headless=True, extra_prefs=prefs) as browser:
+    with InvisiblePlaywright(seed=21, binary_path=firefox_binary, headless=True,
+                             extra_prefs=_launch_prefs(noise_on)) as browser:
         page = browser.new_context().new_page()
         page.goto("about:blank", timeout=30_000)
         for kind in KINDS:
             got = page.evaluate(READ, [kind, SIZE])
             assert "error" not in got, got["error"]
             out[kind] = {name: bytes(values) for name, values in got.items()}
+        gl_maps = gl_maps_of_this_test(firefox_binary)
+    assert_the_gl_is_the_engines_own(firefox_binary, gl_maps)
     return out
 
 
 @pytest.fixture(scope="module")
 def readings(firefox_binary):
-    """kind -> {viaPattern, viaDraw} bytes, with the engine declared and not declared. The browsers are closed before the tests run."""
-    declared = _read(firefox_binary, True)
-    stock = _read(firefox_binary, False)
-    for mode, rows in (("engine declared", declared), ("engine not declared", stock)):
+    """kind -> {viaPattern, viaDraw} bytes, with the canvas noise on and off (the engine on in both). The browsers are closed before the tests run."""
+    noised = _read(firefox_binary, True)
+    control = _read(firefox_binary, False)
+    for mode, rows in (("noise on", noised), ("noise off", control)):
         for kind, row in rows.items():
             assert len(row["viaPattern"]) == SIZE * SIZE * 4 and len(set(row["viaPattern"])) > 1, (
                 "%s: the %s pattern read back is blank or has the wrong size: the source was not drawn" % (mode, kind))
-    return {"declared": declared, "stock": stock}
+    return {"noised": noised, "control": control}
 
 
 def test_create_pattern_from_a_webgl_canvas_carries_the_projection(readings):
-    declared, stock = readings["declared"]["webgl"], readings["stock"]["webgl"]
-    assert declared["viaPattern"] != stock["viaPattern"], (
-        "createPattern(webglCanvas) reads the same pixels with the engine declared and not declared: the pattern is the clean render, the "
+    noised, control = readings["noised"]["webgl"], readings["control"]["webgl"]
+    assert noised["viaPattern"] != control["viaPattern"], (
+        "createPattern(webglCanvas) reads the same pixels with the noise on and off: the pattern is the clean render, the "
         "projection does not reach it")
 
 
 def test_create_pattern_from_an_offscreen_webgl_canvas_carries_the_projection(readings):
-    declared, stock = readings["declared"]["offscreen-webgl"], readings["stock"]["offscreen-webgl"]
-    assert declared["viaPattern"] != stock["viaPattern"], (
-        "createPattern(offscreenWebglCanvas) reads the same pixels with the engine declared and not declared: the pattern is the clean render, "
+    noised, control = readings["noised"]["offscreen-webgl"], readings["control"]["offscreen-webgl"]
+    assert noised["viaPattern"] != control["viaPattern"], (
+        "createPattern(offscreenWebglCanvas) reads the same pixels with the noise on and off: the pattern is the clean render, "
         "the projection does not reach it")
 
 
 @pytest.mark.parametrize("kind", ["webgl", "offscreen-webgl"])
 def test_a_pattern_of_a_webgl_canvas_reads_what_drawimage_of_it_reads(readings, kind):
-    declared = readings["declared"][kind]
-    assert declared["viaPattern"] == declared["viaDraw"], (
-        "%s: the pixels of createPattern + fill and of drawImage differ with the engine declared: the two reads of one canvas carry "
+    noised = readings["noised"][kind]
+    assert noised["viaPattern"] == noised["viaDraw"], (
+        "%s: the pixels of createPattern + fill and of drawImage differ with the noise on: the two reads of one canvas carry "
         "different projections" % kind)
 
 
 def test_create_pattern_from_a_2d_canvas_reads_the_same_with_the_engine_on_and_off(readings):
-    declared, stock = readings["declared"]["2d"], readings["stock"]["2d"]
-    assert declared["viaPattern"] == stock["viaPattern"], (
-        "createPattern(2dCanvas) differs between the engine declared and not declared: a 2D source must be read as drawn")
-    assert declared["viaDraw"] == stock["viaDraw"], "drawImage(2dCanvas) differs between the engine declared and not declared"
-    assert declared["viaPattern"] == declared["viaDraw"], "a pattern of a 2D canvas is not the pixels drawImage reads"
+    """A 2D source is untouched whether the canvas noise is on or off (the engine is on in both launches): it is read as drawn."""
+    noised, control = readings["noised"]["2d"], readings["control"]["2d"]
+    assert noised["viaPattern"] == control["viaPattern"], (
+        "createPattern(2dCanvas) differs between the noise on and off: a 2D source must be read as drawn")
+    assert noised["viaDraw"] == control["viaDraw"], "drawImage(2dCanvas) differs between the noise on and off"
+    assert noised["viaPattern"] == noised["viaDraw"], "a pattern of a 2D canvas is not the pixels drawImage reads"

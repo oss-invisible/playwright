@@ -16,8 +16,12 @@ known-bad:
   per-seed change at readback.
 * A toDataURL PNG carries the deBG chunk retail 151 writes.
 * A WebGL canvas that is not premultiplied (premultipliedAlpha:false, half
-  transparent) reads the same pixels through toDataURL and toBlob, noised with the
-  engine on (hw_seed > 0); the control is the engine off (hw_seed 0: as drawn).
+  transparent) reads the same pixels through toDataURL and toBlob, noised (the
+  engine on, hw_seed > 0); the control is the same engine, the same declared GPU
+  and the same GL, the engine's own, with only the canvas noise declared off
+  (zoom.stealth.canvas.substitute_pixels false), so a defect of our hook that
+  changed the bytes with the noise off shows in the control. In both launches, on
+  Linux, the engine's processes map the engine's own GL and no libEGL of the host's.
 
 Runs against about:blank and a local http page, no network/proxy. Part of the
 e2e release gate.
@@ -32,6 +36,7 @@ import types
 import pytest
 
 from _evidence_on_failure import FailureEvidence
+from engine_process_tree import assert_the_gl_is_the_engines_own, gl_maps_of_this_test
 from _webgl_unavailable import SECOND_ATTEMPT_AFTER_MS, split_probe, unavailable_message
 from invisible_playwright import InvisiblePlaywright
 
@@ -225,20 +230,35 @@ _SECOND_ATTEMPT_JS = """() => {
 }"""
 
 
-def _non_premultiplied(firefox_binary, hw_seed, attempts=None):
+#: A hw_seed no runner has by accident (the engine is on when it is positive). Both launches of the test below keep the engine ON with the
+#: same declared GPU, so on the engine's own GL: a launch with hw_seed 0 would run WebGL on the host's Mesa, which a runner may not serve.
+_HW_SEED = 12345
+
+
+def _launch_prefs(noise_on: bool) -> dict:
+    """The prefs of one launch of the test below: the engine always on (the same declared GPU, the engine's own GL), with the canvas noise
+    on, or with only the canvas noise declared off (``zoom.stealth.canvas.substitute_pixels`` false: the bytes as that GPU drew them)."""
+    prefs = {"zoom.stealth.fpp.hw_seed": _HW_SEED}
+    if not noise_on:
+        prefs["zoom.stealth.canvas.substitute_pixels"] = False
+    return prefs
+
+
+def _non_premultiplied(firefox_binary, noise_on, attempts=None):
     """(the pixels of toDataURL, the pixels of toBlob) of one half-transparent, non-premultiplied WebGL canvas,
-    as 128x128 RGBA bytes, with the engine on (hw_seed > 0) or off (0).
+    as 128x128 RGBA bytes, with the canvas noise on or off (``_launch_prefs``): the engine is on in both.
 
     When the page gets no context the first time, the assertion carries why: what the page heard on
     `webglcontextcreationerror` and, after a pause of 2 s, what a second attempt on a fresh canvas heard (and its
-    renderer if it got one). The second attempt changes no verdict. `attempts`, a record the evidence keeps, gets both."""
+    renderer if it got one). The second attempt changes no verdict. `attempts`, a record the evidence keeps, gets both.
+    On Linux, once the page has its context, the maps of the engine's processes say the GL is the engine's own."""
     import base64
 
     from _page_bytes import unfiltered
 
     with InvisiblePlaywright(
         seed=7, binary_path=firefox_binary, headless=True,
-        extra_prefs={"zoom.stealth.fpp.hw_seed": hw_seed},
+        extra_prefs=_launch_prefs(noise_on),
     ) as b:
         p = b.new_context().new_page()
         p.goto("about:blank", timeout=30_000)
@@ -250,11 +270,13 @@ def _non_premultiplied(firefox_binary, hw_seed, attempts=None):
                 second = p.evaluate(_SECOND_ATTEMPT_JS)
             except Exception as problem:         # only a note: the first attempt is the verdict
                 second = {"error": repr(problem)}
+        gl_maps = gl_maps_of_this_test(firefox_binary)
     if attempts is not None:
         with attempts.lock:
-            attempts.records.append({"hw_seed": hw_seed, "context": got is not None, "first": first, "second": second})
+            attempts.records.append({"noise_on": noise_on, "context": got is not None, "first": first, "second": second})
     assert got is not None, unavailable_message(first, second)
     assert got["premultipliedAlpha"] is False, "the context is premultiplied: %r" % got["premultipliedAlpha"]
+    assert_the_gl_is_the_engines_own(firefox_binary, gl_maps)
     images = [unfiltered(base64.b64decode(got["url"].split(",", 1)[1])), unfiltered(base64.b64decode(got["blob"]))]
     for png in images:
         assert (png["w"], png["h"], png["channels"]) == (128, 128, 4), png
@@ -263,37 +285,40 @@ def _non_premultiplied(firefox_binary, hw_seed, attempts=None):
 
 @pytest.mark.e2e
 def test_a_non_premultiplied_webgl_canvas_reads_the_same_through_todataurl_and_toblob(firefox_binary):
-    """toDataURL and toBlob of a premultipliedAlpha:false WebGL canvas give the same pixels, noised with the engine on.
+    """toDataURL and toBlob of a premultipliedAlpha:false WebGL canvas give the same pixels, noised.
 
     The canvas noise is applied to the snapshot with its alpha type: a context that is not premultiplied stores
     the colours as drawn, and a reader that took it for premultiplied would noise (or convert) them wrongly.
     Both PNG readers go through the same hook (GetImageBuffer, GetInputStream in ClientWebGLContext.cpp). The
     canvas is half transparent (alpha 128/255, colours as drawn), so a premultiplied reading changes the bytes.
-    Negative control, in the same test: with the engine off the two readers are the bytes as drawn, their alpha is
-    the 128 drawn, and the engine-on PNG differs from them."""
+    Negative control, in the same test: the same engine, the same declared GPU and the engine's own GL, with only
+    the canvas noise declared off (``zoom.stealth.canvas.substitute_pixels`` false): the two readers are the bytes
+    as drawn, their alpha is the 128 drawn, and the noised PNG differs from them. So a defect of our hook that
+    changed the bytes with the noise off shows in the control, and no runner's Mesa is in either launch (on Linux
+    the maps of both launches hold the engine's own GL and no libEGL of the host's)."""
     with FailureEvidence("canvas-webgl-non-premultiplied") as evidence:
         attempts = types.SimpleNamespace(lock=threading.Lock(), records=[])
         evidence.note_records("webgl-attempts", attempts)
-        # One arming before both launches (engine on, then off): the variables it sets stay for the second launch, and the
+        # One arming before both launches (noise on, then off): the variables it sets stay for the second launch, and the
         # engine writes one log file per process (MOZ_LOG_FILE has %PID), so both are covered; a second arm() would lose
         # the first one's patch. gfx2d is the module of gfxCriticalNote (gfx/2d/Factory.cpp, LazyLogModule "gfx2d"); the
         # engine has no log module named GfxInfo or WebGL (none in widget/ or dom/canvas), so none is asked for.
         evidence.arm(moz_log="timestamp,gfx2d:5")
-        on_url, on_blob = _non_premultiplied(firefox_binary, 12345, attempts)
-        off_url, off_blob = _non_premultiplied(firefox_binary, 0, attempts)
-        _the_engine_off_and_on_readings_agree(on_url, on_blob, off_url, off_blob)
+        on_url, on_blob = _non_premultiplied(firefox_binary, True, attempts)
+        off_url, off_blob = _non_premultiplied(firefox_binary, False, attempts)
+        _the_noise_off_and_on_readings_agree(on_url, on_blob, off_url, off_blob)
 
 
-def _the_engine_off_and_on_readings_agree(on_url, on_blob, off_url, off_blob):
+def _the_noise_off_and_on_readings_agree(on_url, on_blob, off_url, off_blob):
     alphas = {off_url[i] for i in range(3, len(off_url), 4)}
     assert alphas <= set(range(126, 131)), (
-        "engine off: the alpha of the PNG is %s, not the 128 that was drawn" % sorted(alphas))
+        "noise off: the alpha of the PNG is %s, not the 128 that was drawn" % sorted(alphas))
     differing = lambda a, b: sum(1 for x, y in zip(a, b) if x != y)
     assert off_blob == off_url, (
-        "engine off: %d of %d bytes of toBlob differ from toDataURL" % (differing(off_blob, off_url), len(off_url)))
+        "noise off: %d of %d bytes of toBlob differ from toDataURL" % (differing(off_blob, off_url), len(off_url)))
     assert differing(on_url, off_url), (
-        "toDataURL of a non-premultiplied WebGL canvas is the same with the engine on and off: no noise reaches "
+        "toDataURL of a non-premultiplied WebGL canvas is the same with the noise on and off: no noise reaches "
         "the page, so comparing the two readers says nothing")
     assert on_blob == on_url, (
-        "engine on: %d of %d bytes of toBlob differ from toDataURL of the same non-premultiplied WebGL canvas"
+        "noise on: %d of %d bytes of toBlob differ from toDataURL of the same non-premultiplied WebGL canvas"
         % (differing(on_blob, on_url), len(on_url)))
