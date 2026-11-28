@@ -104,6 +104,10 @@ def _problems(text):
             problems.append("the judge that runs is the one of the branch under judgment, not the one of main")
         if "git show origin/main:ci/required-suites.json" not in run or "--main-required" not in run:
             problems.append("the list is not compared with the list of main (--main-required of `git show origin/main:ci/required-suites.json`)")
+        if ("git cat-file -e origin/main:ci/required-suites.d" not in run or "git archive origin/main ci/required-suites.d" not in run
+                or '"$RUNNER_TEMP/main/required-suites.d"' not in run):
+            problems.append("main's folder of fragments is not copied next to main's list when main has it (git cat-file -e, then git archive origin/main ci/required-suites.d "
+                            "moved to $RUNNER_TEMP/main/required-suites.d): the floor of main would be its list without its fragments")
     if len(runs) != 1:
         problems.append("%d step(s) of the legs of Python 3.11 write a junit, one is needed" % len(runs))
     else:
@@ -126,6 +130,13 @@ def _problems(text):
 def test_the_unit_job_judges_the_exact_count_of_the_row_with_the_judge_of_main():
     problems = _problems(WORKFLOW.read_text(encoding="utf-8"))
     assert not problems, "tests.yml, job unit: " + "; ".join(problems)
+
+
+def test_the_unit_job_copies_the_folder_of_the_fragments_of_main_next_to_its_list():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert not _problems(text)
+    assert any("folder of fragments" in p for p in _problems(text.replace("git archive origin/main ci/required-suites.d", "true"))), "no copy of the folder"
+    assert any("folder of fragments" in p for p in _problems(text.replace("git cat-file -e origin/main:ci/required-suites.d", "true"))), "copied even when main has none"
 
 
 def test_the_unit_job_of_the_old_workflow_is_refused():

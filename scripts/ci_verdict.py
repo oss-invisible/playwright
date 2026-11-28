@@ -16,23 +16,30 @@ pytest wrote and fails on every one of them.
         reads the junit, writes the result json (with `verdict`: "green" or "red") and exits 1, printing EVERY problem
         with its reason, one per line, when: the junit or the row is missing; the junit is not xunit2 (a testcase with
         no `classname`); a test failed, errored or was skipped; fewer tests were collected than `min_tests`, or, when
-        the row is `exact`, any number other than `min_tests` (a deselected test is not in the junit: `min_tests` goes
-        up by hand when a test is added, never silently); a required file or node id did not pass; the binary is
+        the row is `exact`, any number other than `min_tests` (a deselected test is not in the junit: a fragment is
+        added when a test is added, never silently); a required file or node id did not pass; the binary is
         missing (--binary is mandatory: without it exit 2) or the commit cannot be known; the --seal is unreadable.
-        With --main-required (the list of main) the list only grows: a suite of main is gone, its minimum went down,
-        its `exact` went from true to false, its os or tests lost an element, or its marker changed is red.
+        With --main-required (the list of main) the list only grows, on EFFECTIVE rows on both sides (see the fragments, below): a suite of
+        main is gone, its minimum went down, its `exact` went from true to false, its os or tests lost an element, or its marker changed is red.
+        Main's fragments are read from the folder `required-suites.d` NEXT TO main's list; main's list without that folder is red ("main's
+        fragments are not known"). A fragment of main that is missing or changed in the judged tree is allowed only as a FOLD: every effective row
+        identical to main's, consumed.json gaining exactly the `consumes` of the removed fragments, and no fragment that main lacks.
         The one exception is `retired-tests.json` NEXT TO main's list (read from main, never from the judged branch): a file it names that
         no longer exists in the checkout may leave the rows, and the minimum of a row may go down by the tests main counted for it in that
         row (`tests: {row id: n}`), and by no more. A retired file still on disk, or any other lost test, stays red.
         The same file may also retire single tests whose file stays: {"nodeid": "<file>::<test>", "suite": <row id>, "count": n, "reason",
-        "decided_by", "date", "from_min_tests"}. The minimum of that row may go down by the sum of the `count` of its entries and by no more, and
-        only for a nodeid whose file the row of main lists, and only while main's minimum of that row still equals `from_min_tests` (once the removal
-        is on main and its floor is lower, the entry is inert); a declared nodeid that the judged leg still collects is red, and so is any test that
-        goes without an entry.
+        "decided_by", "date"} (`from_min_tests` is optional and ignored). A single test leaves a row by a fragment of the branch that carries a
+        NEGATIVE value for the row and `consumes` the nodeid: each consumed nodeid is a nodeid entry of main's list for that row, is not in main's
+        consumed.json nor in a fragment of main, and the judged leg no longer collects it; |value| is at most the sum of the `count` of the
+        consumed entries for that row, and only for a nodeid whose file the row of main lists. A retirement is consumed once, by name; a declared
+        nodeid that the judged leg still collects is red, and so is any test that goes without an entry.
         What the file of main is can be said only by the gate, which checks main out (a failed download is not
         "main has no list"): the file exists -> it is compared; it does not exist and the gate passed
         --main-has-no-list (main was checked out and has no such file) -> passed, declared; it does not exist
         without --main-has-no-list -> RED, "it is not known what main has".
+        The same for main's folder of fragments: the caller passes --main-has-no-fragments only when git says the ref main's list was read from
+        (e.g. the previous wrapper release, for the core's proof on a tag) has no ci/required-suites.d; main is then its base list, with no
+        fragment and nothing consumed, and the run says so. The flag while the folder exists is red; no flag and no folder is red too.
         The commit is --commit SHA or `git rev-parse HEAD` in the current directory (the checkout of the wrapper),
         NEVER GITHUB_SHA (in a called workflow it is the commit of the engine's repository). --seal reads the seal of
         the gate: the seal that `python -m invisible_core seal` writes, and the release seal, carry NO sha256 of the
@@ -44,6 +51,18 @@ pytest wrote and fails on every one of them.
         Exit 1, one problem per line, when: a (suite, os) of the list has no result; a result is not green; a result
         is of a (suite, os) that is not in the list, or twice; the commit is not the same in every result, or the
         binary sha256 is not the same in every result of one OS (or missing).
+
+    ci_verdict.py fragment --required ci/required-suites.json --name <slug> --set ROW=N [--set ROW=N ...] [--consumes NODEID ...]
+                           [--main-ref origin/main]
+        writes ci/required-suites.d/<slug>.json ({row id: N}, plus `consumes` when given) and prints its path. If the name already exists in
+        the working tree or on the main ref (`git ls-tree`), it takes -2, -3, ...; it NEVER edits an existing fragment.
+
+THE FLOOR IS A SUM OF PARTS. The effective `min_tests` of a row is the `min_tests` of `ci/required-suites.json` plus the sum of the values of the
+fragments in the folder `required-suites.d` next to the list (one loader, `effective_rows`; `args`, `judge` and `complete` read effective rows). The
+folder always exists: it holds `consumed.json` (a JSON list of the retired nodeids already consumed) and one file `<slug>.json` per change
+(the name starts with a lower-case letter or a digit, then only a-z 0-9 . _ -, and ends in .json; consumed.json is not a fragment), whose content is {"<row id>": integer, ..., optional "consumes": [nodeid, ...]}. A value is an
+integer other than 0; a negative one is allowed only with `consumes`. A missing folder, a bad name, an unknown row id, a value that is not an
+integer, 0, or a negative value without `consumes` is a malformed list (exit 2, with the reason).
 
 The list is validated by all three commands (a malformed one is exit 2, with the reason, never green): ids unique; per
 row `os` a non-empty subset of {linux, windows}, `tests` a non-empty list of unique strings, `min_tests` an integer > 0,
@@ -85,6 +104,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -221,12 +241,153 @@ def _read_json_list(path):
         raise Usage("cannot read the required list %s: %s" % (path, exc))
 
 
-def load_required(path):
-    data = _read_json_list(path)
-    problems = validate_list(data)
+# ------------------------------------------------------------------------------------------------ the fragments
+FRAGMENTS_DIR = "required-suites.d"
+CONSUMED_NAME = "consumed.json"
+CONSUMES = "consumes"
+FRAGMENT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*\.json$")
+
+
+class Required:
+    """A required list read with its fragments. `rows` are the EFFECTIVE rows (`min_tests` = the base + the sum of the fragments), `base` the
+    rows as the list has them, `fragments` {slug: {"values": {row id: int}, "consumes": [nodeid]}}, `consumed` the list of consumed.json."""
+
+    def __init__(self, base, rows, fragments, consumed):
+        self.base, self.rows, self.fragments, self.consumed = base, rows, fragments, consumed
+
+
+def fragments_dir(required_path):
+    """The folder of the fragments of a list: `required-suites.d` next to it."""
+    return Path(required_path).with_name(FRAGMENTS_DIR)
+
+
+def _read_fragments(folder, row_ids):
+    """-> (fragments, consumed, problems) of the folder. Every reason it is malformed is in `problems`."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return {}, [], ["the folder %s does not exist (it always holds %s)" % (folder, CONSUMED_NAME)]
+    problems, fragments, consumed = [], {}, []
+    names = sorted(os.listdir(folder))
+    if CONSUMED_NAME not in names:
+        problems.append("%s has no %s" % (folder, CONSUMED_NAME))
+    for name in names:
+        path = folder / name
+        if name == CONSUMED_NAME:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                problems.append("%s cannot be read: %s" % (path, exc))
+                continue
+            if not (isinstance(data, list) and all(isinstance(n, str) and n.strip() for n in data) and len(set(data)) == len(data)):
+                problems.append("%s must be a list of distinct non-empty nodeids" % path)
+            else:
+                consumed = data
+            continue
+        if not path.is_file() or not FRAGMENT_NAME.match(name):
+            problems.append("%s: the name of a fragment is <slug>.json (lower-case letters, digits, '.', '_' and '-', starting with a letter or "
+                            "a digit), and %s is not a fragment" % (path, CONSUMED_NAME))
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            problems.append("%s cannot be read: %s" % (path, exc))
+            continue
+        fragment, bad = _parse_fragment(data, row_ids)
+        problems += ["fragment %s: %s" % (name, why) for why in bad]
+        if not bad:
+            fragments[name[:-len(".json")]] = fragment
+    return fragments, consumed, problems
+
+
+def _parse_fragment(data, row_ids):
+    if not isinstance(data, dict):
+        return None, ["a fragment is a JSON object {row id: integer}"]
+    problems, values, consumes = [], {}, []
+    for key, value in data.items():
+        if key == CONSUMES:
+            if not (isinstance(value, list) and all(isinstance(n, str) and n.strip() for n in value) and len(set(value)) == len(value)):
+                problems.append("%s must be a list of distinct non-empty nodeids, not %r" % (CONSUMES, value))
+            else:
+                consumes = list(value)
+        elif key not in row_ids:
+            problems.append("%r is not a row of the list" % key)
+        elif not _is_int(value):
+            problems.append("the value of %s must be an integer, not %r" % (key, value))
+        elif value == 0:
+            problems.append("the value of %s is 0: a fragment that changes nothing" % key)
+        else:
+            values[key] = value
+    if not values and not problems:
+        problems.append("no row: a fragment names at least one row")
+    for key, value in sorted(values.items()):
+        if value < 0 and not consumes:
+            problems.append("the value of %s is negative (%d) and the fragment has no `%s`: a test leaves a row only by a retirement it consumes"
+                            % (key, value, CONSUMES))
+    return {"values": values, "consumes": consumes}, problems
+
+
+def _effective(base, fragments):
+    rows = []
+    for row in base:
+        if isinstance(row, dict):
+            row = dict(row)
+            row["min_tests"] = _int(row.get("min_tests")) + sum(f["values"].get(row.get("id"), 0) for f in fragments.values())
+        rows.append(row)
+    return rows
+
+
+def _bad_list(head, reasons):
+    """A BadList whose message is `head` and then one reason per line."""
+    return BadList(head + "".join("\n  " + reason for reason in reasons))
+
+
+def read_required(path):
+    """The list and its fragments, strictly: a list or a folder that is malformed is a BadList (exit 2), naming every reason."""
+    base = _read_json_list(path)
+    problems = validate_list(base)
     if problems:
-        raise BadList("the required list %s is malformed:\n  %s" % (path, "\n  ".join(problems)))
-    return data
+        raise _bad_list("the required list %s is malformed:" % path, problems)
+    fragments, consumed, bad = _read_fragments(fragments_dir(path), {r["id"] for r in base})
+    if bad:
+        raise _bad_list("the fragments of the required list %s are malformed:" % path, bad)
+    rows = _effective(base, fragments)
+    low = ["%s: the effective min_tests is %d (> 0 needed)" % (r["id"], r["min_tests"]) for r in rows if r["min_tests"] <= 0]
+    if low:
+        raise _bad_list("the fragments of the required list %s leave a row with no test:" % path, low)
+    return Required(base, rows, fragments, consumed)
+
+
+def effective_rows(required_path):
+    """THE loader: the rows of the list with `min_tests` = the base + the sum of the fragments of the folder next to it."""
+    return read_required(required_path).rows
+
+
+def read_main_required(path, no_fragments=False):
+    """The list of main and its fragments, leniently (main may be older than the format): -> (Required or None, problems). Main's list without
+    its folder is a problem ("main's fragments are not known"), never an empty folder. `no_fragments` is the declaration of the caller that git
+    says the ref the list was read from has no folder (a release older than the format): main's rows are then its base rows, no fragment, nothing
+    consumed. The declaration while the folder is there is a problem."""
+    base = _read_json_list(path)
+    if not isinstance(base, list):
+        return None, ["the list of main is not a JSON list: it cannot be compared"]
+    folder = fragments_dir(path)
+    if no_fragments:
+        if folder.exists():
+            return None, ["the folder %s of main exists, but --main-has-no-fragments says the ref of main has none" % folder]
+        print("NOTE: --main-has-no-fragments: the ref main's list was read from has no %s; main is compared on its base list, with no fragment "
+              "and nothing consumed" % FRAGMENTS_DIR)
+        return Required(base, _effective(base, {}), {}, []), []
+    if not folder.is_dir():
+        return None, ["main's fragments are not known: the list of main %s has no folder %s next to it" % (path, FRAGMENTS_DIR)]
+    ids = {r.get("id") for r in base if isinstance(r, dict)}
+    fragments, consumed, bad = _read_fragments(folder, ids)
+    if bad:
+        return None, ["main's fragments are not readable: %s" % "; ".join(bad)]
+    return Required(base, _effective(base, fragments), fragments, consumed), []
+
+
+def load_required(path):
+    return effective_rows(path)
 
 
 def find_suite(suites, suite_id, os_name):
@@ -341,8 +502,8 @@ RETIRED_NAME = "retired-tests.json"
 def validate_retired(data, suite_ids=None):
     """-> the reasons why `data` is not a well-formed list of retired tests (empty if it is). Two kinds of entry, in one list:
     a FILE that is gone ({file, reason, date, tests: {row id: number of tests the file had in that row on main, counted with the row's marker}}), and
-    a single TEST whose file stays ({nodeid: "<file>::<test>", suite: row id, count > 0, reason, decided_by, date, from_min_tests: the minimum of
-    the row on main when the entry was written, an integer >= count, the same for every entry of a suite}). `suite_ids`, when given, are the row
+    a single TEST whose file stays ({nodeid: "<file>::<test>", suite: row id, count > 0, reason, decided_by, date; optional and ignored, from_min_tests: the minimum of
+    the row on main when the entry was written, an integer >= count, the same for every entry of a suite that has one}). `suite_ids`, when given, are the row
     ids of main's list: the suite of a nodeid entry must be one of them."""
     if not isinstance(data, list):
         return ["the retired list must be a JSON list"]
@@ -400,9 +561,10 @@ def _validate_retired_node(e, where, suite_ids, seen):
     for key in ("reason", "decided_by", "date"):
         if not isinstance(e.get(key), str) or not e.get(key).strip():
             problems.append("%s: %s must be a non-empty string" % (where, key))
-    frm = e.get("from_min_tests")
-    if not _is_int(frm) or frm < 1 or (_is_int(e.get("count")) and frm < e["count"]):
-        problems.append("%s: from_min_tests must be an integer >= count (the minimum of the suite on main when the entry was written)" % where)
+    if "from_min_tests" in e:  # optional and ignored: the retirement is consumed by name now (see against_main); an old entry keeps it
+        frm = e["from_min_tests"]
+        if not _is_int(frm) or frm < 1 or (_is_int(e.get("count")) and frm < e["count"]):
+            problems.append("%s: from_min_tests must be an integer >= count (the minimum of the suite on main when the entry was written)" % where)
     return problems
 
 
@@ -427,48 +589,102 @@ def retired_of_main(main_required):
     return data, []
 
 
-def _retired_tests_of(row, retired, collected, judged):
-    """-> (the number of tests the row may lose because main retired them one by one, problems). An entry counts only if the file of its nodeid is
-    in the row of main (a nodeid that the row does not run is not a test the row loses). The judge has the junit of the leg it judges and only
-    counts of main, so a declared nodeid that the judged leg still collects is red (and counts for nothing), and the nodeid of another row is taken
-    on its count, the leg of that row checking it. An entry counts only while the minimum of the row on main is still its `from_min_tests`: once
-    the removal is on main the floor is lower and the entry is inert (it allows nothing and asks nothing)."""
-    allowed, problems = 0, []
-    listed = row.get("tests", [])
-    for e in retired:
-        if not (isinstance(e, dict) and isinstance(e.get("nodeid"), str) and e.get("suite") == row.get("id")):
-            continue
-        nid = e["nodeid"]
-        if _int(row.get("min_tests")) != e.get("from_min_tests"):
-            continue
-        if nid not in listed and nid.split("::", 1)[0] not in listed:
-            continue
-        if collected is not None and judged == row.get("id") and any(n == nid or _base(n) == nid for n in collected):
-            problems.append("the test %s is declared retired for %s, but the suite still collects it: it did not leave" % (nid, row.get("id")))
-            continue
-        allowed += _int(e.get("count"))
+def _retirement_allowance(current, main, retired, collected, judged):
+    """-> ({row id: how many tests the rows may lose by single-test retirements}, problems). Only the fragments the branch ADDS count (a fragment of
+    main is already in main's effective rows). A fragment may carry a negative value for a row only with `consumes`, and only if: each consumed nodeid
+    is a nodeid entry of main's retired-tests.json for one of its negative rows; it is not in main's consumed.json nor in a fragment of main (a
+    retirement is used once, whatever merges in between), nor in another fragment of the branch; the judged leg no longer collects it; and |value|
+    is at most the sum of the `count` of the consumed entries of that row whose file or node id the row of main lists."""
+    allowed, problems = {}, []
+    entries = [e for e in retired if isinstance(e, dict) and isinstance(e.get("nodeid"), str) and isinstance(e.get("suite"), str)]
+    taken = {n: "main's %s" % CONSUMED_NAME for n in main.consumed}
+    for name, frag in main.fragments.items():
+        for n in frag["consumes"]:
+            taken.setdefault(n, "the fragment %s of main" % name)
+    main_rows = {r.get("id"): r for r in main.base if isinstance(r, dict)}
+    for name in sorted(set(current.fragments) - set(main.fragments)):
+        frag = current.fragments[name]
+        negative = {row: v for row, v in frag["values"].items() if v < 0}
+        usable = {row: 0 for row in negative}
+        for nid in frag["consumes"]:
+            if nid in taken:
+                problems.append("the fragment %s consumes the retirement of %s, which %s has already consumed: a retirement is used once"
+                                % (name, nid, taken[nid]))
+                continue
+            taken[nid] = "the fragment %s" % name
+            mine = [e for e in entries if e["nodeid"] == nid and e["suite"] in negative]
+            if not mine:
+                problems.append("the fragment %s consumes %s, which is not a retired test of main's %s for any row it lowers (%s)"
+                                % (name, nid, RETIRED_NAME, ", ".join(sorted(negative)) or "none"))
+            for e in mine:
+                row = main_rows.get(e["suite"])
+                listed = row.get("tests", []) if isinstance(row, dict) else []
+                if nid not in listed and nid.split("::", 1)[0] not in listed:
+                    continue  # a nodeid the row of main does not run is not a test the row loses
+                if collected is not None and judged == e["suite"] and any(n == nid or _base(n) == nid for n in collected):
+                    problems.append("the test %s is declared retired for %s, but the suite still collects it: it did not leave" % (nid, e["suite"]))
+                    continue
+                usable[e["suite"]] += _int(e.get("count"))
+        for row, value in sorted(negative.items()):
+            if -value > usable[row]:
+                problems.append("the fragment %s lowers %s by %d, but the retired tests it consumes account for %d of it"
+                                % (name, row, -value, usable[row]))
+            else:
+                allowed[row] = allowed.get(row, 0) - value
     return allowed, problems
 
 
+def _fold_problems(current, main, removed):
+    """The only way a fragment of main leaves: the fold. Every effective row is identical to main's, consumed.json gains exactly the `consumes` of the
+    removed fragments, and the branch has no fragment that main lacks."""
+    problems = []
+    cur = {r.get("id"): r for r in current.rows if isinstance(r, dict)}
+    old = {r.get("id"): r for r in main.rows if isinstance(r, dict)}
+    for sid in sorted(set(cur) | set(old), key=str):
+        if cur.get(sid) != old.get(sid):
+            problems.append("fragments of main were removed outside a fold: the effective row %s is not the one of main (%s on main, %s here)"
+                            % (sid, old[sid].get("min_tests") if sid in old else "absent", cur[sid].get("min_tests") if sid in cur else "absent"))
+    expected = set(main.consumed) | {n for name in removed for n in main.fragments[name]["consumes"]}
+    if set(current.consumed) != expected:
+        problems.append("a fold moves the `%s` of the removed fragments into %s and nothing else: expected %d nodeid(s), found %d (missing: %s; extra: %s)"
+                        % (CONSUMES, CONSUMED_NAME, len(expected), len(current.consumed), ", ".join(sorted(expected - set(current.consumed))) or "none",
+                           ", ".join(sorted(set(current.consumed) - expected)) or "none"))
+    added = sorted(set(current.fragments) - set(main.fragments))
+    if added:
+        problems.append("a fold carries no new fragment, and the branch adds: %s" % ", ".join(added))
+    return problems
+
+
 def against_main(current, main, retired=(), exists=os.path.exists, collected=None, judged=None):
-    """The list only grows: every suite of main is still here, with no lower minimum, no exact turned off, no lost
-    test or OS and the same marker. `main` is read leniently (it may be older than the current format).
+    """The list only grows, on EFFECTIVE rows (the base + the fragments) on both sides: every suite of main is still here, with no lower minimum, no
+    exact turned off, no lost test or OS and the same marker. `current` and `main` are `Required`; main is read leniently (it may be older than the
+    current format).
+
+    A fragment of main is never edited. It may leave (be missing here) only in a fold (`_fold_problems`); outside a fold consumed.json is main's.
 
     The one way a test leaves a row is `retired` (the list of MAIN, never of the branch): a file that main retired and that no longer exists
     (`exists`, in the checkout judged) is not a lost test, and the minimum of the row may go down by exactly the tests main counted for that file
     in that row (``tests[row id]``), and by no more. A retired file that is still on disk is not excused: it must stay in its rows.
 
-    The other way is a single retired test (``nodeid``, ``suite``, ``count``) whose file stays in the row: the minimum of the suite may go down by
-    the ``count`` of its entries, and by no more. ``collected`` (the node ids of the junit of the judged leg) and ``judged`` (that leg's suite) let
+    The other way is a single retired test (``nodeid``, ``suite``, ``count``) whose file stays in the row, consumed by a fragment of the branch with a
+    negative value (`_retirement_allowance`). ``collected`` (the node ids of the junit of the judged leg) and ``judged`` (that leg's suite) let
     the judge see that a declared nodeid is gone from the leg; of the collection of main it has only the count."""
     problems = []
-    if not isinstance(main, list):
-        return ["the list of main is not a JSON list: it cannot be compared"]
     retired = list(retired)
+    changed = sorted(n for n in main.fragments if n in current.fragments and current.fragments[n] != main.fragments[n])
+    removed = sorted(n for n in main.fragments if n not in current.fragments)
+    for name in changed:
+        problems.append("the fragment %s of main was changed here: a fragment is never edited" % name)
+    if removed:
+        problems += _fold_problems(current, main, removed)
+    elif set(current.consumed) != set(main.consumed):
+        problems.append("%s differs from main's outside a fold (a retirement is consumed by a fragment, and only a fold moves it)" % CONSUMED_NAME)
     gone = {e["file"]: e["tests"] for e in retired if isinstance(e, dict) and isinstance(e.get("file"), str)
             and isinstance(e.get("tests"), dict) and not exists(e["file"])}
-    by_id = {s.get("id"): s for s in current if isinstance(s, dict)}
-    for old in main:
+    by_test, why = _retirement_allowance(current, main, retired, collected, judged)
+    problems += why
+    by_id = {s.get("id"): s for s in current.rows if isinstance(s, dict)}
+    for old in main.rows:
         if not isinstance(old, dict):
             continue
         sid = old.get("id")
@@ -479,10 +695,7 @@ def against_main(current, main, retired=(), exists=os.path.exists, collected=Non
         lost = [t for t in old.get("tests", []) if t not in new.get("tests", [])]
         excused = [t for t in lost if t in gone]
         lost = [t for t in lost if t not in gone]
-        allowed = sum(_int(gone[t].get(sid)) for t in excused)
-        by_test, why = _retired_tests_of(old, retired, collected, judged)
-        allowed += by_test
-        problems += why
+        allowed = sum(_int(gone[t].get(sid)) for t in excused) + by_test.get(sid, 0)
         if _int(new.get("min_tests")) < _int(old.get("min_tests")) - allowed:
             problems.append("the minimum of %s went down: %s on main, %s here%s"
                             % (sid, old.get("min_tests"), new.get("min_tests"),
@@ -565,7 +778,8 @@ def cmd_judge(ns):
               "problems": problems}
     code_on_red = 1
     try:
-        suites = load_required(ns.required)
+        required = read_required(ns.required)
+        suites = required.rows
         row = find_suite(suites, ns.suite, ns.os)
     except BadList as exc:
         problems.append(str(exc))
@@ -609,8 +823,8 @@ def cmd_judge(ns):
     if collected < minimum:
         problems.append("collected %d test(s), fewer than the minimum %s" % (collected, minimum))
     elif row.get("exact") and collected != minimum:
-        problems.append("collected %d test(s), but the suite is exact: %s, not more (a test was added: raise min_tests "
-                        "by hand)" % (collected, minimum))
+        problems.append("collected %d test(s), but the suite is exact: %s, not more (a test was added: add a fragment, "
+                        "`ci_verdict.py fragment --name <slug> --set %s=N`)" % (collected, minimum, ns.suite))
     missing = []
     for entry in row.get("tests", []):
         why = required_status(entry, cases)
@@ -618,6 +832,8 @@ def cmd_judge(ns):
             missing.append(entry)
             problems.append(why)
 
+    if ns.main_has_no_fragments and not ns.main_required:
+        problems.append("--main-has-no-fragments without --main-required: it says nothing")
     if ns.main_has_no_list and not ns.main_required:
         problems.append("--main-has-no-list without --main-required: it says nothing")
     elif ns.main_required:
@@ -628,8 +844,10 @@ def cmd_judge(ns):
             try:
                 retired, retired_problems = retired_of_main(ns.main_required)
                 problems += retired_problems
-                problems += against_main(suites, _read_json_list(ns.main_required), retired,
-                                         collected={n for n, _o in cases}, judged=ns.suite)
+                main_required, main_problems = read_main_required(ns.main_required, ns.main_has_no_fragments)
+                problems += main_problems
+                if main_required is not None:
+                    problems += against_main(required, main_required, retired, collected={n for n, _o in cases}, judged=ns.suite)
             except Usage as exc:
                 problems.append(str(exc))
         elif ns.main_has_no_list:
@@ -656,6 +874,64 @@ def _finish(ns, result, code_on_red):
             print("VERDICT RED %s/%s: %s" % (ns.suite, ns.os, p))
         return code_on_red
     print("VERDICT GREEN %s/%s: %d collected, %d passed" % (ns.suite, ns.os, result["collected"], result["passed"]))
+    return 0
+
+
+def _names_on_ref(folder, ref):
+    """-> the file names of `folder` on the git ref `ref` (empty when the folder is not there on that ref). A ref git cannot read is a usage error:
+    a name that main may already have must never be guessed."""
+    try:
+        done = subprocess.run(["git", "-C", str(folder.parent), "ls-tree", "--name-only", ref, "--", folder.name + "/"],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Usage("cannot ask git for %s: %s" % (ref, exc))
+    if done.returncode != 0:
+        raise Usage("git cannot list %s/ on %s (%s): fetch it, or name another ref with --main-ref"
+                    % (folder.name, ref, done.stderr.strip() or "exit %d" % done.returncode))
+    return {Path(line.strip()).name for line in done.stdout.splitlines() if line.strip()}
+
+
+def cmd_fragment(ns):
+    """Write the fragment of this change: a NEW file, never an edit of one that exists (here or on main)."""
+    slug = ns.name
+    if not re.match(r"^[a-z0-9][a-z0-9._-]*$", slug or "") or (slug + ".json") == CONSUMED_NAME:
+        raise Usage("--name %r is not a slug: lower-case letters, digits, '.', '_' and '-', starting with a letter or a digit (and not 'consumed')" % slug)
+    base = _read_json_list(ns.required)
+    problems = validate_list(base)
+    if problems:
+        raise _bad_list("the required list %s is malformed:" % ns.required, problems)
+    folder = fragments_dir(ns.required)
+    if not folder.is_dir():
+        raise Usage("the folder %s does not exist" % folder)
+    ids = {row["id"] for row in base}
+    content = {}
+    for item in ns.set or []:
+        row, _eq, number = item.rpartition("=")
+        if not _eq or row not in ids:
+            raise Usage("--set %r is not ROW=N with a row of the list" % item)
+        try:
+            value = int(number)
+        except ValueError:
+            raise Usage("--set %r: N must be an integer" % item)
+        if row in content:
+            raise Usage("--set names %s twice" % row)
+        content[row] = value
+    consumes = list(ns.consumes or [])
+    fragment, bad = _parse_fragment(dict(content, **({CONSUMES: consumes} if consumes else {})), ids)
+    if bad:
+        raise Usage("the fragment would be malformed: %s" % "; ".join(bad))
+    taken = {name for name in os.listdir(folder)} | _names_on_ref(folder, ns.main_ref)
+    name, n = slug, 1
+    while name + ".json" in taken:
+        n += 1
+        name = "%s-%d" % (slug, n)
+    path = folder / (name + ".json")
+    out = dict(content)
+    if consumes:
+        out[CONSUMES] = consumes
+    with open(path, "xb") as fh:  # "x": never over a file that is there
+        fh.write((json.dumps(out, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
+    print(path)
     return 0
 
 
@@ -738,15 +1014,26 @@ def main(argv=None):
     j.add_argument("--main-required")
     j.add_argument("--main-has-no-list", action="store_true",
                    help="the gate checked main out and the list is not there (a failed checkout is not this)")
+    j.add_argument("--main-has-no-fragments", action="store_true",
+                   help="git says the ref main's list was read from has no ci/required-suites.d (a release older than the fragments): "
+                        "main is compared on its base list. Red while the folder is there; without it and without the folder: red")
     c = sub.add_parser("complete", help="check that every (suite, os) reported green at one commit")
     c.add_argument("--required", required=True)
     c.add_argument("--results", required=True)
+    f = sub.add_parser("fragment", help="write the fragment of a change (a new file in required-suites.d)")
+    f.add_argument("--required", required=True)
+    f.add_argument("--name", required=True, help="the slug of the branch; -2, -3, ... is added if the name exists here or on main")
+    f.add_argument("--set", action="append", metavar="ROW=N", help="the tests this change adds (N > 0) to a row; repeat for more rows")
+    f.add_argument("--consumes", action="append", metavar="NODEID", help="the retired test a negative N consumes; repeat")
+    f.add_argument("--main-ref", default="origin/main", help="the ref whose fragments the name must not collide with (default origin/main)")
     ns = ap.parse_args(argv)
     try:
         if ns.cmd == "judge":
             if not ns.binary:
                 raise Usage("judge needs --binary (the engine the suite ran against: its hash goes in the result)")
             return cmd_judge(ns)
+        if ns.cmd == "fragment":
+            return cmd_fragment(ns)
         if ns.cmd == "complete":
             return cmd_complete(ns)
         return cmd_args(ns)

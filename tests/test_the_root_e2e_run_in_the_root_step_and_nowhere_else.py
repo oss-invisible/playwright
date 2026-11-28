@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,9 @@ import pytest
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import ci_verdict  # noqa: E402  (the loader of the rows: min_tests is the list plus its fragments)
+
 WORKFLOW = ROOT / ".github" / "workflows" / "e2e.yml"
 SUITE = "wrapper.e2e.udp.exit"
 #: The job of the Linux parts and the prefix of the rows its matrix runs, one per part.
@@ -38,7 +42,7 @@ ROW_ARGS = 'python scripts/ci_verdict.py args --required ci/required-suites.json
 
 
 def _suite(name: str = SUITE) -> dict:
-    return next(s for s in json.loads((ROOT / "ci" / "required-suites.json").read_text(encoding="utf-8")) if s["id"] == name)
+    return next(s for s in ci_verdict.effective_rows(ROOT / "ci" / "required-suites.json") if s["id"] == name)
 
 
 def _rows() -> dict:
