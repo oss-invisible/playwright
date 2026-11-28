@@ -1295,3 +1295,35 @@ def test_every_retired_test_that_is_gone_from_its_file_is_consumed_or_in_a_fragm
         if not _defines(ROOT / file, test.split("[", 1)[0].split("::")[-1]) and entry["nodeid"] not in used:
             unconsumed.append(entry["nodeid"])
     assert not unconsumed, "retired and gone, but not consumed: %s" % sorted(set(unconsumed))
+
+
+def _main_list_only(tmp_path, rows):
+    """main's list with NO folder next to it (a release older than the fragments)."""
+    folder = tmp_path / "mainside"
+    folder.mkdir()
+    (folder / "main.json").write_text(json.dumps(rows), encoding="utf-8")
+    return str(folder / "main.json")
+
+
+def test_a_main_with_no_fragments_declared_is_compared_on_its_base_list_and_the_run_says_so(tmp_path, capsys):
+    main = _main_list_only(tmp_path, [_suite(min_tests=3, tests=[FILE_A])])
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", main, "--main-has-no-fragments"])
+    out = capsys.readouterr().out
+    assert code == 0 and "--main-has-no-fragments" in out and "compared on its base list" in out
+    # compared for real: a base list that lost a suite of main is red
+    sub = tmp_path / "lost"
+    sub.mkdir()
+    main = _main_list_only(sub, [_suite(), _suite(id="s.gone")])
+    code, _r = _judge(sub, GREEN, extra=["--main-required", main, "--main-has-no-fragments"])
+    assert code == 1 and "s.gone" in capsys.readouterr().out
+
+
+def test_the_declaration_that_main_has_no_fragments_while_its_folder_exists_is_red(tmp_path, capsys):
+    main = _main_file(tmp_path, [_suite()])
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", str(main), "--main-has-no-fragments"])
+    assert code == 1 and "says the ref of main has none" in capsys.readouterr().out
+
+
+def test_main_s_list_without_its_folder_and_without_the_declaration_stays_red(tmp_path, capsys):
+    code, _r = _judge(tmp_path, GREEN, extra=["--main-required", _main_list_only(tmp_path, [_suite()])])
+    assert code == 1 and "main's fragments are not known" in capsys.readouterr().out

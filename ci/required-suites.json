@@ -335,7 +335,7 @@
   "os": [
    "linux"
   ],
-  "min_tests": 4069,
+  "min_tests": 4072,
   "exact": true,
   "tests": [
    "tests/test_a_162_message_is_read_like_a_161_one.py",
@@ -606,7 +606,7 @@
   "os": [
    "windows"
   ],
-  "min_tests": 4073,
+  "min_tests": 4076,
   "exact": true,
   "tests": [
    "tests/test_a_162_message_is_read_like_a_161_one.py",

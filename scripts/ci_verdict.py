@@ -37,6 +37,9 @@ pytest wrote and fails on every one of them.
         "main has no list"): the file exists -> it is compared; it does not exist and the gate passed
         --main-has-no-list (main was checked out and has no such file) -> passed, declared; it does not exist
         without --main-has-no-list -> RED, "it is not known what main has".
+        The same for main's folder of fragments: the caller passes --main-has-no-fragments only when git says the ref main's list was read from
+        (e.g. the previous wrapper release, for the core's proof on a tag) has no ci/required-suites.d; main is then its base list, with no
+        fragment and nothing consumed, and the run says so. The flag while the folder exists is red; no flag and no folder is red too.
         The commit is --commit SHA or `git rev-parse HEAD` in the current directory (the checkout of the wrapper),
         NEVER GITHUB_SHA (in a called workflow it is the commit of the engine's repository). --seal reads the seal of
         the gate: the seal that `python -m invisible_core seal` writes, and the release seal, carry NO sha256 of the
@@ -359,13 +362,21 @@ def effective_rows(required_path):
     return read_required(required_path).rows
 
 
-def read_main_required(path):
+def read_main_required(path, no_fragments=False):
     """The list of main and its fragments, leniently (main may be older than the format): -> (Required or None, problems). Main's list without
-    its folder is a problem ("main's fragments are not known"), never an empty folder."""
+    its folder is a problem ("main's fragments are not known"), never an empty folder. `no_fragments` is the declaration of the caller that git
+    says the ref the list was read from has no folder (a release older than the format): main's rows are then its base rows, no fragment, nothing
+    consumed. The declaration while the folder is there is a problem."""
     base = _read_json_list(path)
     if not isinstance(base, list):
         return None, ["the list of main is not a JSON list: it cannot be compared"]
     folder = fragments_dir(path)
+    if no_fragments:
+        if folder.exists():
+            return None, ["the folder %s of main exists, but --main-has-no-fragments says the ref of main has none" % folder]
+        print("NOTE: --main-has-no-fragments: the ref main's list was read from has no %s; main is compared on its base list, with no fragment "
+              "and nothing consumed" % FRAGMENTS_DIR)
+        return Required(base, _effective(base, {}), {}, []), []
     if not folder.is_dir():
         return None, ["main's fragments are not known: the list of main %s has no folder %s next to it" % (path, FRAGMENTS_DIR)]
     ids = {r.get("id") for r in base if isinstance(r, dict)}
@@ -821,6 +832,8 @@ def cmd_judge(ns):
             missing.append(entry)
             problems.append(why)
 
+    if ns.main_has_no_fragments and not ns.main_required:
+        problems.append("--main-has-no-fragments without --main-required: it says nothing")
     if ns.main_has_no_list and not ns.main_required:
         problems.append("--main-has-no-list without --main-required: it says nothing")
     elif ns.main_required:
@@ -831,7 +844,7 @@ def cmd_judge(ns):
             try:
                 retired, retired_problems = retired_of_main(ns.main_required)
                 problems += retired_problems
-                main_required, main_problems = read_main_required(ns.main_required)
+                main_required, main_problems = read_main_required(ns.main_required, ns.main_has_no_fragments)
                 problems += main_problems
                 if main_required is not None:
                     problems += against_main(required, main_required, retired, collected={n for n, _o in cases}, judged=ns.suite)
@@ -1001,6 +1014,9 @@ def main(argv=None):
     j.add_argument("--main-required")
     j.add_argument("--main-has-no-list", action="store_true",
                    help="the gate checked main out and the list is not there (a failed checkout is not this)")
+    j.add_argument("--main-has-no-fragments", action="store_true",
+                   help="git says the ref main's list was read from has no ci/required-suites.d (a release older than the fragments): "
+                        "main is compared on its base list. Red while the folder is there; without it and without the folder: red")
     c = sub.add_parser("complete", help="check that every (suite, os) reported green at one commit")
     c.add_argument("--required", required=True)
     c.add_argument("--results", required=True)
