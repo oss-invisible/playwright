@@ -28,3 +28,9 @@ ci/py-lock/** text eol=lf
 # The vendored bundles are third-party bytes whose sha256 is pinned in tests/vendor/README.md: no checkout converts their line endings
 # (a Windows runner with core.autocrlf=true would hand them over with CRLF and the hash would no longer match).
 tests/vendor/*.js -text
+
+# The list of required suites and its fragments are compared as the exact dump of their content
+# (one value per line, LF): a Windows checkout with core.autocrlf=true would hand the judge
+# and the tests CRLF text that is not that dump.
+ci/required-suites.json text eol=lf
+ci/required-suites.d/*.json text eol=lf
