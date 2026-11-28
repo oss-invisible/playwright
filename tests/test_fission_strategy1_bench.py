@@ -45,6 +45,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from _bfcache_evidence import (Evidence, frame_evidence_lines, read_after_go_back, record_protocol_events,
+                               summarize_events, write_evidence)
 from _processes import LOG_ENV, NAMED_BY_SITE, remote_types, site_processes_below
 from _servers import LocalServer
 
@@ -457,16 +459,46 @@ def test_content_frame_of_an_iframe_nested_too_deep_is_none(page, cross_site_loo
         owner.dispose()
 
 
+@pytest.fixture
+def protocol_events(monkeypatch):
+    """Every protocol event the client receives, as `(method, params)` (the evidence of a go_back reads it)."""
+    return record_protocol_events(monkeypatch)
+
+
 @pytest.mark.e2e
-def test_oop_frame_comes_out_of_the_back_forward_cache_with_the_top(page, cross_site_loop):
+def test_oop_frame_comes_out_of_the_back_forward_cache_with_the_top(page, cross_site_loop, protocol_events):
     """What the engine does, not the product: the document of a frame in another process is shown again, persisted,
-    when the top comes back from the cache (step 8.3 relies on it)."""
+    when the top comes back from the cache (step 8.3 relies on it).
+
+    A red used to say only that the server heard `persisted: ['false']` reports. It now writes down first (stdout, and the assertion message):
+    what the top says after go_back, the protocol events since go_back (a restore is announced with a `nav-bfcache-` navigation id),
+    every `pageshow` the server heard and the frames the client lists, so that "the engine announced a restore and the frame did not see
+    it" and "Firefox built the top again" can be told apart."""
     page.goto(cross_site_loop["top_shown"], wait_until="load")
     assert wait_for(page, lambda: any(r["path"] == "/report/pageshow" for r in cross_site_loop["reports"]))
     page.goto(cross_site_loop["plain"], wait_until="load")
+    back = len(protocol_events)
     page.go_back(wait_until="load")
-    assert wait_for(page, lambda: any(r["path"] == "/report/pageshow" and r["query"]["persisted"] == ["true"] and
-                                      r["query"]["top"] == ["false"] for r in cross_site_loop["reports"])),         cross_site_loop["reports"]
+    shown_again = wait_for(page, lambda: any(r["path"] == "/report/pageshow" and r["query"]["persisted"] == ["true"] and
+                                             r["query"]["top"] == ["false"] for r in cross_site_loop["reports"]))
+    evidence = _evidence_after_go_back(page, protocol_events, back, cross_site_loop["reports"], shown_again)
+    assert shown_again, "%s\n%s" % (cross_site_loop["reports"], evidence)
+
+
+def _evidence_after_go_back(page, protocol_events, back, reports, shown_again):
+    """Write the evidence down (always, before the assertion) and return its text. The top of this page records no `__shown` (it is the
+    frame that reports), so the reading is `None` there: the events, the type of the navigation entry, the reports and the frames say the rest."""
+    try:
+        evidence = read_after_go_back(page, protocol_events, back)
+    except Exception as problem:     # the page may be gone or changing: that is what is being recorded
+        evidence = Evidence(shown="unreadable: %s: %s" % (type(problem).__name__, problem), navigation_type=None, ready_state=None,
+                            events=summarize_events(protocol_events, back))
+    try:
+        urls = [f.url for f in page.frames]
+    except Exception as problem:
+        urls = ["unreadable: %s: %s" % (type(problem).__name__, problem)]
+    return write_evidence(evidence, "frame pageshow persisted seen" if shown_again else "frame pageshow persisted NOT seen",
+                          frame_evidence_lines(reports, urls))
 
 
 @pytest.mark.e2e

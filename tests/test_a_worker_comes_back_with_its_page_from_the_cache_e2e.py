@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler
 
 import pytest
 
-from _bfcache_evidence import decide_outcome, read_after_go_back, wait_cacheable
+from _bfcache_evidence import decide_outcome, read_after_go_back, record_protocol_events, wait_cacheable
 from _evidence_on_failure import FailureEvidence
 from _servers import LocalServer
 
@@ -117,17 +117,7 @@ def sites():
 @pytest.fixture
 def events(monkeypatch):
     """Every protocol event the client receives, in order."""
-    from invisible_core.juggler.connection import EventListeners
-
-    seen = []
-    dispatch = EventListeners.dispatch_event
-
-    def record(self, method, params, session):
-        seen.append((method, params))
-        return dispatch(self, method, params, session)
-
-    monkeypatch.setattr(EventListeners, "dispatch_event", record)
-    return seen
+    return record_protocol_events(monkeypatch)
 
 
 def _commit_order_is_promised():

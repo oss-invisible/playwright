@@ -109,3 +109,37 @@ def test_the_commit_order_of_a_worker_is_asserted_only_on_an_engine_that_promise
     for tag, promised in (("firefox-62", False), ("firefox-63-candidate", True), ("firefox-64", True), ("local", False)):
         monkeypatch.setattr(seal, "active_seal", lambda tag=tag: types.SimpleNamespace(tag=tag))
         assert e2e._commit_order_is_promised() is promised, tag
+
+
+FRAME_REPORTS = [{"host": "b.test", "path": "/report/pageshow", "query": {"persisted": ["false"], "top": ["false"]}},
+                 {"host": "a.test", "path": "/report/loaded", "query": {}},
+                 {"host": "b.test", "path": "/report/pageshow", "query": {"persisted": ["false"], "top": ["false"]}}]
+
+
+def test_the_evidence_of_a_frame_is_written_without_asserting_anything_and_carries_the_reports_and_the_frames():
+    written = []
+    ev = bfc.read_after_go_back(_Page(None), LOADED_AGAIN, 0)           # the top of this page records no __shown
+    text = bfc.write_evidence(ev, "frame pageshow persisted NOT seen", bfc.frame_evidence_lines(FRAME_REPORTS, ["http://a.test:1/top-shown", "http://b.test:1/shown"]),
+                              written.append)
+    assert written == [text], "written once, and the text returned is the text written"
+    assert text.startswith(ev.text() + " => outcome: frame pageshow persisted NOT seen\n")
+    assert "__shown=None" in text and "the engine announced a restore: no" in text
+    assert "['b.test persisted=false top=false', 'b.test persisted=false top=false']" in text, "only the pageshow reports, in order"
+    assert "report/loaded" not in text and "['http://a.test:1/top-shown', 'http://b.test:1/shown']" in text
+
+
+def test_the_evidence_with_nothing_to_add_is_the_line_decide_outcome_always_wrote():
+    ev = bfc.read_after_go_back(_Page([False, True]), RESTORED, 0)
+    written = []
+    assert bfc.write_evidence(ev, write=written.append) == ev.text() == written[0]
+
+
+def test_the_frame_test_writes_its_evidence_before_it_asserts_and_keeps_its_verdict():
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent.parent / "test_fission_strategy1_bench.py").read_text("utf-8")
+    body = source[source.index("def test_oop_frame_comes_out_of_the_back_forward_cache_with_the_top"):source.index("def _evidence_after_go_back")]
+    assert body.index("_evidence_after_go_back(") < body.index("assert shown_again"), "the evidence is written before the assertion"
+    assert 'r["query"]["persisted"] == ["true"]' in body and 'r["query"]["top"] == ["false"]' in body, "the verdict is still the persisted frame pageshow"
+    assert body.index("back = len(protocol_events)") < body.index("page.go_back("), "the events are counted before go_back"
+    assert "@pytest.mark.e2e" in source and "sleep" not in body and "timeout" not in body

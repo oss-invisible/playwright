@@ -88,15 +88,52 @@ def read_after_go_back(page, events, start: int) -> Evidence:
     )
 
 
+def write_evidence(evidence: Evidence, outcome: str = "", extra=(), write: Callable[[str], None] = print) -> str:
+    """Write the evidence down (one call of ``write``, nothing asserted) and return the text written: the evidence line, `` => outcome: <outcome>``
+    when an outcome is given, then one line for each of ``extra`` (what only the caller knows, e.g. `frame_evidence_lines`)."""
+    text = evidence.text() + (" => outcome: " + outcome if outcome else "")
+    text += "".join("\n" + line for line in extra)
+    write(text)
+    return text
+
+
+def pageshow_reports(reports) -> List[str]:
+    """The `/report/pageshow` reports a test server received, in order, one short string each: ``host persisted=<..> top=<..>``."""
+    return ["%s persisted=%s top=%s" % (r.get("host"), ",".join(r["query"].get("persisted", ["?"])), ",".join(r["query"].get("top", ["?"])))
+            for r in reports if r.get("path") == "/report/pageshow"]
+
+
+def frame_evidence_lines(reports, frame_urls) -> List[str]:
+    """What is specific to a page with a frame of another process: every `pageshow` the server heard, and the frames the client lists."""
+    return ["[bfcache] pageshow reports of the server, in order: %r" % pageshow_reports(reports),
+            "[bfcache] frames the client lists: %r" % list(frame_urls)]
+
+
 def decide_outcome(evidence: Evidence, may_reload: bool, write: Callable[[str], None] = print) -> str:
     """Write the evidence down (always, first), then say what happened: ``"restored"``, or ``"reloaded"`` when the document was built again
     and ``may_reload`` (the case where Firefox may refuse the cache); anything else fails, naming why and carrying the evidence. A restore
     the engine announced that the page did not see fails even where a reload is accepted: that is a defect of ours, not of the cache."""
     outcome = "restored" if evidence.restored else (
         "reloaded" if may_reload and not evidence.engine_announced_a_restore else "failed")
-    write(evidence.text() + " => outcome: " + outcome)
+    write_evidence(evidence, outcome, write=write)
     assert outcome != "failed", "%s: %s" % (evidence.why_not(), evidence.text())
     return outcome
+
+
+def record_protocol_events(monkeypatch) -> list:
+    """Every protocol event the client receives, in order, as ``(method, params)`` (what `summarize_events` reads): the body of the `events`
+    fixture of the tests that take the evidence of a go_back."""
+    from invisible_core.juggler.connection import EventListeners
+
+    seen = []
+    dispatch = EventListeners.dispatch_event
+
+    def record(self, method, params, session):
+        seen.append((method, params))
+        return dispatch(self, method, params, session)
+
+    monkeypatch.setattr(EventListeners, "dispatch_event", record)
+    return seen
 
 
 def wait_cacheable(page, seconds: float = 10.0) -> None:
