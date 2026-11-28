@@ -1,1 +1,4 @@
-[]
+[
+ "tests/test_detectors_e2e.py::test_the_headless_detector_sees_no_headless_and_no_proxy_tell",
+ "tests/test_realness_behind_a_declared_exit_e2e.py::test_the_vendored_detection_page_finds_nothing_behind_the_gateway"
+]

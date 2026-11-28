@@ -1270,3 +1270,28 @@ def test_the_fragment_helper_refuses_what_the_loader_would_refuse(tmp_path, caps
     assert sorted(p.name for p in required.with_name("required-suites.d").iterdir()) == ["consumed.json"]
     assert verdict.main(base + ["--name", "x", "--set", "s.one=-1", "--consumes", GONE_NODE]) == 0
     assert json.loads(next(required.with_name("required-suites.d").glob("x.json")).read_text(encoding="utf-8")) == {"s.one": -1, "consumes": [GONE_NODE]}
+
+
+def _defines(path, name):
+    """True if the file defines a function or a method called `name` (a static look: nothing is imported or collected)."""
+    import ast
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return False
+    return any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name for n in ast.walk(tree))
+
+
+def test_every_retired_test_that_is_gone_from_its_file_is_consumed_or_in_a_fragment():
+    """A retirement whose test no longer exists was applied on main: it must be in consumed.json or in the `consumes` of a fragment, or a later
+    PR could use it again to excuse an unrelated loss. A retirement whose test still exists is pending, and allowed."""
+    required = verdict.read_required(REQUIRED)
+    used = set(required.consumed) | {n for f in required.fragments.values() for n in f["consumes"]}
+    unconsumed = []
+    for entry in json.loads(RETIRED.read_text(encoding="utf-8")):
+        if "nodeid" not in entry:
+            continue
+        file, test = entry["nodeid"].split("::", 1)
+        if not _defines(ROOT / file, test.split("[", 1)[0].split("::")[-1]) and entry["nodeid"] not in used:
+            unconsumed.append(entry["nodeid"])
+    assert not unconsumed, "retired and gone, but not consumed: %s" % sorted(set(unconsumed))
