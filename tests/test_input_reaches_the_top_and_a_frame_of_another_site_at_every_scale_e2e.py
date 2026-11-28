@@ -11,11 +11,11 @@ page, both holding the same four boxes (CSS pixels of the document): a button ``
 centre plus the document's origin in the page:
 
   * click: ``mouse.click`` at the centre of ``click``: the document hears trusted ``mousedown``, ``mouseup`` and ``click`` AT ``click``, with ``clientX/Y`` at the point
-    within one CSS pixel (the point is a device pixel, which at a fractional scale is not a whole CSS pixel);
-  * hover: ``mouse.move`` to the centre of ``hover``: ``mouseover`` is dispatched at ``hover``, with the point, and the element matches ``:hover``;
+    EXACTLY (no tolerance; every requested point is a whole CSS pixel);
+  * hover: ``mouse.move`` to the centre of ``hover``: ``mouseover`` is dispatched at ``hover``, at the exact point, and the element matches ``:hover``;
   * drag: ``mousedown`` at the centre of ``drag``, six moves to a point 30 right and 20 below, ``mouseup``: ``mousedown`` and ``mouseup`` AT ``drag`` with the two points,
     the ``mousemove`` events with the left button held and the last at the end point;
-  * wheel: ``mouse.wheel(0, 120)`` over the centre of ``scroll``: the document hears a trusted ``wheel`` at ``scroll``, with the point, and ``scroll.scrollTop`` grows.
+  * wheel: ``mouse.wheel(0, 120)`` over the centre of ``scroll``: the document hears a trusted ``wheel`` at ``scroll``, at the exact point, and ``scroll.scrollTop`` grows.
 
 The existing suites that read input in a frame of another site and are in the candidate's rows already: ``test_nested_frame_actions.py`` (a click, and a pointer at a large
 offset, with the scales 1, 1.25, 1.5 and 2, in one-, two- and three-process pages, and the wheel at scales 1 and 1.25 under a zoom),
@@ -41,8 +41,6 @@ CLICK, HOVER, DRAG, SCROLL = (50, 40), (130, 40), (250, 65), (90, 130)
 DRAG_TO = (280, 85)
 #: The frame's place in the top document.
 FRAME_AT = (20, 200)
-#: One CSS pixel: the point of an event is a device pixel, rounded to CSS.
-POINT_TOLERANCE = 1.0
 
 BODY = """<style>html,body{margin:0;padding:0}.b{position:absolute;box-sizing:border-box;margin:0;padding:0}
 #click{left:20px;top:20px;width:60px;height:40px}#hover{left:100px;top:20px;width:60px;height:40px;background:#eee}
@@ -69,8 +67,15 @@ def _where(case: str, doc_name: str, what: str, events: List[Dict[str, Any]]) ->
     return "%s, %s document, %s: events heard %r" % (case, doc_name, what, events)
 
 
-def _near(event: Dict[str, Any], point: Tuple[float, float]) -> bool:
-    return abs(event["cx"] - point[0]) <= POINT_TOLERANCE and abs(event["cy"] - point[1]) <= POINT_TOLERANCE
+def _at(event: Dict[str, Any], point: Tuple[float, float], case: str) -> bool:
+    """Exactly the requested point: no tolerance. Every requested point is a whole CSS pixel (the boxes' centres and the frame's origin are), so the event's
+    ``clientX/Y`` of the document is that value at every scale."""
+    return (event["cx"], event["cy"]) == (point[0], point[1])
+
+
+def _said(case: str, event: Dict[str, Any], point: Tuple[float, float]) -> str:
+    dpr = CASES[case][0]
+    return "requested point %r, received (%r, %r), scale %r" % (point, event["cx"], event["cy"], dpr)
 
 
 def _of(events: List[Dict[str, Any]], kind: str, box: str) -> List[Dict[str, Any]]:
@@ -90,7 +95,8 @@ def _check_click(page, doc, origin, case, name) -> None:
     for kind in ("mousedown", "mouseup", "click"):
         heard = _of(events, kind, "click")
         assert heard, "%s; no trusted %s at 'click'" % (where, kind)
-        assert heard[-1]["trusted"] and _near(heard[-1], CLICK), "%s; %s is not the trusted event at the point" % (where, kind)
+        assert heard[-1]["trusted"], "%s; %s is not trusted" % (where, kind)
+        assert _at(heard[-1], CLICK, case), "%s; %s is not at the point: %s" % (where, kind, _said(case, heard[-1], CLICK))
 
 
 def _check_hover(page, doc, origin, case, name) -> None:
@@ -102,7 +108,8 @@ def _check_hover(page, doc, origin, case, name) -> None:
     assert over and over[-1]["trusted"], "%s; no trusted mouseover at 'hover'" % where
     assert wait_for(page, lambda: doc.evaluate("() => document.getElementById('hover').matches(':hover')")), "%s; 'hover' does not match :hover" % where
     moves = [e for e in _events(doc) if e["t"] == "mousemove"]
-    assert moves and _near(moves[-1], HOVER), "%s; the last mousemove is not at the point" % where
+    assert moves, "%s; no mousemove" % where
+    assert _at(moves[-1], HOVER, case), "%s; the last mousemove is not at the point: %s" % (where, _said(case, moves[-1], HOVER))
 
 
 def _check_drag(page, doc, origin, case, name) -> None:
@@ -115,10 +122,12 @@ def _check_drag(page, doc, origin, case, name) -> None:
     events = _events(doc)
     where = _where(case, name, "drag from %r to %r" % (DRAG, DRAG_TO), events)
     down, up = _of(events, "mousedown", "drag"), _of(events, "mouseup", "drag")
-    assert down and _near(down[-1], DRAG), "%s; mousedown at 'drag' is not at the start point" % where
-    assert up and _near(up[-1], DRAG_TO), "%s; mouseup at 'drag' is not at the end point" % where
+    assert down and up, "%s; no mousedown or no mouseup at 'drag'" % where
+    assert _at(down[-1], DRAG, case), "%s; mousedown at 'drag' is not at the start point: %s" % (where, _said(case, down[-1], DRAG))
+    assert _at(up[-1], DRAG_TO, case), "%s; mouseup at 'drag' is not at the end point: %s" % (where, _said(case, up[-1], DRAG_TO))
     held = [e for e in events if e["t"] == "mousemove" and e["buttons"] == 1]
-    assert held and _near(held[-1], DRAG_TO), "%s; the last mousemove with the left button held is not at the end point" % where
+    assert held, "%s; no mousemove with the left button held" % where
+    assert _at(held[-1], DRAG_TO, case), "%s; the last mousemove with the left button held is not at the end point: %s" % (where, _said(case, held[-1], DRAG_TO))
 
 
 def _check_wheel(page, doc, origin, case, name) -> None:
@@ -129,7 +138,8 @@ def _check_wheel(page, doc, origin, case, name) -> None:
     events = _events(doc)
     where = _where(case, name, "wheel over %r" % (SCROLL,), events)
     wheel = _of(events, "wheel", "scroll")
-    assert wheel and wheel[-1]["trusted"] and _near(wheel[-1], SCROLL), "%s; no trusted wheel at 'scroll' at the point" % where
+    assert wheel and wheel[-1]["trusted"], "%s; no trusted wheel at 'scroll'" % where
+    assert _at(wheel[-1], SCROLL, case), "%s; the wheel is not at the point: %s" % (where, _said(case, wheel[-1], SCROLL))
     assert doc.evaluate("() => document.getElementById('scroll').scrollTop") > 0, "%s; the scroller did not scroll" % where
 
 
