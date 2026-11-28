@@ -1219,7 +1219,7 @@ def test_the_real_folder_of_fragments_exists_holds_consumed_json_and_every_fragm
 
 def _git(cwd, *args):
     import subprocess
-    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args],
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
                           cwd=str(cwd), check=True, capture_output=True, text=True)
 
 
